@@ -18,7 +18,7 @@ holder dies, however it dies.
 
 Zig 0.17.0:
 
-    zig build install -Doptimize=ReleaseSafe -p ~/.local
+    zig build install -Doptimize=safe -p ~/.local
 
 `zig build` writes `bin/cpuq` in the checkout; `zig build test` runs the unit
 tests and `test/run.sh` the end-to-end tests against `bin/cpuq`.
@@ -128,12 +128,16 @@ The head of the queue admits nothing while:
   at 2 (warn) or more; Linux `/proc/pressure/memory` `some avg10` at
   `pressure_psi` or more, when the file exists (`pressure_check = off`);
 - the load safety valve is closed (`load_check = off`, or `--no-load-check`
-  per run). The budget is what schedules work; the valve only guards against
-  load from outside cpuq. It trips when the 1-minute load exceeds budget +
-  `load_margin`, reopens only after the load has stayed at or under the
-  budget for 30 seconds, and while the load is above the budget it admits at
-  most one job per 10 seconds, so waiters never stampede into a lagging load
-  average.
+  per run). The budget is what schedules work; the valve is a safety net. It
+  reads the machine's whole 1-minute load, cpuq's own jobs included, so it
+  catches load from outside cpuq and jobs that use more cores than they were
+  granted (a `zig build` whose compiler processes ignore `-j`) alike. It
+  trips when the load exceeds budget + `load_margin`, reopens only after the
+  load has stayed at or under the budget for 30 seconds, and while the load
+  is above the budget it admits at most one job per 10 seconds, so waiters
+  never stampede into a lagging load average. A tripped valve nobody has
+  checked for over a minute reopens at once when the load is at or under the
+  budget, since the 1-minute average already covers that calm.
 
 The budget is capped by the cores active now (macOS `hw.activecpu`, Linux the
 process's CPU affinity). On Apple Silicon `hw.activecpu` does not appear to
@@ -229,3 +233,6 @@ group, the command included, so cpuq does not send it again (as with
 - A descendant that outlives a SIGKILLed cpuq keeps the cores until it exits.
 - One machine: the state directory must be on a local file system with
   working `flock(2)`.
+- One queue per `/tmp`: a container has its own `/tmp`, and with it its own
+  queue. Containers share the host's queue only through a common `CPUQ_DIR`
+  on a bind mount.
