@@ -42,9 +42,9 @@ described in [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Usage
 
-    cpuq run [--cores K] [--priority high|normal|low] [--exclusive] [--label TEXT]
+    cpuq run [--cores K|MIN-MAX] [--priority high|normal|low] [--exclusive] [--label TEXT]
              [--max-wait SECONDS] [--no-load-check] [--qos none] -- CMD ARGS...
-    cpuq status [--json]
+    cpuq status [--json] [--no-usage]
     cpuq budget
     cpuq qos
 
@@ -52,13 +52,18 @@ described in [docs/RELEASING.md](docs/RELEASING.md).
 stderr are inherited (a terminal stays a terminal), signals are forwarded and
 the exit status passes through (a command killed by signal N kills cpuq with
 the same signal, so the shell sees 128+N and a `^C` stops a shell loop).
-K defaults to 2 and is clamped to the budget. `--exclusive` takes the whole
+`--cores K` asks for exactly K cores; `--cores MIN-MAX` starts as soon as MIN
+are free and takes up to MAX of what is free then, which suits any tool that
+takes a job count (`zig build -j`, `make`, test runners) and keeps cores from
+idling while jobs wait. The default is 2, and a request is clamped to the
+budget. `--exclusive` takes the whole
 budget: it waits at the head of the queue for running work to drain and
 blocks everything behind it while it runs. While queued, cpuq prints a line
 to stderr about once a minute (who it waits behind), and `--max-wait` gives
 up with status 75.
 
-CMD gets `CPUQ_CORES=K`, `CPUQ_TOKEN` (its lease) and a GNU make jobserver.
+CMD gets `CPUQ_CORES` (the cores it was granted), `CPUQ_TOKEN` (its lease)
+and a GNU make jobserver sized to the grant.
 `CPUQ_CORES` is advisory: tools use every core unless told otherwise, so pass
 it on: `zig build -j$CPUQ_CORES`, `cargo build -j$CPUQ_CORES`, `ninja
 -j$CPUQ_CORES`. For make, run plain `make`: it takes its job slots from the
@@ -73,13 +78,19 @@ variable is ignored and the run queues normally.
 
 `cpuq status` shows the state directory, the budget, the held and free cores,
 the load, memory pressure and the admission gate, every holder (pid, the
-command's pid, label, command, cores, since) and every waiter (order,
-priority, waiting time). A holder marked `*` is a lease whose cpuq is gone
-while its command still runs and holds the cores. `cpuq status --json`
-gives the same for programs: a `schema` number (1; it changes only when a
-field is removed or changes meaning), the `version`, and the gate as
-`{"state", "load", "text"}` with `state` one of open, pressure, load or
-spacing. `cpuq budget` prints the budget in force; `cpuq qos` prints the
+command's pid, label, command, cores granted, cores in use, since) and every
+waiter (order, cores asked for, priority, waiting time). Cores in use is the
+CPU time the command's whole process tree spends over half a second, the
+short-lived processes it starts and reaps included: a holder using much
+less than its grant is asking for too much; measuring takes the half second,
+which `--no-usage` skips for a script that only needs the counts. A holder
+marked `*` is a lease
+whose cpuq is gone while its command still runs and holds the cores.
+`cpuq status --json` gives the same for programs: a `schema` number (1; it
+changes only when a field is removed or changes meaning), the `version`,
+each holder's `cores` and `using`, each waiter's `cores` and `max`, and the
+gate as `{"state", "load", "text"}` with `state` one of open, pressure, load
+or spacing. `cpuq budget` prints the budget in force; `cpuq qos` prints the
 calling process's scheduling class.
 
 ### Quiet windows
@@ -204,11 +215,14 @@ it reads the gates and, if they are open, tries to take its k tokens, all of
 them or none (on failure it releases what it took). Since only the head
 takes tokens, two waiters can never each hold part of what they need.
 
-**Fairness.** Strict order, no backfill: the head waits for its k cores and
+**Fairness.** Strict order, no backfill: the head waits for its minimum and
 nothing behind it overtakes it, even a small job that would fit now. Without
-run-time estimates any backfill could delay the head. `--exclusive` is k =
-the whole budget at the head (and no admission while an exclusive lease is
-alive). Lowering the budget below what is held only stops admissions.
+run-time estimates any backfill could delay the head. Once its minimum fits,
+the head takes up to its maximum of the free cores, but leaves the next
+waiter's minimum free when it can still get its own, so a wide request does
+not stall the job behind it. `--exclusive` takes the whole budget at the
+head (and nothing is admitted while an exclusive lease is alive). Lowering
+the budget below what is held only stops admissions.
 
 **Holds.** A job's tokens and its lease are exclusively flocked, and the
 command inherits those descriptors (they are not close-on-exec; every other

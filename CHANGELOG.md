@@ -2,6 +2,18 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.2.0 — 2026-10-05
+
+- Elastic grants: `cpuq run --cores MIN-MAX` starts as soon as MIN cores
+  are free and takes up to MAX of what is free, so cores no longer sit idle
+  while a job waits for a fixed count. `CPUQ_CORES` and the make jobserver
+  carry the grant. A wide request leaves the next waiter's minimum free.
+  `--cores K` still asks for exactly K.
+- `cpuq status` shows the cores each holder actually uses beside its grant,
+  measured over its whole process tree (the short-lived compilers and test
+  processes it starts included), and each waiter's request as MIN-MAX.
+  `--json` adds `using` to holders and `max` to waiters.
+
 ## 0.1.0 — 2026-10-05
 
 The first release: one binary for macOS (arm64, x86-64) and Linux (x86-64,
