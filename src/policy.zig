@@ -216,6 +216,25 @@ pub fn psiPressure(text: []const u8, threshold: f64) Pressure {
     return .unknown;
 }
 
+/// The number of CPUs in a Linux CPU list such as "0-7" or "0,2-5,8\n"
+/// (/sys/devices/system/cpu/present); null when it is not one.
+pub fn cpuListCount(text: []const u8) ?u32 {
+    var n: u32 = 0;
+    var parts = std.mem.tokenizeAny(u8, text, ", \n");
+    while (parts.next()) |part| {
+        if (std.mem.cutScalar(u8, part, '-')) |range| {
+            const lo = std.fmt.parseInt(u32, range[0], 10) catch return null;
+            const hi = std.fmt.parseInt(u32, range[1], 10) catch return null;
+            if (hi < lo) return null;
+            n += hi - lo + 1;
+        } else {
+            _ = std.fmt.parseInt(u32, part, 10) catch return null;
+            n += 1;
+        }
+    }
+    return if (n > 0) n else null;
+}
+
 /// What the machine looks like at the moment of an admission decision.
 pub const Machine = struct {
     active: u32,
@@ -307,6 +326,15 @@ test "effective budget: default reserve, env, config, active-core cap" {
     try testing.expectEqual(5, effectiveBudget(5, .{ .budget = 4 }, 10, 10)); // env wins
     try testing.expectEqual(10, effectiveBudget(16, .{ .active_cap = false }, 10, 10)); // one token per core
     try testing.expectEqual(10, effectiveBudget(16, cfg, 10, 10));
+}
+
+test "cpu lists" {
+    try testing.expectEqual(8, cpuListCount("0-7\n").?);
+    try testing.expectEqual(1, cpuListCount("0\n").?);
+    try testing.expectEqual(7, cpuListCount("0,2-5,8,10\n").?);
+    try testing.expectEqual(null, cpuListCount(""));
+    try testing.expectEqual(null, cpuListCount("7-3"));
+    try testing.expectEqual(null, cpuListCount("x"));
 }
 
 test "memory pressure gate" {

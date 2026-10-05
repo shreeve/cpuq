@@ -80,6 +80,27 @@ t_budget() {
   check "all 20 finished with status 0" "[ $rc = 0 ]"
 }
 
+t_affinity() {
+  setup affinity
+  if ! command -v taskset >/dev/null || [ "$(getconf _NPROCESSORS_CONF)" -lt 6 ]; then
+    echo "  skipped: needs Linux with taskset and 6 or more CPUs"
+    return
+  fi
+  # Holds on tokens 2-5 only: A takes 0-1, B takes 2-5 (with a budget of 6),
+  # then A ends.
+  CPUQ_BUDGET=6 "$CPUQ" run --cores 2 -- sleep 1 & local a=$!
+  wait_held 2
+  CPUQ_BUDGET=6 "$CPUQ" run --cores 4 -- sleep 8 & local b=$!
+  wait_held 6
+  wait $a
+  wait_held 4
+  # Budget 4, all 4 held: a run confined to CPUs 0-1 sees tokens 0-1 free,
+  # but must count the holds on 2-5 and wait.
+  CPUQ_BUDGET=4 taskset -c 0,1 "$CPUQ" run --cores 2 --max-wait 2 -- true; local rc=$?
+  kill $b 2>/dev/null; wait $b 2>/dev/null
+  check "a run confined to 2 CPUs counts holds on every core and waits (exit $rc, want 75)" "[ $rc = 75 ]"
+}
+
 t_kill_holder() {
   setup kill-holder
   "$CPUQ" run --cores 9 -- sleep 30 & local holder=$!
@@ -387,7 +408,7 @@ t_status() {
   check "status shows the dir, the holder and the waiter" "[[ '$s' == *'dir     $CPUQ_DIR'* && '$s' == *build* && '$s' == *big* ]]"
 }
 
-TESTS=${*:-budget kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested max_wait waiters_cpu qos jobserver status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested max_wait waiters_cpu qos jobserver status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

@@ -33,13 +33,20 @@ pub fn activeCpus() u32 {
     return @intCast(@max(n, 1));
 }
 
-/// The machine's cores: one token file each.
-pub fn totalCpus() u32 {
+/// The machine's cores: one token file each. On Linux this is every CPU the
+/// machine has, not the caller's affinity, so that runs confined to fewer
+/// CPUs (taskset, a cpuset) agree with everyone else on the token set.
+pub fn totalCpus(io: Io) u32 {
     if (is_darwin) {
         var n: c_int = 0;
         var len: usize = @sizeOf(c_int);
         if (c.sysctlbyname("hw.ncpu", &n, &len, null, 0) == 0 and n > 0) return @intCast(n);
         return 1;
+    }
+    for ([_][]const u8{ "/sys/devices/system/cpu/present", "/sys/devices/system/cpu/possible" }) |path| {
+        var buf: [256]u8 = undefined;
+        const text = Io.Dir.cwd().readFile(io, path, &buf) catch continue;
+        if (policy.cpuListCount(text)) |n| return n;
     }
     const n = std.Thread.getCpuCount() catch return 1;
     return @intCast(@max(n, 1));

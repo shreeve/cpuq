@@ -151,7 +151,7 @@ fn envBudget(ctx: *Ctx) ?u32 {
 }
 
 fn budgetNow(ctx: *Ctx, m: policy.Machine) u32 {
-    return policy.effectiveBudget(envBudget(ctx), ctx.cfg, m.active, sys.totalCpus());
+    return policy.effectiveBudget(envBudget(ctx), ctx.cfg, m.active, sys.totalCpus(ctx.io));
 }
 
 const RunOptions = struct {
@@ -314,7 +314,7 @@ fn lockOrFail(st: *state.State) void {
 fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
     const io = ctx.io;
     const cfg = ctx.cfg;
-    const cores = sys.totalCpus();
+    const cores = sys.totalCpus(io);
     const start = nowSeconds(io);
 
     lockOrFail(st);
@@ -645,7 +645,7 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
         const s: JsonStatus = .{
             .dir = st.path,
             .budget = budget,
-            .cores = sys.totalCpus(),
+            .cores = sys.totalCpus(ctx.io),
             .active_cores = m.active,
             .held = held,
             .free = budget -| held,
@@ -660,7 +660,7 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
         return 0;
     }
     w.print("dir     {s}\n", .{st.path}) catch {};
-    w.print("budget  {d} cores ({d} active of {d}); held {d}, free {d}\n", .{ budget, m.active, sys.totalCpus(), held, budget -| held }) catch {};
+    w.print("budget  {d} cores ({d} active of {d}); held {d}, free {d}\n", .{ budget, m.active, sys.totalCpus(ctx.io), held, budget -| held }) catch {};
     w.print("load    {d:.2} {d:.2} {d:.2}; memory pressure {s}; gate {s}\n", .{ load[0], load[1], load[2], pressure, gate_text }) catch {};
     var b1: [16]u8 = undefined;
     w.print("\nholders ({d})\n", .{holders.items.len}) catch {};

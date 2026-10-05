@@ -296,17 +296,30 @@ fn tokenName(buf: []u8, i: u32) []const u8 {
     return std.mem.print(buf, "{d:0>4}", .{i}) catch unreachable;
 }
 
-/// The head's all-or-nothing acquisition of k of the machine's `cores`
-/// tokens: it takes k free tokens only if the held ones plus k fit in the
-/// budget, and otherwise releases whatever it took. Call with the
-/// admission lock held.
+/// The head's all-or-nothing acquisition of k tokens: it takes the k
+/// lowest-numbered free tokens only if the held ones plus k fit in the
+/// budget, and otherwise releases whatever it took. Every token file
+/// counts, not just the first `cores`: a run that sees fewer cores (an
+/// older cpuq, a smaller machine view) must still see every hold. Call with
+/// the admission lock held.
 pub fn takeTokens(s: *State, arena: std.mem.Allocator, k: u32, exclusive: bool, budget: u32, cores: u32, exclusive_running: bool) !?[]Io.File {
+    var n = cores;
+    var it = s.tokens.iterate();
+    while (try it.next(s.io)) |entry| {
+        if (entry.kind != .file) continue;
+        const i = std.fmt.parseInt(u32, entry.name, 10) catch continue;
+        n = @max(n, i + 1);
+    }
     var got: std.ArrayList(Io.File) = .empty;
     var held: u32 = 0;
     var i: u32 = 0;
-    while (i < cores) : (i += 1) {
+    while (i < n) : (i += 1) {
         var buf: [16]u8 = undefined;
-        const f = try State.createShared(s.io, s.tokens, tokenName(&buf, i));
+        const name = tokenName(&buf, i);
+        const f = if (i < cores)
+            try State.createShared(s.io, s.tokens, name)
+        else
+            s.tokens.openFile(s.io, name, .{}) catch continue;
         if (try f.tryLock(s.io, .exclusive)) {
             if (got.items.len < k) {
                 try got.append(arena, f);
