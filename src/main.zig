@@ -141,7 +141,7 @@ fn machine(ctx: *Ctx) policy.Machine {
     return .{
         .active = sys.activeCpus(),
         .load1 = sys.loadAverage()[0],
-        .pressure = if (ctx.cfg.pressure_check) sys.memoryPressure(ctx.io, ctx.cfg.pressure_psi) else .unknown,
+        .pressure = if (ctx.cfg.pressure_check) sys.memoryPressure(ctx.io, ctx.cfg.pressure_psi) else .off,
     };
 }
 

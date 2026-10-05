@@ -200,7 +200,9 @@ pub const Valve = struct {
     }
 };
 
-pub const Pressure = enum { normal, high, unknown };
+/// Memory pressure as the OS reports it; `unknown` when it reports nothing,
+/// `off` when `pressure_check` is off.
+pub const Pressure = enum { normal, high, unknown, off };
 
 /// macOS kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical.
 pub fn macPressure(level: c_int) Pressure {
