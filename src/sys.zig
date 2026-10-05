@@ -186,7 +186,9 @@ fn onSignal(sig: c.SIG, info: *const c.siginfo_t, _: ?*anyopaque) callconv(.c) v
 }
 
 /// Installs the forwarding handlers. Exec resets them to the default in the
-/// command.
+/// command. A signal cpuq was started with ignored (`nohup`, a `&` job in a
+/// script) is left ignored, so the command inherits it ignored, as it would
+/// without cpuq.
 pub fn installForwarding() void {
     var sa: c.Sigaction = .{
         .handler = .{ .sigaction = onSignal },
@@ -194,7 +196,11 @@ pub fn installForwarding() void {
         .flags = c.SA.SIGINFO | c.SA.RESTART,
     };
     _ = c.sigemptyset(&sa.mask);
-    for (forwarded) |sig| _ = c.sigaction(sig, &sa, null);
+    for (forwarded) |sig| {
+        var old: c.Sigaction = undefined;
+        if (c.sigaction(sig, null, &old) == 0 and old.handler.handler == c.SIG.IGN) continue;
+        _ = c.sigaction(sig, &sa, null);
+    }
 }
 
 /// Records the command's pid for the handlers and delivers any signal that

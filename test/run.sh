@@ -33,6 +33,14 @@ setup() {
   echo "== $CUR"
 }
 
+# dfl CMD...: exec CMD with SIGINT and SIGQUIT at their defaults. A `&` job
+# in a script starts with both ignored, and cpuq (like any command) keeps an
+# ignored signal ignored.
+dfl() { exec python3 -c 'import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+os.execvp(sys.argv[1], sys.argv[1:])' "$@"; }
+
 held() { "$CPUQ" status --json | sed -n 's/^  "held": \([0-9]*\),*/\1/p'; }
 now() { python3 -c 'import time; print("%.3f" % time.time())'; }
 
@@ -151,7 +159,7 @@ print(r.returncode)")
 t_direct_sigint() {
   setup direct-sigint
   local f=$T/ints
-  "$CPUQ" run -- sh -c "trap 'echo INT >>$f; exit 3' INT; while :; do sleep 0.05; done" & local p=$!
+  dfl "$CPUQ" run -- sh -c "trap 'echo INT >>$f; exit 3' INT; while :; do sleep 0.05; done" & local p=$!
   wait_held 2
   sleep 0.3
   kill -INT $p
@@ -166,10 +174,11 @@ t_terminal_sigint() {
   # A pty makes the run a foreground job; ^C goes to the whole process group.
   local out
   out=$(python3 - "$CPUQ" "$f" <<'EOF'
-import os, pty, sys, time
+import os, pty, signal, sys, time
 cpuq, f = sys.argv[1], sys.argv[2]
 pid, fd = pty.fork()
 if pid == 0:
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
     os.execv(cpuq, [cpuq, "run", "--", "sh", "-c",
         "trap 'echo INT >>%s' INT; i=0; while [ $i -lt 30 ]; do sleep 0.05; i=$((i+1)); done; exit 4" % f])
 time.sleep(0.8)
@@ -191,6 +200,17 @@ print(n, status)
 EOF
 )
   check "^C at a terminal reaches the command exactly once (ints, exit: $out)" "[ '$out' = '1 4' ]"
+}
+
+t_ignored_signals() {
+  setup ignored-signals
+  local sig base got
+  for sig in HUP INT; do
+    # What `nohup` or a `&` job in a script hands down: the signal ignored.
+    base=$( (trap '' $sig; sh -c "kill -$sig \$\$; echo survived") )
+    got=$( (trap '' $sig; "$CPUQ" run -- sh -c "kill -$sig \$\$; echo survived") )
+    check "a SIG$sig ignored by the caller stays ignored for the command (without cpuq: '$base'; with: '$got')" "[ '$base' = survived ] && [ '$got' = survived ]"
+  done
 }
 
 t_order() {
@@ -367,7 +387,7 @@ t_status() {
   check "status shows the dir, the holder and the waiter" "[[ '$s' == *'dir     $CPUQ_DIR'* && '$s' == *build* && '$s' == *big* ]]"
 }
 
-TESTS=${*:-budget kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint order aging no_starvation exclusive nested max_wait waiters_cpu qos jobserver status}
+TESTS=${*:-budget kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested max_wait waiters_cpu qos jobserver status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"
