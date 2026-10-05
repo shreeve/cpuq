@@ -45,7 +45,7 @@ signal.signal(signal.SIGINT, signal.SIG_DFL)
 signal.signal(signal.SIGQUIT, signal.SIG_DFL)
 os.execvp(sys.argv[1], sys.argv[1:])' "$@"; }
 
-held() { "$CPUQ" status --json | sed -n 's/^  "held": \([0-9]*\),*/\1/p'; }
+held() { "$CPUQ" status --json --no-usage | sed -n 's/^  "held": \([0-9]*\),*/\1/p'; }
 now() { python3 -c 'import time; print("%.3f" % time.time())'; }
 
 # wait_held N [seconds]: until N cores are held.
@@ -60,7 +60,7 @@ wait_held() {
 # Wait until the queue holds N waiters.
 wait_waiters() {
   local i=0
-  while [ "$("$CPUQ" status --json | grep -c '"order"')" != "$1" ]; do
+  while [ "$("$CPUQ" status --json --no-usage | grep -c '"order"')" != "$1" ]; do
     i=$((i + 1)); [ $i -gt 100 ] && return 1
     sleep 0.1
   done
@@ -128,7 +128,7 @@ t_kill_cpuq_only() {
   sleep 1
   "$CPUQ" status
   local h1; h1=$(held)
-  local gone; gone=$("$CPUQ" status --json | grep -c '"holder_alive": false')
+  local gone; gone=$("$CPUQ" status --json --no-usage | grep -c '"holder_alive": false')
   "$CPUQ" run --cores 9 -- true; local rc=$?
   local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
   echo "  after kill -9 of cpuq: held $h1; next run admitted ${dt}s after the kill (the sleep runs 4s)"
@@ -303,6 +303,55 @@ t_nested() {
   check "a stale CPUQ_TOKEN is ignored and the run queues normally (token now '$out')" "[ -n '$out' ] && [ '$out' != 0000099999 ]"
 }
 
+t_elastic() {
+  setup elastic
+  "$CPUQ" run --cores 7 -- sleep 2 & wait_held 7
+  local t0; t0=$(now)
+  local got; got=$("$CPUQ" run --cores 2-4 -- sh -c 'echo $CPUQ_CORES')
+  local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
+  check "a 2-4 request starts at once beside 7 held of 9, with 2 (got $got in ${dt}s)" "[ '$got' = 2 ] && python3 -c 'import sys; sys.exit(0 if $dt < 1 else 1)'"
+  local fixed; fixed=$("$CPUQ" run --cores 3 --max-wait 1 -- true; echo $?)
+  check "a fixed 3 still waits for 3 (exit $fixed, want 75)" "[ '$fixed' = 75 ]"
+  wait
+  got=$("$CPUQ" run --cores 2-4 -- sh -c 'echo $CPUQ_CORES')
+  check "on an idle machine a 2-4 request gets 4 (got $got)" "[ '$got' = 4 ]"
+  got=$("$CPUQ" run --cores 1-20 -- sh -c 'echo $CPUQ_CORES')
+  check "a maximum above the budget is clamped to it (got $got)" "[ '$got' = 9 ]"
+}
+
+t_reserve() {
+  setup reserve
+  local f=$T/log
+  local stamp='python3 -c "import time; print(\"%.3f\" % time.time())"'
+  "$CPUQ" run --cores 9 -- sleep 1.5 & wait_held 9
+  "$CPUQ" run --cores 2-9 -- sh -c "echo wide \$CPUQ_CORES \$($stamp) >>$f; sleep 1" & wait_waiters 1
+  "$CPUQ" run --cores 2-4 -- sh -c "echo next \$CPUQ_CORES \$($stamp) >>$f; sleep 1" & wait_waiters 2
+  wait
+  local got; got=$(sort "$f" | awk '{print $1, $2}' | tr '\n' ' ')
+  local apart; apart=$(sort "$f" | awk '{print $3}' | python3 -c 'import sys; t = [float(x) for x in sys.stdin]; print("%.2f" % abs(t[0] - t[1]))')
+  echo "  after the holder ends: $got; started ${apart}s apart"
+  check "a wide request leaves the next waiter's minimum, and both start together" "[ '$got' = 'next 2 wide 7 ' ] && python3 -c 'import sys; sys.exit(0 if $apart < 0.5 else 1)'"
+}
+
+t_usage() {
+  setup usage
+  "$CPUQ" run --cores 3 --label spin -- python3 -c 'import time
+e = time.time() + 4
+while time.time() < e: pass' &
+  "$CPUQ" run --cores 2 --label idle -- sleep 4 &
+  wait_held 5
+  sleep 1
+  local u; u=$("$CPUQ" status --json | python3 -c 'import json, sys
+s = json.load(sys.stdin)
+print(" ".join("%s=%.2f" % (h["label"], h["using"]) for h in sorted(s["holders"], key=lambda h: h["label"])))')
+  wait
+  echo "  measured use: $u"
+  check "status measures use: a 1-CPU spinner granted 3 uses about 1, a sleeper about 0 ($u)" "python3 -c '
+import sys
+u = dict(p.split(\"=\") for p in \"$u\".split())
+sys.exit(0 if 0.7 < float(u[\"spin\"]) < 1.3 and float(u[\"idle\"]) < 0.2 else 1)'"
+}
+
 t_lost_seq() {
   setup lost-seq
   "$CPUQ" run --cores 5 --label holder -- sleep 2 & local h=$!
@@ -312,7 +361,7 @@ t_lost_seq() {
   rm -f "$CPUQ_DIR/seq"
   "$CPUQ" run --cores 4 --label second -- sleep 1 & local x=$!
   wait_waiters 2 || wait_held 9
-  local tickets; tickets=$("$CPUQ" status --json | sed -n 's/^ *"ticket": \([0-9]*\),*/\1/p' | sort -n | tr '\n' ' ')
+  local tickets; tickets=$("$CPUQ" status --json --no-usage | sed -n 's/^ *"ticket": \([0-9]*\),*/\1/p' | sort -n | tr '\n' ' ')
   local t0; t0=$(now)
   wait $h; wait $w; local rw=$?; wait $x; local rx=$?
   local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
@@ -434,7 +483,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested lost_seq max_wait waiters_cpu qos jobserver status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lost_seq max_wait waiters_cpu qos jobserver status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

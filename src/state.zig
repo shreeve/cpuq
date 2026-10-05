@@ -150,6 +150,8 @@ pub const Record = struct {
     pid: i32 = 0,
     child: i32 = 0,
     cores: u32 = 0,
+    /// A waiter's maximum (its minimum is `cores`); a lease's `cores` is its grant.
+    max: u32 = 0,
     priority: policy.Priority = .normal,
     exclusive: bool = false,
     since: i64 = 0,
@@ -157,8 +159,8 @@ pub const Record = struct {
     cmd: []const u8 = "",
 
     pub fn write(r: Record, w: *Io.Writer) Io.Writer.Error!void {
-        try w.print("ticket={d}\npid={d}\nchild={d}\ncores={d}\npriority={t}\nexclusive={d}\nsince={d}\n", .{
-            r.ticket, r.pid, r.child, r.cores, r.priority, @intFromBool(r.exclusive), r.since,
+        try w.print("ticket={d}\npid={d}\nchild={d}\ncores={d}\nmax={d}\npriority={t}\nexclusive={d}\nsince={d}\n", .{
+            r.ticket, r.pid, r.child, r.cores, r.max, r.priority, @intFromBool(r.exclusive), r.since,
         });
         try w.writeAll("label=");
         try writeLine(w, r.label);
@@ -180,6 +182,7 @@ pub const Record = struct {
             if (std.mem.eql(u8, k, "pid")) r.pid = std.fmt.parseInt(i32, v, 10) catch 0;
             if (std.mem.eql(u8, k, "child")) r.child = std.fmt.parseInt(i32, v, 10) catch 0;
             if (std.mem.eql(u8, k, "cores")) r.cores = std.fmt.parseInt(u32, v, 10) catch 0;
+            if (std.mem.eql(u8, k, "max")) r.max = std.fmt.parseInt(u32, v, 10) catch 0;
             if (std.mem.eql(u8, k, "priority")) r.priority = policy.Priority.parse(v) orelse .normal;
             if (std.mem.eql(u8, k, "exclusive")) r.exclusive = std.mem.eql(u8, v, "1");
             if (std.mem.eql(u8, k, "since")) r.since = std.fmt.parseInt(i64, v, 10) catch 0;
@@ -319,13 +322,13 @@ fn tokenName(buf: []u8, i: u32) []const u8 {
     return std.mem.print(buf, "{d:0>4}", .{i}) catch unreachable;
 }
 
-/// The head's all-or-nothing acquisition of k tokens: it takes the k
-/// lowest-numbered free tokens only if the held ones plus k fit in the
-/// budget, and otherwise releases whatever it took. Every token file in
-/// the directory counts, beyond the first `cores` too, so every run sees
-/// every hold whatever core count it was started with. Call with the
-/// admission lock held.
-pub fn takeTokens(s: *State, arena: std.mem.Allocator, k: u32, exclusive: bool, budget: u32, cores: u32, exclusive_running: bool) !?[]Io.File {
+/// The head's all-or-nothing acquisition: it locks every free token, counts
+/// the held ones, asks `policy.admit` how many to take, keeps that many of
+/// the lowest-numbered free tokens and releases the rest, or all of them
+/// when the answer is to wait. Every token file in the directory counts,
+/// beyond the first `cores` too, so every run sees every hold whatever core
+/// count it was started with. Call with the admission lock held.
+pub fn takeTokens(s: *State, arena: std.mem.Allocator, req: policy.Request, exclusive: bool, budget: u32, cores: u32, exclusive_running: bool, reserve: u32) !?[]Io.File {
     var n = cores;
     var it = s.tokens.iterate();
     while (try it.next(s.io)) |entry| {
@@ -333,7 +336,7 @@ pub fn takeTokens(s: *State, arena: std.mem.Allocator, k: u32, exclusive: bool, 
         const i = std.fmt.parseInt(u32, entry.name, 10) catch continue;
         n = @max(n, i + 1);
     }
-    var got: std.ArrayList(Io.File) = .empty;
+    var free: std.ArrayList(Io.File) = .empty;
     var held: u32 = 0;
     var i: u32 = 0;
     while (i < n) : (i += 1) {
@@ -344,20 +347,24 @@ pub fn takeTokens(s: *State, arena: std.mem.Allocator, k: u32, exclusive: bool, 
         else
             s.tokens.openFile(s.io, name, .{}) catch continue;
         if (try f.tryLock(s.io, .exclusive)) {
-            if (got.items.len < k) {
-                try got.append(arena, f);
-                continue;
-            }
-            f.unlock(s.io);
+            try free.append(arena, f);
         } else {
             held += 1;
+            f.close(s.io);
         }
-        f.close(s.io);
     }
-    if (got.items.len == k and policy.fits(k, exclusive, budget, held, exclusive_running)) return got.items;
-    for (got.items) |f| {
+    const k = policy.admit(req, exclusive, budget, held, exclusive_running, reserve) orelse 0;
+    const keep = @min(k, free.items.len);
+    for (free.items[keep..]) |f| {
         f.unlock(s.io);
         f.close(s.io);
     }
-    return null;
+    if (keep == 0 or keep < k) {
+        for (free.items[0..keep]) |f| {
+            f.unlock(s.io);
+            f.close(s.io);
+        }
+        return null;
+    }
+    return free.items[0..keep];
 }

@@ -269,19 +269,44 @@ pub fn gate(cfg: Config, m: Machine, budget: u32, valve: ?*Valve, now: i64) Gate
     return .open;
 }
 
-/// The cores a request is granted: an exclusive run takes the whole budget,
-/// any other request is clamped to it.
-pub fn grant(requested: u32, exclusive: bool, budget: u32) u32 {
-    return if (exclusive) budget else @min(@max(requested, 1), budget);
-}
+/// A request for cores: at least `min`, and up to `max` when they are free.
+/// `--cores 3` is 3-3; `--cores 2-4` is 2-4.
+pub const Request = struct {
+    min: u32,
+    max: u32,
 
-/// The admission rule for the head of the queue. `held` counts the tokens
-/// held by running work; `exclusive_running` is true while an exclusive
-/// lease is alive.
-pub fn fits(k: u32, exclusive: bool, budget: u32, held: u32, exclusive_running: bool) bool {
-    if (exclusive_running) return false;
-    if (exclusive) return held == 0;
-    return held + k <= budget;
+    pub fn parse(s: []const u8) ?Request {
+        if (std.mem.cutScalar(u8, s, '-')) |range| {
+            const lo = parseCount(range[0]) orelse return null;
+            const hi = parseCount(range[1]) orelse return null;
+            return if (hi >= lo) .{ .min = lo, .max = hi } else null;
+        }
+        const n = parseCount(s) orelse return null;
+        return .{ .min = n, .max = n };
+    }
+
+    pub fn fixed(r: Request) bool {
+        return r.min == r.max;
+    }
+};
+
+/// The admission rule for the head of the queue: how many cores it takes
+/// now, or null to keep waiting. A request is clamped to the budget. It is
+/// admitted once its minimum fits beside the `held` cores, and takes as
+/// much more as is free, up to its maximum, but leaves `reserve` (the next
+/// waiter's minimum) free when it can do so and still get its own minimum.
+/// An exclusive run takes the whole budget once nothing is held, and
+/// nothing is admitted while an exclusive lease is alive.
+pub fn admit(req: Request, exclusive: bool, budget: u32, held: u32, exclusive_running: bool, reserve: u32) ?u32 {
+    if (exclusive_running) return null;
+    if (exclusive) return if (held == 0) budget else null;
+    const lo = @min(@max(req.min, 1), budget);
+    const hi = @min(@max(req.max, lo), budget);
+    if (held >= budget) return null;
+    const free = budget - held;
+    if (free < lo) return null;
+    const room = if (free >= lo + reserve) free - reserve else free;
+    return @min(hi, room);
 }
 
 /// MAKEFLAGS for a command whose jobserver pipe is (r, w): the caller's
@@ -419,22 +444,49 @@ test "a stale tripped valve reopens at once when the load is calm" {
     try testing.expectEqual(Gate{ .load = 3 }, gate(cfg, calm, 8, &v, 4600));
 }
 
-test "active-core cap shrinks the grant" {
-    // 10 cores active, budget 8: a 9-core request is clamped to 8.
-    try testing.expectEqual(8, grant(9, false, effectiveBudget(null, .{}, 10)));
-    // Only 6 cores active: the same request gets 6.
-    try testing.expectEqual(6, grant(9, false, effectiveBudget(9, .{}, 6)));
-    try testing.expectEqual(1, grant(0, false, 8));
-    try testing.expectEqual(8, grant(2, true, 8));
+test "requests" {
+    try testing.expectEqual(Request{ .min = 3, .max = 3 }, Request.parse("3").?);
+    try testing.expectEqual(Request{ .min = 2, .max = 4 }, Request.parse("2-4").?);
+    try testing.expectEqual(Request{ .min = 2, .max = 2 }, Request.parse("2-2").?);
+    try testing.expectEqual(null, Request.parse("4-2"));
+    try testing.expectEqual(null, Request.parse("0-2"));
+    try testing.expectEqual(null, Request.parse("2-"));
+    try testing.expectEqual(null, Request.parse("x"));
 }
 
 test "admission rule" {
-    try testing.expect(fits(3, false, 9, 6, false));
-    try testing.expect(!fits(3, false, 9, 7, false));
-    try testing.expect(fits(9, true, 9, 0, false));
-    try testing.expect(!fits(9, true, 9, 1, false));
-    try testing.expect(!fits(1, false, 9, 0, true)); // an exclusive run blocks everything
-    try testing.expect(!fits(2, false, 4, 3, false)); // budget lowered under running work
+    const three: Request = .{ .min = 3, .max = 3 };
+    try testing.expectEqual(3, admit(three, false, 9, 6, false, 0).?);
+    try testing.expectEqual(null, admit(three, false, 9, 7, false, 0));
+    try testing.expectEqual(9, admit(three, true, 9, 0, false, 0).?);
+    try testing.expectEqual(null, admit(three, true, 9, 1, false, 0));
+    try testing.expectEqual(null, admit(.{ .min = 1, .max = 1 }, false, 9, 0, true, 0)); // an exclusive run blocks everything
+    try testing.expectEqual(null, admit(.{ .min = 2, .max = 2 }, false, 4, 3, false, 0)); // budget lowered under running work
+    try testing.expectEqual(null, admit(three, false, 4, 5, false, 0)); // more held than the budget
+}
+
+test "a request is clamped to the budget" {
+    // 10 cores active, budget 8: a 9-core request gets 8.
+    try testing.expectEqual(8, admit(.{ .min = 9, .max = 9 }, false, effectiveBudget(null, .{}, 10), 0, false, 0).?);
+    // Only 6 cores active: the same request gets 6.
+    try testing.expectEqual(6, admit(.{ .min = 9, .max = 9 }, false, effectiveBudget(9, .{}, 6), 0, false, 0).?);
+    try testing.expectEqual(1, admit(.{ .min = 0, .max = 0 }, false, 8, 0, false, 0).?);
+}
+
+test "elastic grants" {
+    const two_four: Request = .{ .min = 2, .max = 4 };
+    // Budget 8, 6 held: 2 free, so a 2-4 request starts at once with 2.
+    try testing.expectEqual(2, admit(two_four, false, 8, 6, false, 0).?);
+    // All free: it takes its maximum.
+    try testing.expectEqual(4, admit(two_four, false, 8, 0, false, 0).?);
+    // 1 free: it waits for its minimum.
+    try testing.expectEqual(null, admit(two_four, false, 8, 7, false, 0));
+    // A wide request leaves the next waiter's minimum free...
+    try testing.expectEqual(6, admit(.{ .min = 2, .max = 8 }, false, 8, 0, false, 2).?);
+    // ...unless that would cut it below its own minimum: then it takes all.
+    try testing.expectEqual(3, admit(.{ .min = 2, .max = 8 }, false, 8, 5, false, 2).?);
+    // A maximum above the budget is clamped to it.
+    try testing.expectEqual(8, admit(.{ .min = 2, .max = 20 }, false, 8, 0, false, 0).?);
 }
 
 test "aging promotes one class per period" {

@@ -250,6 +250,104 @@ pub fn dieBySignal(sig: c.SIG) noreturn {
     c._exit(128 + @as(u8, @intCast(@backingInt(sig))));
 }
 
+extern "c" fn proc_listallpids(buffer: ?*anyopaque, size: c_int) c_int;
+extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, size: c_int) c_int;
+extern "c" fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: ?*anyopaque) c_int;
+extern "c" fn mach_timebase_info(info: *MachTimebase) c_int;
+extern "c" fn sysconf(name: c_int) c_long;
+const MachTimebase = extern struct { numer: u32, denom: u32 };
+
+pub const Proc = struct {
+    pid: i32,
+    ppid: i32,
+    /// CPU time used so far, user plus system, in nanoseconds: the
+    /// process's own and that of its children it has already reaped, so the
+    /// many short processes a build or test run starts are counted too.
+    cpu_ns: u64,
+};
+
+/// Every process the caller can see, with its parent and its CPU time so
+/// far: macOS proc_pidinfo and proc_pid_rusage, Linux /proc/PID/stat.
+pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
+    var list: std.ArrayList(Proc) = .empty;
+    if (is_darwin) {
+        // struct proc_bsdinfo (PROC_PIDTBSDINFO, 136 bytes): pbi_ppid at 16.
+        // struct rusage_info_v1 (144 bytes): ri_user_time at 16,
+        // ri_system_time at 24, ri_child_user_time at 96,
+        // ri_child_system_time at 104, in Mach absolute time units.
+        var tb: MachTimebase = .{ .numer = 1, .denom = 1 };
+        _ = mach_timebase_info(&tb);
+        const count = proc_listallpids(null, 0);
+        if (count <= 0) return &.{};
+        const pids = arena.alloc(c_int, @as(usize, @intCast(count)) + 64) catch return &.{};
+        const n = proc_listallpids(pids.ptr, @intCast(pids.len * @sizeOf(c_int)));
+        if (n <= 0) return &.{};
+        for (pids[0..@min(@as(usize, @intCast(n)), pids.len)]) |pid| {
+            var bsd: [136]u8 align(8) = undefined;
+            if (proc_pidinfo(pid, 3, 0, &bsd, bsd.len) != bsd.len) continue;
+            var ru: [144]u8 align(8) = undefined;
+            if (proc_pid_rusage(pid, 1, &ru) != 0) continue;
+            var ticks: u64 = 0;
+            for ([_]usize{ 16, 24, 96, 104 }) |at| ticks +%= std.mem.readInt(u64, ru[at..][0..8], .little);
+            list.append(arena, .{
+                .pid = pid,
+                .ppid = @bitCast(std.mem.readInt(u32, bsd[16..20], .little)),
+                .cpu_ns = @intCast(@as(u128, ticks) * tb.numer / tb.denom),
+            }) catch break;
+        }
+        return list.items;
+    }
+    const tick_hz: u64 = @intCast(@max(sysconf(2), 1)); // _SC_CLK_TCK
+    var dir = Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch return &.{};
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        const pid = std.fmt.parseInt(i32, entry.name, 10) catch continue;
+        var path_buf: [32]u8 = undefined;
+        const path = std.mem.print(&path_buf, "/proc/{d}/stat", .{pid}) catch continue;
+        var buf: [1024]u8 = undefined;
+        const text = Io.Dir.cwd().readFile(io, path, &buf) catch continue;
+        // Fields after the command, which is in parentheses and may hold
+        // spaces: state, ppid, ..., utime, stime, cutime, cstime (12th to
+        // 15th; cutime and cstime are the reaped children's).
+        const close = std.mem.findScalarLast(u8, text, ')') orelse continue;
+        var fields = std.mem.tokenizeScalar(u8, text[close + 1 ..], ' ');
+        var ppid: i32 = 0;
+        var ticks: u64 = 0;
+        var i: usize = 0;
+        while (fields.next()) |f| : (i += 1) {
+            switch (i) {
+                1 => ppid = std.fmt.parseInt(i32, f, 10) catch 0,
+                11, 12, 13, 14 => ticks += std.fmt.parseInt(u64, f, 10) catch 0,
+                else => {},
+            }
+            if (i == 14) break;
+        }
+        list.append(arena, .{ .pid = pid, .ppid = ppid, .cpu_ns = ticks * std.time.ns_per_s / tick_hz }) catch break;
+    }
+    return list.items;
+}
+
+/// The CPU time of `root` and all its descendants in a snapshot.
+pub fn treeCpu(procs: []const Proc, root: i32) u64 {
+    var total: u64 = 0;
+    var frontier: [512]i32 = undefined;
+    var len: usize = 1;
+    frontier[0] = root;
+    var seen: usize = 0;
+    while (seen < len) : (seen += 1) {
+        const pid = frontier[seen];
+        for (procs) |p| {
+            if (p.pid == pid) total += p.cpu_ns;
+            if (p.ppid == pid and p.pid != pid and len < frontier.len) {
+                frontier[len] = p.pid;
+                len += 1;
+            }
+        }
+    }
+    return total;
+}
+
 pub fn processAlive(pid: c.pid_t) bool {
     if (pid <= 0) return false;
     if (c.kill(pid, @fromBackingInt(@intCast(0))) == 0) return true;

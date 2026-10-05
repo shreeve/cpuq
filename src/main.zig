@@ -16,12 +16,13 @@ const version = @import("build_options").version;
 
 const usage =
     \\usage: cpuq run [options] [--] CMD [ARGS...]
-    \\       cpuq status [--json]
+    \\       cpuq status [--json] [--no-usage]
     \\       cpuq budget
     \\       cpuq qos
     \\
     \\run options:
-    \\  --cores K             cores to hold (default 2; clamped to the budget)
+    \\  --cores K|MIN-MAX     cores to hold: exactly K, or MIN to MAX of what is
+    \\                        free (default 2; clamped to the budget)
     \\  --priority P          high, normal (default) or low
     \\  --exclusive           take the whole budget once running work drains
     \\  --label TEXT          a name shown by `cpuq status`
@@ -155,7 +156,7 @@ fn budgetNow(ctx: *Ctx, m: policy.Machine) u32 {
 }
 
 const RunOptions = struct {
-    cores: u32 = 2,
+    request: policy.Request = .{ .min = 2, .max = 2 },
     priority: policy.Priority = .normal,
     exclusive: bool = false,
     label: []const u8 = "",
@@ -202,8 +203,8 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             return null;
         }
         if (std.mem.eql(u8, name, "--cores")) {
-            o.cores = policy.parseCount(value) orelse {
-                _ = usageError("--cores needs a whole number, at least 1, not '{s}'", .{value});
+            o.request = policy.Request.parse(value) orelse {
+                _ = usageError("--cores needs K or MIN-MAX, whole numbers of at least 1, not '{s}'", .{value});
                 return null;
             };
         } else if (std.mem.eql(u8, name, "--priority")) {
@@ -321,7 +322,8 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
     var rec: state.Record = .{
         .ticket = st.nextTicket() catch |err| fail("ticket: {t}", .{err}),
         .pid = sys.getpid(),
-        .cores = o.cores,
+        .cores = o.request.min,
+        .max = o.request.max,
         .priority = o.priority,
         .exclusive = o.exclusive,
         .since = start,
@@ -379,11 +381,12 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
         last_gate = policy.gate(cfg, m, budget, if (o.load_check) &valve else null, now);
         if (o.load_check and cfg.load_check) st.writeValve(valve);
         if (last_gate == .open) {
-            const k = policy.grant(o.cores, o.exclusive, budget);
             const exclusive_running = (state.scanLeases(st, a, true) catch @as([]state.Entry, &.{})).len != 0;
-            const got = state.takeTokens(st, ctx.arena, k, o.exclusive, budget, @max(cores, budget), exclusive_running) catch |err| fail("tokens: {t}", .{err});
+            // Leave the next waiter's minimum free when this grant can spare it.
+            const reserve: u32 = if (queue.len > 1 and !queue[1].record.exclusive) @min(queue[1].record.cores, budget) else 0;
+            const got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, budget, @max(cores, budget), exclusive_running, reserve) catch |err| fail("tokens: {t}", .{err});
             if (got) |tokens| {
-                rec.cores = k;
+                rec.cores = @intCast(tokens.len);
                 rec.since = now;
                 // The lease is named by the ticket number; should a live job
                 // hold that name anyway, take a fresh number rather than wait.
@@ -561,6 +564,9 @@ const JsonHolder = struct {
     holder_alive: bool,
     child: i32,
     cores: u32,
+    /// Cores the command's process tree kept busy over the sample: CPU time
+    /// over wall time; null when there is no command to measure.
+    using: ?f64,
     priority: []const u8,
     exclusive: bool,
     label: []const u8,
@@ -572,7 +578,9 @@ const JsonWaiter = struct {
     order: usize,
     ticket: u64,
     pid: i32,
+    /// The request: at least `cores`, up to `max`.
     cores: u32,
+    max: u32,
     priority: []const u8,
     class: []const u8,
     exclusive: bool,
@@ -608,10 +616,44 @@ const JsonStatus = struct {
     waiters: []const JsonWaiter,
 };
 
+/// How long `cpuq status` watches the holders to measure their use.
+const sample_ms = 500;
+
+/// Cores each lease's command keeps busy, measured over `sample_ms`; null
+/// for a lease with no command yet. Nothing is sampled when nothing is held.
+fn sampleUsage(io: Io, a: std.mem.Allocator, leases: []const state.Entry) []?f64 {
+    const out = a.alloc(?f64, leases.len) catch return &.{};
+    @memset(out, null);
+    if (leases.len == 0) return out;
+    const t0 = Io.Clock.awake.now(io);
+    const before = sys.processes(io, a);
+    io.sleep(.fromMilliseconds(sample_ms), .awake) catch {};
+    const after = sys.processes(io, a);
+    const wall_ns: f64 = @floatFromInt(t0.durationTo(Io.Clock.awake.now(io)).toNanoseconds());
+    if (wall_ns <= 0) return out;
+    for (leases, out) |l, *u| {
+        if (l.record.child <= 0) continue;
+        const used = sys.treeCpu(after, l.record.child) -| sys.treeCpu(before, l.record.child);
+        u.* = @as(f64, @floatFromInt(used)) / wall_ns;
+    }
+    return out;
+}
+
+fn nullUsage(a: std.mem.Allocator, n: usize) []?f64 {
+    const out = a.alloc(?f64, n) catch return &.{};
+    @memset(out, null);
+    return out;
+}
+
 fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
     var json = false;
+    var measure = true;
     for (args) |a| {
-        if (std.mem.eql(u8, a, "--json")) json = true else return usageError("unknown status option '{s}'", .{a});
+        if (std.mem.eql(u8, a, "--json")) {
+            json = true;
+        } else if (std.mem.eql(u8, a, "--no-usage")) {
+            measure = false;
+        } else return usageError("unknown status option '{s}'", .{a});
     }
     const io = ctx.io;
     const a = ctx.arena;
@@ -631,6 +673,10 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
     var gbuf: [256]u8 = undefined;
     const gate_text = gateText(&gbuf, g, budget);
 
+    // What each holder actually uses: its command's process tree, CPU time
+    // over wall time between two snapshots.
+    const busy = if (measure) sampleUsage(io, a, leases) else nullUsage(a, leases.len);
+
     var holders: std.ArrayList(JsonHolder) = .empty;
     for (leases) |l| {
         const r = l.record;
@@ -640,6 +686,7 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
             .holder_alive = sys.processAlive(r.pid),
             .child = r.child,
             .cores = r.cores,
+            .using = busy[holders.items.len],
             .priority = @tagName(r.priority),
             .exclusive = r.exclusive,
             .label = r.label,
@@ -655,6 +702,7 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
             .ticket = r.ticket,
             .pid = r.pid,
             .cores = r.cores,
+            .max = @max(r.max, r.cores),
             .priority = @tagName(r.priority),
             .class = className(e.class),
             .exclusive = r.exclusive,
@@ -693,29 +741,47 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
     w.print("dir     {s}\n", .{st.path}) catch {};
     w.print("budget  {d} cores ({d} active of {d}); held {d}, free {d}\n", .{ budget, m.active, sys.totalCpus(ctx.io), held, budget -| held }) catch {};
     w.print("load    {d:.2} {d:.2} {d:.2}; memory pressure {s}; gate {s}\n", .{ load[0], load[1], load[2], pressure, gate_text }) catch {};
+    // The label column fits the longest label, within reason.
+    var lw: usize = 5;
+    for (holders.items) |h| lw = @max(lw, @min(dash(h.label).len, 32));
+    for (waiters.items) |q| lw = @max(lw, @min(dash(q.label).len, 32));
     var b1: [16]u8 = undefined;
     w.print("\nholders ({d})\n", .{holders.items.len}) catch {};
-    if (holders.items.len != 0) w.writeAll("  PID      CMD-PID  CORES  PRIO    SINCE    LABEL         COMMAND\n") catch {};
+    var lbuf: [40]u8 = undefined;
+    if (holders.items.len != 0) w.print("  PID      CMD-PID  CORES  USING  PRIO    SINCE    {s} COMMAND\n", .{pad(&lbuf, "LABEL", lw)}) catch {};
     for (holders.items) |h| {
         var pid_buf: [16]u8 = undefined;
         const pid_text = std.mem.print(&pid_buf, "{d}{s}", .{ h.pid, if (h.holder_alive) "" else "*" }) catch "?";
         var child_buf: [16]u8 = undefined;
         const child_text = std.mem.print(&child_buf, "{d}", .{h.child}) catch "?";
-        w.print("  {s:<8} {s:<8} {d:<6} {s:<7} {s:<8} {s:<13} {s}{s}\n", .{
-            pid_text,                child_text,    h.cores,   if (h.exclusive) "excl" else h.priority,
-            age(&b1, now - h.since), dash(h.label), h.command, if (h.holder_alive) "" else "  (cpuq gone; the command still holds the cores)",
+        var using_buf: [16]u8 = undefined;
+        const using_text = if (h.using) |u| std.mem.print(&using_buf, "{d:.1}", .{u}) catch "?" else "-";
+        w.print("  {s:<8} {s:<8} {d:<6} {s:<6} {s:<7} {s:<8} {s} {s}{s}\n", .{
+            pid_text,                child_text,                    h.cores,   using_text,                                                                     if (h.exclusive) "excl" else h.priority,
+            age(&b1, now - h.since), pad(&lbuf, dash(h.label), lw), h.command, if (h.holder_alive) "" else "  (cpuq gone; the command still holds the cores)",
         }) catch {};
     }
     w.print("\nwaiters ({d})\n", .{waiters.items.len}) catch {};
-    if (waiters.items.len != 0) w.writeAll("  #    PID      CORES  PRIO    WAITING  LABEL         COMMAND\n") catch {};
+    if (waiters.items.len != 0) w.print("  #    PID      CORES  PRIO    WAITING  {s} COMMAND\n", .{pad(&lbuf, "LABEL", lw)}) catch {};
     for (waiters.items) |q| {
         var prio_buf: [24]u8 = undefined;
         const prio = if (q.exclusive) "excl" else if (std.mem.eql(u8, q.class, q.priority)) q.priority else std.mem.print(&prio_buf, "{s}>{s}", .{ q.priority, q.class }) catch q.priority;
         var pid_buf: [16]u8 = undefined;
         const pid_text = std.mem.print(&pid_buf, "{d}", .{q.pid}) catch "?";
-        w.print("  {d:<4} {s:<8} {d:<6} {s:<7} {s:<8} {s:<13} {s}\n", .{ q.order, pid_text, q.cores, prio, age(&b1, now - q.since), dash(q.label), q.command }) catch {};
+        var cores_buf: [24]u8 = undefined;
+        const cores_text = if (q.max > q.cores) std.mem.print(&cores_buf, "{d}-{d}", .{ q.cores, q.max }) catch "?" else std.mem.print(&cores_buf, "{d}", .{q.cores}) catch "?";
+        w.print("  {d:<4} {s:<8} {s:<6} {s:<7} {s:<8} {s} {s}\n", .{ q.order, pid_text, cores_text, prio, age(&b1, now - q.since), pad(&lbuf, dash(q.label), lw), q.command }) catch {};
     }
     return 0;
+}
+
+/// `s` left-aligned in a field of `width` (a longer `s` is cut to fit).
+fn pad(buf: []u8, s: []const u8, width: usize) []const u8 {
+    const w = @min(width, buf.len);
+    const n = @min(s.len, w);
+    @memcpy(buf[0..n], s[0..n]);
+    @memset(buf[n..w], ' ');
+    return buf[0..w];
 }
 
 fn dash(s: []const u8) []const u8 {
