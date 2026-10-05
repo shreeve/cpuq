@@ -126,13 +126,12 @@ fn parseNonNegative(s: []const u8) ?f64 {
 }
 
 /// The budget in force now: CPUQ_BUDGET, else the configured budget, else
-/// the active cores minus a reserve of 2; capped by the active cores and by
-/// the machine's cores (one token file per core).
-pub fn effectiveBudget(env_budget: ?u32, cfg: Config, active: u32, cores: u32) u32 {
+/// the active cores minus a reserve of 2; capped by the active cores unless
+/// `active_cap` is off, which lets a budget oversubscribe the machine.
+pub fn effectiveBudget(env_budget: ?u32, cfg: Config, active: u32) u32 {
     const live = @max(active, 1);
     var b = env_budget orelse cfg.budget orelse (if (live > 2) live - 2 else 1);
     if (cfg.active_cap and b > live) b = live;
-    if (b > cores) b = cores;
     return @max(b, 1);
 }
 
@@ -326,15 +325,15 @@ const testing = std.testing;
 
 test "effective budget: default reserve, env, config, active-core cap" {
     const cfg: Config = .{};
-    try testing.expectEqual(8, effectiveBudget(null, cfg, 10, 10));
-    try testing.expectEqual(1, effectiveBudget(null, cfg, 2, 2));
-    try testing.expectEqual(1, effectiveBudget(null, cfg, 0, 10));
-    try testing.expectEqual(9, effectiveBudget(9, cfg, 10, 10));
-    try testing.expectEqual(6, effectiveBudget(9, cfg, 6, 10)); // only 6 cores active
-    try testing.expectEqual(4, effectiveBudget(null, .{ .budget = 4 }, 10, 10));
-    try testing.expectEqual(5, effectiveBudget(5, .{ .budget = 4 }, 10, 10)); // env wins
-    try testing.expectEqual(10, effectiveBudget(16, .{ .active_cap = false }, 10, 10)); // one token per core
-    try testing.expectEqual(10, effectiveBudget(16, cfg, 10, 10));
+    try testing.expectEqual(8, effectiveBudget(null, cfg, 10));
+    try testing.expectEqual(1, effectiveBudget(null, cfg, 2));
+    try testing.expectEqual(1, effectiveBudget(null, cfg, 0));
+    try testing.expectEqual(9, effectiveBudget(9, cfg, 10));
+    try testing.expectEqual(6, effectiveBudget(9, cfg, 6)); // only 6 cores active
+    try testing.expectEqual(4, effectiveBudget(null, .{ .budget = 4 }, 10));
+    try testing.expectEqual(5, effectiveBudget(5, .{ .budget = 4 }, 10)); // env wins
+    try testing.expectEqual(16, effectiveBudget(16, .{ .active_cap = false }, 10)); // oversubscribed on purpose
+    try testing.expectEqual(10, effectiveBudget(16, cfg, 10));
 }
 
 test "cpu lists" {
@@ -422,9 +421,9 @@ test "a stale tripped valve reopens at once when the load is calm" {
 
 test "active-core cap shrinks the grant" {
     // 10 cores active, budget 8: a 9-core request is clamped to 8.
-    try testing.expectEqual(8, grant(9, false, effectiveBudget(null, .{}, 10, 10)));
+    try testing.expectEqual(8, grant(9, false, effectiveBudget(null, .{}, 10)));
     // Only 6 cores active: the same request gets 6.
-    try testing.expectEqual(6, grant(9, false, effectiveBudget(9, .{}, 6, 10)));
+    try testing.expectEqual(6, grant(9, false, effectiveBudget(9, .{}, 6)));
     try testing.expectEqual(1, grant(0, false, 8));
     try testing.expectEqual(8, grant(2, true, 8));
 }

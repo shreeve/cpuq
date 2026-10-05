@@ -151,7 +151,7 @@ fn envBudget(ctx: *Ctx) ?u32 {
 }
 
 fn budgetNow(ctx: *Ctx, m: policy.Machine) u32 {
-    return policy.effectiveBudget(envBudget(ctx), ctx.cfg, m.active, sys.totalCpus(ctx.io));
+    return policy.effectiveBudget(envBudget(ctx), ctx.cfg, m.active);
 }
 
 const RunOptions = struct {
@@ -381,7 +381,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
         if (last_gate == .open) {
             const k = policy.grant(o.cores, o.exclusive, budget);
             const exclusive_running = (state.scanLeases(st, a, true) catch @as([]state.Entry, &.{})).len != 0;
-            const got = state.takeTokens(st, ctx.arena, k, o.exclusive, budget, cores, exclusive_running) catch |err| fail("tokens: {t}", .{err});
+            const got = state.takeTokens(st, ctx.arena, k, o.exclusive, budget, @max(cores, budget), exclusive_running) catch |err| fail("tokens: {t}", .{err});
             if (got) |tokens| {
                 rec.cores = k;
                 rec.since = now;

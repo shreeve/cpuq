@@ -1,14 +1,17 @@
 #!/bin/bash
 # test/run.sh [TEST...]: the end-to-end tests. Each test gets its own state
-# directory and a config with the load and pressure gates off, so the tests
-# do not depend on the machine's load. CPUQ=/path/to/cpuq tests another
-# binary.
+# directory and a config with the load and pressure gates and the active-core
+# cap off, so the tests depend neither on the machine's load nor on its size.
+# CPUQ=/path/to/cpuq tests another binary.
 set -u
 cd "$(dirname "$0")/.."
 CPUQ=${CPUQ:-$PWD/bin/cpuq}
 [ -x "$CPUQ" ] || { echo "no $CPUQ; run zig build first"; exit 2; }
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cpuq-test.XXXXXX")
-trap 'pkill -P $$ 2>/dev/null; rm -rf "$ROOT"' EXIT
+# On exit, end every process the tests started, children's children
+# included, so none outlives the run holding its output open.
+killtree() { local p; for p in $(pgrep -P "$1"); do killtree "$p"; kill "$p" 2>/dev/null; done; }
+trap 'killtree $$; rm -rf "$ROOT"' EXIT
 PASS=0
 FAIL=0
 FAILED=""
@@ -28,6 +31,7 @@ setup() {
     echo "load_check = off"
     echo "pressure_check = off"
     echo "poll = 0.2"
+    echo "active_cap = off" # a budget of 9 on a machine with fewer cores
     for line in "$@"; do echo "$line"; done
   } >"$CPUQ_CONFIG"
   echo "== $CUR"

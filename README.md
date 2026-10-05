@@ -107,8 +107,9 @@ its owner, which is the thing cpuq exists to avoid.
 
 The budget is the cores cpuq hands out: `CPUQ_BUDGET`, else `budget` in the
 config file, else the active core count minus 2 (8 on a 10-core Mac), leaving
-a reserve for the owner's own work. It is capped by the cores active now and
-by the machine's core count. The config file is `CPUQ_CONFIG`, default
+a reserve for the owner's own work. It is capped by the cores active now;
+with `active_cap = off` it is not, and a budget above the machine's core
+count oversubscribes it on purpose. The config file is `CPUQ_CONFIG`, default
 `~/.config/cpuq/config`, with `key = value` lines (`#` comments):
 
 | key | default | meaning |
