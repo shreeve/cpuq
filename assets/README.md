@@ -6,6 +6,7 @@
 | `cpuq-mark.svg` | the mark alone, for light backgrounds |
 | `cpuq-mark-dark.svg` | the mark alone, for dark backgrounds |
 | `menubar/cpuqTemplate-N.svg` | menu-bar template images, 18×18 pt, N = 0…4 |
+| `cpuq-social.svg`, `cpuq-social.png` | 1280×640 banner: the mark, the name and the tagline. The PNG is the one to use, since the SVG's text depends on installed fonts. Upload it as the repository's social preview (Settings → General → Social preview; GitHub has no API for it) |
 
 The mark is a chip with four cores inside: three held (green) and one free.
 
