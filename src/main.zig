@@ -385,8 +385,19 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
             if (got) |tokens| {
                 rec.cores = k;
                 rec.since = now;
-                const lease_name = state.leaseName(ctx.arena.alloc(u8, 16) catch fail("out of memory", .{}), rec.ticket, o.exclusive);
-                const lease = st.createLease(rec, lease_name) catch |err| fail("lease: {t}", .{err});
+                // The lease is named by the ticket number; should a live job
+                // hold that name anyway, take a fresh number rather than wait.
+                var lease_name: []const u8 = undefined;
+                const lease = for (0..3) |_| {
+                    lease_name = state.leaseName(ctx.arena.alloc(u8, 16) catch fail("out of memory", .{}), rec.ticket, o.exclusive);
+                    break st.createLease(rec, lease_name) catch |err| switch (err) {
+                        error.WouldBlock => {
+                            rec.ticket = st.nextTicket() catch |e| fail("ticket: {t}", .{e});
+                            continue;
+                        },
+                        else => fail("lease: {t}", .{err}),
+                    };
+                } else fail("lease: no free lease name", .{});
                 valve.last_admit = now;
                 if (o.load_check and cfg.load_check) st.writeValve(valve);
                 st.queue.deleteFile(io, ticket_name) catch {};

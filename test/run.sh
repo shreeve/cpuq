@@ -299,6 +299,24 @@ t_nested() {
   check "a stale CPUQ_TOKEN is ignored and the run queues normally (token now '$out')" "[ -n '$out' ] && [ '$out' != 0000099999 ]"
 }
 
+t_lost_seq() {
+  setup lost-seq
+  "$CPUQ" run --cores 5 --label holder -- sleep 2 & local h=$!
+  wait_held 5
+  "$CPUQ" run --cores 5 --label first -- true & local w=$!
+  wait_waiters 1
+  rm -f "$CPUQ_DIR/seq"
+  "$CPUQ" run --cores 4 --label second -- sleep 1 & local x=$!
+  wait_waiters 2 || wait_held 9
+  local tickets; tickets=$("$CPUQ" status --json | sed -n 's/^ *"ticket": \([0-9]*\),*/\1/p' | sort -n | tr '\n' ' ')
+  local t0; t0=$(now)
+  wait $h; wait $w; local rw=$?; wait $x; local rx=$?
+  local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
+  echo "  tickets after seq was deleted: $tickets; the rest ran within ${dt}s"
+  check "a lost seq never hands out a live ticket number" "[ \$(printf '%s\n' $tickets | sort -u | wc -l) = 3 ] && [ \$(printf '%s\n' $tickets | tail -1) = 3 ]"
+  check "every run still completes (first $rw, second $rx)" "[ $rw = 0 ] && [ $rx = 0 ] && python3 -c 'import sys; sys.exit(0 if $dt < 5 else 1)'"
+}
+
 t_max_wait() {
   setup max-wait
   "$CPUQ" run --cores 9 -- sleep 3 & wait_held 9
@@ -408,7 +426,7 @@ t_status() {
   check "status shows the dir, the holder and the waiter" "[[ '$s' == *'dir     $CPUQ_DIR'* && '$s' == *build* && '$s' == *big* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested max_wait waiters_cpu qos jobserver status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested lost_seq max_wait waiters_cpu qos jobserver status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

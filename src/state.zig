@@ -72,19 +72,39 @@ pub const State = struct {
         s.admission.unlock(s.io);
     }
 
-    /// The next ticket number. Call with the admission lock held.
+    /// The next ticket number: above both `seq` and every ticket and lease
+    /// on disk, so a lost or garbled `seq` never hands out a live number.
+    /// `seq` is replaced by a rename, never left half-written. Call with the
+    /// admission lock held.
     pub fn nextTicket(s: *State) !u64 {
         var buf: [32]u8 = undefined;
-        const last = blk: {
+        var last: u64 = blk: {
             const text = s.dir.readFile(s.io, "seq", &buf) catch |err| switch (err) {
                 error.FileNotFound => break :blk 0,
                 else => return err,
             };
             break :blk std.fmt.parseInt(u64, std.mem.trim(u8, text, " \n"), 10) catch 0;
         };
+        last = @max(last, try highestNumber(s.io, s.queue), try highestNumber(s.io, s.leases));
         var out: [32]u8 = undefined;
-        try s.dir.writeFile(s.io, .{ .sub_path = "seq", .data = try std.mem.print(&out, "{d}\n", .{last + 1}) });
+        try s.dir.writeFile(s.io, .{ .sub_path = "seq.new", .data = try std.mem.print(&out, "{d}\n", .{last + 1}) });
+        try s.dir.rename("seq.new", s.dir, "seq", s.io);
         return last + 1;
+    }
+
+    /// The highest ticket number among a directory's names: tickets
+    /// (P-NNNNNNNNNN, .new-N) and leases (NNNNNNNNNN, NNNNNNNNNN.x).
+    fn highestNumber(io: Io, dir: Io.Dir) !u64 {
+        var high: u64 = 0;
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            var name = entry.name;
+            if (std.mem.cutPrefix(u8, name, ".new-")) |rest| name = rest;
+            if (std.mem.cutSuffix(u8, name, ".x")) |rest| name = rest;
+            if (std.mem.findScalar(u8, name, '-')) |i| name = name[i + 1 ..];
+            high = @max(high, std.fmt.parseInt(u64, name, 10) catch continue);
+        }
+        return high;
     }
 
     pub fn readValve(s: *State) policy.Valve {
@@ -112,11 +132,14 @@ pub const State = struct {
         return f;
     }
 
-    /// Creates a job's lease, exclusively locked. Call with the admission
-    /// lock held.
+    /// Creates a job's lease, exclusively locked. A name some live job
+    /// already holds fails with error.WouldBlock rather than waiting (it
+    /// would wait under the admission lock) and is left untouched. Call with
+    /// the admission lock held.
     pub fn createLease(s: *State, r: Record, name: []const u8) !Io.File {
-        const f = try s.leases.createFile(s.io, name, .{ .lock = .exclusive, .truncate = true });
+        const f = try s.leases.createFile(s.io, name, .{ .lock = .exclusive, .lock_nonblocking = true, .truncate = false });
         errdefer f.close(s.io);
+        try f.setLength(s.io, 0);
         try writeRecord(s.io, f, r);
         return f;
     }
@@ -298,10 +321,10 @@ fn tokenName(buf: []u8, i: u32) []const u8 {
 
 /// The head's all-or-nothing acquisition of k tokens: it takes the k
 /// lowest-numbered free tokens only if the held ones plus k fit in the
-/// budget, and otherwise releases whatever it took. Every token file
-/// counts, not just the first `cores`: a run that sees fewer cores (an
-/// older cpuq, a smaller machine view) must still see every hold. Call with
-/// the admission lock held.
+/// budget, and otherwise releases whatever it took. Every token file in
+/// the directory counts, beyond the first `cores` too, so every run sees
+/// every hold whatever core count it was started with. Call with the
+/// admission lock held.
 pub fn takeTokens(s: *State, arena: std.mem.Allocator, k: u32, exclusive: bool, budget: u32, cores: u32, exclusive_running: bool) !?[]Io.File {
     var n = cores;
     var it = s.tokens.iterate();
