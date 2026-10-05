@@ -16,12 +16,29 @@ holder dies, however it dies.
 
 ## Install
 
-Zig 0.17.0:
+macOS and Linux, arm64 and x86-64:
+
+    curl -fsSL https://raw.githubusercontent.com/shreeve/cpuq/main/install.sh | bash
+
+or with Homebrew (macOS or Linux):
+
+    brew install shreeve/tap/cpuq
+
+`install.sh` downloads the latest release for this machine, checks it
+against the release's sha256 checksums and installs `cpuq` to
+`~/.local/bin`, or to `/usr/local/bin` when run as root (`BIN=DIR` picks
+another). `| bash -s v0.1.0` pins a version and `| bash -s -- --uninstall`
+removes it. The queue is per user, so on a shared machine one copy on
+everyone's `PATH` is enough: `curl … | sudo bash`. The Linux binaries are
+static and run on any distribution.
+
+From source, with Zig 0.17.0:
 
     zig build install -Doptimize=safe -p ~/.local
 
 `zig build` writes `bin/cpuq` in the checkout; `zig build test` runs the unit
-tests and `test/run.sh` the end-to-end tests against `bin/cpuq`.
+tests and `test/run.sh` the end-to-end tests against `bin/cpuq`. Releasing is
+described in [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Usage
 
@@ -233,6 +250,8 @@ group, the command included, so cpuq does not send it again (as with
 - A descendant that outlives a SIGKILLed cpuq keeps the cores until it exits.
 - One machine: the state directory must be on a local file system with
   working `flock(2)`.
+- One queue per user: the state directory is `/tmp/cpuq-UID`, so two users
+  on one machine each have their own budget.
 - One queue per `/tmp`: a container has its own `/tmp`, and with it its own
   queue. Containers share the host's queue only through a common `CPUQ_DIR`
   on a bind mount.
