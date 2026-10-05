@@ -1,10 +1,20 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/cpuq-mark-dark.svg">
+    <img src="assets/cpuq-mark.svg" alt="cpuq: a chip with four cores, three held and one free" width="112">
+  </picture>
+</p>
+
 # cpuq
 
-A machine-wide CPU core queue. Heavy jobs (builds, test suites, benchmarks)
-started from many shells, sessions and agents wait their turn for a number of
-cores out of a shared budget, then run in the foreground holding them. One
-binary, no daemon: every hold is a `flock(2)` on a file in a state directory,
-so the kernel releases it when its holder dies, however it dies.
+A machine-wide jobserver for builds, tests, benchmarks and coding agents, on
+macOS and Linux.
+
+It is a CPU core queue: heavy jobs started from many shells, sessions and
+agents wait their turn for a number of cores out of a shared budget, then run
+in the foreground holding them. One binary, no daemon: every hold is a
+`flock(2)` on a file in a state directory, so the kernel releases it when its
+holder dies, however it dies.
 
 ## Install
 
