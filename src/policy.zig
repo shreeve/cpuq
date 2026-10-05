@@ -150,18 +150,24 @@ pub fn effectiveClass(base: Priority, waited_s: i64, aging_s: u32) u2 {
 /// reopens only after the load has stayed at or under the budget for
 /// `calm_s`; while the load is above the budget (tripped or not) it admits
 /// at most one job per `spacing_s`, so waiters never stampede into a load
-/// average that lags.
+/// average that lags. A tripped valve nobody has checked for `stale_s`
+/// reopens at once when the load is at or under the budget: the 1-minute
+/// load average already covers that calm.
 pub const Valve = struct {
     tripped: bool = false,
     calm_since: i64 = 0,
     last_admit: i64 = 0,
+    last_check: i64 = 0,
 
     pub const calm_s = 30;
     pub const spacing_s = 10;
+    pub const stale_s = 60;
 
     pub const Verdict = enum { open, tripped, spacing };
 
     pub fn check(v: *Valve, now: i64, load: f64, budget: u32, margin: f64) Verdict {
+        const unchecked_s = now - v.last_check;
+        v.last_check = now;
         const b: f64 = @floatFromInt(budget);
         if (load > b + margin) {
             v.tripped = true;
@@ -174,7 +180,7 @@ pub const Valve = struct {
                 return .tripped;
             }
             if (v.calm_since == 0) v.calm_since = now;
-            if (now - v.calm_since < calm_s) return .tripped;
+            if (now - v.calm_since < calm_s and unchecked_s <= stale_s) return .tripped;
             v.tripped = false;
             v.calm_since = 0;
         }
@@ -189,6 +195,7 @@ pub const Valve = struct {
         v.tripped = std.mem.eql(u8, t, "1");
         v.calm_since = std.fmt.parseInt(i64, it.next() orelse "0", 10) catch 0;
         v.last_admit = std.fmt.parseInt(i64, it.next() orelse "0", 10) catch 0;
+        v.last_check = std.fmt.parseInt(i64, it.next() orelse "0", 10) catch 0;
         return v;
     }
 };
@@ -384,10 +391,31 @@ test "load safety valve with hysteresis" {
     try testing.expectEqual(Gate.open, gate(cfg, at.m(30), 8, null, 200));
     try testing.expectEqual(Gate.open, gate(.{ .load_check = false }, at.m(30), 8, &v, 200));
 
-    const p = Valve.parse("1 150 181\n");
+    const p = Valve.parse("1 150 181 191\n");
     try testing.expect(p.tripped);
     try testing.expectEqual(150, p.calm_since);
     try testing.expectEqual(181, p.last_admit);
+    try testing.expectEqual(191, p.last_check);
+}
+
+test "a stale tripped valve reopens at once when the load is calm" {
+    const cfg: Config = .{};
+    const calm: Machine = .{ .active = 10, .load1 = 3, .pressure = .normal };
+    const busy: Machine = .{ .active = 10, .load1 = 9, .pressure = .normal };
+    // Tripped and unchecked for an hour: open at once if the load is calm.
+    var v: Valve = .{ .tripped = true, .last_check = 1000 };
+    try testing.expectEqual(Gate.open, gate(cfg, calm, 8, &v, 4600));
+    try testing.expect(!v.tripped);
+    try testing.expectEqual(4600, v.last_check);
+    // Left by a file without a check time: the same.
+    v = Valve.parse("1 0 0\n");
+    try testing.expectEqual(Gate.open, gate(cfg, calm, 8, &v, 4600));
+    // Stale, but the load is over the budget: still tripped.
+    v = .{ .tripped = true, .last_check = 1000 };
+    try testing.expectEqual(Gate{ .load = 9 }, gate(cfg, busy, 8, &v, 4600));
+    // Checked a moment ago: the calm period still applies.
+    v = .{ .tripped = true, .last_check = 4590 };
+    try testing.expectEqual(Gate{ .load = 3 }, gate(cfg, calm, 8, &v, 4600));
 }
 
 test "active-core cap shrinks the grant" {

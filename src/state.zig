@@ -115,7 +115,7 @@ pub const State = struct {
 
     pub fn writeValve(s: *State, v: policy.Valve) void {
         var out: [128]u8 = undefined;
-        const text = std.mem.print(&out, "{d} {d} {d}\n", .{ @intFromBool(v.tripped), v.calm_since, v.last_admit }) catch return;
+        const text = std.mem.print(&out, "{d} {d} {d} {d}\n", .{ @intFromBool(v.tripped), v.calm_since, v.last_admit, v.last_check }) catch return;
         s.dir.writeFile(s.io, .{ .sub_path = "valve", .data = text }) catch {};
     }
 
