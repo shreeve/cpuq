@@ -1,0 +1,50 @@
+name: CI
+
+# Every push to main and every pull request: formatting, the unit tests,
+# and the end-to-end tests against a safe build, on Linux and macOS. The
+# unit tests also run against musl, the libc of the shipped Linux binary.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: "0.17.0"
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Check formatting
+        run: zig build fmt
+
+      - name: Unit tests
+        run: zig build test --summary all
+
+      - name: Unit tests (x86_64-linux-musl)
+        if: runner.os == 'Linux'
+        run: zig build test -Dtarget=x86_64-linux-musl --summary all
+
+      - name: End-to-end tests
+        run: |
+          zig build -Doptimize=safe
+          test/run.sh
