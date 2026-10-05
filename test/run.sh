@@ -424,6 +424,10 @@ t_status() {
   local s; s=$("$CPUQ" status)
   wait
   check "status shows the dir, the holder and the waiter" "[[ '$s' == *'dir     $CPUQ_DIR'* && '$s' == *build* && '$s' == *big* ]]"
+  local j; j=$("$CPUQ" status --json | python3 -c 'import json, sys
+s = json.load(sys.stdin)
+print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s["gate"]["load"])' "$("$CPUQ" --version)")
+  check "status --json has schema 1, the version and a structured gate (got '$j')" "[ '$j' = '1 True open None' ]"
 }
 
 TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested lost_seq max_wait waiters_cpu qos jobserver status}

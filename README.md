@@ -58,8 +58,12 @@ variable is ignored and the run queues normally.
 the load, memory pressure and the admission gate, every holder (pid, the
 command's pid, label, command, cores, since) and every waiter (order,
 priority, waiting time). A holder marked `*` is a lease whose cpuq is gone
-while its command still runs and holds the cores. `cpuq budget` prints the
-budget in force; `cpuq qos` prints the calling process's scheduling class.
+while its command still runs and holds the cores. `cpuq status --json`
+gives the same for programs: a `schema` number (1; it changes only when a
+field is removed or changes meaning), the `version`, and the gate as
+`{"state", "load", "text"}` with `state` one of open, pressure, load or
+spacing. `cpuq budget` prints the budget in force; `cpuq qos` prints the
+calling process's scheduling class.
 
 ### Quiet windows
 

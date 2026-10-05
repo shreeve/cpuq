@@ -12,7 +12,7 @@ test {
     _ = state;
 }
 
-const version = "0.1.0";
+const version = @import("build_options").version;
 
 const usage =
     \\usage: cpuq run [options] [--] CMD [ARGS...]
@@ -581,7 +581,20 @@ const JsonWaiter = struct {
     since: i64,
 };
 
+/// The gate in a form a program can act on: `state` is open, pressure, load
+/// (the valve is tripped) or spacing (one admission per 10 s), and `load` is
+/// the 1-minute load behind a load or spacing state.
+const JsonGate = struct {
+    state: []const u8,
+    load: ?f64,
+    text: []const u8,
+};
+
+/// `cpuq status --json`. `schema` changes only when a field is removed or
+/// changes meaning; new fields may appear in any version.
 const JsonStatus = struct {
+    schema: u32 = 1,
+    version: []const u8 = version,
     dir: []const u8,
     budget: u32,
     cores: u32,
@@ -590,7 +603,7 @@ const JsonStatus = struct {
     free: u32,
     load: [3]f64,
     memory_pressure: []const u8,
-    gate: []const u8,
+    gate: JsonGate,
     holders: []const JsonHolder,
     waiters: []const JsonWaiter,
 };
@@ -662,7 +675,14 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
             .free = budget -| held,
             .load = load,
             .memory_pressure = pressure,
-            .gate = gate_text,
+            .gate = .{
+                .state = @tagName(g),
+                .load = switch (g) {
+                    .load, .spacing => |l| l,
+                    .open, .pressure => null,
+                },
+                .text = gate_text,
+            },
             .holders = holders.items,
             .waiters = waiters.items,
         };
