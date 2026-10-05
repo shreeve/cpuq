@@ -12,9 +12,9 @@ The mark is a chip with four cores inside: three held (green) and one free.
 ## Menu-bar meter
 
 The menu-bar images are macOS template images: black and alpha only, so the
-system tints them for light and dark menu bars. They are drawn as a "q" (the
-chip's right edge runs down into a tail), with the four cores as a meter of
-the budget in use. Held cells are solid and free cells are 30% alpha.
+system tints them for light and dark menu bars. They are the app icon's chip
+at 18 pt, with its four cores as a meter of the budget in use. Held cells are
+solid and free cells are 30% alpha.
 Choose N from `cpuq status --json`:
 
     N = 0                              when no cores are held
