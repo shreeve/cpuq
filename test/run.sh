@@ -1,0 +1,374 @@
+#!/bin/bash
+# test/run.sh [TEST...]: the end-to-end tests. Each test gets its own state
+# directory and a config with the load and pressure gates off, so the tests
+# do not depend on the machine's load. CPUQ=/path/to/cpuq tests another
+# binary.
+set -u
+cd "$(dirname "$0")/.."
+CPUQ=${CPUQ:-$PWD/bin/cpuq}
+[ -x "$CPUQ" ] || { echo "no $CPUQ; run zig build first"; exit 2; }
+ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cpuq-test.XXXXXX")
+trap 'pkill -P $$ 2>/dev/null; rm -rf "$ROOT"' EXIT
+PASS=0
+FAIL=0
+FAILED=""
+
+ok() { PASS=$((PASS + 1)); echo "  ok   $1"; }
+bad() { FAIL=$((FAIL + 1)); FAILED="$FAILED $CUR"; echo "  FAIL $1"; }
+check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
+
+# setup NAME [config lines...]: a fresh state dir and config for one test.
+setup() {
+  CUR=$1; shift
+  T=$ROOT/$CUR
+  mkdir -p "$T"
+  export CPUQ_DIR=$T/state CPUQ_CONFIG=$T/config CPUQ_BUDGET=9
+  unset CPUQ_TOKEN MAKEFLAGS
+  {
+    echo "load_check = off"
+    echo "pressure_check = off"
+    echo "poll = 0.2"
+    for line in "$@"; do echo "$line"; done
+  } >"$CPUQ_CONFIG"
+  echo "== $CUR"
+}
+
+held() { "$CPUQ" status --json | sed -n 's/^  "held": \([0-9]*\),*/\1/p'; }
+now() { python3 -c 'import time; print("%.3f" % time.time())'; }
+
+# wait_held N [seconds]: until N cores are held.
+wait_held() {
+  local i=0
+  while [ "$(held)" != "$1" ]; do
+    i=$((i + 1)); [ $i -gt $((${2:-10} * 10)) ] && return 1
+    sleep 0.1
+  done
+}
+
+# Wait until the queue holds N waiters.
+wait_waiters() {
+  local i=0
+  while [ "$("$CPUQ" status --json | grep -c '"order"')" != "$1" ]; do
+    i=$((i + 1)); [ $i -gt 100 ] && return 1
+    sleep 0.1
+  done
+}
+
+t_budget() {
+  setup budget
+  local pids=() i
+  for i in $(seq 20); do "$CPUQ" run --cores 3 -- sleep 1 & pids+=($!); done
+  local max=0 samples=0 h
+  while kill -0 "${pids[@]}" 2>/dev/null || [ -n "$(jobs -r)" ]; do
+    h=$(held); samples=$((samples + 1))
+    [ -n "$h" ] && [ "$h" -gt "$max" ] && max=$h
+    sleep 0.2
+    [ $samples -gt 200 ] && break
+  done
+  local rc=0
+  for p in "${pids[@]}"; do wait "$p" || rc=1; done
+  echo "  20 x --cores 3, budget 9: max held $max over $samples samples"
+  check "never more than 9 cores held" "[ $max -le 9 ] && [ $max -gt 0 ]"
+  check "all 20 finished with status 0" "[ $rc = 0 ]"
+}
+
+t_kill_holder() {
+  setup kill-holder
+  "$CPUQ" run --cores 9 -- sleep 30 & local holder=$!
+  wait_held 9
+  "$CPUQ" run --cores 9 -- true & local waiter=$!
+  wait_waiters 1
+  local t0; t0=$(now)
+  pkill -9 -P $holder; kill -9 $holder
+  wait $waiter; local rc=$?
+  local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
+  echo "  waiter admitted ${dt}s after SIGKILL of the holder (cpuq and its command)"
+  check "SIGKILL of the holder frees its cores at once" "[ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if $dt < 1.5 else 1)'"
+}
+
+t_kill_cpuq_only() {
+  setup kill-cpuq-only
+  "$CPUQ" run --cores 9 --label survivor -- sleep 4 & local holder=$!
+  wait_held 9
+  local t0; t0=$(now)
+  kill -9 $holder
+  sleep 1
+  "$CPUQ" status
+  local h1; h1=$(held)
+  local gone; gone=$("$CPUQ" status --json | grep -c '"holder_alive": false')
+  "$CPUQ" run --cores 9 -- true; local rc=$?
+  local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
+  echo "  after kill -9 of cpuq: held $h1; next run admitted ${dt}s after the kill (the sleep runs 4s)"
+  check "the command keeps the cores after cpuq is SIGKILLed" "[ '$h1' = 9 ] && [ $gone = 1 ]"
+  check "the cores free when the command ends" "[ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if 3.0 < $dt < 6 else 1)'"
+}
+
+t_leaked_descendant() {
+  setup leaked-descendant
+  "$CPUQ" run --cores 9 -- sh -c 'sleep 30 >/dev/null 2>&1 & exit 0'
+  local h; h=$(held)
+  local t0; t0=$(now)
+  "$CPUQ" run --cores 9 -- true; local rc=$?
+  local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
+  echo "  after the command exits leaving 'sleep 30' behind: held $h; next run took ${dt}s"
+  check "a background descendant does not keep the cores" "[ '$h' = 0 ] && [ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if $dt < 1 else 1)'"
+  pkill -f '^sleep 30$' 2>/dev/null
+}
+
+t_kill_waiter() {
+  setup kill-waiter
+  "$CPUQ" run --cores 9 -- sleep 2 & local holder=$!
+  wait_held 9
+  "$CPUQ" run --cores 9 -- true & local w1=$!
+  wait_waiters 1
+  "$CPUQ" run --cores 9 -- true & local w2=$!
+  wait_waiters 2
+  kill -9 $w1
+  local t0; t0=$(now)
+  wait $w2; local rc=$?
+  local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
+  wait $holder
+  echo "  second waiter admitted ${dt}s after the first was SIGKILLed (holder had <2s left)"
+  check "a SIGKILLed waiter does not block the queue" "[ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if $dt < 3 else 1)'"
+}
+
+t_exit_status() {
+  setup exit-status
+  "$CPUQ" run -- sh -c 'exit 7'; local rc=$?
+  check "exit 7 passes through as 7 (got $rc)" "[ $rc = 7 ]"
+  "$CPUQ" run -- sh -c 'kill -TERM $$'; rc=$?
+  check "a command killed by SIGTERM reports 143 (got $rc)" "[ $rc = 143 ]"
+  local how
+  how=$(python3 -c "
+import subprocess
+r = subprocess.run(['$CPUQ', 'run', '--', 'sh', '-c', 'kill -INT \$\$'])
+print(r.returncode)")
+  check "cpuq re-raises the command's SIGINT: the parent sees death by signal 2 (got $how)" "[ '$how' = -2 ]"
+  "$CPUQ" run -- /nonexistent/cmd 2>/dev/null; rc=$?
+  check "a missing command is 127 (got $rc)" "[ $rc = 127 ]"
+}
+
+t_direct_sigint() {
+  setup direct-sigint
+  local f=$T/ints
+  "$CPUQ" run -- sh -c "trap 'echo INT >>$f; exit 3' INT; while :; do sleep 0.05; done" & local p=$!
+  wait_held 2
+  sleep 0.3
+  kill -INT $p
+  wait $p; local rc=$?
+  local n; n=$(wc -l <"$f" 2>/dev/null | tr -d ' ')
+  check "kill -INT to cpuq reaches the command once (got ${n:-0}, exit $rc)" "[ '$n' = 1 ] && [ $rc = 3 ]"
+}
+
+t_terminal_sigint() {
+  setup terminal-sigint
+  local f=$T/ints
+  # A pty makes the run a foreground job; ^C goes to the whole process group.
+  local out
+  out=$(python3 - "$CPUQ" "$f" <<'EOF'
+import os, pty, sys, time
+cpuq, f = sys.argv[1], sys.argv[2]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(cpuq, [cpuq, "run", "--", "sh", "-c",
+        "trap 'echo INT >>%s' INT; i=0; while [ $i -lt 30 ]; do sleep 0.05; i=$((i+1)); done; exit 4" % f])
+time.sleep(0.8)
+os.write(fd, b"\x03")
+deadline = time.time() + 10
+status = None
+while time.time() < deadline:
+    try:
+        os.read(fd, 1024)
+    except OSError:
+        pass
+    p, st = os.waitpid(pid, os.WNOHANG)
+    if p:
+        status = os.waitstatus_to_exitcode(st)
+        break
+    time.sleep(0.05)
+n = sum(1 for _ in open(f)) if os.path.exists(f) else 0
+print(n, status)
+EOF
+)
+  check "^C at a terminal reaches the command exactly once (ints, exit: $out)" "[ '$out' = '1 4' ]"
+}
+
+t_order() {
+  setup order
+  local f=$T/order
+  "$CPUQ" run --cores 9 -- sleep 1.5 & local h=$!
+  wait_held 9
+  "$CPUQ" run --cores 9 --priority low -- sh -c "echo L >>$f" & wait_waiters 1
+  "$CPUQ" run --cores 9 -- sh -c "echo A >>$f" & wait_waiters 2
+  "$CPUQ" run --cores 9 -- sh -c "echo B >>$f" & wait_waiters 3
+  "$CPUQ" run --cores 9 -- sh -c "echo C >>$f" & wait_waiters 4
+  "$CPUQ" run --cores 9 --priority high -- sh -c "echo H >>$f" & wait_waiters 5
+  "$CPUQ" status
+  wait
+  local got; got=$(tr -d '\n' <"$f")
+  check "FIFO within a priority, high before normal before low (got $got)" "[ '$got' = HABCL ]"
+}
+
+t_aging() {
+  setup aging "aging = 2"
+  local f=$T/order
+  "$CPUQ" run --cores 9 -- sleep 3 & local h=$!
+  wait_held 9
+  "$CPUQ" run --cores 9 --priority low -- sh -c "echo L >>$f" & wait_waiters 1
+  sleep 2.5
+  "$CPUQ" run --cores 9 -- sh -c "echo N >>$f" & wait_waiters 2
+  wait
+  local got; got=$(tr -d '\n' <"$f")
+  check "a low waiter promoted by aging goes before a later normal one (got $got)" "[ '$got' = LN ]"
+}
+
+t_no_starvation() {
+  setup no-starvation
+  local f=$T/order
+  "$CPUQ" run --cores 5 -- sleep 1.5 & wait_held 5
+  "$CPUQ" run --cores 9 -- sh -c "echo big >>$f" & wait_waiters 1
+  "$CPUQ" run --cores 2 -- sh -c "echo s1 >>$f" & wait_waiters 2
+  "$CPUQ" run --cores 2 -- sh -c "echo s2 >>$f" & wait_waiters 3
+  sleep 0.5
+  local early; early=$(cat "$f" 2>/dev/null | tr '\n' ' ')
+  wait
+  local got; got=$(tr '\n' ' ' <"$f")
+  echo "  4 cores free while the 9-core head waits; ran early: '${early}'; order: $got"
+  check "a 9-core head is served before later small jobs (no backfill)" "[ -z '$early' ] && [[ '$got' == 'big '* ]] && [ \$(wc -l <'$f') = 3 ]"
+}
+
+t_exclusive() {
+  setup exclusive
+  local f=$T/log
+  "$CPUQ" run --cores 3 -- sh -c "sleep 1; echo held-end >>$f" & wait_held 3
+  "$CPUQ" run --exclusive -- sh -c "echo excl-start >>$f; sleep 1; echo excl-end >>$f" & wait_waiters 1
+  "$CPUQ" run --cores 1 -- sh -c "echo small >>$f" & wait_waiters 2
+  wait
+  local got; got=$(tr '\n' ' ' <"$f")
+  check "--exclusive waits for drain and blocks new work while it runs (got: $got)" "[ '$got' = 'held-end excl-start excl-end small ' ]"
+}
+
+t_nested() {
+  setup nested
+  local t0; t0=$(now)
+  local out; out=$("$CPUQ" run --cores 9 -- sh -c "\"$CPUQ\" run --cores 9 -- sh -c 'echo nested \$CPUQ_CORES'")
+  local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
+  check "a nested run starts at once within its parent's grant (${dt}s, '$out')" "[ '$out' = 'nested 9' ] && python3 -c 'import sys; sys.exit(0 if $dt < 1 else 1)'"
+  out=$(CPUQ_TOKEN=0000099999 "$CPUQ" run --cores 2 -- sh -c 'echo $CPUQ_TOKEN')
+  check "a stale CPUQ_TOKEN is ignored and the run queues normally (token now '$out')" "[ -n '$out' ] && [ '$out' != 0000099999 ]"
+}
+
+t_max_wait() {
+  setup max-wait
+  "$CPUQ" run --cores 9 -- sleep 3 & wait_held 9
+  "$CPUQ" run --max-wait 1 -- true; local rc=$?
+  wait
+  check "--max-wait gives up with 75 (got $rc)" "[ $rc = 75 ]"
+}
+
+t_waiters_cpu() {
+  setup waiters-cpu "poll = 0.5"
+  "$CPUQ" run --cores 9 -- sleep 12 & local h=$!
+  wait_held 9
+  local pids=() i
+  for i in $(seq 100); do "$CPUQ" run --cores 1 -- true & pids+=($!); done
+  local queued=no
+  wait_waiters 100 && queued=yes
+  sleep 1
+  local list; list=$(IFS=,; echo "${pids[*]}")
+  # CPU seconds used by the waiters: /proc on Linux, ps elsewhere.
+  cpu() { python3 - "$list" <<'EOF'
+import os, subprocess, sys
+pids = sys.argv[1].split(",")
+t = 0.0
+if os.path.isdir("/proc/self"):
+    tick = os.sysconf("SC_CLK_TCK")
+    for p in pids:
+        try:
+            f = open("/proc/%s/stat" % p).read().rsplit(")", 1)[1].split()
+            t += (int(f[11]) + int(f[12])) / tick
+        except OSError:
+            pass
+else:
+    out = subprocess.run(["ps", "-o", "time=", "-p", sys.argv[1]], capture_output=True, text=True).stdout
+    for line in out.split():
+        parts = line.split(":")
+        t += sum(float(x) * 60 ** i for i, x in enumerate(reversed(parts)))
+print("%.2f" % t)
+EOF
+  }
+  local c0; c0=$(cpu)
+  sleep 5
+  local c1; c1=$(cpu)
+  local used; used=$(python3 -c "print('%.2f' % ($c1 - $c0))")
+  echo "  100 waiters: CPU time ${c0}s after queueing, ${c1}s five seconds later: ${used}s used in 5s ($(python3 -c "print('%.2f' % ($used / 5 * 100))")% of one core)"
+  kill $h 2>/dev/null
+  local rc=0
+  for p in "${pids[@]}"; do wait "$p" || rc=1; done
+  check "100 waiters were queued while measured ($queued)" "[ $queued = yes ]"
+  check "100 queued waiters use almost no CPU" "python3 -c 'import sys; sys.exit(0 if $used < 0.5 else 1)'"
+  check "all 100 waiters ran" "[ $rc = 0 ]"
+}
+
+t_qos() {
+  setup qos
+  local outside low normal high excl
+  outside=$("$CPUQ" qos)
+  low=$("$CPUQ" run --priority low -- "$CPUQ" qos)
+  normal=$("$CPUQ" run -- "$CPUQ" qos)
+  high=$("$CPUQ" run --priority high -- "$CPUQ" qos)
+  excl=$("$CPUQ" run --exclusive --priority low -- "$CPUQ" qos)
+  none=$("$CPUQ" run --priority low --qos none -- "$CPUQ" qos)
+  echo "  outside: $outside; low: $low; normal: $normal; high: $high; exclusive low: $excl; low --qos none: $none"
+  if [ "$(uname)" = Darwin ]; then
+    check "low runs at background QoS, normal at utility" "[ '$low' = background ] && [ '$normal' = utility ]"
+  else
+    check "low runs at nice 15, normal at nice 5" "[ '$low' = 'nice 15' ] && [ '$normal' = 'nice 5' ]"
+  fi
+  check "high, --exclusive and --qos none leave the class unchanged" "[ '$high' = '$outside' ] && [ '$excl' = '$outside' ] && [ '$none' = '$outside' ]"
+}
+
+t_jobserver() {
+  setup jobserver
+  local d=$T/make
+  mkdir -p "$d/running"
+  {
+    printf 'J := 1 2 3 4 5 6 7 8 9 10\nall: $(addprefix job,$(J))\n'
+    printf 'job%%:\n\t@touch running/$@; ls running | wc -l >> log; sleep 0.3; rm running/$@\n'
+  } >"$d/Makefile"
+  local make
+  for make in /usr/bin/make $(command -v gmake); do
+    local ver; ver=$("$make" --version | head -1)
+    # GNU make 4.x lets a -j on its own command line override the jobserver
+    # (it warns "-jN forced in submake"); make 3.81 keeps the jobserver for
+    # a bare -j.
+    local modes=('' '-j$CPUQ_CORES')
+    case $ver in *" 3."*) modes+=('-j') ;; esac
+    for mode in "${modes[@]}"; do
+      rm -f "$d/log"
+      (cd "$d" && "$CPUQ" run --cores 3 -- sh -c "$make -s $mode") || { bad "$make $mode failed"; continue; }
+      local max; max=$(sort -n "$d/log" | tail -1 | tr -d ' ')
+      local n; n=$(wc -l <"$d/log" | tr -d ' ')
+      check "$ver, 'make $mode' under --cores 3: $n recipes, at most $max at once" "[ '$max' -le 3 ] && [ '$max' -ge 2 ] && [ $n = 10 ]"
+    done
+  done
+  local mf; mf=$(MAKEFLAGS="k --no-print-directory -j8" "$CPUQ" run --cores 3 -- sh -c 'echo "$MAKEFLAGS"')
+  echo "  MAKEFLAGS seen by the command: '$mf'"
+  check "MAKEFLAGS keeps the caller's other flags" "[[ '$mf' == 'k --no-print-directory -j --jobserver-auth='*' --jobserver-fds='* ]]"
+}
+
+t_status() {
+  setup status
+  "$CPUQ" run --cores 4 --label build -- sleep 1.5 & wait_held 4
+  "$CPUQ" run --cores 9 --label big -- true & wait_waiters 1
+  "$CPUQ" status
+  local s; s=$("$CPUQ" status)
+  wait
+  check "status shows the dir, the holder and the waiter" "[[ '$s' == *'dir     $CPUQ_DIR'* && '$s' == *build* && '$s' == *big* ]]"
+}
+
+TESTS=${*:-budget kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint order aging no_starvation exclusive nested max_wait waiters_cpu qos jobserver status}
+for t in $TESTS; do "t_$t"; done
+echo
+echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"
+[ $FAIL = 0 ]
