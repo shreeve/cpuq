@@ -663,6 +663,19 @@ t_last_words() {
   wait_lease_holder far
   kill -TERM $h2; wait $h2; local rc_h2=$?
   exec 6>&-
+  # The kit's release: close the hold's stdin, then kill it at once.
+  local n
+  for n in 1 2 3 4 5; do
+    mkfifo "$T/k$n"
+    if [ $((n % 2)) = 1 ]; then
+      "$CPUQ" lease near --hold --label kit <"$T/k$n" >/dev/null & h1=$!
+    else
+      PATH="$bin:$PATH" "$CPUQ" lease far --host far --hold --label kit@far <"$T/k$n" >/dev/null & h1=$!
+    fi
+    exec 7>"$T/k$n"
+    if [ $((n % 2)) = 1 ]; then wait_lease_holder near; else wait_lease_holder far; fi
+    exec 7>&-; kill $h1 2>/dev/null; wait $h1 2>/dev/null
+  done
   kill $holder; wait $holder
   local i=0
   while "$CPUQ" status --json --no-usage | grep -q '"holders": \[$'; do i=$((i + 1)); [ $i -gt 50 ] && break; sleep 0.1; done
@@ -671,6 +684,8 @@ print(" ".join("%s%s:%s:%s" % (j["label"], "@" + j["host"] if j["host"] else "",
   echo "  exits $rc_w $rc_h1 $rc_h2; history: $got"
   check "killed while waiting, a run exits by the signal and gave up (not lost)" "[ $rc_w = 143 ] && [[ '$got' == *'waiter:gave_up:15'* ]]"
   check "killed while held, a --hold lease ends by the signal, here and on a host" "[ $rc_h1 = 129 ] && [ $rc_h2 = 143 ] && [[ '$got' == *'near:done:1 '* && '$got' == *'far@far:done:15'* ]]"
+  local kit; kit=$(echo "$got" | tr ' ' '\n' | grep -cE '^kit(@far@far)?:done:')
+  check "closed and killed at once (the kit's release), a hold still ends, 5 of 5 (got $kit)" "[ '$kit' = 5 ]"
   check "nothing is lost" "[[ '$got' != *lost* ]]"
 }
 

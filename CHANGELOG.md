@@ -2,6 +2,15 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.7.6 — 2026-10-06
+
+- Fix: a `--hold` lease released the way a script naturally does it (close
+  its stdin, then kill it at once) was still often recorded as lost: the
+  kill landed while cpuq was ending the hold, after it had stopped
+  guarding against signals and before it logged the end. It now records
+  the hold as ended normally, and at every step from queueing to the end a
+  fatal signal leaves the job's next line in the history.
+
 ## 0.7.5 — 2026-10-06
 
 - Fix: cpuq could panic (integer overflow) while it read another job's

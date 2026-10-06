@@ -465,19 +465,23 @@ fn logEvent(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra) void {
     history.append(ctx.io, path, ev);
 }
 
-/// Arms the line a fatal signal leaves in history in place of cpuq's own:
-/// `gave_up` while it waits, `ended` while it holds a lease with no command.
-fn armLastWords(ctx: *Ctx, job: JobLog, event: []const u8, cores: ?u32) void {
+/// Arms the line a fatal signal leaves in history in place of cpuq's own
+/// next one: `gave_up` while it waits, `ended` once it holds. With `done`,
+/// the job's work is over (a hold's stdin closed): it ended with status 0,
+/// whatever signal then stops cpuq. Each event is logged before the next
+/// line is armed, so no moment is left without one; a second line for the
+/// same event is harmless.
+fn armLastWords(ctx: *Ctx, job: JobLog, event: []const u8, cores: ?u32, done: bool) void {
     const path = historyPath(ctx);
     if (path.len == 0) return;
     var head_buf: [256]u8 = undefined;
     const head = std.mem.print(&head_buf, "{{\"v\":1,\"event\":\"{s}\",\"id\":\"{s}\",\"t\":", .{ event, job.id }) catch return;
     var tail_buf: [64]u8 = undefined;
-    const tail = if (cores) |k|
-        std.mem.print(&tail_buf, ",\"pid\":{d},\"cores\":{d}", .{ job.base.pid, k }) catch return
-    else
-        std.mem.print(&tail_buf, ",\"pid\":{d}", .{job.base.pid}) catch return;
-    sys.armLastWords(path, head, tail);
+    var tw: Io.Writer = .fixed(&tail_buf);
+    tw.print(",\"pid\":{d}", .{job.base.pid}) catch return;
+    if (cores) |k| tw.print(",\"cores\":{d}", .{k}) catch return;
+    if (done) tw.writeAll(",\"exit\":0") catch return;
+    sys.armLastWords(path, head, tw.buffered(), !done);
 }
 
 /// Logs how a command ended.
@@ -537,7 +541,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
     st.unlock();
     const job = newJobLog(ctx, o);
     logEvent(ctx, job, "queued", .{});
-    armLastWords(ctx, job, "gave_up", null);
+    armLastWords(ctx, job, "gave_up", null, false);
 
     var next_note = start + cfg.note_s;
     var last_gate: policy.Gate = .open;
@@ -746,7 +750,6 @@ var forced_now = false;
 /// Call with the admission lock held; returns with it released.
 fn admitted(ctx: *Ctx, st: *state.State, o: RunOptions, rec: *state.Record, grant: state.Grant, ticket: Io.File, ticket_name: []const u8, job: JobLog, now: i64, ahead: bool) Lease {
     const io = ctx.io;
-    sys.disarmLastWords();
     rec.cores = @intCast(grant.files.len);
     rec.slots = grant.slotText(ctx.arena);
     rec.since = now;
@@ -768,6 +771,7 @@ fn admitted(ctx: *Ctx, st: *state.State, o: RunOptions, rec: *state.Record, gran
     ticket.close(io);
     st.unlock();
     logEvent(ctx, job, "started", .{ .cores = rec.cores, .slots = grant.slots, .ahead = if (ahead) true else null, .lent = if (lent_now > 0) lent_now else null, .forced = if (forced_now) true else null });
+    armLastWords(ctx, job, "ended", rec.cores, false);
     return .{ .record = rec.*, .name = lease_name, .file = lease, .tokens = grant.files, .job = job };
 }
 
@@ -822,7 +826,6 @@ fn giveUp(ctx: *Ctx, st: *state.State, ticket_name: []const u8, waited: i64, job
     st.queue.deleteFile(ctx.io, ticket_name) catch {};
     st.dropControl(ticket_name);
     st.unlock();
-    sys.disarmLastWords();
     logEvent(ctx, job, "gave_up", .{});
     std.debug.print("cpuq: gave up after waiting {d}s\n", .{waited});
     std.process.exit(exit_timeout);
@@ -1123,9 +1126,8 @@ fn heldEntry(ctx: *Ctx, name: []const u8, host: []const u8) ?[]const u8 {
 fn holdAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, lease: Lease) u8 {
     ctx.out.print("held {s} {s}\n", .{ o.lease.?, lease.name }) catch {};
     ctx.out.flush() catch {};
-    armLastWords(ctx, lease.job, "ended", lease.record.cores);
     untilStdinCloses();
-    sys.disarmLastWords();
+    armLastWords(ctx, lease.job, "ended", lease.record.cores, true);
     release(ctx.io, st, lease);
     logEvent(ctx, lease.job, "ended", .{ .cores = lease.record.cores, .exit = 0 });
     return 0;
@@ -1155,7 +1157,7 @@ fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
     const argv = [_][]const u8{ "ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4", host, remote.items };
     const job = newJobLog(ctx, o);
     logEvent(ctx, job, "queued", .{});
-    armLastWords(ctx, job, "gave_up", null);
+    armLastWords(ctx, job, "gave_up", null, false);
     var child = std.process.spawn(io, .{ .argv = &argv, .stdin = .pipe, .stdout = .pipe, .stderr = .inherit }) catch |err|
         fail("ssh {s}: {t}", .{ host, err });
 
@@ -1167,7 +1169,6 @@ fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
     const word = words.next() orelse "";
     _ = words.next();
     const id = words.next() orelse "";
-    sys.disarmLastWords();
     if (!std.mem.eql(u8, word, "held") or id.len == 0) {
         if (child.stdin) |f| f.close(io);
         child.stdin = null;
@@ -1186,16 +1187,18 @@ fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
     }
 
     logEvent(ctx, job, "started", .{ .cores = 1 });
+    armLastWords(ctx, job, "ended", 1, false);
     var pid_buf: [16]u8 = undefined;
     const val = std.mem.concat(a, u8, &.{ id, ":", std.mem.print(&pid_buf, "{d}", .{sys.getpid()}) catch "0" }) catch fail("out of memory", .{});
     if (o.hold) {
         ctx.out.print("held {s}@{s} {s}@{s}={s}\n", .{ o.lease.?, host, o.lease.?, host, val }) catch {};
         ctx.out.flush() catch {};
         // Killed while it holds, it still ends the job in history; ssh,
-        // its stdin gone with it, ends the remote hold.
-        armLastWords(ctx, job, "ended", 1);
+        // its stdin gone with it, ends the remote hold. Once stdin closes
+        // the hold is over, and a kill that follows at once (the kit's
+        // release does) still records it as ended normally.
         untilStdinCloses();
-        sys.disarmLastWords();
+        armLastWords(ctx, job, "ended", 1, true);
         if (child.stdin) |f| f.close(io);
         child.stdin = null;
         _ = child.wait(io) catch {};
