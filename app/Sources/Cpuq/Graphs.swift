@@ -367,6 +367,34 @@ struct GraphsView: View {
         let busy: Double
         let block: String?
         var measured = true
+        /// Set when the core belongs to another job, which leaves it idle and has lent it: the
+        /// lender's project and job.
+        var lender: String? = nil
+        var lenderBlock: String? = nil
+    }
+
+    /// Lending puts more cores in use than the budget, but the Mac has only its own: the work
+    /// over the budget runs on the cores their holders leave idle. So each column's cells over
+    /// the budget are drawn on the idle cells of that column, as borrowed, and no lane beyond
+    /// the budget is shown unless nothing idle is left to borrow.
+    static func borrowed(_ cells: [Cell], budget: Int) -> [Cell] {
+        var out: [Cell] = []
+        for column in Dictionary(grouping: cells, by: \.column).values {
+            var over = column.filter { $0.lane >= budget && $0.project != nil }.sorted { $0.lane < $1.lane }
+            // Idle, or not yet measured (the newest column has no reading yet).
+            var idle = column.filter { $0.lane < budget && $0.project != nil && (!$0.measured || $0.busy < 0.5) }.sorted { $0.lane > $1.lane }
+            var taken = Set<Int>()
+            while !over.isEmpty, let lent = idle.first {
+                let b = over.removeFirst()
+                idle.removeFirst()
+                taken.insert(lent.lane)
+                out.append(Cell(column: lent.column, lane: lent.lane, project: b.project, busy: b.busy, block: b.block,
+                                measured: b.measured, lender: lent.project, lenderBlock: lent.block))
+            }
+            let unplaced = Set(over.map(\.lane))
+            out += column.filter { !taken.contains($0.lane) && ($0.lane < budget || unplaced.contains($0.lane)) }
+        }
+        return out
     }
 
     struct WaitCell: Identifiable {
@@ -382,8 +410,10 @@ struct GraphsView: View {
     private var now: some View {
         let end = Date()
         let axis = TimeAxis(span: min(max(end.timeIntervalSince(model.oldest(now: end)), 300), GraphModel.keep), end: end)
-        let lanes = max(model.budget, (model.blocks.flatMap(\.lanes).max() ?? 0) + 1)
-        let (cells, waitCells) = Self.grid(model, columns: axis.columns, end: end, lanes: lanes)
+        let held = max(model.budget, (model.blocks.flatMap(\.lanes).max() ?? 0) + 1)
+        let (all, waitCells) = Self.grid(model, columns: axis.columns, end: end, lanes: held)
+        let cells = Self.borrowed(all, budget: model.budget)
+        let lanes = max(model.budget, (cells.filter { $0.project != nil }.map(\.lane).max() ?? 0) + 1)
         let machine = Self.machine(model, columns: axis.columns)
         return VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -423,6 +453,9 @@ struct GraphsView: View {
                 Label { Text("held, idle") } icon: { swatch(.blue.opacity(0.22), 10) }
                 Label { Text("busy") } icon: { swatch(.blue.opacity(0.9), 10) }
                 Label { Text("held, not measured") } icon: { swatch(.blue.opacity(0.6), 3) }
+                Label { Text("borrowed (edge: owner)") } icon: {
+                    VStack(spacing: 0) { swatch(.green, 2); swatch(.blue.opacity(0.9), 8) }
+                }
             }
             Label { Text("waiting") } icon: { swatch(.red.opacity(0.75), 8) }
             Label { Text("waiting, gate shut") } icon: { swatch(.orange.opacity(0.75), 8) }
@@ -495,6 +528,12 @@ struct GraphsView: View {
                 RectangleMark(xStart: .value("Time", Double(c.column) + 0.12), xEnd: .value("Time", Double(c.column) + 0.88),
                               yStart: .value("Core", Double(c.lane) + (c.measured ? 0.1 : 0.4)), yEnd: .value("Core", Double(c.lane) + (c.measured ? 0.9 : 0.6)))
                     .foregroundStyle(c.project.map { model.color($0).opacity(c.measured ? 0.2 + 0.75 * c.busy : 0.6) } ?? Color.secondary.opacity(0.08))
+                // A borrowed core: the borrower's work, edged in the color of the job that lent it.
+                if let lender = c.lender {
+                    RectangleMark(xStart: .value("Time", Double(c.column) + 0.12), xEnd: .value("Time", Double(c.column) + 0.88),
+                                  yStart: .value("Core", Double(c.lane) + 0.74), yEnd: .value("Core", Double(c.lane) + 0.9))
+                        .foregroundStyle(model.color(lender))
+                }
             }
             waitingRow(waits)
             ForEach(Array(machine.enumerated()), id: \.offset) { c, m in
@@ -732,6 +771,10 @@ struct GraphsView: View {
             let lane = Int(p.y)
             guard let cell = cells.first(where: { $0.column == column && $0.lane == lane }), let id = cell.block,
                   let b = model.blocks.first(where: { $0.id == id }) else { return when + Text("core \(lane + 1) free").foregroundColor(.secondary) }
+            if let lent = cell.lenderBlock, let owner = model.blocks.first(where: { $0.id == lent }) {
+                return when + Text("core \(lane + 1): ").foregroundColor(.secondary) + Text(owner.label).bold()
+                    + Text(" leaves it idle; ").foregroundColor(.secondary) + Text(b.label).bold() + Text(" has borrowed it").foregroundColor(.secondary)
+            }
             let cores = runs(b.lanes).map { $0.count == 1 ? "\($0.lowerBound + 1)" : "\($0.lowerBound + 1)–\($0.upperBound)" }.joined(separator: ", ")
             let near = b.active.min { abs($0.at.timeIntervalSince(at)) < abs($1.at.timeIntervalSince(at)) }
             let active = near.flatMap { abs($0.at.timeIntervalSince(at)) < 30 ? $0.cores : nil } ?? b.average

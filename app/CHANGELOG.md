@@ -3,6 +3,13 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.5.0 — 2026-10-06
+
+- Lent cores are drawn where they really run. When cpuq lends a job's idle cores, the work over
+  the budget no longer shows as extra lanes past the budget, which the Mac does not have: it is
+  drawn on the lender's idle cores, in the borrower's color with an edge in the owner's color.
+  Pointing at one says whose core it is and who has borrowed it.
+
 ## 0.4.3 — 2026-10-06
 
 - When the budget is the CPU count, the chart draws one line, "budget 10 = CPUs", instead of
