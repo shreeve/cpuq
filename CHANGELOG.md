@@ -2,6 +2,29 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.4.0 — 2026-10-05
+
+- History: every job is recorded as it queues, starts and ends, outside
+  `/tmp` so it outlives a reboot. `cpuq history [--label X] [--limit N]
+  [--json]` lists how long jobs waited and ran, the cores they kept busy
+  (their CPU time, from the kernel) against their grant, and how they ended,
+  including jobs lost to a killed cpuq or a restart; a summary says how to
+  size `--cores`.
+- On a terminal, `cpuq status` and `cpuq history` draw boxed tables in
+  color: the gate and memory by state, holders using under half their grant
+  in yellow, and cores held per project. `cpuq status --watch` redraws in
+  place.
+- `cpuq status` names the busiest processes outside cpuq when they add up to
+  a core or more, or the gate is closed (`--json`: `outside`).
+- Waiters get an ETA from the history's typical run times (`--json`: `eta`).
+- `cpuq status --host HOST` shows another machine's queue over ssh;
+  `--host local --host pup` shows both.
+- A program that waits without `--max-wait` and without a terminal is told
+  once that its own timeout may end the wait first.
+- Cpuq.app (in `app/`, macOS 14+): a menu-bar meter, the chip filling a cell
+  per quarter of the budget in use, with a menu of what runs, waits and
+  holds leases, and a live view in Terminal.
+
 ## 0.3.0 — 2026-10-05
 
 - Named leases: `cpuq lease NAME -- CMD` is a first-come, first-served lock

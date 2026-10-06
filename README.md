@@ -46,7 +46,8 @@ described in [docs/RELEASING.md](docs/RELEASING.md).
              [--max-wait SECONDS] [--no-load-check] [--qos none] -- CMD ARGS...
     cpuq lease NAME [--slots N] [--host HOST] [--priority P] [--label TEXT] [--max-wait SECONDS] -- CMD ARGS...
     cpuq wait --label PATTERN [--max-wait SECONDS]
-    cpuq status [--json] [--no-usage]
+    cpuq status [--host HOST]... [--json] [--no-usage] [--watch[=SECONDS]]
+    cpuq history [--label PATTERN] [--limit N] [--json]
     cpuq budget
     cpuq qos
 
@@ -78,23 +79,67 @@ starts at once within its parent's grant and passes everything through
 untouched (it execs CMD). If the token's lease is no longer held, the
 variable is ignored and the run queues normally.
 
-`cpuq status` shows the state directory, the budget, the held and free cores,
-the load, memory pressure and the admission gate, every holder (pid, the
-command's pid, label, command, cores granted, cores in use, since) and every
-waiter (order, cores asked for, priority, waiting time). Cores in use is the
-CPU time the command's whole process tree spends over half a second, the
-short-lived processes it starts and reaps included: a holder using much
-less than its grant is asking for too much; measuring takes the half second,
-which `--no-usage` skips for a script that only needs the counts. A holder
-marked `*` is a lease
-whose cpuq is gone while its command still runs and holds the cores.
-Named leases follow, each with its holder and waiters. `cpuq status --json`
-gives the same for programs: a `schema` number (1; it
-changes only when a field is removed or changes meaning), the `version`,
-each holder's `cores` and `using`, each waiter's `cores` and `max`, the
-named `leases` with their `holder` and `waiters`, and the gate as `{"state", "load", "text"}` with `state` one of open, pressure, load
-or spacing. `cpuq budget` prints the budget in force; `cpuq qos` prints the
-calling process's scheduling class.
+`cpuq budget` prints the budget in force; `cpuq qos` prints the calling
+process's scheduling class.
+
+### Watching the machine
+
+`cpuq status` shows the budget, the cores held and free, the load, memory
+pressure and the admission gate, then every holder (label, cores granted,
+cores in use, priority, how long, pid, command), every waiter (order, cores
+asked for, priority, how long, ETA, command) and the named leases. On a
+terminal it draws boxed tables, with the gate and memory in green, yellow or
+red and a holder using less than half its grant in yellow (it asks for too
+much), plus the cores held per project (the label up to its first `:`);
+`NO_COLOR` keeps the boxes and drops the color. Anywhere else it prints plain
+text. `--watch` redraws it in place every 2 seconds (`--watch=N`: every N)
+until `^C`.
+
+Cores in use is the CPU time a command's whole process tree spends over half
+a second, the short-lived processes it starts and reaps included. The same
+sample rates every other process: when work outside cpuq adds up to a core or
+more, or the gate is closed, status names the busiest such processes, so the
+cause of a load spike shows at once. `--no-usage` skips the half second for a
+script that only needs the counts. A waiter's ETA plays the queue forward
+with each label's typical run time from the history (its project's when the
+label is new); `?` means nothing ahead of it has a history yet. A holder
+marked `*` is a lease whose cpuq is gone while its command still runs.
+
+`--host HOST` shows HOST's status instead, fetched over ssh and drawn here;
+`--host` repeats, and `--host local` is this machine, so
+`cpuq status --host local --host pup` is one view of both.
+
+`cpuq status --json` gives the same for programs: a `schema` number (1; it
+changes only when a field is removed or changes meaning), the `version`, the
+gate as `{"state", "load", "text"}` with `state` one of open, pressure, load
+or spacing, each holder's `cores` and `using`, each waiter's `cores`, `max`
+and `eta`, the named `leases` with their `holders` and `waiters`, and
+`outside`, the busiest processes outside cpuq. With several `--host`s it is
+one object keyed by host.
+
+### The menu-bar app (macOS)
+
+[`app/`](app/) holds Cpuq.app, a menu-bar companion: the chip in the menu
+bar fills a cell per quarter of the budget in use, and its menu shows what
+runs, what waits (with ETAs), the leases and any load outside cpuq. It only
+reads `cpuq status --json`.
+
+### History
+
+Every job is recorded as it queues, starts and ends, in
+`~/.local/state/cpuq/history.jsonl` (`$XDG_STATE_HOME/cpuq`; beside the state
+directory when `CPUQ_DIR` is set; `CPUQ_HISTORY` names the file), outside
+`/tmp` so it outlives a reboot. `cpuq history` lists jobs newest first: label,
+pool (cores or a lease), cores, how long each waited and ran, the cores it
+kept busy on average (its CPU time, from the kernel, over its run time), and
+how it ended: an exit status, a signal, `gave up` (`--max-wait`) or `lost`,
+a job that never finished because its cpuq was killed or the machine
+restarted. A summary follows: the median and longest wait, and the cores used
+of the cores granted on average, which says how to size `--cores`.
+`--label` filters (`rig:*` for a prefix), `--limit` sets how many (20), and
+`--json` gives the jobs to a program. A program that waits without
+`--max-wait` and without a terminal (an agent's tool call) is told once that
+its own timeout may end the wait first.
 
 ### Quiet windows
 
@@ -154,6 +199,7 @@ wait for another session's work without polling `cpuq status`;
 | `CPUQ_CORES` | set for CMD: the cores it holds |
 | `CPUQ_TOKEN` | set for CMD: its lease, which makes runs inside it nested |
 | `CPUQ_LEASES` | set for CMD: the named leases it runs inside, `NAME=ID` here and `NAME@HOST=ID:PID` on HOST |
+| `CPUQ_HISTORY` | the history file |
 
 ### Budget and configuration
 
