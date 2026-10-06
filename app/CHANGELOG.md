@@ -3,6 +3,14 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.7.0 — 2026-10-06
+
+- One page instead of a switch: the stacked chart on top, the lanes under it, then the waiting
+  row and the Mac strip, all over one time axis, with one pointer line through them all. Each
+  of Stacked, Lanes and Mac can be turned off at the top right (remembered); the waiting row
+  always shows. Pointing at the Mac strip says how many CPUs cpuq's jobs and other work kept
+  busy then.
+
 ## 0.6.0 — 2026-10-06
 
 - Jobs can be handled from the app (with cpuq 0.7.1 or later). In the menu, each running job has

@@ -322,7 +322,13 @@ struct GraphsView: View {
     var control: ((String, Int, String) -> Void)? = nil
     @State private var tab = 0
     @State private var hover: CGPoint?
-    @AppStorage("chartStyle") private var style = "lanes"
+    /// Which chart the pointer is in: `hover` is in that chart's units.
+    @State private var hoverIn = Pane.lanes
+    enum Pane { case stack, lanes, waiting, mac }
+    /// Which of the views over time are on: each can be turned off, the waiting row stays.
+    @AppStorage("showStacked") private var showStacked = true
+    @AppStorage("showLanes") private var showLanes = true
+    @AppStorage("showMac") private var showMac = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -336,7 +342,7 @@ struct GraphsView: View {
             if tab == 0 { now } else { history }
         }
         .padding(16)
-        .frame(minWidth: 560, minHeight: 480)
+        .frame(minWidth: 560, minHeight: 600)
     }
 
     // MARK: Now
@@ -427,52 +433,76 @@ struct GraphsView: View {
         let cells = Self.borrowed(all, budget: model.budget)
         let lanes = max(model.budget, (cells.filter { $0.project != nil }.map(\.lane).max() ?? 0) + 1)
         let machine = Self.machine(model, columns: axis.columns)
+        // Views of one thing over one time axis, each of which can be turned off: how much is
+        // held and busy by project against the CPUs; which cores; who waits; and the whole Mac.
         return VStack(alignment: .leading, spacing: 12) {
             HStack {
                 ((hover.flatMap { describe($0, axis: axis, cells: cells) }) ?? summary())
                     .font(.title3).monospacedDigit().lineLimit(1)
                 Spacer()
-                Picker("", selection: $style) {
-                    Text("Lanes").tag("lanes")
-                    Text("Stacked").tag("stack")
+                HStack(spacing: 2) {
+                    Toggle("Stacked", isOn: $showStacked)
+                    Toggle("Lanes", isOn: $showLanes)
+                    Toggle("Mac", isOn: $showMac)
                 }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 160)
+                .toggleStyle(.button).controlSize(.small)
             }
-            Group {
-                if style == "stack" {
-                    stackChart(axis: axis, waits: waitCells, machine: machine)
-                } else {
-                    lanesChart(axis: axis, lanes: lanes, cells: cells, waits: waitCells, machine: machine)
+            VStack(spacing: 4) {
+                if showStacked {
+                    stackChart(axis: axis, machine: machine)
+                        .frame(minHeight: 150, maxHeight: .infinity)
+                }
+                if showLanes {
+                    lanesChart(axis: axis, lanes: lanes, cells: cells)
+                        .frame(minHeight: 170, maxHeight: .infinity)
+                }
+                waitingChart(axis: axis, waits: waitCells, labels: !showMac)
+                    .frame(height: showMac ? 42 : 62)
+                if showMac {
+                    macChart(axis: axis, machine: machine)
+                        .frame(height: 92)
                 }
             }
-            .frame(minHeight: 280)
+            if !showStacked && !showLanes { Spacer(minLength: 0) }
             key
             table
         }
     }
 
+    /// A leading axis label, the same width in both charts so their plots line up.
+    private func axisLabel(_ text: Text) -> some View {
+        text.frame(width: 64, alignment: .trailing)
+    }
+
+    /// A trailing axis label, likewise.
+    private func trailingLabel(_ text: Text) -> some View {
+        text.frame(width: 30, alignment: .leading)
+    }
+
     /// What the marks mean, as swatches.
     private var key: some View {
         let swatch = { (c: Color, h: CGFloat) in RoundedRectangle(cornerRadius: 2).fill(c).frame(width: 14, height: h) }
-        return HStack(spacing: 14) {
-            if style == "stack" {
-                Label { Text("busy") } icon: { swatch(.blue.opacity(0.9), 10) }
-                Label { Text("held, idle") } icon: { swatch(.blue.opacity(0.22), 10) }
-                Label { Text("held, not measured") } icon: { swatch(.blue.opacity(0.55), 10) }
-                Label { Text("other work") } icon: { swatch(.secondary.opacity(0.35), 10) }
-            } else {
-                Label { Text("free") } icon: { swatch(.secondary.opacity(0.12), 10) }
-                Label { Text("held, idle") } icon: { swatch(.blue.opacity(0.22), 10) }
-                Label { Text("busy") } icon: { swatch(.blue.opacity(0.9), 10) }
-                Label { Text("held, not measured") } icon: { swatch(.blue.opacity(0.6), 3) }
-                Label { Text("borrowed (edge: owner)") } icon: {
-                    VStack(spacing: 0) { swatch(.green, 2); swatch(.blue.opacity(0.9), 8) }
-                }
+        let cores = Group {
+            Label { Text("busy") } icon: { swatch(.blue.opacity(0.9), 10) }
+            Label { Text("held, idle") } icon: { swatch(.blue.opacity(0.22), 10) }
+            Label { Text("held, not measured") } icon: { swatch(.blue.opacity(0.6), 3) }
+            Label { Text("borrowed (edge: owner)") } icon: {
+                VStack(spacing: 0) { swatch(.green, 2); swatch(.blue.opacity(0.9), 8) }
             }
+            Label { Text("free") } icon: { swatch(.secondary.opacity(0.12), 10) }
+        }
+        let rest = Group {
+            Label { Text("other work") } icon: { swatch(.secondary.opacity(0.35), 10) }
             Label { Text("waiting") } icon: { swatch(.red.opacity(0.75), 8) }
             Label { Text("waiting, gate shut") } icon: { swatch(.orange.opacity(0.75), 8) }
-            Spacer()
-            Text("recent time is widest").foregroundStyle(.tertiary)
+        }
+        let note = Text("recent time is widest").foregroundStyle(.tertiary)
+        return ViewThatFits(in: .horizontal) {
+            HStack(spacing: 14) { cores; rest; Spacer(); note }
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 14) { cores }
+                HStack(spacing: 14) { rest; Spacer(); note }
+            }
         }
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -492,12 +522,16 @@ struct GraphsView: View {
         }
     }
 
-    /// The x axis both charts share: ticks at round ages, the edge labels inside the chart.
-    private func timeAxis(_ axis: TimeAxis) -> some AxisContent {
+    /// The time axis the charts share: ticks at round ages, labeled under the lowest chart,
+    /// the edge labels inside it.
+    private func timeAxis(_ axis: TimeAxis, labels: Bool = true, grid: Bool = false) -> some AxisContent {
         AxisMarks(values: axis.ticks.map(\.x)) { v in
             let d = v.as(Double.self) ?? 0
-            AxisValueLabel(anchor: d == axis.count ? .topTrailing : d == 0 ? .topLeading : .top) {
-                if let t = axis.ticks.first(where: { abs($0.x - d) < 0.0001 }) { Text(t.label) }
+            if grid { AxisGridLine().foregroundStyle(.secondary.opacity(0.12)) }
+            if labels {
+                AxisValueLabel(anchor: d == axis.count ? .topTrailing : d == 0 ? .topLeading : .top) {
+                    if let t = axis.ticks.first(where: { abs($0.x - d) < 0.0001 }) { Text(t.label) }
+                }
             }
         }
     }
@@ -520,7 +554,7 @@ struct GraphsView: View {
 
     /// The running job whose core is under the pointer, if any (lanes only).
     private func runningJobUnderPointer(_ axis: TimeAxis) -> (pid: Int, label: String)? {
-        guard style != "stack", let h = hover, h.y >= 0 else { return nil }
+        guard hoverIn == .lanes, let h = hover, h.y >= 0 else { return nil }
         let at = axis.time(Double(h.x))
         let lane = Int(h.y)
         guard let b = model.blocks.first(where: { $0.to == nil && $0.lanes.contains(lane) && $0.from <= at }),
@@ -528,14 +562,18 @@ struct GraphsView: View {
         return (pid, b.label)
     }
 
-    /// The pointer, in the chart's units.
-    private func hovering(_ proxy: ChartProxy) -> some View {
+    /// The pointer, in the units of the chart it is in.
+    private func hovering(_ proxy: ChartProxy, _ pane: Pane) -> some View {
         GeometryReader { geo in
             Rectangle().fill(.clear).contentShape(Rectangle())
                 .onContinuousHover { phase in
-                    guard case .active(let p) = phase, let frame = proxy.plotFrame else { hover = nil; return }
+                    guard case .active(let p) = phase, let frame = proxy.plotFrame else {
+                        if hoverIn == pane { hover = nil }
+                        return
+                    }
                     let origin = geo[frame].origin
                     if let hx = proxy.value(atX: p.x - origin.x, as: Double.self), let hy = proxy.value(atY: p.y - origin.y, as: Double.self) {
+                        hoverIn = pane
                         hover = CGPoint(x: hx, y: hy)
                     }
                 }
@@ -544,14 +582,9 @@ struct GraphsView: View {
 
     // MARK: Lanes
 
-    /// The lanes, the waiting row, and under it a strip of the Mac's CPUs busy (0 to 12, with
-    /// lines at the budget and the CPU count).
-    private func lanesChart(axis: TimeAxis, lanes: Int, cells: [Cell], waits: [WaitCell], machine: [(active: Double, outside: Double)?]) -> some View {
-        let cpus = Double(ProcessInfo.processInfo.activeProcessorCount)
-        let budget = Double(model.budget)
-        let base = -5.0, height = 3.0, cap = max(12, cpus + 2)
-        let y = { (v: Double) in base + height * min(v, cap) / cap }
-        return Chart {
+    /// The lanes, one per core of the budget.
+    private func lanesChart(axis: TimeAxis, lanes: Int, cells: [Cell]) -> some View {
+        Chart {
             ForEach(cells) { c in
                 RectangleMark(xStart: .value("Time", Double(c.column) + 0.12), xEnd: .value("Time", Double(c.column) + 0.88),
                               yStart: .value("Core", Double(c.lane) + (c.measured ? 0.1 : 0.4)), yEnd: .value("Core", Double(c.lane) + (c.measured ? 0.9 : 0.6)))
@@ -563,56 +596,87 @@ struct GraphsView: View {
                         .foregroundStyle(model.color(lender))
                 }
             }
-            waitingRow(waits)
+            if let h = hover { RuleMark(x: .value("Time", Double(h.x))).foregroundStyle(.secondary.opacity(0.6)) }
+        }
+        .chartLegend(.hidden)
+        .chartXScale(domain: 0...max(axis.count, 1))
+        .chartXAxis { timeAxis(axis, labels: false) }
+        .chartYScale(domain: 0...Double(lanes))
+        .chartYAxis {
+            AxisMarks(position: .leading, values: (0..<lanes).map { Double($0) + 0.5 }) { v in
+                AxisValueLabel { if let d = v.as(Double.self) { axisLabel(Text("\(Int(d) + 1)")) } }
+            }
+            AxisMarks(position: .trailing, values: [0.0]) { _ in AxisValueLabel { trailingLabel(Text("")) } }
+        }
+        .chartOverlay { hovering($0, .lanes) }
+        .contextMenu { clearMenu(axis) }
+    }
+
+    /// Waiting: a bar as tall as the count (one, two, three or more), the count written once
+    /// over each stretch of more than one; orange while the gate is shut.
+    private func waitingChart(axis: TimeAxis, waits: [WaitCell], labels: Bool) -> some View {
+        Chart {
+            ForEach(waits) { c in
+                RectangleMark(xStart: .value("Time", Double(c.column) + 0.12), xEnd: .value("Time", Double(c.column) + 0.88),
+                              yStart: .value("Waiting", 0), yEnd: .value("Waiting", c.count == 0 ? 0.08 : 0.25 * Double(min(c.count, 3))))
+                    .foregroundStyle(c.count == 0 ? Color.secondary.opacity(0.12) : (c.gated ? Color.orange : Color.red).opacity(0.75))
+                    .annotation(position: .top, spacing: 1) {
+                        if c.label { Text("\(c.count)").font(.system(size: 10, weight: .bold)).foregroundStyle(c.gated ? .orange : .red) }
+                    }
+            }
+            if let h = hover { RuleMark(x: .value("Time", Double(h.x))).foregroundStyle(.secondary.opacity(0.6)) }
+        }
+        .chartLegend(.hidden)
+        .chartXScale(domain: 0...max(axis.count, 1))
+        .chartXAxis { timeAxis(axis, labels: labels) }
+        .chartYScale(domain: 0...1.15)
+        .chartYAxis {
+            AxisMarks(position: .leading, values: [0.35]) { _ in AxisValueLabel { axisLabel(Text("waiting").foregroundColor(.red)) } }
+            AxisMarks(position: .trailing, values: [0.0]) { _ in AxisValueLabel { trailingLabel(Text("")) } }
+        }
+        .chartOverlay { hovering($0, .waiting) }
+        .contextMenu { clearMenu(axis) }
+    }
+
+    /// The whole Mac: its CPUs busy with cpuq's jobs (dark) and with other work (pale), 0 to
+    /// 12, with lines at the budget and the CPU count.
+    private func macChart(axis: TimeAxis, machine: [(active: Double, outside: Double)?]) -> some View {
+        let cpus = Double(ProcessInfo.processInfo.activeProcessorCount)
+        let budget = Double(model.budget)
+        let cap = max(12, cpus + 2)
+        return Chart {
             ForEach(Array(machine.enumerated()), id: \.offset) { c, m in
                 if let m {
                     RectangleMark(xStart: .value("Time", Double(c) + 0.12), xEnd: .value("Time", Double(c) + 0.88),
-                                  yStart: .value("Core", base), yEnd: .value("Core", y(m.active)))
+                                  yStart: .value("CPUs", 0), yEnd: .value("CPUs", min(m.active, cap)))
                         .foregroundStyle(Color.primary.opacity(0.55))
                     RectangleMark(xStart: .value("Time", Double(c) + 0.12), xEnd: .value("Time", Double(c) + 0.88),
-                                  yStart: .value("Core", y(m.active)), yEnd: .value("Core", y(m.active + m.outside)))
+                                  yStart: .value("CPUs", min(m.active, cap)), yEnd: .value("CPUs", min(m.active + m.outside, cap)))
                         .foregroundStyle(Color.secondary.opacity(0.35))
                 }
             }
             if abs(budget - cpus) >= 0.5 {
-                RuleMark(y: .value("Core", y(budget))).foregroundStyle(.secondary.opacity(0.5)).lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                RuleMark(y: .value("CPUs", budget)).foregroundStyle(.secondary.opacity(0.5)).lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
             }
-            RuleMark(y: .value("Core", y(cpus))).foregroundStyle(.secondary.opacity(0.6)).lineStyle(StrokeStyle(lineWidth: 1))
+            RuleMark(y: .value("CPUs", cpus)).foregroundStyle(.secondary.opacity(0.6)).lineStyle(StrokeStyle(lineWidth: 1))
             if let h = hover { RuleMark(x: .value("Time", Double(h.x))).foregroundStyle(.secondary.opacity(0.6)) }
         }
         .chartLegend(.hidden)
         .chartXScale(domain: 0...max(axis.count, 1))
         .chartXAxis { timeAxis(axis) }
-        .chartYScale(domain: (base - 0.1)...Double(lanes))
+        .chartYScale(domain: 0...cap)
         .chartYAxis {
-            AxisMarks(position: .leading, values: (0..<lanes).map { Double($0) + 0.5 }) { v in
-                AxisValueLabel { if let d = v.as(Double.self) { Text("\(Int(d) + 1)") } }
-            }
-            AxisMarks(position: .leading, values: [-1.4]) { _ in AxisValueLabel { Text("waiting").foregroundStyle(.red) } }
-            AxisMarks(position: .leading, values: abs(budget - cpus) < 0.5 ? [y(cpus)] : [y(budget), y(cpus)]) { v in
+            AxisMarks(position: .leading, values: abs(budget - cpus) < 0.5 ? [cpus] : [budget, cpus]) { v in
                 AxisValueLabel {
                     if let d = v.as(Double.self) {
-                        Text(abs(budget - cpus) < 0.5 ? "\(Int(cpus)) = budget" : abs(d - y(cpus)) < 0.01 ? "\(Int(cpus)) CPUs" : "\(Int(budget))").font(.caption2)
+                        axisLabel(Text(abs(budget - cpus) < 0.5 ? "\(Int(cpus)) = budget" : abs(d - cpus) < 0.01 ? "\(Int(cpus)) CPUs" : "\(Int(budget))").font(.caption2))
                     }
                 }
             }
-            AxisMarks(position: .trailing, values: [base + height * 0.3]) { _ in AxisValueLabel { Text("Mac").foregroundStyle(.secondary) } }
+            AxisMarks(position: .trailing, values: [cap * 0.3]) { _ in AxisValueLabel { trailingLabel(Text("Mac").foregroundColor(.secondary)) } }
         }
-        .chartOverlay { hovering($0) }
+        .chartOverlay { hovering($0, .mac) }
         .contextMenu { clearMenu(axis) }
-    }
-
-    /// Waiting: a bar as tall as the count (one, two, three or more), the count written once
-    /// over each stretch of more than one.
-    private func waitingRow(_ waits: [WaitCell]) -> some ChartContent {
-        ForEach(waits) { c in
-            RectangleMark(xStart: .value("Time", Double(c.column) + 0.12), xEnd: .value("Time", Double(c.column) + 0.88),
-                          yStart: .value("Core", -1.75), yEnd: .value("Core", c.count == 0 ? -1.67 : -1.75 + 0.25 * Double(min(c.count, 3))))
-                .foregroundStyle(c.count == 0 ? Color.secondary.opacity(0.12) : (c.gated ? Color.orange : Color.red).opacity(0.75))
-                .annotation(position: .top, spacing: 1) {
-                    if c.label { Text("\(c.count)").font(.system(size: 10, weight: .bold)).foregroundStyle(c.gated ? .orange : .red) }
-                }
-        }
     }
 
     // MARK: Stacked
@@ -657,7 +721,9 @@ struct GraphsView: View {
         return out
     }
 
-    private func stackChart(axis: TimeAxis, waits: [WaitCell], machine: [(active: Double, outside: Double)?]) -> some View {
+    /// The cores held, stacked by project (busy solid, idle pale), the work outside cpuq over
+    /// them, and lines at the budget and the CPU count. It shares the lanes' time axis below.
+    private func stackChart(axis: TimeAxis, machine: [(active: Double, outside: Double)?]) -> some View {
         let cpus = Double(ProcessInfo.processInfo.activeProcessorCount)
         let budget = Double(model.budget)
         let bands = Self.bands(model, columns: axis.columns, end: axis.end)
@@ -682,7 +748,6 @@ struct GraphsView: View {
                         .foregroundStyle(Color.secondary.opacity(0.35))
                 }
             }
-            waitingRow(waits)
             // One line when the budget is the CPU count, so the labels never overlap.
             if abs(budget - cpus) < 0.5 {
                 RuleMark(y: .value("Cores", cpus)).foregroundStyle(.secondary.opacity(0.6))
@@ -697,16 +762,17 @@ struct GraphsView: View {
         }
         .chartLegend(.hidden)
         .chartXScale(domain: 0...max(axis.count, 1))
-        .chartXAxis { timeAxis(axis) }
-        .chartYScale(domain: -1.85...max(cpus + 1, peak.rounded(.up) + 0.5))
+        .chartXAxis { timeAxis(axis, labels: false, grid: true) }
+        .chartYScale(domain: 0...max(cpus + 1, peak.rounded(.up) + 0.5))
         .chartYAxis {
-            AxisMarks(position: .leading, values: Array(stride(from: 0.0, through: cpus, by: 2))) { _ in
+            AxisMarks(position: .leading, values: Array(stride(from: 0.0, through: cpus, by: 2))) { v in
                 AxisGridLine().foregroundStyle(.secondary.opacity(0.15))
-                AxisValueLabel()
+                AxisValueLabel { if let d = v.as(Double.self) { axisLabel(Text("\(Int(d))")) } }
             }
-            AxisMarks(position: .leading, values: [-1.4]) { _ in AxisValueLabel { Text("waiting").foregroundStyle(.red) } }
+            // Room on the right as wide as the Mac strip's "Mac", so the plots line up.
+            AxisMarks(position: .trailing, values: [0.0]) { _ in AxisValueLabel { trailingLabel(Text("")) } }
         }
-        .chartOverlay { hovering($0) }
+        .chartOverlay { hovering($0, .stack) }
         .contextMenu { clearMenu(axis) }
     }
 
@@ -786,7 +852,13 @@ struct GraphsView: View {
 
     private func describeJob(_ p: CGPoint, column: Int, at: Date, a: TimeInterval, end: Date, cells: [Cell]) -> Text? {
         let when = Text(a < 5 ? "now   " : age(a) + " ago   ").foregroundColor(.secondary)
-        if p.y >= 0 && style == "stack" {
+        if hoverIn == .mac {
+            let then = model.samples.min { abs($0.at.timeIntervalSince(at)) < abs($1.at.timeIntervalSince(at)) }
+                .flatMap { abs($0.at.timeIntervalSince(at)) < 30 ? $0 : nil }
+            guard let then else { return when + Text("the app was not watching then").foregroundColor(.secondary) }
+            return when + Text("the Mac").bold() + Text(String(format: " · %.1f CPUs busy in cpuq's jobs, %.1f with other work", then.active, then.outside))
+        }
+        if hoverIn == .stack {
             // The project whose band is under the pointer in that column.
             let columns = TimeAxis(span: min(max(end.timeIntervalSince(model.oldest(now: end)), 300), GraphModel.keep), end: end).columns
             guard let band = Self.bands(model, columns: columns, end: end).first(where: { $0.column == column && $0.low <= p.y && p.y < $0.high })
@@ -795,7 +867,7 @@ struct GraphsView: View {
             if band.measured { t = t + Text(String(format: ", %.1f active", band.busy - band.low)) }
             return t
         }
-        if p.y >= 0 {
+        if hoverIn == .lanes {
             let lane = Int(p.y)
             guard let cell = cells.first(where: { $0.column == column && $0.lane == lane }), let id = cell.block,
                   let b = model.blocks.first(where: { $0.id == id }) else { return when + Text("core \(lane + 1) free").foregroundColor(.secondary) }
