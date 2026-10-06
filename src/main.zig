@@ -23,7 +23,7 @@ const usage =
     \\usage: cpuq run [options] [--] CMD [ARGS...]
     \\       cpuq lease NAME [--slots N] [--host HOST] [lease options] [--] CMD [ARGS...]
     \\       cpuq wait --label PATTERN [--max-wait SECONDS]
-    \\       cpuq status [--json] [--no-usage] [--watch[=SECONDS]]
+    \\       cpuq status [--host HOST]... [--json] [--no-usage] [--watch[=SECONDS]]
     \\       cpuq history [--label PATTERN] [--limit N] [--json]
     \\       cpuq budget
     \\       cpuq qos
@@ -458,6 +458,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
 
     var next_note = start + cfg.note_s;
     var last_gate: policy.Gate = .open;
+    var hinted = false;
     while (true) {
         var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
         defer scratch.deinit();
@@ -476,6 +477,12 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
         if (out_of_time and pos > 0) giveUp(ctx, st, ticket_name, now - start, job);
         if (now >= next_note) {
             note(ctx, st, a, now - start, queue, pos, last_gate, o.lease);
+            // A program waiting without --max-wait (an agent's tool call, a
+            // script) may be killed by its own timeout first: say so once.
+            if (!hinted and o.max_wait == null and std.c.isatty(0) == 0) {
+                std.debug.print("cpuq: no --max-wait: if this caller has a timeout, it may end this wait before the job starts\n", .{});
+                hinted = true;
+            }
             next_note = now + cfg.note_s;
         }
         var wake_ms: i64 = @min(next_note - now, 60) * 1000;
@@ -1185,46 +1192,46 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
 }
 
 const JsonHolder = struct {
-    ticket: u64,
-    pid: i32,
-    holder_alive: bool,
-    child: i32,
-    cores: u32,
+    ticket: u64 = 0,
+    pid: i32 = 0,
+    holder_alive: bool = false,
+    child: i32 = 0,
+    cores: u32 = 0,
     /// Cores the command's process tree kept busy over the sample: CPU time
     /// over wall time; null when there is no command to measure.
-    using: ?f64,
-    priority: []const u8,
-    exclusive: bool,
-    label: []const u8,
-    command: []const u8,
-    since: i64,
+    using: ?f64 = null,
+    priority: []const u8 = "",
+    exclusive: bool = false,
+    label: []const u8 = "",
+    command: []const u8 = "",
+    since: i64 = 0,
 };
 
 const JsonWaiter = struct {
     /// Seconds until it is expected to start, from the history of jobs
     /// with its holders' and the waiters ahead's labels; null when unknown.
     eta: ?f64 = null,
-    order: usize,
-    ticket: u64,
-    pid: i32,
+    order: usize = 0,
+    ticket: u64 = 0,
+    pid: i32 = 0,
     /// The request: at least `cores`, up to `max`.
-    cores: u32,
-    max: u32,
-    priority: []const u8,
-    class: []const u8,
-    exclusive: bool,
-    label: []const u8,
-    command: []const u8,
-    since: i64,
+    cores: u32 = 0,
+    max: u32 = 0,
+    priority: []const u8 = "",
+    class: []const u8 = "",
+    exclusive: bool = false,
+    label: []const u8 = "",
+    command: []const u8 = "",
+    since: i64 = 0,
 };
 
 /// The gate in a form a program can act on: `state` is open, pressure, load
 /// (the valve is tripped) or spacing (one admission per 10 s), and `load` is
 /// the 1-minute load behind a load or spacing state.
 const JsonGate = struct {
-    state: []const u8,
-    load: ?f64,
-    text: []const u8,
+    state: []const u8 = "",
+    load: ?f64 = null,
+    text: []const u8 = "",
 };
 
 /// Typical run times from the history: the median run of finished jobs by
@@ -1318,9 +1325,9 @@ fn estimate(rt: RunTimes, budget: u32, holders: []const JsonHolder, waiters: []J
 /// A named lease in `cpuq status --json`: its holders (one per slot taken)
 /// and waiters.
 const JsonLease = struct {
-    name: []const u8,
-    holders: []const JsonHolder,
-    waiters: []const JsonWaiter,
+    name: []const u8 = "",
+    holders: []const JsonHolder = &.{},
+    waiters: []const JsonWaiter = &.{},
 };
 
 fn toHolders(a: std.mem.Allocator, leases: []const state.Entry, busy: []const ?f64) []JsonHolder {
@@ -1368,21 +1375,21 @@ fn toWaiters(a: std.mem.Allocator, queue: []const state.Entry) []JsonWaiter {
 const JsonStatus = struct {
     schema: u32 = 1,
     version: []const u8 = version,
-    dir: []const u8,
-    budget: u32,
-    cores: u32,
-    active_cores: u32,
-    held: u32,
-    free: u32,
-    load: [3]f64,
-    memory_pressure: []const u8,
-    gate: JsonGate,
-    holders: []const JsonHolder,
-    waiters: []const JsonWaiter,
+    dir: []const u8 = "",
+    budget: u32 = 0,
+    cores: u32 = 0,
+    active_cores: u32 = 0,
+    held: u32 = 0,
+    free: u32 = 0,
+    load: [3]f64 = .{ 0, 0, 0 },
+    memory_pressure: []const u8 = "",
+    gate: JsonGate = .{},
+    holders: []const JsonHolder = &.{},
+    waiters: []const JsonWaiter = &.{},
     /// Named leases that are held or waited for.
-    leases: []const JsonLease,
+    leases: []const JsonLease = &.{},
     /// The busiest processes outside every cpuq job (empty with --no-usage).
-    outside: []const JsonOutside,
+    outside: []const JsonOutside = &.{},
 };
 
 const StatusView = struct {
@@ -1397,6 +1404,9 @@ const StatusView = struct {
     leases: []const JsonLease,
     outside: []const JsonOutside,
     now: i64,
+    /// For another host's status: its name and its cpuq's version.
+    host: ?[]const u8 = null,
+    version: ?[]const u8 = null,
 };
 
 /// Whether outside load is worth showing: a core or more of it, or a gate
@@ -1416,7 +1426,7 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
     const width = table.terminalWidth(1);
     var host_buf: [256]u8 = undefined;
     const host = if (std.c.gethostname(&host_buf, host_buf.len) == 0) std.mem.sliceTo(&host_buf, 0) else "";
-    const short_host = std.mem.sliceTo(host, '.');
+    const short_host = v.host orelse std.mem.sliceTo(host, '.');
     const C = table.Cell;
 
     const mem: C = switch (v.pressure) {
@@ -1437,7 +1447,7 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
     } };
     const free = v.budget -| v.held;
     const summary: table.Table = .{
-        .title = a.print("cpuq {s}{s}{s}", .{ version, if (short_host.len != 0) " · " else "", short_host }) catch "cpuq",
+        .title = a.print("cpuq {s}{s}{s}", .{ v.version orelse version, if (short_host.len != 0) " · " else "", short_host }) catch "cpuq",
         .columns = &.{
             .{ .head = "BUDGET", .alignment = .right },
             .{ .head = "HELD", .alignment = .right },
@@ -1607,9 +1617,9 @@ const sample_ms = 500;
 
 /// A busy process that is not part of any cpuq job.
 const JsonOutside = struct {
-    pid: i32,
-    name: []const u8,
-    using: f64,
+    pid: i32 = 0,
+    name: []const u8 = "",
+    using: f64 = 0,
 };
 
 const Sample = struct {
@@ -1672,8 +1682,19 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
     var json = false;
     var measure = true;
     var watch_s: ?u32 = null;
-    for (args) |a| {
-        if (std.mem.eql(u8, a, "--json")) {
+    var hosts: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--host") or std.mem.startsWith(u8, a, "--host=")) {
+            const h = if (std.mem.cutPrefix(u8, a, "--host=")) |v| v else blk: {
+                i += 1;
+                if (i >= args.len) return usageError("--host needs a host name", .{});
+                break :blk args[i];
+            };
+            if (h.len == 0 or h[0] == '-') return usageError("--host needs a host name", .{});
+            hosts.append(ctx.arena, h) catch {};
+        } else if (std.mem.eql(u8, a, "--json")) {
             json = true;
         } else if (std.mem.eql(u8, a, "--no-usage")) {
             measure = false;
@@ -1683,7 +1704,7 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
             watch_s = policy.parseCount(v) orelse return usageError("--watch=SECONDS needs a whole number, at least 1, not '{s}'", .{v});
         } else return usageError("unknown status option '{s}'", .{a});
     }
-    const every = watch_s orelse return statusOnce(ctx, json, measure);
+    const every = watch_s orelse return statusHosts(ctx, hosts.items, json, measure);
     if (json or std.c.isatty(1) == 0) return usageError("--watch draws on a terminal; for a program, poll `cpuq status --json`", .{});
     // Redraw in place until ^C, each round on its own scratch memory.
     const process_arena = ctx.arena;
@@ -1695,7 +1716,7 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
         var buf: Io.Writer.Allocating = .init(ctx.arena);
         const out = ctx.out;
         ctx.out = &buf.writer;
-        _ = statusOnce(ctx, false, measure);
+        _ = statusHosts(ctx, hosts.items, false, measure);
         ctx.out = out;
         out.writeAll("\x1b[H\x1b[2J") catch {};
         out.writeAll(buf.written()) catch {};
@@ -1703,6 +1724,77 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
         ctx.arena = process_arena;
         ctx.io.sleep(.fromSeconds(every), .awake) catch {};
     }
+}
+
+/// `cpuq status` for each of `hosts` in turn (`local` is this machine), or
+/// this machine alone when none are given. With --json and several hosts,
+/// one object keyed by host.
+fn statusHosts(ctx: *Ctx, hosts: []const []const u8, json: bool, measure: bool) u8 {
+    if (hosts.len == 0) return statusOnce(ctx, json, measure);
+    var rc: u8 = 0;
+    if (json and hosts.len > 1) ctx.out.writeAll("{\n") catch {};
+    for (hosts, 0..) |h, k| {
+        if (json and hosts.len > 1) ctx.out.print("{s}\"{s}\": ", .{ if (k == 0) "" else ",\n", h }) catch {};
+        if (!json and k != 0) ctx.out.writeAll("\n") catch {};
+        const local = std.mem.eql(u8, h, "local");
+        const r = if (local) statusOnce(ctx, json, measure) else statusRemote(ctx, h, json, measure);
+        if (r != 0) rc = r;
+    }
+    if (json and hosts.len > 1) ctx.out.writeAll("}\n") catch {};
+    return rc;
+}
+
+/// HOST's status over ssh: drawn here in boxes on a terminal, else HOST's
+/// own output passed through.
+fn statusRemote(ctx: *Ctx, host: []const u8, json: bool, measure: bool) u8 {
+    const a = ctx.arena;
+    const boxed = !json and std.c.isatty(1) != 0;
+    var remote: std.ArrayList(u8) = .empty;
+    remote.appendSlice(a, "cpuq status") catch {};
+    if (json or boxed) remote.appendSlice(a, " --json") catch {};
+    if (!measure) remote.appendSlice(a, " --no-usage") catch {};
+    const argv = [_][]const u8{ "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, remote.items };
+    const result = std.process.run(a, ctx.io, .{ .argv = &argv }) catch |err| {
+        std.debug.print("cpuq: ssh {s}: {t}\n", .{ host, err });
+        return exit_failure;
+    };
+    if (!result.term.success()) {
+        std.debug.print("cpuq: status on {s} failed: {s}\n", .{ host, std.mem.trim(u8, result.stderr, " \n") });
+        return exit_failure;
+    }
+    if (!boxed) {
+        ctx.out.writeAll(result.stdout) catch {};
+        return 0;
+    }
+    const st = std.json.parseFromSliceLeaky(JsonStatus, a, result.stdout, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch {
+        std.debug.print("cpuq: {s} answered in an older format; upgrade its cpuq\n", .{host});
+        return exit_failure;
+    };
+    const gate: policy.Gate = if (std.mem.eql(u8, st.gate.state, "pressure"))
+        .pressure
+    else if (std.mem.eql(u8, st.gate.state, "load"))
+        .{ .load = st.gate.load orelse 0 }
+    else if (std.mem.eql(u8, st.gate.state, "spacing"))
+        .{ .spacing = st.gate.load orelse 0 }
+    else
+        .open;
+    const waiters = a.dupe(JsonWaiter, st.waiters) catch st.waiters;
+    statusBoxed(ctx, .{
+        .budget = st.budget,
+        .held = st.held,
+        .load = st.load,
+        .pressure = std.meta.stringToEnum(policy.Pressure, st.memory_pressure) orelse .unknown,
+        .gate = gate,
+        .gate_text = st.gate.text,
+        .holders = st.holders,
+        .waiters = waiters,
+        .leases = st.leases,
+        .outside = st.outside,
+        .now = nowSeconds(ctx.io),
+        .host = host,
+        .version = st.version,
+    });
+    return 0;
 }
 
 fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
