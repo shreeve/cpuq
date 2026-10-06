@@ -573,7 +573,7 @@ struct GraphsView: View {
             }
             Label { Text("memory pressure") } icon: { swatch(.red.opacity(0.75), 4) }
             Label { Text("gate shut") } icon: { swatch(.orange.opacity(0.18), 10) }
-            Label { Text("cores waiting") } icon: { swatch(.red.opacity(0.75), 8) }
+            Label { Text("jobs waiting") } icon: { swatch(.red.opacity(0.75), 8) }
         }
         let note = Text("recent time is widest").foregroundStyle(.tertiary)
         return ViewThatFits(in: .horizontal) {
@@ -729,26 +729,32 @@ struct GraphsView: View {
         .contextMenu { clearMenu(axis) }
     }
 
-    /// Waiting: the cores the waiting jobs ask for, hanging down from the line, red, or orange
-    /// while the gate is shut. Pointing at it names who waited.
+    /// Waiting: how many jobs wait, as bars hanging down from the line, red, or orange while
+    /// the gate is shut; the number written once under each stretch wide enough to hold it.
+    /// Pointing at it names who waited and for how many cores.
     private func waitingChart(axis: TimeAxis, waits: [WaitCell], machine: [MachineColumn?], labelGate: Bool) -> some View {
-        let deepest = Double(max(waits.map(\.cores).max() ?? 0, 4))
+        let deepest = Double(max(waits.map(\.count).max() ?? 0, 3))
         return Chart {
-            gateBands(machine, low: -deepest * 1.3, high: 0, label: labelGate)
+            gateBands(machine, low: -deepest * 1.45, high: 0, label: labelGate)
             ForEach(waits.filter { $0.count > 0 }) { c in
                 RectangleMark(xStart: .value("Time", Double(c.column) + 0.06), xEnd: .value("Time", Double(c.column) + 0.94),
-                              yStart: .value("Cores", 0), yEnd: .value("Cores", -Double(max(c.cores, 1))))
+                              yStart: .value("Jobs", 0), yEnd: .value("Jobs", -Double(c.count)))
                     .foregroundStyle((c.gated ? Color.orange : Color.red).opacity(0.75))
+                    .annotation(position: .bottom, spacing: 1) {
+                        if c.label { Text("\(c.count)").font(.system(size: 10, weight: .bold)).foregroundStyle(c.gated ? .orange : .red).fixedSize() }
+                    }
             }
-            RuleMark(y: .value("Cores", 0)).foregroundStyle(.secondary.opacity(0.3))
+            RuleMark(y: .value("Jobs", 0)).foregroundStyle(.secondary.opacity(0.3))
             if let h = hover { RuleMark(x: .value("Time", Double(h.x))).foregroundStyle(.secondary.opacity(0.6)) }
         }
         .chartLegend(.hidden)
         .chartXScale(domain: 0...max(axis.count, 1))
         .chartXAxis { timeAxis(axis) }
-        .chartYScale(domain: (-deepest * 1.3)...0.2)
+        .chartYScale(domain: (-deepest * 1.45)...0.2)
         .chartYAxis {
-            AxisMarks(position: .leading, values: [-deepest * 0.45]) { _ in AxisValueLabel { axisLabel(Text("waiting").foregroundColor(.red)) } }
+            AxisMarks(position: .leading, values: [-deepest * 0.55]) { _ in
+                AxisValueLabel { axisLabel(Text("waiting\njobs").foregroundColor(.red)).multilineTextAlignment(.trailing) }
+            }
         }
         .chartOverlay { hovering($0, .waiting) }
         .contextMenu { clearMenu(axis) }
@@ -941,7 +947,7 @@ struct GraphsView: View {
         while i < waits.count {
             var j = i
             while j < waits.count && waits[j].count == waits[i].count { j += 1 }
-            if waits[i].count > 1 { waits[(i + j - 1) / 2].label = true }
+            if waits[i].count > 0 && j - i >= 3 { waits[(i + j - 1) / 2].label = true }
             i = j
         }
         return (cells, waits)

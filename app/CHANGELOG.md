@@ -10,8 +10,9 @@ notes, shown by the update dialog too.
   blue), and still assigned so the projects on screen together never share one.
 - The top line fits: memory shows only when its pressure is high, CPUs read as a bare
   percentage, and the line shrinks a little before it would cut off.
-- The waiting row no longer writes job counts under its bars, where they collided; pointing at
-  it names who waited.
+- The waiting row counts jobs again ("waiting jobs"), its bars hanging down from the line, with
+  the bare number under each stretch wide enough to hold it, so the counts no longer collide;
+  pointing at it names who waited and for how many cores.
 - "1 core", not "1 cores".
 
 ## 0.8.0 — 2026-10-06
