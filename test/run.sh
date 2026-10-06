@@ -546,8 +546,11 @@ t_backfill_known() {
   "$CPUQ" run --cores 1-2 --label quick -- sh -c "echo quick \$CPUQ_CORES >>$f" &
   wait
   local got; got=$(tr '\n' ' ' <"$f")
-  echo "  order: $got"
-  check "a job known to be quick goes ahead with all that is free; a slow one waits (got: $got)" "[[ '$got' == 'quick 2 head slow ' ]]"
+  # Who went ahead, from history: head and slow start together once hold
+  # ends, so their order in the file is a race.
+  local ahead; ahead=$(grep '"event":"started"' "$h" | grep '"ahead":true' | sed 's/.*"label":"\([^"]*\)".*/\1/' | tr '\n' ' ')
+  echo "  order: $got; went ahead: $ahead"
+  check "a job known to be quick goes ahead with all that is free; a slow one waits (got: $got; ahead: $ahead)" "[[ '$got' == 'quick 2 '* ]] && [ '$ahead' = 'quick ' ]"
 }
 
 t_zombie() {
