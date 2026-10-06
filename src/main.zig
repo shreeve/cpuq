@@ -8,11 +8,13 @@ const state = @import("state.zig");
 const sys = @import("sys.zig");
 
 const history = @import("history.zig");
+const table = @import("table.zig");
 
 test {
     _ = policy;
     _ = state;
     _ = history;
+    _ = table;
 }
 
 const version = @import("build_options").version;
@@ -21,7 +23,7 @@ const usage =
     \\usage: cpuq run [options] [--] CMD [ARGS...]
     \\       cpuq lease NAME [--slots N] [--host HOST] [lease options] [--] CMD [ARGS...]
     \\       cpuq wait --label PATTERN [--max-wait SECONDS]
-    \\       cpuq status [--json] [--no-usage]
+    \\       cpuq status [--json] [--no-usage] [--watch[=SECONDS]]
     \\       cpuq history [--label PATTERN] [--limit N] [--json]
     \\       cpuq budget
     \\       cpuq qos
@@ -59,6 +61,8 @@ const exit_notfound = 127;
 const Ctx = struct {
     io: Io,
     arena: std.mem.Allocator,
+    /// `status --watch`'s line under the tables.
+    watch_note: ?[]const u8 = null,
     env: *std.process.Environ.Map,
     out: *Io.Writer,
     cfg: policy.Config = .{},
@@ -1075,6 +1079,9 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
     }
 
     const now = nowFloat(io);
+    const boxed = std.c.isatty(1) != 0;
+    const color = boxed and ctx.env.get("NO_COLOR") == null;
+    var trows: std.ArrayList([]const table.Cell) = .empty;
     var lw: usize = 5;
     var pw: usize = 4;
     for (picked.items) |j| {
@@ -1083,7 +1090,7 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
     }
     var lbuf: [40]u8 = undefined;
     var pbuf: [24]u8 = undefined;
-    w.print("  WHEN     {s} {s} CORES  WAITED   RAN      USED  EXIT\n", .{ pad(&lbuf, "LABEL", lw), pad(&pbuf, "POOL", pw) }) catch {};
+    if (!boxed) w.print("  WHEN     {s} {s} CORES  WAITED   RAN      USED  EXIT\n", .{ pad(&lbuf, "LABEL", lw), pad(&pbuf, "POOL", pw) }) catch {};
     for (picked.items) |j| {
         var b1: [16]u8 = undefined;
         var b2: [16]u8 = undefined;
@@ -1101,6 +1108,26 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
             .lost => "lost",
             .active => if (j.started != null) "running" else "waiting",
         };
+        if (boxed) {
+            const exit_tint: table.Tint = switch (j.state) {
+                .done => if (j.signal == null and (j.exit orelse 0) == 0) .good else .bad,
+                .gave_up => .warn,
+                .lost => .bad,
+                .active => .accent,
+            };
+            const used_tint: ?table.Tint = if (j.used()) |u| (if (j.cores) |c| (if (c >= 2 and u * 2 < @as(f64, @floatFromInt(c))) table.Tint.warn else null) else null) else .dim;
+            trows.append(a, a.dupe(table.Cell, &.{
+                .{ .text = a.dupe(u8, age(&b1, @intFromFloat(now - j.last()))) catch "?", .tint = .dim },
+                .{ .text = dash(j.label), .tint = .accent },
+                .{ .text = j.pool },
+                .{ .text = a.dupe(u8, cores_text) catch "?" },
+                .{ .text = a.dupe(u8, waited_text) catch "?" },
+                .{ .text = a.dupe(u8, ran_text) catch "?" },
+                .{ .text = a.dupe(u8, used_text) catch "?", .tint = used_tint },
+                .{ .text = a.dupe(u8, exit_text) catch "?", .tint = exit_tint },
+            }) catch continue) catch {};
+            continue;
+        }
         w.print("  {s:<8} {s} {s} {s:<6} {s:<8} {s:<8} {s:<5} {s}\n", .{
             age(&b1, @intFromFloat(now - j.last())), pad(&lbuf, dash(j.label), lw), pad(&pbuf, j.pool, pw),
             cores_text,                              waited_text,                   ran_text,
@@ -1127,13 +1154,33 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
     for (waits.items) |x| longest = @max(longest, x);
     var b1: [16]u8 = undefined;
     var b2: [16]u8 = undefined;
-    w.print("\n{d} jobs; waited {s} median, {s} longest", .{ picked.items.len, duration(&b1, history.median(waits.items)), duration(&b2, longest) }) catch {};
+    var sum: std.ArrayList(u8) = .empty;
+    sum.print(a, "{d} jobs; waited {s} median, {s} longest", .{ picked.items.len, duration(&b1, history.median(waits.items)), duration(&b2, longest) }) catch {};
     if (measured != 0) {
         const m: f64 = @floatFromInt(measured);
-        w.print("; used {d:.1} of {d:.1} cores granted on average", .{ used / m, granted / m }) catch {};
+        sum.print(a, "; used {d:.1} of {d:.1} cores granted on average", .{ used / m, granted / m }) catch {};
     }
-    if (lost != 0) w.print("; {d} lost (the machine restarted or cpuq was killed)", .{lost}) catch {};
-    w.writeAll("\n") catch {};
+    if (lost != 0) sum.print(a, "; {d} lost (the machine restarted or cpuq was killed)", .{lost}) catch {};
+    if (boxed) {
+        const t: table.Table = .{
+            .title = if (pattern) |p| a.print("history · {s}", .{p}) catch "history" else "history",
+            .columns = &.{
+                .{ .head = "WHEN" },
+                .{ .head = "LABEL" },
+                .{ .head = "POOL" },
+                .{ .head = "CORES", .alignment = .right },
+                .{ .head = "WAITED", .alignment = .right },
+                .{ .head = "RAN", .alignment = .right },
+                .{ .head = "USED", .alignment = .right },
+                .{ .head = "EXIT", .flexible = true },
+            },
+            .rows = trows.items,
+            .notes = &.{sum.items},
+        };
+        t.boxed(a, w, table.terminalWidth(1), color) catch {};
+        return 0;
+    }
+    w.print("\n{s}\n", .{sum.items}) catch {};
     return 0;
 }
 
@@ -1247,6 +1294,191 @@ const JsonStatus = struct {
     leases: []const JsonLease,
 };
 
+const StatusView = struct {
+    budget: u32,
+    held: u32,
+    load: [3]f64,
+    pressure: policy.Pressure,
+    gate: policy.Gate,
+    gate_text: []const u8,
+    holders: []const JsonHolder,
+    waiters: []const JsonWaiter,
+    leases: []const JsonLease,
+    now: i64,
+};
+
+/// `cpuq status` on a terminal: boxed tables, colored unless NO_COLOR is set.
+fn statusBoxed(ctx: *Ctx, v: StatusView) void {
+    const a = ctx.arena;
+    const w = ctx.out;
+    const color = ctx.env.get("NO_COLOR") == null;
+    const width = table.terminalWidth(1);
+    var host_buf: [256]u8 = undefined;
+    const host = if (std.c.gethostname(&host_buf, host_buf.len) == 0) std.mem.sliceTo(&host_buf, 0) else "";
+    const short_host = std.mem.sliceTo(host, '.');
+    const C = table.Cell;
+
+    const mem: C = switch (v.pressure) {
+        .normal => .{ .text = "normal", .tint = .good },
+        .high => .{ .text = "pressure", .tint = .bad },
+        .unknown => .{ .text = "unknown", .tint = .dim },
+        .off => .{ .text = "off", .tint = .dim },
+    };
+    const gate: C = .{ .text = switch (v.gate) {
+        .open => "open",
+        .pressure => "closed: memory",
+        .load => |l| a.print("closed: load {d:.1}", .{l}) catch "closed",
+        .spacing => |l| a.print("spacing: load {d:.1}", .{l}) catch "spacing",
+    }, .tint = switch (v.gate) {
+        .open => .good,
+        .spacing => .warn,
+        .load, .pressure => .bad,
+    } };
+    const free = v.budget -| v.held;
+    const summary: table.Table = .{
+        .title = a.print("cpuq {s}{s}{s}", .{ version, if (short_host.len != 0) " · " else "", short_host }) catch "cpuq",
+        .columns = &.{
+            .{ .head = "BUDGET", .alignment = .right },
+            .{ .head = "HELD", .alignment = .right },
+            .{ .head = "FREE", .alignment = .right },
+            .{ .head = "LOAD 1 5 15" },
+            .{ .head = "MEMORY" },
+            .{ .head = "GATE" },
+        },
+        .rows = &.{&.{
+            .{ .text = a.print("{d}", .{v.budget}) catch "?" },
+            .{ .text = a.print("{d}", .{v.held}) catch "?", .tint = if (v.held != 0) .accent else null },
+            .{ .text = a.print("{d}", .{free}) catch "?", .tint = if (free == 0) .warn else .good },
+            .{ .text = a.print("{d:.1} {d:.1} {d:.1}", .{ v.load[0], v.load[1], v.load[2] }) catch "?", .tint = if (v.load[0] > @as(f64, @floatFromInt(v.budget))) .warn else null },
+            mem,
+            gate,
+        }},
+    };
+    summary.boxed(a, w, width, color) catch {};
+
+    if (v.holders.len != 0) {
+        var rows: std.ArrayList([]const C) = .empty;
+        for (v.holders) |h| {
+            const using: C = if (h.using) |u| .{
+                .text = a.print("{d:.1}", .{u}) catch "?",
+                // Using less than half the grant: the request is too big.
+                .tint = if (h.cores >= 2 and u * 2 < @as(f64, @floatFromInt(h.cores))) .warn else null,
+            } else .{ .text = "-", .tint = .dim };
+            var b: [16]u8 = undefined;
+            rows.append(a, a.dupe(C, &.{
+                .{ .text = dash(h.label), .tint = .accent },
+                .{ .text = a.print("{d}", .{h.cores}) catch "?" },
+                using,
+                .{ .text = if (h.exclusive) "exclusive" else h.priority, .tint = if (h.exclusive) .warn else null },
+                .{ .text = a.dupe(u8, age(&b, v.now - h.since)) catch "?" },
+                .{ .text = a.print("{d}{s}", .{ h.pid, if (h.holder_alive) "" else "*" }) catch "?", .tint = .dim },
+                .{ .text = h.command },
+            }) catch continue) catch {};
+        }
+        const t: table.Table = .{
+            .title = a.print("holding {d} of {d} cores", .{ v.held, v.budget }) catch "holding",
+            .columns = &.{
+                .{ .head = "LABEL" },
+                .{ .head = "CORES", .alignment = .right },
+                .{ .head = "USING", .alignment = .right },
+                .{ .head = "PRIO" },
+                .{ .head = "SINCE" },
+                .{ .head = "PID", .alignment = .right },
+                .{ .head = "COMMAND", .flexible = true },
+            },
+            .rows = rows.items,
+        };
+        w.writeAll("\n") catch {};
+        t.boxed(a, w, width, color) catch {};
+    }
+
+    if (v.waiters.len != 0) {
+        var rows: std.ArrayList([]const C) = .empty;
+        for (v.waiters) |q| {
+            var b: [16]u8 = undefined;
+            const prio = if (q.exclusive) "exclusive" else if (std.mem.eql(u8, q.class, q.priority)) q.priority else a.print("{s}>{s}", .{ q.priority, q.class }) catch q.priority;
+            rows.append(a, a.dupe(C, &.{
+                .{ .text = a.print("{d}", .{q.order}) catch "?", .tint = .dim },
+                .{ .text = dash(q.label), .tint = .accent },
+                .{ .text = if (q.max > q.cores) a.print("{d}-{d}", .{ q.cores, q.max }) catch "?" else a.print("{d}", .{q.cores}) catch "?" },
+                .{ .text = prio },
+                .{ .text = a.dupe(u8, age(&b, v.now - q.since)) catch "?" },
+                .{ .text = q.command },
+            }) catch continue) catch {};
+        }
+        const t: table.Table = .{
+            .title = a.print("waiting ({d})", .{v.waiters.len}) catch "waiting",
+            .columns = &.{
+                .{ .head = "#", .alignment = .right },
+                .{ .head = "LABEL" },
+                .{ .head = "CORES", .alignment = .right },
+                .{ .head = "PRIO" },
+                .{ .head = "WAITING" },
+                .{ .head = "COMMAND", .flexible = true },
+            },
+            .rows = rows.items,
+        };
+        w.writeAll("\n") catch {};
+        t.boxed(a, w, width, color) catch {};
+    }
+
+    if (v.leases.len != 0) {
+        var rows: std.ArrayList([]const C) = .empty;
+        for (v.leases) |l| {
+            var held_by: std.ArrayList(u8) = .empty;
+            for (l.holders, 0..) |h, k| {
+                var b: [16]u8 = undefined;
+                held_by.print(a, "{s}{s} ({s})", .{ if (k == 0) "" else ", ", dash(h.label), age(&b, v.now - h.since) }) catch {};
+            }
+            var next: std.ArrayList(u8) = .empty;
+            for (l.waiters, 0..) |q, k| next.print(a, "{s}{s}", .{ if (k == 0) "" else ", ", dash(q.label) }) catch {};
+            rows.append(a, a.dupe(C, &.{
+                .{ .text = l.name, .tint = .accent },
+                .{ .text = if (held_by.items.len != 0) held_by.items else "free", .tint = if (held_by.items.len != 0) null else .good },
+                .{ .text = a.print("{d}", .{l.waiters.len}) catch "?" },
+                .{ .text = if (next.items.len != 0) next.items else "-", .tint = if (next.items.len != 0) null else .dim },
+            }) catch continue) catch {};
+        }
+        const t: table.Table = .{
+            .title = "leases",
+            .columns = &.{
+                .{ .head = "NAME" },
+                .{ .head = "HELD BY" },
+                .{ .head = "WAITING", .alignment = .right },
+                .{ .head = "NEXT", .flexible = true },
+            },
+            .rows = rows.items,
+        };
+        w.writeAll("\n") catch {};
+        t.boxed(a, w, width, color) catch {};
+    }
+
+    // Notes: each project's share (labels before their first ':'), and where
+    // to look next.
+    var notes: std.ArrayList([]const u8) = .empty;
+    if (v.holders.len != 0) {
+        var groups: std.StringArrayHashMapUnmanaged(u32) = .empty;
+        for (v.holders) |h| {
+            const key = if (h.label.len == 0) "-" else std.mem.sliceTo(h.label, ':');
+            const gop = groups.getOrPut(a, key) catch continue;
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += h.cores;
+        }
+        var line: std.ArrayList(u8) = .empty;
+        line.appendSlice(a, "cores by project:") catch {};
+        for (groups.keys(), groups.values(), 0..) |k, n, i| line.print(a, "{s} {s} {d}", .{ if (i == 0) "" else " ·", k, n }) catch {};
+        notes.append(a, line.items) catch {};
+    }
+    if (v.holders.len == 0 and v.waiters.len == 0 and v.leases.len == 0) notes.append(a, "nothing held or waiting") catch {};
+    notes.append(a, "past jobs: cpuq history · for scripts: cpuq status --json") catch {};
+    if (ctx.watch_note) |n| notes.append(a, n) catch {};
+    w.writeAll("\n") catch {};
+    for (notes.items) |n| {
+        w.writeAll("  ") catch {};
+        if (color) w.print("\x1b[2m{s}\x1b[0m\n", .{n}) catch {} else w.print("{s}\n", .{n}) catch {};
+    }
+}
+
 /// How long `cpuq status` watches the holders to measure their use.
 const sample_ms = 500;
 
@@ -1279,13 +1511,41 @@ fn nullUsage(a: std.mem.Allocator, n: usize) []?f64 {
 fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
     var json = false;
     var measure = true;
+    var watch_s: ?u32 = null;
     for (args) |a| {
         if (std.mem.eql(u8, a, "--json")) {
             json = true;
         } else if (std.mem.eql(u8, a, "--no-usage")) {
             measure = false;
+        } else if (std.mem.eql(u8, a, "--watch")) {
+            watch_s = 2;
+        } else if (std.mem.cutPrefix(u8, a, "--watch=")) |v| {
+            watch_s = policy.parseCount(v) orelse return usageError("--watch=SECONDS needs a whole number, at least 1, not '{s}'", .{v});
         } else return usageError("unknown status option '{s}'", .{a});
     }
+    const every = watch_s orelse return statusOnce(ctx, json, measure);
+    if (json or std.c.isatty(1) == 0) return usageError("--watch draws on a terminal; for a program, poll `cpuq status --json`", .{});
+    // Redraw in place until ^C, each round on its own scratch memory.
+    const process_arena = ctx.arena;
+    while (true) {
+        var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        defer scratch.deinit();
+        ctx.arena = scratch.allocator();
+        ctx.watch_note = ctx.arena.print("refreshing every {d}s · ^C to stop", .{every}) catch null;
+        var buf: Io.Writer.Allocating = .init(ctx.arena);
+        const out = ctx.out;
+        ctx.out = &buf.writer;
+        _ = statusOnce(ctx, false, measure);
+        ctx.out = out;
+        out.writeAll("\x1b[H\x1b[2J") catch {};
+        out.writeAll(buf.written()) catch {};
+        out.flush() catch {};
+        ctx.arena = process_arena;
+        ctx.io.sleep(.fromSeconds(every), .awake) catch {};
+    }
+}
+
+fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
     const io = ctx.io;
     const a = ctx.arena;
     var st = openState(ctx);
@@ -1349,6 +1609,21 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
         };
         std.json.Stringify.value(s, .{ .whitespace = .indent_2 }, w) catch {};
         w.writeAll("\n") catch {};
+        return 0;
+    }
+    if (std.c.isatty(1) != 0) {
+        statusBoxed(ctx, .{
+            .budget = budget,
+            .held = held,
+            .load = load,
+            .pressure = m.pressure,
+            .gate = g,
+            .gate_text = gate_text,
+            .holders = holders,
+            .waiters = waiters,
+            .leases = named.items,
+            .now = now,
+        });
         return 0;
     }
     w.print("dir     {s}\n", .{st.path}) catch {};
