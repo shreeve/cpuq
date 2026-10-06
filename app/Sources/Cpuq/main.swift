@@ -9,6 +9,8 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
+    private var menuOpen = false
+    private var rebuildOnClose = false
     private var status: Status?
     private var problem: String?
     private var timer: Timer?
@@ -38,6 +40,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         rebuild()
+        menuOpen = true
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuOpen = false
+        if rebuildOnClose {
+            rebuildOnClose = false
+            rebuild()
+        }
     }
 
     /// Reads `cpuq status --json` off the main thread, then updates the icon
@@ -108,61 +119,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - The menu
 
+    /// Rebuilds the menu. While it is open, its items are only retitled in place when their
+    /// number is unchanged: an open menu does not shrink when items go, which would leave blank
+    /// rows. Otherwise the rebuild waits for it to close.
     private func rebuild() {
+        let fresh = NSMenu()
+        fill(fresh)
+        if menuOpen {
+            guard fresh.numberOfItems == menu.numberOfItems else { rebuildOnClose = true; return }
+            for (old, new) in zip(menu.items, fresh.items) where !old.isSeparatorItem {
+                old.title = new.title
+                old.attributedTitle = new.attributedTitle
+            }
+            return
+        }
         menu.removeAllItems()
+        for item in fresh.items {
+            fresh.removeItem(item)
+            menu.addItem(item)
+        }
+    }
+
+    /// Fills `m` with the status and the commands.
+    private func fill(_ m: NSMenu) {
         guard let s = status else {
-            menu.addItem(text(problem ?? "reading cpuq status…", bold: false))
-            menu.addItem(.separator())
-            menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+            m.addItem(text(problem ?? "reading cpuq status…", bold: false))
+            m.addItem(.separator())
+            m.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
             return
         }
         let now = Date().timeIntervalSince1970
-        menu.addItem(text("cpuq \(s.version)  ·  \(s.held) of \(s.budget) cores in use", bold: true))
+        m.addItem(text("cpuq \(s.version)  ·  \(s.held) of \(s.budget) cores in use", bold: true))
         let load = s.load.first.map { String(format: "%.1f", $0) } ?? "?"
-        menu.addItem(text("load \(load)  ·  memory \(s.memoryPressure)  ·  gate \(s.gate.text)", bold: false))
+        m.addItem(text("load \(load)  ·  memory \(s.memoryPressure)  ·  gate \(s.gate.text)", bold: false))
 
         if !s.holders.isEmpty {
-            menu.addItem(.separator())
-            menu.addItem(section("Running"))
+            m.addItem(.separator())
+            m.addItem(section("Running"))
             for h in s.holders {
                 let using = h.using.map { String(format: "%.1f", $0) } ?? "–"
-                menu.addItem(text("\(name(h.label, h.command))   \(h.cores) in use · \(using) active · \(age(now - Double(h.since)))", bold: false))
+                m.addItem(text("\(name(h.label, h.command))   \(h.cores) in use · \(using) active · \(age(now - Double(h.since)))", bold: false))
             }
         }
         if !s.waiters.isEmpty {
-            menu.addItem(.separator())
-            menu.addItem(section("Waiting"))
+            m.addItem(.separator())
+            m.addItem(section("Waiting"))
             for w in s.waiters {
                 let cores = w.exclusive ? "exclusive" : (w.max > w.cores ? "\(w.cores)–\(w.max)" : "\(w.cores)")
                 let eta = w.eta.map { $0 < 1 ? "next" : "~" + age($0) } ?? "?"
-                menu.addItem(text("\(w.order). \(name(w.label, w.command))   \(cores) cores · ETA \(eta)", bold: false))
+                m.addItem(text("\(w.order). \(name(w.label, w.command))   \(cores) cores · ETA \(eta)", bold: false))
             }
         }
         if !s.leases.isEmpty {
-            menu.addItem(.separator())
-            menu.addItem(section("Leases"))
+            m.addItem(.separator())
+            m.addItem(section("Leases"))
             for l in s.leases {
                 let by = l.holders.map { name($0.label, $0.command) }.joined(separator: ", ")
-                menu.addItem(text("\(l.name)   \(by.isEmpty ? "free" : by) · \(l.waiters.count) waiting", bold: false))
+                m.addItem(text("\(l.name)   \(by.isEmpty ? "free" : by) · \(l.waiters.count) waiting", bold: false))
             }
         }
         let outside = s.outside.reduce(0) { $0 + $1.using }
         if outside >= 1 {
-            menu.addItem(.separator())
-            menu.addItem(section(String(format: "Outside cpuq: %.1f cores active", outside)))
+            m.addItem(.separator())
+            m.addItem(section(String(format: "Outside cpuq: %.1f cores active", outside)))
             for o in s.outside {
-                menu.addItem(text(String(format: "%@ (%d)   %.1f", o.name, o.pid, o.using), bold: false))
+                m.addItem(text(String(format: "%@ (%d)   %.1f", o.name, o.pid, o.using), bold: false))
             }
         }
-        menu.addItem(.separator())
-        menu.addItem(withTitle: "Show Graphs…", action: #selector(showGraphs), keyEquivalent: "g").target = self
-        menu.addItem(withTitle: "Open Live View in Terminal", action: #selector(openLiveView), keyEquivalent: "l").target = self
+        m.addItem(.separator())
+        m.addItem(withTitle: "Show Graphs…", action: #selector(showGraphs), keyEquivalent: "g").target = self
+        m.addItem(withTitle: "Open Live View in Terminal", action: #selector(openLiveView), keyEquivalent: "l").target = self
         if Bundle.main.bundleURL.pathExtension == "app" {
             let check = NSMenuItem(title: "Check for Updates…", action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)), keyEquivalent: "")
             check.target = updater
-            menu.addItem(check)
+            m.addItem(check)
         }
-        menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        m.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }
 
     // MARK: - The graphs window

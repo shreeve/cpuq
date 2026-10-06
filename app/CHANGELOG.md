@@ -3,6 +3,20 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.4.0 — 2026-10-05
+
+- Two views of the same hour, switched with Lanes | Stacked at the top right (remembered):
+  - Lanes: one lane per core of the budget, and under the waiting row a strip of the Mac's CPUs
+    busy, cpuq's jobs dark and other work grey, against the budget and the CPU count.
+  - Stacked: each column's cores stacked by project, solid where busy and pale where held but
+    idle, other work grey on top, with the budget and the CPU count marked.
+- Every column is the same width; how long it lasts sets the squeeze (5 seconds for the last 2
+  minutes, then 15 and 30 seconds, and a minute beyond half an hour), so nothing changes shape.
+- A stretch a job ran before the app watched it is a thin bar, not idle; once the job ends, its
+  average from history fills it in.
+- The menu no longer leaves blank rows: while it is open, its lines are retitled in place, and
+  any added or removed wait until it closes.
+
 ## 0.3.1 — 2026-10-05
 
 - The lanes' columns are fixed stretches of the clock (5 seconds for the last 2 minutes, then 15,
