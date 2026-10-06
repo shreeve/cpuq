@@ -3,6 +3,16 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.2.1 — 2026-10-05
+
+- The chart labels its own lines and bars: the active line ends in "4.2 active", the dotted one
+  in "0.5 outside cpuq" (when there is any), and the latest red bar says how many wait. The key
+  under the chart is gone.
+- The hour is full from launch: the cores in use and the waits before the app started come from
+  `cpuq history`. History records no measurements, so the active lines start at launch.
+- The table's columns have fixed widths, so its numbers no longer shift as they change.
+- Pointing at an empty part of the chart shows the present, not the nearest sample.
+
 ## 0.2.0 — 2026-10-05
 
 The graphs window, redone to read at a glance.
