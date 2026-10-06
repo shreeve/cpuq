@@ -2,6 +2,23 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.3.0 — 2026-10-05
+
+- Named leases: `cpuq lease NAME -- CMD` is a first-come, first-served lock
+  on anything that is not cores (a benchmark machine, a database), with
+  priorities, aging, `--max-wait`, `cpuq status`, and holds the kernel frees
+  however their holder ends. `--slots N` lets N hold it at once. CMD gets
+  `CPUQ_LEASES`, so a lease of the same name inside it starts at once.
+- `cpuq lease NAME --host HOST -- CMD` holds the lease on HOST's cpuq over
+  ssh while CMD runs here; ending, crashing or losing the connection gives it
+  back. Pipelines that drive another machine and that machine's own work
+  share one queue.
+- `cpuq wait --label PATTERN` blocks until no matching job holds or waits.
+- `cpuq status` lists the named leases with their holders and waiters, and
+  `--json` adds `leases`.
+- `--max-wait 0` takes what is free now and gives up at once otherwise; it
+  used to give up before trying.
+
 ## 0.2.0 — 2026-10-05
 
 - Elastic grants: `cpuq run --cores MIN-MAX` starts as soon as MIN cores

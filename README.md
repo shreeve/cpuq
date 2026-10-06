@@ -44,6 +44,8 @@ described in [docs/RELEASING.md](docs/RELEASING.md).
 
     cpuq run [--cores K|MIN-MAX] [--priority high|normal|low] [--exclusive] [--label TEXT]
              [--max-wait SECONDS] [--no-load-check] [--qos none] -- CMD ARGS...
+    cpuq lease NAME [--slots N] [--host HOST] [--priority P] [--label TEXT] [--max-wait SECONDS] -- CMD ARGS...
+    cpuq wait --label PATTERN [--max-wait SECONDS]
     cpuq status [--json] [--no-usage]
     cpuq budget
     cpuq qos
@@ -60,7 +62,7 @@ budget. `--exclusive` takes the whole
 budget: it waits at the head of the queue for running work to drain and
 blocks everything behind it while it runs. While queued, cpuq prints a line
 to stderr about once a minute (who it waits behind), and `--max-wait` gives
-up with status 75.
+up with status 75; `--max-wait 0` takes what is free now or gives up at once.
 
 CMD gets `CPUQ_CORES` (the cores it was granted), `CPUQ_TOKEN` (its lease)
 and a GNU make jobserver sized to the grant.
@@ -86,10 +88,11 @@ less than its grant is asking for too much; measuring takes the half second,
 which `--no-usage` skips for a script that only needs the counts. A holder
 marked `*` is a lease
 whose cpuq is gone while its command still runs and holds the cores.
-`cpuq status --json` gives the same for programs: a `schema` number (1; it
+Named leases follow, each with its holder and waiters. `cpuq status --json`
+gives the same for programs: a `schema` number (1; it
 changes only when a field is removed or changes meaning), the `version`,
-each holder's `cores` and `using`, each waiter's `cores` and `max`, and the
-gate as `{"state", "load", "text"}` with `state` one of open, pressure, load
+each holder's `cores` and `using`, each waiter's `cores` and `max`, the
+named `leases` with their `holder` and `waiters`, and the gate as `{"state", "load", "text"}` with `state` one of open, pressure, load
 or spacing. `cpuq budget` prints the budget in force; `cpuq qos` prints the
 calling process's scheduling class.
 
@@ -104,6 +107,43 @@ interactive `cpuq run --exclusive -- $SHELL`. cpuq has no separate hold
 command: a hold not tied to a running process would need a file that outlives
 its owner, which is the thing cpuq exists to avoid.
 
+### Named leases
+
+`cpuq lease NAME -- CMD` runs CMD holding NAME, a first-come, first-served
+lock on anything that is not cores: a benchmark machine, a database, one
+build per cache. It is the same queue as cores, with one holder at a time,
+or N with `--slots N` (a database that takes three connections, a machine
+that takes two builds); callers of one lease pass the same N. Priorities,
+aging, `--label`, `--max-wait` and `cpuq status` work as for `cpuq run`, and
+the kernel frees the lease however its holder ends. A lease
+gates nothing on the machine's load and leaves the command's cores,
+jobserver and scheduling class alone. A name is letters, digits, `.`, `_`
+and `-`.
+
+CMD gets `CPUQ_LEASES`, the leases it runs inside, so a `cpuq lease` of the
+same name within it starts at once: scripts that each take a lease can call
+one another.
+
+`--host HOST` holds the lease on HOST's cpuq and runs CMD here: cpuq starts
+`ssh HOST cpuq lease NAME --hold`, waits for HOST to grant the lease, runs
+CMD, then closes the connection, which gives the lease back. If cpuq is
+killed or the connection drops, the far side's cpuq dies with its session and
+HOST's kernel frees the lease, so a crashed pipeline never strands it. A
+script on one machine that drives work on another (`ssh` to it, step by
+step) and work started on that machine itself then share one queue:
+
+    cpuq lease pup-bench --host pup --label gate -- ./gate.sh
+
+HOST needs cpuq on the `PATH` of a non-interactive ssh command, and the ssh
+login must not ask for a password. A run inside a `--host` lease that calls
+`cpuq lease NAME --host HOST` again starts at once; to let a command on HOST
+see the lease as its own, pass `CPUQ_LEASES` through ssh.
+
+`cpuq wait --label PATTERN` returns once no job whose label matches holds or
+waits for cores or a lease (`PATTERN*` matches a prefix), so a script can
+wait for another session's work without polling `cpuq status`;
+`--max-wait` gives up with 75.
+
 ### Environment
 
 | variable | meaning |
@@ -113,6 +153,7 @@ its owner, which is the thing cpuq exists to avoid.
 | `CPUQ_CONFIG` | the config file, default `~/.config/cpuq/config` |
 | `CPUQ_CORES` | set for CMD: the cores it holds |
 | `CPUQ_TOKEN` | set for CMD: its lease, which makes runs inside it nested |
+| `CPUQ_LEASES` | set for CMD: the named leases it runs inside, `NAME=ID` here and `NAME@HOST=ID:PID` on HOST |
 
 ### Budget and configuration
 
