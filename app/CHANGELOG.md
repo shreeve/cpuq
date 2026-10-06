@@ -13,7 +13,7 @@ notes, shown by the update dialog too.
 
 - In use by project stacks at every moment: a project that stops drops to 0 at once, where it
   sloped down to the next sample that named it, and both live charts share one time axis.
-- Cores in use follow the cores handed out.
+- Cores in use step from one value to the next, as cores are handed out.
 - History draws each project's active cores over its cores in use, from 0, instead of after
   them, with the figures past both bars ("1 job", not "1 jobs").
 - With cpuq 0.4.4 the active line no longer leaps when a job reaps a finished child.
