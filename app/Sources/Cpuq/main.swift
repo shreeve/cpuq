@@ -149,6 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         let now = Date().timeIntervalSince1970
+        let controls = supportsControls(version: s.version)
         m.addItem(text("cpuq \(s.version)  ·  \(s.held) of \(s.budget) cores in use", bold: true))
         let load = s.load.first.map { String(format: "%.1f", $0) } ?? "?"
         m.addItem(text("load \(load)  ·  memory \(s.memoryPressure)  ·  gate \(s.gate.text)", bold: false))
@@ -158,7 +159,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             m.addItem(section("Running"))
             for h in s.holders {
                 let using = h.using.map { String(format: "%.1f", $0) } ?? "–"
-                m.addItem(text("\(name(h.label, h.command))   \(h.cores) in use · \(using) active · \(age(now - Double(h.since)))", bold: false))
+                let item = text("\(name(h.label, h.command))   \(h.cores) in use · \(using) active · \(age(now - Double(h.since)))\(h.paused ? " · paused" : "")", bold: false)
+                if controls && !h.exclusive {
+                    item.submenu = jobMenu([
+                        h.paused ? ("Resume", "resume") : ("Pause", "pause"),
+                        ("Stop…", "stop"),
+                    ], pid: h.pid, who: name(h.label, h.command))
+                }
+                m.addItem(item)
             }
         }
         if !s.waiters.isEmpty {
@@ -167,7 +175,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for w in s.waiters {
                 let cores = w.exclusive ? "exclusive" : (w.max > w.cores ? "\(w.cores)–\(w.max)" : "\(w.cores)")
                 let eta = w.eta.map { $0 < 1 ? "next" : "~" + age($0) } ?? "?"
-                m.addItem(text("\(w.order). \(name(w.label, w.command))   \(cores) cores · ETA \(eta)", bold: false))
+                let item = text("\(w.order). \(name(w.label, w.command))   \(cores) cores · ETA \(eta)", bold: false)
+                if controls {
+                    item.submenu = jobMenu([("Move to Front", "first"), ("Start Now…", "start"), ("Cancel", "cancel")], pid: w.pid, who: name(w.label, w.command))
+                }
+                m.addItem(item)
             }
         }
         if !s.leases.isEmpty {
@@ -207,7 +219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 backing: .buffered, defer: false)
             window.title = "cpuq"
             window.isReleasedWhenClosed = false
-            window.contentView = NSHostingView(rootView: GraphsView(model: graphs))
+            window.contentView = NSHostingView(rootView: GraphsView(model: graphs, control: { [weak self] action, pid, who in self?.perform(action, pid: String(pid), who: who) }))
             window.center()
             graphsWindow = window
             // History changes slowly: read it now and each minute while the window is open.
@@ -230,6 +242,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func name(_ label: String, _ command: String) -> String {
         label.isEmpty ? String(command.split(separator: " ").first ?? "job") : label
+    }
+
+    /// A job's actions: each runs `cpuq ACTION PID`.
+    private func jobMenu(_ actions: [(String, String)], pid: Int, who: String) -> NSMenu {
+        let menu = NSMenu()
+        for (title, action) in actions {
+            let item = NSMenuItem(title: title, action: #selector(control(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = [action, String(pid), who]
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    /// Runs a job action, asking first for the two that cost something: starting a job past the
+    /// budget raises the load, and stopping one throws its work away.
+    @objc private func control(_ sender: NSMenuItem) {
+        guard let info = sender.representedObject as? [String], info.count == 3 else { return }
+        perform(info[0], pid: info[1], who: info[2])
+    }
+
+    func perform(_ action: String, pid: String, who: String) {
+        let ask: (String, String)? = switch action {
+        case "start": ("Start \(who) now?", "It starts past the queue and the budget, so the load goes up until other jobs finish.")
+        case "stop": ("Stop \(who)?", "Its work so far is lost; it gets SIGTERM and can clean up.")
+        default: nil
+        }
+        if let (title, detail) = ask {
+            let alert = NSAlert()
+            alert.messageText = title
+            alert.informativeText = detail
+            alert.addButton(withTitle: action == "start" ? "Start Now" : "Stop")
+            alert.addButton(withTitle: "Cancel")
+            NSApp.activate()
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        Task.detached(priority: .userInitiated) {
+            _ = Self.run([action, pid])
+            await MainActor.run { self.poll() }
+        }
     }
 
     /// A line of the status. It opens the graphs when chosen, which also keeps it in full color:

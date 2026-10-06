@@ -28,6 +28,8 @@ public struct Status: Decodable, Sendable, Equatable {
         public var cores = 0
         /// Which of the budget's cores it holds, by number from 0 (cpuq 0.4.5 and later).
         public var slots: [Int] = []
+        /// Paused by hand (cpuq 0.7.1 and later).
+        public var paused = false
         public var using: Double?
         public var priority = ""
         public var exclusive = false
@@ -38,6 +40,7 @@ public struct Status: Decodable, Sendable, Equatable {
 
     public struct Waiter: Decodable, Sendable, Equatable {
         public var order = 0
+        public var pid = 0
         public var cores = 0
         public var max = 0
         public var exclusive = false
@@ -102,12 +105,13 @@ extension Status.Gate {
 }
 
 extension Status.Holder {
-    private enum Keys: String, CodingKey { case pid, cores, slots, using, priority, exclusive, label, command, since }
+    private enum Keys: String, CodingKey { case pid, cores, slots, paused, using, priority, exclusive, label, command, since }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         pid = try c.decodeIfPresent(Int.self, forKey: .pid) ?? 0
         cores = try c.decodeIfPresent(Int.self, forKey: .cores) ?? 0
         slots = try c.decodeIfPresent([Int].self, forKey: .slots) ?? []
+        paused = try c.decodeIfPresent(Bool.self, forKey: .paused) ?? false
         using = try c.decodeIfPresent(Double.self, forKey: .using)
         priority = try c.decodeIfPresent(String.self, forKey: .priority) ?? ""
         exclusive = try c.decodeIfPresent(Bool.self, forKey: .exclusive) ?? false
@@ -118,10 +122,11 @@ extension Status.Holder {
 }
 
 extension Status.Waiter {
-    private enum Keys: String, CodingKey { case order, cores, max, exclusive, label, command, since, eta }
+    private enum Keys: String, CodingKey { case order, pid, cores, max, exclusive, label, command, since, eta }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         order = try c.decodeIfPresent(Int.self, forKey: .order) ?? 0
+        pid = try c.decodeIfPresent(Int.self, forKey: .pid) ?? 0
         cores = try c.decodeIfPresent(Int.self, forKey: .cores) ?? 0
         max = try c.decodeIfPresent(Int.self, forKey: .max) ?? cores
         exclusive = try c.decodeIfPresent(Bool.self, forKey: .exclusive) ?? false
@@ -179,6 +184,14 @@ public func supportsWatch(version: String) -> Bool {
     let parts = version.split(separator: ".").compactMap { Int($0) }
     guard parts.count >= 2 else { return false }
     return parts[0] > 0 || parts[1] >= 4
+}
+
+/// Whether a cpuq of this version takes `first`, `start`, `cancel`, `pause`, `resume` and `stop`
+/// (0.7.1 and later).
+public func supportsControls(version: String) -> Bool {
+    let p = version.split(separator: ".").compactMap { Int($0) }
+    guard p.count >= 3 else { return false }
+    return (p[0], p[1], p[2]) >= (0, 7, 1)
 }
 
 /// One job from `cpuq history --json`.

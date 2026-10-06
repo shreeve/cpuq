@@ -78,3 +78,11 @@ import Testing
     #expect(jobs[0].slots == [0, 1])
     #expect(jobs[0].queued == 1700000000.5)
 }
+
+@Test func jobActionsNeedCpuq071() {
+    #expect(supportsControls(version: "0.7.1"))
+    #expect(supportsControls(version: "0.8.0"))
+    #expect(!supportsControls(version: "0.7.0"))
+    #expect(!supportsControls(version: "0.6.2"))
+    #expect(!supportsControls(version: ""))
+}

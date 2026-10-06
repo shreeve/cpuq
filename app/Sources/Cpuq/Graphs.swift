@@ -62,6 +62,7 @@ final class GraphModel {
 
     struct Waiting: Identifiable {
         let id: Int
+        var pid = 0
         let label: String
         let cores: String
         let since: Int
@@ -250,7 +251,7 @@ final class GraphModel {
     }
 
     var waiting: [Waiting] {
-        (status?.waiters ?? []).map { Waiting(id: $0.order, label: Self.label($0.label, $0.command), cores: Self.wants($0), since: $0.since) }
+        (status?.waiters ?? []).map { Waiting(id: $0.order, pid: $0.pid, label: Self.label($0.label, $0.command), cores: Self.wants($0), since: $0.since) }
     }
 
     static func label(_ label: String, _ command: String) -> String {
@@ -317,6 +318,8 @@ struct TimeAxis {
 
 struct GraphsView: View {
     let model: GraphModel
+    /// Runs a job action (`cpuq ACTION PID`), asking first where it costs something.
+    var control: ((String, Int, String) -> Void)? = nil
     @State private var tab = 0
     @State private var hover: CGPoint?
     @AppStorage("chartStyle") private var style = "lanes"
@@ -375,8 +378,8 @@ struct GraphsView: View {
 
     /// Lending puts more cores in use than the budget, but the Mac has only its own: the work
     /// over the budget runs on the cores their holders leave idle. So each column's cells over
-    /// the budget are drawn on the idle cells of that column, as borrowed, and no lane beyond
-    /// the budget is shown unless nothing idle is left to borrow.
+    /// the budget are drawn on the idle cells of that column, as borrowed, or once their lenders
+    /// are gone, on free lanes; no lane beyond the budget is shown unless both run out.
     static func borrowed(_ cells: [Cell], budget: Int) -> [Cell] {
         var out: [Cell] = []
         for column in Dictionary(grouping: cells, by: \.column).values {
@@ -390,6 +393,15 @@ struct GraphsView: View {
                 taken.insert(lent.lane)
                 out.append(Cell(column: lent.column, lane: lent.lane, project: b.project, busy: b.busy, block: b.block,
                                 measured: b.measured, lender: lent.project, lenderBlock: lent.block))
+            }
+            // Over the budget with nobody idle to borrow from: the work runs on a CPU nobody
+            // holds, so it goes on a free lane, the highest first.
+            var free = column.filter { $0.lane < budget && $0.project == nil }.sorted { $0.lane > $1.lane }
+            while !over.isEmpty, let spot = free.first {
+                let b = over.removeFirst()
+                free.removeFirst()
+                taken.insert(spot.lane)
+                out.append(Cell(column: spot.column, lane: spot.lane, project: b.project, busy: b.busy, block: b.block, measured: b.measured))
             }
             let unplaced = Set(over.map(\.lane))
             out += column.filter { !taken.contains($0.lane) && ($0.lane < budget || unplaced.contains($0.lane)) }
@@ -493,11 +505,27 @@ struct GraphsView: View {
     /// The chart's right-click menu: forget what is older than the point clicked, or than five
     /// minutes ago.
     @ViewBuilder private func clearMenu(_ axis: TimeAxis) -> some View {
+        if let job = runningJobUnderPointer(axis), let control, supportsControls(version: model.status?.version ?? "") {
+            let paused = model.status?.holders.first { $0.pid == job.pid }?.paused ?? false
+            Button(paused ? "Resume \(job.label)" : "Pause \(job.label)") { control(paused ? "resume" : "pause", job.pid, job.label) }
+            Button("Stop \(job.label)…") { control("stop", job.pid, job.label) }
+            Divider()
+        }
         if let h = hover {
             let at = axis.time(Double(h.x))
             Button("Clear Data Older Than \(age(axis.end.timeIntervalSince(at))) Ago") { model.clear(before: at); hover = nil }
         }
         Button("Keep Only the Last 5 Minutes") { model.clear(before: Date().addingTimeInterval(-300)); hover = nil }
+    }
+
+    /// The running job whose core is under the pointer, if any (lanes only).
+    private func runningJobUnderPointer(_ axis: TimeAxis) -> (pid: Int, label: String)? {
+        guard style != "stack", let h = hover, h.y >= 0 else { return nil }
+        let at = axis.time(Double(h.x))
+        let lane = Int(h.y)
+        guard let b = model.blocks.first(where: { $0.to == nil && $0.lanes.contains(lane) && $0.from <= at }),
+              let pid = Int(b.id.split(separator: "-").first ?? "") else { return nil }
+        return (pid, b.label)
     }
 
     /// The pointer, in the chart's units.
@@ -825,6 +853,13 @@ struct GraphsView: View {
                         .frame(width: 220, alignment: .leading)
                     Text("waiting \(age(Date().timeIntervalSince1970 - Double(w.since))) for \(w.cores)")
                         .foregroundStyle(.red).lineLimit(1).frame(width: 224, alignment: .leading).gridCellColumns(3)
+                }
+                .contextMenu {
+                    if let control, supportsControls(version: model.status?.version ?? "") {
+                        Button("Move to Front") { control("first", w.pid, w.label) }
+                        Button("Start Now…") { control("start", w.pid, w.label) }
+                        Button("Cancel") { control("cancel", w.pid, w.label) }
+                    }
                 }
             }
             if model.rows.isEmpty && model.waiting.isEmpty {

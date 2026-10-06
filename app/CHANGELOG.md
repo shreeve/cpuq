@@ -3,6 +3,15 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.6.0 — 2026-10-06
+
+- Jobs can be handled from the app (with cpuq 0.7.1 or later). In the menu, each running job has
+  Pause or Resume and Stop, and each waiting job has Move to Front, Start Now and Cancel. In the
+  graphs window, right-click a running job's cores, or a waiting job in the table. Start Now
+  (past the budget, so the load goes up) and Stop (its work is lost) ask first.
+- A paused job says so in the menu.
+- Work over the budget whose lenders have finished is drawn on a free lane, not past the budget.
+
 ## 0.5.0 — 2026-10-06
 
 - Lent cores are drawn where they really run. When cpuq lends a job's idle cores, the work over

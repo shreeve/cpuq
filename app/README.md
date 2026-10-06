@@ -9,7 +9,9 @@ switched at the top right: Lanes, one lane per core of the budget, each cell emp
 pale while held and solid while busy, with a strip of the Mac's CPUs busy; or Stacked, each
 column's cores stacked by project, busy solid and idle pale, other work grey on top. A red row
 counts who waited; recent time is widest. A table under it lists what each project has in use
-and active, and who waits; its History tab sums `cpuq history` per project. **Open Live View in Terminal** runs `cpuq status --watch`.
+and active, and who waits; its History tab sums `cpuq history` per project. Each running job in the menu has Pause or Resume and Stop, and each waiting job Move to Front,
+Start Now and Cancel (with cpuq 0.7.1 or later); the graphs window offers the same on a right
+click. **Open Live View in Terminal** runs `cpuq status --watch`.
 
 The app only reads `cpuq status --json` (every 3 seconds) and `cpuq history --json`, so cpuq
 works the same with or without it. It finds cpuq where install.sh and Homebrew put it
