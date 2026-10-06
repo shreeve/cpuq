@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/cpuq-icon.svg" width="160" alt="The cpuq icon: a chip with four cores, three held and one free">
+  <img src="assets/cpuq-icon.svg" width="160" alt="The cpuq icon: a chip with four cores, three in use and one free">
 </p>
 
 <h1 align="center">cpuq</h1>
@@ -84,18 +84,19 @@ process's scheduling class.
 
 ### Watching the machine
 
-`cpuq status` shows the budget, the cores held and free, the load, memory
-pressure and the admission gate, then every holder (label, cores granted,
-cores in use, priority, how long, pid, command), every waiter (order, cores
-asked for, priority, how long, ETA, command) and the named leases. On a
-terminal it draws boxed tables, with the gate and memory in green, yellow or
-red and a holder using less than half its grant in yellow (it asks for too
-much), plus the cores held per project (the label up to its first `:`);
+`cpuq status` shows the budget, the cores in use (handed out to jobs) and
+free, the load, memory pressure and the admission gate, then every job
+holding cores (label, cores in use, cores active, priority, how long, pid,
+command), every waiter (order, cores asked for, priority, how long, ETA,
+command) and the named leases. On a terminal it draws boxed tables, with the
+gate and memory in green, yellow or red and a job keeping fewer than half its
+cores active in yellow (it asks for too much), plus the cores in use per
+project (the label up to its first `:`);
 `NO_COLOR` keeps the boxes and drops the color. Anywhere else it prints plain
 text. `--watch` redraws it in place every 2 seconds (`--watch=N`: every N)
 until `^C`.
 
-Cores in use is the CPU time a command's whole process tree spends over half
+Cores active is the CPU time a command's whole process tree spends over half
 a second, the short-lived processes it starts and reaps included. The same
 sample rates every other process: when work outside cpuq adds up to a core or
 more, or the gate is closed, status names the busiest such processes, so the
@@ -121,7 +122,8 @@ one object keyed by host.
 
 [`app/`](app/) holds Cpuq.app, a menu-bar companion: the chip in the menu
 bar fills a cell per quarter of the budget in use, and its menu shows what
-runs, what waits (with ETAs), the leases and any load outside cpuq. It only
+runs (cores in use and active), what waits (with ETAs), the leases and any
+load outside cpuq. It only
 reads `cpuq status --json`.
 
 ### History
@@ -130,12 +132,13 @@ Every job is recorded as it queues, starts and ends, in
 `~/.local/state/cpuq/history.jsonl` (`$XDG_STATE_HOME/cpuq`; beside the state
 directory when `CPUQ_DIR` is set; `CPUQ_HISTORY` names the file), outside
 `/tmp` so it outlives a reboot. `cpuq history` lists jobs newest first: label,
-pool (cores or a lease), cores, how long each waited and ran, the cores it
-kept busy on average (its CPU time, from the kernel, over its run time), and
+pool (cores or a lease), cores in use, how long each waited and ran, the
+cores it kept active on average (its CPU time, from the kernel, over its run
+time), and
 how it ended: an exit status, a signal, `gave up` (`--max-wait`) or `lost`,
 a job that never finished because its cpuq was killed or the machine
-restarted. A summary follows: the median and longest wait, and the cores used
-of the cores granted on average, which says how to size `--cores`.
+restarted. A summary follows: the median and longest wait, and the cores
+active of the cores in use on average, which says how to size `--cores`.
 `--label` filters (`rig:*` for a prefix), `--limit` sets how many (20), and
 `--json` gives the jobs to a program. A program that waits without
 `--max-wait` and without a terminal (an agent's tool call) is told once that

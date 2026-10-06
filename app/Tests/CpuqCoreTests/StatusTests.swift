@@ -58,3 +58,12 @@ import Testing
     #expect(age(185) == "3m05s")
     #expect(age(7800) == "2h10m")
 }
+
+@Test func watchArrivesInCpuq040() {
+    #expect(!supportsWatch(version: "0.2.0"))
+    #expect(!supportsWatch(version: "0.3.0"))
+    #expect(supportsWatch(version: "0.4.0"))
+    #expect(supportsWatch(version: "0.10.1"))
+    #expect(supportsWatch(version: "1.0.0"))
+    #expect(!supportsWatch(version: ""))
+}

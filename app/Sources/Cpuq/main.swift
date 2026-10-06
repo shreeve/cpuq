@@ -47,7 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 let s = self.status
                 self.item.button?.image = self.chip(level: meterLevel(held: s?.held ?? 0, budget: s?.budget ?? 0))
-                self.item.button?.toolTip = s.map { "cpuq: \($0.held) of \($0.budget) cores held · gate \($0.gate.text)" } ?? "cpuq: \(self.problem ?? "")"
+                self.item.button?.toolTip = s.map { "cpuq: \($0.held) of \($0.budget) cores in use · gate \($0.gate.text)" } ?? "cpuq: \(self.problem ?? "")"
                 if self.menu.highlightedItem != nil || self.menu.numberOfItems == 0 { return }
                 self.rebuild()
             }
@@ -92,7 +92,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         let now = Date().timeIntervalSince1970
-        menu.addItem(text("cpuq \(s.version)  ·  \(s.held) of \(s.budget) cores held", bold: true))
+        menu.addItem(text("cpuq \(s.version)  ·  \(s.held) of \(s.budget) cores in use", bold: true))
         let load = s.load.first.map { String(format: "%.1f", $0) } ?? "?"
         menu.addItem(text("load \(load)  ·  memory \(s.memoryPressure)  ·  gate \(s.gate.text)", bold: false))
 
@@ -101,7 +101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(section("Running"))
             for h in s.holders {
                 let using = h.using.map { String(format: "%.1f", $0) } ?? "–"
-                menu.addItem(text("\(name(h.label, h.command))   \(h.cores) granted · \(using) using · \(age(now - Double(h.since)))", bold: false))
+                menu.addItem(text("\(name(h.label, h.command))   \(h.cores) in use · \(using) active · \(age(now - Double(h.since)))", bold: false))
             }
         }
         if !s.waiters.isEmpty {
@@ -124,7 +124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let outside = s.outside.reduce(0) { $0 + $1.using }
         if outside >= 1 {
             menu.addItem(.separator())
-            menu.addItem(section(String(format: "Outside cpuq: %.1f cores", outside)))
+            menu.addItem(section(String(format: "Outside cpuq: %.1f cores active", outside)))
             for o in s.outside {
                 menu.addItem(text(String(format: "%@ (%d)   %.1f", o.name, o.pid, o.using), bold: false))
             }
@@ -153,7 +153,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openLiveView() {
         guard let path = findCpuq() else { return }
-        let script = "tell application \"Terminal\"\nactivate\ndo script \"\(path) status --watch\"\nend tell"
+        // `status --watch` is cpuq 0.4.0's; an older cpuq gets the same view
+        // redrawn by the shell.
+        let command = supportsWatch(version: status?.version ?? "")
+            ? "\(path) status --watch"
+            : "while :; do clear; \(path) status; sleep 2; done"
+        let script = "tell application \"Terminal\"\nactivate\ndo script \"\(command)\"\nend tell"
         NSAppleScript(source: script)?.executeAndReturnError(nil)
     }
 

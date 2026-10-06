@@ -628,7 +628,7 @@ fn note(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, waited: i64, queue: [
         const budget = budgetNow(ctx, m);
         const held = state.heldTokens(st) catch 0;
         if (pos == 0 and g != .open) w.print(", {s}", .{gateText(&b3, g, budget)}) catch {};
-        w.print("; {d}/{d} cores held", .{ held, budget }) catch {};
+        w.print("; {d}/{d} cores in use", .{ held, budget }) catch {};
     }
     for (leases, 0..) |l, i| {
         w.print("{s} {s} (pid {d}", .{
@@ -1097,7 +1097,7 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
     }
     var lbuf: [40]u8 = undefined;
     var pbuf: [24]u8 = undefined;
-    if (!boxed) w.print("  WHEN     {s} {s} CORES  WAITED   RAN      USED  EXIT\n", .{ pad(&lbuf, "LABEL", lw), pad(&pbuf, "POOL", pw) }) catch {};
+    if (!boxed) w.print("  WHEN     {s} {s} IN USE WAITED   RAN      ACTIVE EXIT\n", .{ pad(&lbuf, "LABEL", lw), pad(&pbuf, "POOL", pw) }) catch {};
     for (picked.items) |j| {
         var b1: [16]u8 = undefined;
         var b2: [16]u8 = undefined;
@@ -1135,7 +1135,7 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
             }) catch continue) catch {};
             continue;
         }
-        w.print("  {s:<8} {s} {s} {s:<6} {s:<8} {s:<8} {s:<5} {s}\n", .{
+        w.print("  {s:<8} {s} {s} {s:<6} {s:<8} {s:<8} {s:<6} {s}\n", .{
             age(&b1, @intFromFloat(now - j.last())), pad(&lbuf, dash(j.label), lw), pad(&pbuf, j.pool, pw),
             cores_text,                              waited_text,                   ran_text,
             used_text,                               exit_text,
@@ -1165,7 +1165,7 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
     sum.print(a, "{d} jobs; waited {s} median, {s} longest", .{ picked.items.len, duration(&b1, history.median(waits.items)), duration(&b2, longest) }) catch {};
     if (measured != 0) {
         const m: f64 = @floatFromInt(measured);
-        sum.print(a, "; used {d:.1} of {d:.1} cores granted on average", .{ used / m, granted / m }) catch {};
+        sum.print(a, "; {d:.1} active of {d:.1} cores in use on average", .{ used / m, granted / m }) catch {};
     }
     if (lost != 0) sum.print(a, "; {d} lost (the machine restarted or cpuq was killed)", .{lost}) catch {};
     if (boxed) {
@@ -1175,10 +1175,10 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
                 .{ .head = "WHEN" },
                 .{ .head = "LABEL" },
                 .{ .head = "POOL" },
-                .{ .head = "CORES", .alignment = .right },
+                .{ .head = "IN USE", .alignment = .right },
                 .{ .head = "WAITED", .alignment = .right },
                 .{ .head = "RAN", .alignment = .right },
-                .{ .head = "USED", .alignment = .right },
+                .{ .head = "ACTIVE", .alignment = .right },
                 .{ .head = "EXIT", .flexible = true },
             },
             .rows = trows.items,
@@ -1450,7 +1450,7 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
         .title = a.print("cpuq {s}{s}{s}", .{ v.version orelse version, if (short_host.len != 0) " · " else "", short_host }) catch "cpuq",
         .columns = &.{
             .{ .head = "BUDGET", .alignment = .right },
-            .{ .head = "HELD", .alignment = .right },
+            .{ .head = "IN USE", .alignment = .right },
             .{ .head = "FREE", .alignment = .right },
             .{ .head = "LOAD 1 5 15" },
             .{ .head = "MEMORY" },
@@ -1487,11 +1487,11 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
             }) catch continue) catch {};
         }
         const t: table.Table = .{
-            .title = a.print("holding {d} of {d} cores", .{ v.held, v.budget }) catch "holding",
+            .title = a.print("in use: {d} of {d} cores", .{ v.held, v.budget }) catch "in use",
             .columns = &.{
                 .{ .head = "LABEL" },
-                .{ .head = "CORES", .alignment = .right },
-                .{ .head = "USING", .alignment = .right },
+                .{ .head = "IN USE", .alignment = .right },
+                .{ .head = "ACTIVE", .alignment = .right },
                 .{ .head = "PRIO" },
                 .{ .head = "SINCE" },
                 .{ .head = "PID", .alignment = .right },
@@ -1578,8 +1578,8 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
             }) catch continue) catch {};
         }
         const t: table.Table = .{
-            .title = a.print("outside cpuq: {d:.1} cores", .{total}) catch "outside cpuq",
-            .columns = &.{ .{ .head = "PROCESS", .flexible = true }, .{ .head = "PID", .alignment = .right }, .{ .head = "USING", .alignment = .right } },
+            .title = a.print("outside cpuq: {d:.1} cores active", .{total}) catch "outside cpuq",
+            .columns = &.{ .{ .head = "PROCESS", .flexible = true }, .{ .head = "PID", .alignment = .right }, .{ .head = "ACTIVE", .alignment = .right } },
             .rows = rows.items,
         };
         w.writeAll("\n") catch {};
@@ -1598,11 +1598,11 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
             gop.value_ptr.* += h.cores;
         }
         var line: std.ArrayList(u8) = .empty;
-        line.appendSlice(a, "cores by project:") catch {};
+        line.appendSlice(a, "cores in use by project:") catch {};
         for (groups.keys(), groups.values(), 0..) |k, n, i| line.print(a, "{s} {s} {d}", .{ if (i == 0) "" else " ·", k, n }) catch {};
         notes.append(a, line.items) catch {};
     }
-    if (v.holders.len == 0 and v.waiters.len == 0 and v.leases.len == 0) notes.append(a, "nothing held or waiting") catch {};
+    if (v.holders.len == 0 and v.waiters.len == 0 and v.leases.len == 0) notes.append(a, "nothing in use or waiting") catch {};
     notes.append(a, "past jobs: cpuq history · for scripts: cpuq status --json") catch {};
     if (ctx.watch_note) |n| notes.append(a, n) catch {};
     w.writeAll("\n") catch {};
@@ -1883,7 +1883,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
         return 0;
     }
     w.print("dir     {s}\n", .{st.path}) catch {};
-    w.print("budget  {d} cores ({d} active of {d}); held {d}, free {d}\n", .{ budget, m.active, sys.totalCpus(ctx.io), held, budget -| held }) catch {};
+    w.print("budget  {d} cores ({d} online of {d}); in use {d}, free {d}\n", .{ budget, m.active, sys.totalCpus(ctx.io), held, budget -| held }) catch {};
     w.print("load    {d:.2} {d:.2} {d:.2}; memory pressure {s}; gate {s}\n", .{ load[0], load[1], load[2], pressure, gate_text }) catch {};
     if (showOutside(smp.outside, g)) {
         w.writeAll("outside") catch {};
@@ -1897,7 +1897,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
     var b1: [16]u8 = undefined;
     w.print("\nholders ({d})\n", .{holders.len}) catch {};
     var lbuf: [40]u8 = undefined;
-    if (holders.len != 0) w.print("  PID      CMD-PID  CORES  USING  PRIO    SINCE    {s} COMMAND\n", .{pad(&lbuf, "LABEL", lw)}) catch {};
+    if (holders.len != 0) w.print("  PID      CMD-PID  IN USE ACTIVE PRIO    SINCE    {s} COMMAND\n", .{pad(&lbuf, "LABEL", lw)}) catch {};
     for (holders) |h| {
         var pid_buf: [16]u8 = undefined;
         const pid_text = std.mem.print(&pid_buf, "{d}{s}", .{ h.pid, if (h.holder_alive) "" else "*" }) catch "?";
@@ -1906,8 +1906,8 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
         var using_buf: [16]u8 = undefined;
         const using_text = if (h.using) |u| std.mem.print(&using_buf, "{d:.1}", .{u}) catch "?" else "-";
         w.print("  {s:<8} {s:<8} {d:<6} {s:<6} {s:<7} {s:<8} {s} {s}{s}\n", .{
-            pid_text,                child_text,                    h.cores,   using_text,                                                                     if (h.exclusive) "excl" else h.priority,
-            age(&b1, now - h.since), pad(&lbuf, dash(h.label), lw), h.command, if (h.holder_alive) "" else "  (cpuq gone; the command still holds the cores)",
+            pid_text,                child_text,                    h.cores,   using_text,                                                                   if (h.exclusive) "excl" else h.priority,
+            age(&b1, now - h.since), pad(&lbuf, dash(h.label), lw), h.command, if (h.holder_alive) "" else "  (cpuq gone; the command still has the cores)",
         }) catch {};
     }
     w.print("\nwaiters ({d})\n", .{waiters.len}) catch {};

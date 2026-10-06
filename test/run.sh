@@ -539,7 +539,7 @@ d = json.load(sys.stdin)
 print(" ".join("%s:%d" % (h, d[h]["held"]) for h in sorted(d)))')
   check "status --host gives one JSON object keyed by host (got $got)" "[ '$got' = 'far:2 local:2' ]"
   local text; text=$(PATH="$bin:$PATH" "$CPUQ" status --no-usage --host far)
-  check "status --host passes the host's own text through when piped" "[[ '$text' == *'held 2'* ]]"
+  check "status --host passes the host's own text through when piped" "[[ '$text' == *'in use 2'* ]]"
   "$CPUQ" status --watch >/dev/null 2>&1; local rc=$?
   check "status --watch refuses when not on a terminal (got $rc)" "[ $rc = 2 ]"
   wait

@@ -170,3 +170,10 @@ public func age(_ seconds: Double) -> String {
     if s < 3600 { return String(format: "%dm%02ds", s / 60, s % 60) }
     return String(format: "%dh%02dm", s / 3600, (s % 3600) / 60)
 }
+
+/// Whether a cpuq of this version has `status --watch` (0.4.0 and later).
+public func supportsWatch(version: String) -> Bool {
+    let parts = version.split(separator: ".").compactMap { Int($0) }
+    guard parts.count >= 2 else { return false }
+    return parts[0] > 0 || parts[1] >= 4
+}

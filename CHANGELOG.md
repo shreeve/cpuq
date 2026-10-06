@@ -6,14 +6,17 @@ User-visible changes to cpuq. Each version's section is its release notes.
 
 - History: every job is recorded as it queues, starts and ends, outside
   `/tmp` so it outlives a reboot. `cpuq history [--label X] [--limit N]
-  [--json]` lists how long jobs waited and ran, the cores they kept busy
-  (their CPU time, from the kernel) against their grant, and how they ended,
+  [--json]` lists how long jobs waited and ran, the cores they kept active
+  (their CPU time, from the kernel) against the cores in use, and how they
+  ended,
   including jobs lost to a killed cpuq or a restart; a summary says how to
   size `--cores`.
 - On a terminal, `cpuq status` and `cpuq history` draw boxed tables in
-  color: the gate and memory by state, holders using under half their grant
-  in yellow, and cores held per project. `cpuq status --watch` redraws in
-  place.
+  color: the gate and memory by state, jobs keeping under half their cores
+  active in yellow, and cores in use per project. `cpuq status --watch`
+  redraws in place.
+- Status reads in two words: cores *in use* (handed out to jobs) and cores
+  *active* (the CPU they keep busy). The JSON fields keep their names.
 - `cpuq status` names the busiest processes outside cpuq when they add up to
   a core or more, or the gate is closed (`--json`: `outside`).
 - Waiters get an ETA from the history's typical run times (`--json`: `eta`).
