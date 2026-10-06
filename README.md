@@ -245,6 +245,14 @@ interactive `cpuq run --exclusive -- $SHELL`. cpuq has no separate hold
 command: a hold not tied to a running process would need a file that outlives
 its owner, which is the thing cpuq exists to avoid.
 
+A named lease can carry a quiet window too: `cpuq lease NAME --exclusive`
+takes NAME, then the machine's whole budget once running work drains, and
+keeps both until it ends. Nothing else is admitted meanwhile; the lease's own
+command runs its `cpuq run`s inside the window. With `--host HOST --hold` the
+window is on HOST: a script that drives timing work over ssh holds HOST's
+cores for as long as it holds the lease, and other work on HOST fills the
+machine between such holders.
+
 ### Named leases
 
 `cpuq lease NAME -- CMD` runs CMD holding NAME, a first-come, first-served

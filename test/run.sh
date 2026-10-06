@@ -689,6 +689,37 @@ print(" ".join("%s%s:%s:%s" % (j["label"], "@" + j["host"] if j["host"] else "",
   check "nothing is lost" "[[ '$got' != *lost* ]]"
 }
 
+t_lease_exclusive() {
+  setup lease-exclusive
+  local bin=$T/bin f=$T/log
+  mkdir -p "$bin"
+  printf '#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done\nshift\nexec sh -c "$*"\n' >"$bin/ssh"
+  chmod +x "$bin/ssh"
+  ln -sf "$CPUQ" "$bin/cpuq"
+  # A run holds 2 cores; the exclusive lease waits for it to end, then holds
+  # the machine: a run started meanwhile waits for the lease, and a run
+  # inside the lease's command starts at once.
+  "$CPUQ" run --cores 2 --label busy -- sh -c "sleep 1.5; echo busy-done >>$f" & local b=$!
+  wait_held 2
+  "$CPUQ" lease bench --exclusive --label timing -- sh -c "echo timing >>$f; \"$CPUQ\" run --cores 1 -- sh -c 'echo inner >>$f'; sleep 1.5; echo timing-done >>$f" & local l=$!
+  wait_lease_holder bench
+  "$CPUQ" run --cores 1 --label late -- sh -c "echo late >>$f" & local r=$!
+  wait $b $l $r
+  local got; got=$(tr '\n' ' ' <"$f")
+  check "an exclusive lease waits for running work, then nothing else runs until it ends, but its own runs do (got: $got)" "[ '$got' = 'busy-done timing inner timing-done late ' ]"
+  # Held with --hold on a host: other runs there wait; closed and killed at
+  # once, it frees the machine and leaves nothing lost.
+  mkfifo "$T/in"
+  PATH="$bin:$PATH" "$CPUQ" lease bench --host far --hold --exclusive --label kit <"$T/in" >/dev/null & local h=$!
+  exec 7>"$T/in"
+  wait_held 9
+  "$CPUQ" run --cores 1 --max-wait 1 -- true 2>/dev/null; local rc=$?
+  exec 7>&-; kill $h 2>/dev/null; wait $h 2>/dev/null
+  "$CPUQ" run --cores 1 --max-wait 3 -- true; local after=$?
+  local lost; lost=$("$CPUQ" history --json | python3 -c 'import json, sys; print(sum(1 for j in json.load(sys.stdin) if j["state"] == "lost"))')
+  check "while an exclusive --hold holds the machine others wait (rc $rc); after it, they run (rc $after); nothing lost ($lost)" "[ $rc = 75 ] && [ $after = 0 ] && [ '$lost' = 0 ]"
+}
+
 t_controls() {
   setup controls
   local f=$T/order
@@ -963,6 +994,18 @@ t_jobserver() {
   check "MAKEFLAGS keeps the caller's other flags" "[[ '$mf' == 'k --no-print-directory -j --jobserver-auth='*' --jobserver-fds='* ]]"
 }
 
+t_long_command() {
+  setup long-command
+  # A command line over 1 KB (an inline script): its record must still carry
+  # the child pid, which pause, stop and lending all go by.
+  local pad; pad=$(printf 'x%.0s' $(seq 2000))
+  "$CPUQ" run --cores 1 --label long -- sh -c "sleep 30.239 # $pad" & local p=$!
+  wait_held 1
+  local child; child=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print(json.load(sys.stdin)["holders"][0]["child"])')
+  "$CPUQ" stop long >/dev/null; wait $p
+  check "a job whose command is over 1 KB still has its child pid recorded (got $child)" "[ '$child' -gt 0 ]"
+}
+
 t_status() {
   setup status
   "$CPUQ" run --cores 4 --label build -- sleep 1.5 & wait_held 4
@@ -977,7 +1020,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold last_words wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold last_words lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

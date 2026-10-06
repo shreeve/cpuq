@@ -45,7 +45,9 @@ const usage =
     \\hold it at once (default 1). --host HOST holds it on HOST's cpuq over ssh
     \\while CMD runs here. CMD gets CPUQ_LEASES. --host HOST --hold, with no
     \\command, prints `held NAME@HOST ENTRY` once granted (ENTRY: a CPUQ_LEASES
-    \\entry) and holds the lease until stdin closes, for a script.
+    \\entry) and holds the lease until stdin closes, for a script. --exclusive
+    \\also takes the machine's whole budget once running work drains, and
+    \\keeps it while the lease is held: a timing window (with --host, on HOST).
     \\wait: until no job whose label matches (PATTERN* for a prefix) holds or
     \\waits.
     \\
@@ -268,7 +270,7 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             _ = usageError("{s} takes no value", .{name});
             return null;
         }
-        for ([_][]const u8{ "--cores", "--exclusive", "--no-load-check", "--qos" }) |r| {
+        for ([_][]const u8{ "--cores", "--no-load-check", "--qos" }) |r| {
             if (std.mem.eql(u8, name, r)) o.run_only = r;
         }
         if (std.mem.eql(u8, name, "--cores")) {
@@ -481,8 +483,12 @@ fn armLastWords(ctx: *Ctx, job: JobLog, event: []const u8, cores: ?u32, done: bo
     tw.print(",\"pid\":{d}", .{job.base.pid}) catch return;
     if (cores) |k| tw.print(",\"cores\":{d}", .{k}) catch return;
     if (done) tw.writeAll(",\"exit\":0") catch return;
-    sys.armLastWords(path, head, tw.buffered(), !done);
+    sys.armLastWords(words_slot, path, head, tw.buffered(), !done);
 }
+
+/// Which last-words slot the job being waited for or run uses: 1 for the
+/// cores of a lease taken `--exclusive`, so its two jobs each get a line.
+var words_slot: u1 = 0;
 
 /// Logs how a command ended.
 fn logEnded(ctx: *Ctx, job: JobLog, cores: u32, w: sys.Waited) void {
@@ -922,12 +928,16 @@ fn note(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, waited: i64, queue: [
     std.debug.print("{s}\n", .{w.buffered()});
 }
 
+/// Writes a lease's record over the old one, from the start. A record has no
+/// size limit (a command can be a long inline script), so it goes through a
+/// positional writer rather than a fixed buffer, which once dropped records
+/// over 1 KB and left their child pid unknown.
 fn rewriteRecord(io: Io, f: Io.File, r: state.Record) void {
-    var buf: [1024]u8 = undefined;
-    var w: Io.Writer = .fixed(&buf);
-    r.write(&w) catch return;
     f.setLength(io, 0) catch return;
-    f.writePositionalAll(io, w.buffered(), 0) catch {};
+    var buf: [1024]u8 = undefined;
+    var fw = f.writer(io, &buf);
+    r.write(&fw.interface) catch return;
+    fw.interface.flush() catch {};
 }
 
 fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, lease_in: Lease) u8 {
@@ -945,6 +955,15 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
     var pipe: [2]std.c.fd_t = .{ -1, -1 };
     if (o.lease) |name| {
         addLeaseEnv(ctx, name, lease.name);
+        // Holding the machine's cores too (`--exclusive`): the command's own
+        // `cpuq run`s start at once inside them, as nested runs.
+        if (exclusive_cores) |x| {
+            for (x.lease.tokens) |t| sys.inherit(t.handle);
+            sys.inherit(x.lease.file.handle);
+            var num: [16]u8 = undefined;
+            ctx.env.put("CPUQ_CORES", std.mem.print(&num, "{d}", .{x.lease.record.cores}) catch "1") catch fail("out of memory", .{});
+            ctx.env.put("CPUQ_TOKEN", x.lease.name) catch fail("out of memory", .{});
+        }
     } else {
         var num: [16]u8 = undefined;
         ctx.env.put("CPUQ_CORES", std.mem.print(&num, "{d}", .{k}) catch "1") catch fail("out of memory", .{});
@@ -968,12 +987,17 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
         sys.setChild(pid);
         lease.record.child = pid;
         rewriteRecord(io, lease.file, lease.record);
+        if (exclusive_cores) |*x| {
+            x.lease.record.child = pid;
+            rewriteRecord(io, x.lease.file, x.lease.record);
+        }
         break :blk sys.waitChild(pid);
     } else |err| blk: {
         std.debug.print("cpuq: {s}: {t}\n", .{ o.cmd[0], err });
         break :blk .{ .exit = .{ .code = if (err == error.FileNotFound) exit_notfound else exit_noexec } };
     };
 
+    releaseExclusiveCores(ctx, waited);
     release(io, st, lease);
     logEnded(ctx, lease.job, k, waited);
     ctx.out.flush() catch {};
@@ -1089,9 +1113,38 @@ fn cmdLease(ctx: *Ctx, args: []const [:0]const u8) u8 {
         return exit_notfound;
     };
     var st = openNamed(ctx, name);
-    const lease = waitTurn(ctx, &st, o);
+    var named = o;
+    named.exclusive = false;
+    const lease = waitTurn(ctx, &st, named);
+    // `--exclusive`: the machine's cores too, once running work drains, held
+    // with the lease, so nothing else runs while it is held: a timing window.
+    // The lease comes first, so two holders never wait on each other.
+    var cst: state.State = undefined;
+    if (o.exclusive) {
+        cst = openState(ctx);
+        var co = o;
+        co.lease = null;
+        co.hold = false;
+        co.slots = 1;
+        co.request = .{ .min = 1, .max = 1 };
+        words_slot = 1;
+        exclusive_cores = .{ .st = &cst, .lease = waitTurn(ctx, &cst, co) };
+        words_slot = 0;
+    }
     if (o.hold) return holdAdmitted(ctx, &st, o, lease);
     return runAdmitted(ctx, &st, o, exe, lease);
+}
+
+/// The machine's cores held with a lease taken `--exclusive`, given back with it.
+var exclusive_cores: ?struct { st: *state.State, lease: Lease } = null;
+
+/// Gives back the cores held with an `--exclusive` lease, if any, and logs
+/// their end as the lease's own: `done` when the lease ended normally.
+fn releaseExclusiveCores(ctx: *Ctx, ended: ?sys.Waited) void {
+    const x = exclusive_cores orelse return;
+    exclusive_cores = null;
+    release(ctx.io, x.st, x.lease);
+    if (ended) |w| logEnded(ctx, x.lease.job, x.lease.record.cores, w) else logEvent(ctx, x.lease.job, "ended", .{ .cores = x.lease.record.cores, .exit = 0 });
 }
 
 /// Blocks until stdin reaches its end: the holder of a `--hold` closed it,
@@ -1130,6 +1183,12 @@ fn holdAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, lease: Lease) u8 {
     ctx.out.flush() catch {};
     untilStdinCloses();
     armLastWords(ctx, lease.job, "ended", lease.record.cores, true);
+    if (exclusive_cores) |x| {
+        words_slot = 1;
+        armLastWords(ctx, x.lease.job, "ended", x.lease.record.cores, true);
+        words_slot = 0;
+    }
+    releaseExclusiveCores(ctx, null);
     release(ctx.io, st, lease);
     logEvent(ctx, lease.job, "ended", .{ .cores = lease.record.cores, .exit = 0 });
     return 0;
@@ -1154,6 +1213,7 @@ fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
     // so everything after the host is quoted for it.
     var remote: std.ArrayList(u8) = .empty;
     remote.print(a, "cpuq lease {s} --hold --slots {d} --priority {t}", .{ o.lease.?, o.slots, o.priority }) catch fail("out of memory", .{});
+    if (o.exclusive) remote.appendSlice(a, " --exclusive") catch fail("out of memory", .{});
     if (o.label.len != 0) remote.print(a, " --label {s}", .{shellQuote(a, o.label)}) catch fail("out of memory", .{});
     if (o.max_wait) |mw| remote.print(a, " --max-wait {d}", .{mw}) catch fail("out of memory", .{});
     const argv = [_][]const u8{ "ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4", host, remote.items };

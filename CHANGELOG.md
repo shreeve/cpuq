@@ -2,6 +2,16 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.7.8 — 2026-10-06
+
+- `cpuq lease NAME --exclusive`: a named lease that is also a quiet window. Once it has the
+  lease, it takes the machine's whole budget as running work drains, and holds both until it
+  ends; nothing else is admitted meanwhile, while the lease's own command runs its `cpuq run`s
+  inside. With `--host HOST --hold` the window is on HOST, so a script timing work over ssh
+  keeps HOST quiet for as long as it holds the lease (the kit's pup-bench lease, for one).
+- Fix: a job whose command line passed 1 KB (an inline script) had its child pid left unrecorded,
+  so cpuq could not measure it, lend its idle cores, or pause or stop its process tree.
+
 ## 0.7.7 — 2026-10-06
 
 - `cpuq status --json` gives the load valve's thresholds in `gate`: `trip` (the load above

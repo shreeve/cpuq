@@ -221,28 +221,34 @@ var pending_signal = std.atomic.Value(u32).init(0);
 /// Last words: the history line cpuq appends if a signal kills it while it
 /// waits, or holds a lease with no command, so the job reads as ended and
 /// not as lost. The line is `head`, the time, `tail` and (when asked) the
-/// signal, rendered ahead of time so the handler only writes.
+/// signal, rendered ahead of time so the handler only writes. There are two
+/// slots: a lease taken `--exclusive` is two jobs, the lease and the cores.
+const Words = struct {
+    head: [256]u8 = undefined,
+    head_len: usize = 0,
+    tail: [64]u8 = undefined,
+    tail_len: usize = 0,
+    signal: bool = false,
+    armed: std.atomic.Value(bool) = .init(false),
+};
 var last_path: [1024]u8 = undefined;
-var last_head: [256]u8 = undefined;
-var last_head_len: usize = 0;
-var last_tail: [64]u8 = undefined;
-var last_tail_len: usize = 0;
-var last_signal = false;
-var last_armed = std.atomic.Value(bool).init(false);
+var last_words: [2]Words = .{ .{}, .{} };
 
-/// Arms the last words, catching hangup, ^C, ^\ and kill; arming again
-/// replaces them. A signal cpuq was started with ignored stays ignored.
-pub fn armLastWords(path: []const u8, head: []const u8, tail: []const u8, with_signal: bool) void {
-    last_armed.store(false, .release);
-    if (path.len >= last_path.len or head.len > last_head.len or tail.len > last_tail.len) return;
+/// Arms slot `slot`'s last words, catching hangup, ^C, ^\ and kill; arming
+/// it again replaces them. A signal cpuq was started with ignored stays
+/// ignored.
+pub fn armLastWords(slot: u1, path: []const u8, head: []const u8, tail: []const u8, with_signal: bool) void {
+    const w = &last_words[slot];
+    w.armed.store(false, .release);
+    if (path.len >= last_path.len or head.len > w.head.len or tail.len > w.tail.len) return;
     @memcpy(last_path[0..path.len], path);
     last_path[path.len] = 0;
-    @memcpy(last_head[0..head.len], head);
-    last_head_len = head.len;
-    @memcpy(last_tail[0..tail.len], tail);
-    last_tail_len = tail.len;
-    last_signal = with_signal;
-    last_armed.store(true, .release);
+    @memcpy(w.head[0..head.len], head);
+    w.head_len = head.len;
+    @memcpy(w.tail[0..tail.len], tail);
+    w.tail_len = tail.len;
+    w.signal = with_signal;
+    w.armed.store(true, .release);
     var sa: c.Sigaction = .{ .handler = .{ .handler = onFatal }, .mask = undefined, .flags = 0 };
     _ = c.sigemptyset(&sa.mask);
     for ([_]c.SIG{ .HUP, .INT, .QUIT, .TERM }) |sig| {
@@ -253,20 +259,21 @@ pub fn armLastWords(path: []const u8, head: []const u8, tail: []const u8, with_s
 }
 
 fn onFatal(sig: c.SIG) callconv(.c) void {
-    if (last_armed.swap(false, .acq_rel)) {
-        var buf: [last_head.len + last_tail.len + 64]u8 = undefined;
+    for (&last_words) |*w| {
+        if (!w.armed.swap(false, .acq_rel)) continue;
+        var buf: [256 + 64 + 64]u8 = undefined;
         var n: usize = 0;
-        @memcpy(buf[n..][0..last_head_len], last_head[0..last_head_len]);
-        n += last_head_len;
+        @memcpy(buf[n..][0..w.head_len], w.head[0..w.head_len]);
+        n += w.head_len;
         var ts: c.timespec = undefined;
         _ = c.clock_gettime(.REALTIME, &ts);
         n += putUint(buf[n..], @intCast(ts.sec));
         const ms: u64 = @intCast(@divTrunc(ts.nsec, 1_000_000));
         buf[n..][0..4].* = .{ '.', '0' + @as(u8, @intCast(ms / 100)), '0' + @as(u8, @intCast(ms / 10 % 10)), '0' + @as(u8, @intCast(ms % 10)) };
         n += 4;
-        @memcpy(buf[n..][0..last_tail_len], last_tail[0..last_tail_len]);
-        n += last_tail_len;
-        if (last_signal) {
+        @memcpy(buf[n..][0..w.tail_len], w.tail[0..w.tail_len]);
+        n += w.tail_len;
+        if (w.signal) {
             const key = ",\"signal\":";
             @memcpy(buf[n..][0..key.len], key);
             n += key.len;
