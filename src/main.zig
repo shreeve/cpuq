@@ -396,6 +396,7 @@ fn newJobLog(ctx: *Ctx, o: RunOptions) JobLog {
 
 const EventExtra = struct {
     cores: ?u32 = null,
+    slots: ?[]const u32 = null,
     exit: ?u8 = null,
     signal: ?u32 = null,
     cpu: ?f64 = null,
@@ -412,6 +413,7 @@ fn logEvent(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra) void {
     ev.exit = extra.exit;
     ev.signal = extra.signal;
     ev.cpu = extra.cpu;
+    ev.slots = extra.slots;
     history.append(ctx.io, path, ev);
 }
 
@@ -511,8 +513,10 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
             // Leave the next waiter's minimum free when this grant can spare it.
             const reserve: u32 = if (queue.len > 1 and !queue[1].record.exclusive) @min(queue[1].record.cores, budget) else 0;
             const got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, budget, @max(cores, budget), exclusive_running, reserve) catch |err| fail("tokens: {t}", .{err});
-            if (got) |tokens| {
+            if (got) |grant| {
+                const tokens = grant.files;
                 rec.cores = @intCast(tokens.len);
+                rec.slots = grant.slotText(ctx.arena);
                 rec.since = now;
                 // The lease is named by the ticket number; should a live job
                 // hold that name anyway, take a fresh number rather than wait.
@@ -532,7 +536,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
                 st.queue.deleteFile(io, ticket_name) catch {};
                 ticket.close(io);
                 st.unlock();
-                logEvent(ctx, job, "started", .{ .cores = rec.cores });
+                logEvent(ctx, job, "started", .{ .cores = rec.cores, .slots = grant.slots });
                 return .{ .record = rec, .name = lease_name, .file = lease, .tokens = tokens, .job = job };
             }
         }
@@ -993,6 +997,7 @@ const JsonJob = struct {
     min: u32,
     max: u32,
     cores: ?u32,
+    slots: ?[]const u32,
     queued: f64,
     started: ?f64,
     ended: ?f64,
@@ -1067,6 +1072,7 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
             .min = j.min,
             .max = j.max,
             .cores = j.cores,
+            .slots = j.slots,
             .queued = j.queued,
             .started = j.started,
             .ended = j.ended,
@@ -1197,6 +1203,8 @@ const JsonHolder = struct {
     holder_alive: bool = false,
     child: i32 = 0,
     cores: u32 = 0,
+    /// The core tokens it holds, by number: which of the budget's cores.
+    slots: []const u32 = &.{},
     /// Cores the command's process tree kept busy over the sample: CPU time
     /// over wall time; null when there is no command to measure.
     using: ?f64 = null,
@@ -1340,6 +1348,7 @@ fn toHolders(a: std.mem.Allocator, leases: []const state.Entry, busy: []const ?f
             .holder_alive = sys.processAlive(r.pid),
             .child = r.child,
             .cores = r.cores,
+            .slots = r.slotList(a),
             .using = if (i < busy.len) busy[i] else null,
             .priority = @tagName(r.priority),
             .exclusive = r.exclusive,

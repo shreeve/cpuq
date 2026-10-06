@@ -113,7 +113,8 @@ marked `*` is a lease whose cpuq is gone while its command still runs.
 `cpuq status --json` gives the same for programs: a `schema` number (1; it
 changes only when a field is removed or changes meaning), the `version`, the
 gate as `{"state", "load", "text"}` with `state` one of open, pressure, load
-or spacing, each holder's `cores` and `using`, each waiter's `cores`, `max`
+or spacing, each holder's `cores`, `slots` (which of the budget's cores it holds, by
+number, 0 up) and `using`, each waiter's `cores`, `max`
 and `eta`, the named `leases` with their `holders` and `waiters`, and
 `outside`, the busiest processes outside cpuq. With several `--host`s it is
 one object keyed by host.

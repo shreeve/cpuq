@@ -2,6 +2,13 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.4.5 — 2026-10-05
+
+- cpuq records which of the budget's cores each job holds, by number, and
+  reports them: `slots` for each holder in `cpuq status --json`, and for
+  each job in `cpuq history --json`. A job takes the lowest-numbered free
+  cores, as it always has; Cpuq.app draws them as lanes.
+
 ## 0.4.4 — 2026-10-05
 
 - A job's active cores on macOS no longer leap when it reaps a child: a

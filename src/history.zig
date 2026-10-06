@@ -40,6 +40,8 @@ pub const Event = struct {
     signal: ?u32 = null,
     /// CPU seconds the command and the descendants it reaped used (ended).
     cpu: ?f64 = null,
+    /// The core tokens it took, by number (started).
+    slots: ?[]const u32 = null,
 };
 
 /// The longest command kept in a line, so a line stays well under 4 KB.
@@ -98,6 +100,7 @@ pub const Job = struct {
     exit: ?u8 = null,
     signal: ?u32 = null,
     cpu: ?f64 = null,
+    slots: ?[]const u32 = null,
     state: State = .active,
 
     /// Seconds spent waiting: until admitted, or until it gave up.
@@ -164,6 +167,7 @@ pub fn load(io: Io, a: std.mem.Allocator, path: []const u8, boot: f64, alive: *c
             } else if (std.mem.eql(u8, ev.event, "started")) {
                 j.started = ev.t;
                 j.cores = ev.cores;
+                j.slots = ev.slots;
             } else if (std.mem.eql(u8, ev.event, "ended")) {
                 j.ended = ev.t;
                 j.exit = ev.exit;

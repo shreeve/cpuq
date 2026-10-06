@@ -157,6 +157,9 @@ pub const Record = struct {
     since: i64 = 0,
     label: []const u8 = "",
     cmd: []const u8 = "",
+    /// The core tokens a holder took, by number, comma-separated ("0,1,2"):
+    /// which of the budget's cores are its own.
+    slots: []const u8 = "",
 
     pub fn write(r: Record, w: *Io.Writer) Io.Writer.Error!void {
         try w.print("ticket={d}\npid={d}\nchild={d}\ncores={d}\nmax={d}\npriority={t}\nexclusive={d}\nsince={d}\n", .{
@@ -166,6 +169,7 @@ pub const Record = struct {
         try writeLine(w, r.label);
         try w.writeAll("cmd=");
         try writeLine(w, r.cmd);
+        if (r.slots.len != 0) try w.print("slots={s}\n", .{r.slots});
     }
 
     fn writeLine(w: *Io.Writer, text: []const u8) Io.Writer.Error!void {
@@ -188,15 +192,24 @@ pub const Record = struct {
             if (std.mem.eql(u8, k, "since")) r.since = std.fmt.parseInt(i64, v, 10) catch 0;
             if (std.mem.eql(u8, k, "label")) r.label = v;
             if (std.mem.eql(u8, k, "cmd")) r.cmd = v;
+            if (std.mem.eql(u8, k, "slots")) r.slots = v;
         }
         return r;
+    }
+
+    /// `slots` as numbers.
+    pub fn slotList(r: Record, a: std.mem.Allocator) []u32 {
+        var out: std.ArrayList(u32) = .empty;
+        var it = std.mem.tokenizeScalar(u8, r.slots, ',');
+        while (it.next()) |n| out.append(a, std.fmt.parseInt(u32, n, 10) catch continue) catch break;
+        return out.items;
     }
 };
 
 test "record round trip" {
     var buf: [512]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
-    const r: Record = .{ .ticket = 42, .pid = 7, .cores = 3, .priority = .low, .exclusive = true, .since = 1700000000, .label = "heavy", .cmd = "zig build\ttest\n-x" };
+    const r: Record = .{ .ticket = 42, .pid = 7, .cores = 3, .priority = .low, .exclusive = true, .since = 1700000000, .label = "heavy", .cmd = "zig build\ttest\n-x", .slots = "0,3,4" };
     try r.write(&w);
     const p = Record.parse(w.buffered());
     try std.testing.expectEqual(42, p.ticket);
@@ -204,6 +217,9 @@ test "record round trip" {
     try std.testing.expect(p.exclusive);
     try std.testing.expectEqualStrings("heavy", p.label);
     try std.testing.expectEqualStrings("zig build test -x", p.cmd);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualSlices(u32, &.{ 0, 3, 4 }, p.slotList(arena.allocator()));
 }
 
 pub fn writeRecord(io: Io, file: Io.File, r: Record) !void {
@@ -322,13 +338,26 @@ fn tokenName(buf: []u8, i: u32) []const u8 {
     return std.mem.print(buf, "{d:0>4}", .{i}) catch unreachable;
 }
 
+/// The token files a grant holds, and their numbers.
+pub const Grant = struct {
+    files: []Io.File,
+    slots: []u32,
+
+    /// The numbers as a record writes them: "0,1,2".
+    pub fn slotText(g: Grant, a: std.mem.Allocator) []const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        for (g.slots, 0..) |n, i| out.print(a, "{s}{d}", .{ if (i == 0) "" else ",", n }) catch break;
+        return out.items;
+    }
+};
+
 /// The head's all-or-nothing acquisition: it locks every free token, counts
 /// the held ones, asks `policy.admit` how many to take, keeps that many of
 /// the lowest-numbered free tokens and releases the rest, or all of them
 /// when the answer is to wait. Every token file in the directory counts,
 /// beyond the first `cores` too, so every run sees every hold whatever core
 /// count it was started with. Call with the admission lock held.
-pub fn takeTokens(s: *State, arena: std.mem.Allocator, req: policy.Request, exclusive: bool, budget: u32, cores: u32, exclusive_running: bool, reserve: u32) !?[]Io.File {
+pub fn takeTokens(s: *State, arena: std.mem.Allocator, req: policy.Request, exclusive: bool, budget: u32, cores: u32, exclusive_running: bool, reserve: u32) !?Grant {
     var n = cores;
     var it = s.tokens.iterate();
     while (try it.next(s.io)) |entry| {
@@ -337,6 +366,7 @@ pub fn takeTokens(s: *State, arena: std.mem.Allocator, req: policy.Request, excl
         n = @max(n, i + 1);
     }
     var free: std.ArrayList(Io.File) = .empty;
+    var numbers: std.ArrayList(u32) = .empty;
     var held: u32 = 0;
     var i: u32 = 0;
     while (i < n) : (i += 1) {
@@ -348,6 +378,7 @@ pub fn takeTokens(s: *State, arena: std.mem.Allocator, req: policy.Request, excl
             s.tokens.openFile(s.io, name, .{}) catch continue;
         if (try f.tryLock(s.io, .exclusive)) {
             try free.append(arena, f);
+            try numbers.append(arena, i);
         } else {
             held += 1;
             f.close(s.io);
@@ -366,5 +397,5 @@ pub fn takeTokens(s: *State, arena: std.mem.Allocator, req: policy.Request, excl
         }
         return null;
     }
-    return free.items[0..keep];
+    return .{ .files = free.items[0..keep], .slots = numbers.items[0..keep] };
 }
