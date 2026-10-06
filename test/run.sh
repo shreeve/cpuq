@@ -226,8 +226,16 @@ cpuq, f = sys.argv[1], sys.argv[2]
 pid, fd = pty.fork()
 if pid == 0:
     signal.signal(signal.SIGINT, signal.SIG_DFL)
-    os.execv(cpuq, [cpuq, "run", "--", "sh", "-c",
-        "trap 'echo INT >>%s' INT; i=0; while [ $i -lt 30 ]; do sleep 0.05; i=$((i+1)); done; exit 4" % f])
+    # The command counts its own SIGINTs: no shell in between, whose handling
+    # of a child killed by ^C depends on timing.
+    os.execv(cpuq, [cpuq, "run", "--", sys.executable, "-c",
+        "import signal, sys, time\n"
+        "n = []\n"
+        "signal.signal(signal.SIGINT, lambda *a: n.append(1))\n"
+        "end = time.time() + 1.5\n"
+        "while time.time() < end: time.sleep(0.05)\n"
+        "open(%r, 'w').write('INT\\n' * len(n))\n"
+        "sys.exit(4)\n" % f])
 time.sleep(0.8)
 os.write(fd, b"\x03")
 deadline = time.time() + 10
