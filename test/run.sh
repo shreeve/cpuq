@@ -723,10 +723,13 @@ print(" ".join(e["label"][4:] for e in sorted((json.loads(l) for l in sys.stdin)
   "$CPUQ" pause ctl:spin >/dev/null
   # The job's own sleep: the command child its cpuq recorded.
   local child; child=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print(json.load(sys.stdin)["holders"][0]["child"])')
-  local paused; paused=$(ps -o stat= -p "$child" | tr -d ' ')
+  # A stop is delivered asynchronously: give it a moment to show.
+  local paused i=0
+  while paused=$(ps -o stat= -p "$child" | tr -d ' '); [[ "$paused" != T* ]] && [ $i -lt 20 ]; do i=$((i + 1)); sleep 0.1; done
   local flag; flag=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print(json.load(sys.stdin)["holders"][0]["paused"])')
   "$CPUQ" resume ctl:spin >/dev/null
-  local resumed; resumed=$(ps -o stat= -p "$child" | tr -d ' ')
+  local resumed; i=0
+  while resumed=$(ps -o stat= -p "$child" | tr -d ' '); [[ "$resumed" == T* ]] && [ $i -lt 20 ]; do i=$((i + 1)); sleep 0.1; done
   "$CPUQ" stop ctl:spin >/dev/null
   wait $p; local rp=$?
   sleep 0.3
