@@ -764,6 +764,7 @@ fn admitted(ctx: *Ctx, st: *state.State, o: RunOptions, rec: *state.Record, gran
         };
     } else fail("lease: no free lease name", .{});
     st.queue.deleteFile(io, ticket_name) catch {};
+    st.dropControl(ticket_name);
     ticket.close(io);
     st.unlock();
     logEvent(ctx, job, "started", .{ .cores = rec.cores, .slots = grant.slots, .ahead = if (ahead) true else null, .lent = if (lent_now > 0) lent_now else null, .forced = if (forced_now) true else null });
@@ -819,6 +820,7 @@ fn goAhead(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, o: RunOptions, que
 /// Leaves the queue and exits 75. Call with the admission lock held.
 fn giveUp(ctx: *Ctx, st: *state.State, ticket_name: []const u8, waited: i64, job: JobLog) noreturn {
     st.queue.deleteFile(ctx.io, ticket_name) catch {};
+    st.dropControl(ticket_name);
     st.unlock();
     sys.disarmLastWords();
     logEvent(ctx, job, "gave_up", .{});
@@ -990,6 +992,7 @@ fn release(io: Io, st: *state.State, lease: Lease) void {
     lease.file.close(io);
     lockOrFail(st);
     st.leases.deleteFile(io, lease.name) catch {};
+    st.setPaused(lease.name, false);
     st.unlock();
 }
 

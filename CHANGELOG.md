@@ -2,6 +2,13 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.7.4 — 2026-10-06
+
+- Fix: a job paused by hand and then killed by other means than `cpuq
+  stop` left its pause marker behind, and an order (`cpuq first`) given to
+  a waiter in the moment it started was never taken; both now go with the
+  job.
+
 ## 0.7.3 — 2026-10-06
 
 - A job killed while it waits (hangup, ^C, ^\ or SIGTERM) is recorded in

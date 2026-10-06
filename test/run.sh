@@ -719,6 +719,15 @@ print(" ".join(e["label"][4:] for e in sorted((json.loads(l) for l in sys.stdin)
   check "stop ends the job's whole tree, leaving nothing behind (left: '$left')" "[ -z '$left' ]"
   echo "  sleep while paused: $paused, after resume: $resumed; status paused: $flag; stopped with $rp"
   check "pause stops the job's tree and status says so; resume continues it; stop ends it" "[[ '$paused' == T* ]] && [[ '$resumed' != T* ]] && [ '$flag' = True ] && [ $rp != 0 ]"
+  # Killed while paused, a job leaves no marker behind.
+  "$CPUQ" run --cores 1 --label ctl:nap -- sleep 30.917 & p=$!
+  wait_held 1
+  "$CPUQ" pause ctl:nap >/dev/null
+  child=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print(json.load(sys.stdin)["holders"][0]["child"])')
+  kill -9 "$child"
+  wait $p
+  local litter; litter=$(ls "$CPUQ_DIR" | grep -E '^(control|paused)-' | tr '\n' ' ')
+  check "no hand-given order or pause marker outlives its job (left: '$litter')" "[ -z '$litter' ]"
 }
 
 t_right_size() {

@@ -157,6 +157,13 @@ pub const State = struct {
         return null;
     }
 
+    /// Drops an order the waiter will no longer take: it started or left.
+    pub fn dropControl(s: *State, ticket: []const u8) void {
+        var name_buf: [96]u8 = undefined;
+        const name = std.mem.print(&name_buf, "control-{s}", .{ticket}) catch return;
+        s.dir.deleteFile(s.io, name) catch {};
+    }
+
     pub fn giveControl(s: *State, ticket: []const u8, action: []const u8) void {
         var name_buf: [96]u8 = undefined;
         const name = std.mem.print(&name_buf, "control-{s}", .{ticket}) catch return;
