@@ -396,6 +396,8 @@ fn newJobLog(ctx: *Ctx, o: RunOptions) JobLog {
 
 const EventExtra = struct {
     cores: ?u32 = null,
+    /// Started ahead of the head of the queue (backfill).
+    ahead: ?bool = null,
     slots: ?[]const u32 = null,
     exit: ?u8 = null,
     signal: ?u32 = null,
@@ -414,6 +416,7 @@ fn logEvent(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra) void {
     ev.signal = extra.signal;
     ev.cpu = extra.cpu;
     ev.slots = extra.slots;
+    ev.ahead = extra.ahead;
     history.append(ctx.io, path, ev);
 }
 
@@ -462,6 +465,8 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
     var last_gate: policy.Gate = .open;
     var hinted = false;
     var hinted_fixed = false;
+    // Run times from history, read once when backfill first needs them.
+    var run_times: ?RunTimes = null;
     while (true) {
         var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
         defer scratch.deinit();
@@ -493,8 +498,30 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
         wake_ms = @max(wake_ms, 100);
 
         if (pos > 0) {
-            // Not at the head: block on the waiter just ahead until it is
+            // Behind the head: start now if backfill allows (never for a
+            // named lease or an exclusive run, and only through an open
+            // gate), else block on the waiter just ahead until it is
             // admitted or gone.
+            if (!named and !o.exclusive and cfg.backfill) {
+                const budget: u32 = budgetNow(ctx, machine(ctx));
+                var v = st.readValve();
+                const g = policy.gate(cfg, machine(ctx), budget, if (o.load_check) &v else null, now);
+                if (g == .open) if (goAhead(ctx, st, a, o, queue, pos, budget, now, &run_times)) |req| {
+                    const got = state.takeTokens(st, ctx.arena, req, false, budget, @max(cores, budget), false, 0) catch |err| fail("tokens: {t}", .{err});
+                    if (got) |grant| {
+                        const head = queue[0].record;
+                        std.debug.print("cpuq: starting ahead of {s}, which waits for {d} cores, on {d} of the free ones\n", .{ if (head.label.len != 0) head.label else head.cmd, head.cores, grant.files.len });
+                        if (o.load_check and cfg.load_check) {
+                            v.last_admit = now;
+                            st.writeValve(v);
+                        }
+                        return admitted(ctx, st, o, &rec, grant, ticket, ticket_name, job, now, true);
+                    }
+                };
+                // The first few waiters look again every 2 seconds; the rest
+                // keep sleeping on the one ahead, so a long queue costs little.
+                if (pos < 8) wake_ms = @min(wake_ms, 2000);
+            }
             const pred = st.queue.openFile(io, queue[pos - 1].name, .{}) catch null;
             st.unlock();
             if (pred) |f| {
@@ -515,40 +542,18 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
             const reserve: u32 = if (queue.len > 1 and !queue[1].record.exclusive) @min(queue[1].record.cores, budget) else 0;
             const got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, budget, @max(cores, budget), exclusive_running, reserve) catch |err| fail("tokens: {t}", .{err});
             if (got) |grant| {
-                const tokens = grant.files;
-                rec.cores = @intCast(tokens.len);
-                rec.slots = grant.slotText(ctx.arena);
-                rec.since = now;
-                // The lease is named by the ticket number; should a live job
-                // hold that name anyway, take a fresh number rather than wait.
-                var lease_name: []const u8 = undefined;
-                const lease = for (0..3) |_| {
-                    lease_name = state.leaseName(ctx.arena.alloc(u8, 16) catch fail("out of memory", .{}), rec.ticket, o.exclusive);
-                    break st.createLease(rec, lease_name) catch |err| switch (err) {
-                        error.WouldBlock => {
-                            rec.ticket = st.nextTicket() catch |e| fail("ticket: {t}", .{e});
-                            continue;
-                        },
-                        else => fail("lease: {t}", .{err}),
-                    };
-                } else fail("lease: no free lease name", .{});
                 valve.last_admit = now;
                 if (check_load) st.writeValve(valve);
-                st.queue.deleteFile(io, ticket_name) catch {};
-                ticket.close(io);
-                st.unlock();
-                logEvent(ctx, job, "started", .{ .cores = rec.cores, .slots = grant.slots });
-                return .{ .record = rec, .name = lease_name, .file = lease, .tokens = tokens, .job = job };
+                return admitted(ctx, st, o, &rec, grant, ticket, ticket_name, job, now, false);
             }
-            // First in line for a fixed count while fewer cores sit free: the
-            // queue is strictly in order, so this wait holds up everyone
-            // behind it too. Say once what would start it now.
+            // First in line for a fixed count while fewer cores sit free: say
+            // once what would start it now.
             if (!named and !hinted_fixed and pos == 0 and o.request.fixed() and o.request.min > 1) {
                 var held: u32 = 0;
                 for (state.scanLeases(st, a, false) catch &.{}) |l| held += l.record.cores;
                 const free = budget -| held;
                 if (free > 0 and free < o.request.min) {
-                    std.debug.print("cpuq: waiting for {d} cores while {d} {s} free, holding up the queue behind it; --cores {d}-{d} would start now (size the job from $CPUQ_CORES)\n", .{ o.request.min, free, if (free == 1) "is" else "are", free, o.request.min });
+                    std.debug.print("cpuq: waiting for {d} cores while {d} {s} free; --cores {d}-{d} would start now (size the job from $CPUQ_CORES)\n", .{ o.request.min, free, if (free == 1) "is" else "are", free, o.request.min });
                     hinted_fixed = true;
                 }
             }
@@ -557,6 +562,79 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
         st.unlock();
         io.sleep(.fromMilliseconds(cfg.poll_ms), .awake) catch {};
     }
+}
+
+/// Takes the grant: writes the lease, leaves the queue, and logs the start.
+/// Call with the admission lock held; returns with it released.
+fn admitted(ctx: *Ctx, st: *state.State, o: RunOptions, rec: *state.Record, grant: state.Grant, ticket: Io.File, ticket_name: []const u8, job: JobLog, now: i64, ahead: bool) Lease {
+    const io = ctx.io;
+    rec.cores = @intCast(grant.files.len);
+    rec.slots = grant.slotText(ctx.arena);
+    rec.since = now;
+    // The lease is named by the ticket number; should a live job hold that
+    // name anyway, take a fresh number rather than wait.
+    var lease_name: []const u8 = undefined;
+    const lease = for (0..3) |_| {
+        lease_name = state.leaseName(ctx.arena.alloc(u8, 16) catch fail("out of memory", .{}), rec.ticket, o.exclusive);
+        break st.createLease(rec.*, lease_name) catch |err| switch (err) {
+            error.WouldBlock => {
+                rec.ticket = st.nextTicket() catch |e| fail("ticket: {t}", .{e});
+                continue;
+            },
+            else => fail("lease: {t}", .{err}),
+        };
+    } else fail("lease: no free lease name", .{});
+    st.queue.deleteFile(io, ticket_name) catch {};
+    ticket.close(io);
+    st.unlock();
+    logEvent(ctx, job, "started", .{ .cores = rec.cores, .slots = grant.slots, .ahead = if (ahead) true else null });
+    return .{ .record = rec.*, .name = lease_name, .file = lease, .tokens = grant.files, .job = job };
+}
+
+/// Backfill: whether this waiter, behind the head, may start now on cores
+/// the head cannot use yet (`policy.backfill`), and with how many: what is
+/// free, up to its maximum. Its
+/// minimum must fit in what is free, and no waiter ahead of it may start
+/// first: neither the head, if it fits, nor one between that backfill would
+/// also let go ahead. Call with the admission lock held.
+fn goAhead(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, o: RunOptions, queue: []const state.Entry, pos: usize, budget: u32, now: i64, rt: *?RunTimes) ?policy.Request {
+    const leases = state.scanLeases(st, a, false) catch return null;
+    var held: u32 = 0;
+    for (leases) |l| {
+        if (l.record.exclusive) return null;
+        held += l.record.cores;
+    }
+    const head = queue[0].record;
+    // An exclusive head waits for the machine to drain: nobody goes ahead.
+    if (head.exclusive) return null;
+    const free = budget -| held;
+    const fits = struct {
+        fn need(r: state.Record, b: u32) u32 {
+            return if (r.exclusive) b else @min(@max(r.cores, 1), b);
+        }
+    };
+    if (fits.need(head, budget) <= free) return null;
+    if (fits.need(.{ .cores = o.request.min }, budget) > free) return null;
+    // Kept across passes of the wait, so read into the process's arena, not
+    // the pass's scratch.
+    if (rt.* == null) rt.* = RunTimes.load(ctx, ctx.arena);
+    const times = rt.*.?;
+    var ahead = [_]JsonWaiter{.{ .cores = head.cores, .exclusive = head.exclusive, .label = head.label }};
+    estimate(times, budget, toHolders(a, leases, &.{}), &ahead, now);
+    const head_waited: f64 = @floatFromInt(now - head.since);
+    const head_typical = times.typical(head.label);
+    const rule = struct {
+        fn of(t: RunTimes, label: []const u8, eta: ?f64, waited: f64, typical: ?f64, least: u32) bool {
+            return policy.backfill(t.typical(label), eta, waited, typical, least);
+        }
+    };
+    for (queue[1..pos]) |e| {
+        if (e.record.exclusive or fits.need(e.record, budget) > free) continue;
+        if (rule.of(times, e.record.label, ahead[0].eta, head_waited, head_typical, ctx.cfg.patience_s)) return null;
+    }
+    const min = fits.need(.{ .cores = o.request.min }, budget);
+    if (!rule.of(times, o.label, ahead[0].eta, head_waited, head_typical, ctx.cfg.patience_s)) return null;
+    return .{ .min = min, .max = @max(min, @min(o.request.max, free)) };
 }
 
 /// Leaves the queue and exits 75. Call with the admission lock held.

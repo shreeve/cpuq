@@ -60,8 +60,8 @@ are free and takes up to MAX of what is free then, which suits any tool that
 takes a job count (`zig build -j`, `make`, test runners) and keeps cores from
 idling while jobs wait. The default is 2, and a request is clamped to the
 budget. `--exclusive` takes the whole
-budget: it waits at the head of the queue for running work to drain and
-blocks everything behind it while it runs. While queued, cpuq prints a line
+budget: it waits at the head of the queue for running work to drain, with
+nothing going ahead of it, and blocks everything behind it while it runs. While queued, cpuq prints a line
 to stderr about once a minute (who it waits behind), and `--max-wait` gives
 up with status 75; `--max-wait 0` takes what is free now or gives up at once.
 
@@ -228,6 +228,8 @@ count oversubscribes it on purpose. The config file is `CPUQ_CONFIG`, default
 | `aging` | 600 | seconds of waiting per one-class promotion; 0 turns it off |
 | `poll` | 0.5 | seconds between the head's re-checks |
 | `note` | 60 | seconds between "waiting" lines |
+| `backfill` | on | let a waiter start ahead of the head on cores the head cannot use yet |
+| `patience` | 30 | the least seconds the head lets others go ahead without run times to judge by |
 
 An invalid line is an error naming the file and line.
 
@@ -303,14 +305,32 @@ admission lock, and holds that lock while it waits. Waiters are ordered by
 class (priority after aging), then ticket number. A waiter that is not at
 the head blocks on the ticket just ahead of it (a blocking shared flock
 that returns when that waiter is admitted or dies), so a long queue costs
-nothing. Only the head polls, every `poll` seconds: under the admission lock
-it reads the gates and, if they are open, tries to take its k tokens, all of
-them or none (on failure it releases what it took). Since only the head
-takes tokens, two waiters can never each hold part of what they need.
+nothing. The head polls every `poll` seconds: under the admission lock it reads the
+gates and, if they are open, tries to take its k tokens, all of them or none
+(on failure it releases what it took). The first eight waiters behind it
+also look every 2 seconds whether backfill lets them start (below); the
+rest only block. Every grant is all or nothing under the admission lock, so
+two waiters can never each hold part of what they need.
 
-**Fairness.** Strict order, no backfill: the head waits for its minimum and
-nothing behind it overtakes it, even a small job that would fit now. Without
-run-time estimates any backfill could delay the head. Once its minimum fits,
+**Fairness and backfill.** The queue is in order, but cores the head cannot
+use yet need not sit idle. A waiter behind it may start at once, taking what
+is free up to its maximum, when its minimum fits, nobody ahead of it may go
+first (the head if it fits, or an earlier waiter backfill would also let
+go), and either:
+
+- history knows both run times, and the waiter's typical run ends before
+  the head is expected to start, so the head loses nothing; or
+- history cannot say, and the head has waited less than its patience: half
+  its own typical run, from `patience` seconds (30) to 5 minutes. After
+  that, nothing goes ahead, and cores that free up are kept for the head.
+
+A wrong estimate delays the head by at most one job's overrun, and patience
+bounds how long others may go ahead, so the head never starves. Nothing goes
+ahead of an `--exclusive` head (it waits for the machine to drain), and
+named leases stay strictly in order. A job that went ahead says so on stderr
+and is marked `"ahead": true` in its history. `backfill = off` restores
+strict order. A head waiting for an exact count while fewer cores are free
+says once that a range would start it now. Once the head's minimum fits,
 the head takes up to its maximum of the free cores, but leaves the next
 waiter's minimum free when it can still get its own, so a wide request does
 not stall the job behind it. `--exclusive` takes the whole budget at the

@@ -290,7 +290,7 @@ t_aging() {
 }
 
 t_no_starvation() {
-  setup no-starvation
+  setup no-starvation "backfill = off"
   local f=$T/order
   "$CPUQ" run --cores 5 -- sleep 1.5 & wait_held 5
   "$CPUQ" run --cores 9 -- sh -c "echo big >>$f" & wait_waiters 1
@@ -301,7 +301,7 @@ t_no_starvation() {
   wait
   local got; got=$(tr '\n' ' ' <"$f")
   echo "  4 cores free while the 9-core head waits; ran early: '${early}'; order: $got"
-  check "a 9-core head is served before later small jobs (no backfill)" "[ -z '$early' ] && [[ '$got' == 'big '* ]] && [ \$(wc -l <'$f') = 3 ]"
+  check "with backfill off, a 9-core head is served before later small jobs" "[ -z '$early' ] && [[ '$got' == 'big '* ]] && [ \$(wc -l <'$f') = 3 ]"
 }
 
 t_exclusive() {
@@ -505,6 +505,51 @@ t_fixed_hint() {
   check "a blocking fixed request is told once to ask for a range (got $fixed, range $range)" "[ '$fixed' = 1 ] && [ '$range' = 0 ]"
 }
 
+t_backfill() {
+  setup backfill "patience = 2"
+  local f=$T/order
+  # 7 of 9 held; the head wants 3, so 2 sit free.
+  "$CPUQ" run --cores 7 -- sleep 4 & wait_held 7
+  "$CPUQ" run --cores 3 --label head -- sh -c "echo head >>$f" & wait_waiters 1
+  # Behind it, a 1-3 request with no run time to judge by goes ahead at once,
+  # within the head's patience, taking the 2 free.
+  local t0; t0=$(now)
+  "$CPUQ" run --cores 1-3 --label small -- sh -c "echo small \$CPUQ_CORES >>$f"
+  local dt; dt=$(python3 -c "print('%.1f' % ($(now) - $t0))")
+  # Past the head's patience, the next one waits in line.
+  sleep 2.5
+  "$CPUQ" run --cores 1 --label late -- sh -c "echo late >>$f" &
+  wait
+  local got; got=$(tr '\n' ' ' <"$f")
+  echo "  order: $got (small started after ${dt}s)"
+  check "a small job goes ahead on the free cores, taking them all (got: $got)" "[[ '$got' == 'small 2 '* ]] && python3 -c 'import sys; sys.exit(0 if $dt < 3 else 1)'"
+  check "after the head's patience, nobody goes ahead (got: $got)" "[[ '$got' == *'head late '* ]]"
+  local ahead; ahead=$("$CPUQ" history --json | python3 -c 'import json, sys; print(sum(1 for j in json.load(sys.stdin) if j["label"] == "small"))')
+  check "history keeps the job that went ahead" "[ '$ahead' = 1 ]"
+}
+
+t_backfill_known() {
+  setup backfill_known "patience = 0"
+  local f=$T/order h=$CPUQ_DIR/history.jsonl
+  mkdir -p "$CPUQ_DIR"
+  # History's run times: hold 3 s, quick 0.2 s, slow a minute.
+  ev() { printf '{"v":1,"event":"%s","id":"%s","t":%s,"pid":1,"label":"%s","cores":%s,"min":%s,"max":%s,"exit":0}\n' "$@" >>"$h"; }
+  ev started 1 1 hold 7 7 7; ev ended 1 4 hold 7 7 7
+  ev started 2 1 quick 1 1 1; ev ended 2 1.2 quick 1 1 1
+  ev started 3 1 slow 1 1 1; ev ended 3 61 slow 1 1 1
+  "$CPUQ" run --cores 7 --label hold -- sleep 3 & wait_held 7
+  "$CPUQ" run --cores 3 --label head -- sh -c "echo head >>$f" & wait_waiters 1
+  # With patience 0, only a job known to finish before the head can start
+  # goes ahead, with all that is free; a slow one waits, and does not hold
+  # up the quick one behind it.
+  "$CPUQ" run --cores 1 --label slow -- sh -c "echo slow >>$f" & wait_waiters 2
+  "$CPUQ" run --cores 1-2 --label quick -- sh -c "echo quick \$CPUQ_CORES >>$f" &
+  wait
+  local got; got=$(tr '\n' ' ' <"$f")
+  echo "  order: $got"
+  check "a job known to be quick goes ahead with all that is free; a slow one waits (got: $got)" "[[ '$got' == 'quick 2 head slow ' ]]"
+}
+
 t_zombie() {
   setup zombie
   # A child spins a second, then waits as a zombie until its parent reaps
@@ -590,8 +635,9 @@ t_lost_seq() {
   "$CPUQ" run --cores 5 --label first -- true & local w=$!
   wait_waiters 1
   rm -f "$CPUQ_DIR/seq"
+  # second fits in the 4 free and goes ahead of first (backfill).
   "$CPUQ" run --cores 4 --label second -- sleep 1 & local x=$!
-  wait_waiters 2 || wait_held 9
+  wait_held 9
   local tickets; tickets=$("$CPUQ" status --json --no-usage | sed -n 's/^ *"ticket": \([0-9]*\),*/\1/p' | sort -n | tr '\n' ' ')
   local t0; t0=$(now)
   wait $h; wait $w; local rw=$?; wait $x; local rx=$?
@@ -716,7 +762,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host wait history zombie fixed_hint outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host wait history zombie fixed_hint backfill backfill_known outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

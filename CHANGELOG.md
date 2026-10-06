@@ -2,6 +2,20 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.5.0 — 2026-10-05
+
+- Backfill: a waiter behind the head starts at once on cores the head
+  cannot use yet, taking what is free up to its maximum, when its minimum
+  fits and nobody ahead of it may go first, and either history says it will
+  be done before the head could start, or (without run times to judge by)
+  the head has waited less than its patience: half its typical run, 30
+  seconds to 5 minutes. After that, freed cores are kept for the head.
+  Nothing goes ahead of an `--exclusive` head; named leases stay in order.
+  A job that goes ahead says so and is marked `"ahead": true` in history.
+  Config: `backfill = on|off`, `patience = SECONDS`.
+- A head waiting for an exact count while fewer cores are free says once
+  that a range (`--cores 2-3`) would start it now.
+
 ## 0.4.5 — 2026-10-05
 
 - cpuq records which of the budget's cores each job holds, by number, and

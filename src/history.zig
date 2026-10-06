@@ -42,6 +42,9 @@ pub const Event = struct {
     cpu: ?f64 = null,
     /// The core tokens it took, by number (started).
     slots: ?[]const u32 = null,
+    /// It started ahead of the head of the queue, on cores the head could
+    /// not use yet (started).
+    ahead: ?bool = null,
 };
 
 /// The longest command kept in a line, so a line stays well under 4 KB.

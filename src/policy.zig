@@ -48,6 +48,12 @@ pub const Config = struct {
     aging_s: u32 = 600,
     /// Seconds between the "waiting" lines a queued run prints to stderr.
     note_s: u32 = 60,
+    /// Let a waiter behind the head start on cores the head cannot use yet
+    /// (`backfill`).
+    backfill: bool = true,
+    /// The least time, in seconds, the head lets others go ahead when there
+    /// is no run time to judge by (`patience`).
+    patience_s: u32 = 30,
 };
 
 pub const Diagnostic = struct {
@@ -98,6 +104,10 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             cfg.aging_s = a;
         } else if (std.mem.eql(u8, key, "note")) {
             cfg.note_s = parseCount(value) orelse return bad(diag, "note must be a whole number of seconds, at least 1");
+        } else if (std.mem.eql(u8, key, "backfill")) {
+            cfg.backfill = parseBool(value) orelse return bad(diag, "backfill must be on or off");
+        } else if (std.mem.eql(u8, key, "patience")) {
+            cfg.patience_s = std.fmt.parseInt(u32, value, 10) catch return bad(diag, "patience must be a whole number of seconds");
         } else {
             return bad(diag, "unknown key");
         }
@@ -307,6 +317,47 @@ pub fn admit(req: Request, exclusive: bool, budget: u32, held: u32, exclusive_ru
     if (free < lo) return null;
     const room = if (free >= lo + reserve) free - reserve else free;
     return @min(hi, room);
+}
+
+/// Backfill: whether a waiter behind the head may start now, taking what is
+/// free up to its maximum, on cores the head cannot use yet. `run` is the
+/// waiter's typical run time and `head_eta` the seconds until the head is
+/// expected to start, each null when history cannot say. With both known,
+/// the waiter goes ahead only if it should be done by then, so the head
+/// loses nothing. Without them, it goes ahead only while the head has
+/// waited less than its `patience`; after that, cores that free up are kept
+/// for the head.
+pub fn backfill(run: ?f64, head_eta: ?f64, head_waited: f64, head_typical: ?f64, least: u32) bool {
+    if (run) |r| if (head_eta) |eta| return r <= eta;
+    return head_waited < patience(head_typical, least);
+}
+
+/// How long the head lets others go ahead without a run time to judge by:
+/// half its own typical run, from `least` seconds (30 by default) to 5
+/// minutes.
+pub fn patience(head_typical: ?f64, least: u32) f64 {
+    const lo: f64 = @floatFromInt(least);
+    return std.math.clamp((head_typical orelse 0) / 2, lo, @max(lo, 300));
+}
+
+test "backfill goes ahead only when it should not delay the head" {
+    // Known run times: ahead if done before the head could start.
+    try std.testing.expect(backfill(60, 120, 0, null, 30));
+    try std.testing.expect(!backfill(300, 120, 0, null, 30));
+    // Unknown: ahead while the head's patience lasts.
+    try std.testing.expect(backfill(null, 120, 10, null, 30));
+    try std.testing.expect(backfill(60, null, 29, null, 30));
+    try std.testing.expect(!backfill(null, null, 30, null, 30));
+    // Patience is half the head's typical run, from 30 s to 5 min.
+    try std.testing.expectEqual(@as(f64, 30), patience(null, 30));
+    try std.testing.expectEqual(@as(f64, 30), patience(20, 30));
+    try std.testing.expectEqual(@as(f64, 100), patience(200, 30));
+    try std.testing.expectEqual(@as(f64, 300), patience(3600, 30));
+    try std.testing.expect(backfill(null, null, 99, 200, 30));
+    try std.testing.expect(!backfill(null, null, 100, 200, 30));
+    // A configured least patience.
+    try std.testing.expectEqual(@as(f64, 2), patience(null, 2));
+    try std.testing.expectEqual(@as(f64, 600), patience(null, 600));
 }
 
 /// MAKEFLAGS for a command whose jobserver pipe is (r, w): the caller's
