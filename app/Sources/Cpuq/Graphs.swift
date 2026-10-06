@@ -222,17 +222,9 @@ final class GraphModel {
     /// A project's place in the palette, which also orders the stacked chart.
     func slot(_ project: String) -> Int { slots[project] ?? Int.max }
 
-    /// Project colors: distinct hues with no red or orange (they mean waiting and a shut gate)
-    /// and one blue; grey means work outside cpuq.
-    static let palette: [Color] = [
-        Color(red: 0.31, green: 0.47, blue: 0.65),  // blue
-        Color(red: 0.35, green: 0.63, blue: 0.31),  // green
-        Color(red: 0.69, green: 0.48, blue: 0.63),  // purple
-        Color(red: 0.93, green: 0.79, blue: 0.28),  // yellow
-        Color(red: 0.46, green: 0.72, blue: 0.70),  // teal
-        Color(red: 0.61, green: 0.46, blue: 0.37),  // brown
-        Color(red: 1.00, green: 0.62, blue: 0.65),  // pink
-    ]
+    /// Project colors: the system's bright hues, less red, orange and pink (they mean waiting
+    /// and a shut gate), and less teal and cyan, too near blue; grey means work outside cpuq.
+    static let palette: [Color] = [.blue, .green, .purple, .yellow, .mint, .brown, .indigo]
 
     func color(_ project: String) -> Color {
         Self.palette[(slots[project] ?? 0) % Self.palette.count]
@@ -288,7 +280,7 @@ final class GraphModel {
     }
 
     static func wants(_ w: Status.Waiter) -> String {
-        w.exclusive ? "every core" : (w.max > w.cores ? "\(w.cores)–\(w.max) cores" : "\(w.cores) cores")
+        w.exclusive ? "every core" : (w.max > w.cores ? "\(w.cores)–\(w.max) cores" : w.cores == 1 ? "1 core" : "\(w.cores) cores")
     }
 
     static func project(_ label: String) -> String {
@@ -471,7 +463,7 @@ struct GraphsView: View {
         // always, who waits. Stretches the gate was shut are shaded through all of them.
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
-                verdict().font(.title3).monospacedDigit().lineLimit(1)
+                verdict().font(.title3).monospacedDigit().lineLimit(1).minimumScaleFactor(0.75)
                 Spacer()
                 HStack(spacing: 2) {
                     Toggle("All CPUs", isOn: $showMac)
@@ -738,7 +730,7 @@ struct GraphsView: View {
     }
 
     /// Waiting: the cores the waiting jobs ask for, hanging down from the line, red, or orange
-    /// while the gate is shut; the number of jobs written once over each stretch of more than one.
+    /// while the gate is shut. Pointing at it names who waited.
     private func waitingChart(axis: TimeAxis, waits: [WaitCell], machine: [MachineColumn?], labelGate: Bool) -> some View {
         let deepest = Double(max(waits.map(\.cores).max() ?? 0, 4))
         return Chart {
@@ -747,9 +739,6 @@ struct GraphsView: View {
                 RectangleMark(xStart: .value("Time", Double(c.column) + 0.06), xEnd: .value("Time", Double(c.column) + 0.94),
                               yStart: .value("Cores", 0), yEnd: .value("Cores", -Double(max(c.cores, 1))))
                     .foregroundStyle((c.gated ? Color.orange : Color.red).opacity(0.75))
-                    .annotation(position: .bottom, spacing: 1) {
-                        if c.label { Text("\(c.count) jobs").font(.system(size: 9, weight: .bold)).foregroundStyle(c.gated ? .orange : .red).fixedSize() }
-                    }
             }
             RuleMark(y: .value("Cores", 0)).foregroundStyle(.secondary.opacity(0.3))
             if let h = hover { RuleMark(x: .value("Time", Double(h.x))).foregroundStyle(.secondary.opacity(0.6)) }
@@ -981,10 +970,10 @@ struct GraphsView: View {
         }
         if let busy = model.samples.last?.busy {
             let hot = busy >= (s.gate.busyTrip ?? 0.9)
-            line = line + Text(" · CPUs ").foregroundColor(.secondary) + Text("\(Int((busy * 100).rounded()))% busy").foregroundColor(hot ? .orange : .secondary)
+            line = line + Text(" · CPUs ").foregroundColor(.secondary) + Text("\(Int((busy * 100).rounded()))%").foregroundColor(hot ? .orange : .secondary)
         }
-        line = line + Text(" · memory ").foregroundColor(.secondary)
-            + Text(s.memoryPressure.isEmpty ? "–" : s.memoryPressure).foregroundColor(s.memoryPressure == "high" ? .red : .secondary)
+        // Memory only when it matters.
+        if s.memoryPressure == "high" { line = line + Text(" · memory pressure high").foregroundColor(.red) }
         let outside = s.outside.reduce(0) { $0 + $1.using }
         if outside >= 0.3 { line = line + Text(String(format: " · %.1f outside cpuq", outside)).foregroundColor(.secondary) }
         return line

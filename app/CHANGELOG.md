@@ -3,6 +3,14 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.8.1 — 2026-10-06
+
+- The top line fits: memory shows only when its pressure is high, CPUs read as a bare
+  percentage, and the line shrinks a little before it would cut off.
+- The waiting row no longer writes job counts under its bars, where they collided; pointing at
+  it names who waited.
+- "1 core", not "1 cores".
+
 ## 0.8.0 — 2026-10-06
 
 A redesign from three reviews of the window (visual design, prior art, and the questions it is
