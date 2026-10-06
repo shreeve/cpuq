@@ -173,6 +173,15 @@ reads `cpuq status --json` and `cpuq history --json`. Install it with
 `brew install --cask shreeve/tap/cpuq-app`; it updates itself through
 Sparkle.
 
+<p align="center">
+  <img src="assets/screenshots/cpuq-app-lanes.png" width="760" alt="Cpuq.app's graphs window: ten lanes, one per core of the budget, over the last hour; two projects' jobs fill five cores, nearly all busy, with nobody waiting">
+</p>
+
+Each lane is one of the budget's cores: empty while free, pale while a job
+holds it but leaves it idle, solid while busy. Here two projects use 95% of
+what they reserved and nobody waits. Under the lanes, a red row counts who
+waits, and a strip shows the Mac's CPUs busy, cpuq's jobs and everything else.
+
 ### History
 
 Every job is recorded as it queues, starts and ends, in
