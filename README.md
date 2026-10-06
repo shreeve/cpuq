@@ -121,10 +121,12 @@ one object keyed by host.
 ### The menu-bar app (macOS)
 
 [`app/`](app/) holds Cpuq.app, a menu-bar companion: the chip in the menu
-bar fills a cell per quarter of the budget in use, and its menu shows what
-runs (cores in use and active), what waits (with ETAs), the leases and any
-load outside cpuq. It only
-reads `cpuq status --json`.
+bar fills a cell per quarter of the budget in use, its menu shows what runs
+(cores in use and active), what waits (with ETAs), the leases and any load
+outside cpuq, and Show Graphs charts the last hour and the history. It only
+reads `cpuq status --json` and `cpuq history --json`. Install it with
+`brew install --cask shreeve/tap/cpuq-app`; it updates itself through
+Sparkle.
 
 ### History
 
