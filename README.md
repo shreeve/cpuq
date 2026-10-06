@@ -14,6 +14,49 @@ in the foreground holding them. One binary, no daemon: every hold is a
 `flock(2)` on a file in a state directory, so the kernel releases it when its
 holder dies, however it dies.
 
+## Why a queue, and not self-tuning
+
+A job can know how many cores it can use: a test binary is single-threaded,
+a compile runs in parallel. It cannot know how many it should use, because
+that depends on everything else the machine is running, and no single
+process sees that.
+
+- **Each job tuning itself to the CPU** means each assumes it owns every
+  core. Alone, that is right. With several sessions and agents each starting
+  `-j10` builds and test runs on a 10-CPU machine, it is 30 or more threads
+  on 10 CPUs, a load of 50 to 100, and every job crawling.
+- **Each job tuning itself to the current load** (`make -l`, checking the
+  load average) races. Every job checks at the same moment, sees an idle
+  machine and starts, and the load average lags by a minute, so they pile in
+  together.
+
+cpuq is the shared piece no process can be on its own:
+
+- **One count for the whole machine.** Cores are handed out atomically
+  across every shell, session and agent, so two jobs never both take the
+  same free capacity.
+- **A queue:** who goes next, with priorities, aging and ETAs, plus
+  backfill and lending, so free or idle cores do not sit unused while
+  others wait.
+- **Quiet windows:** `--exclusive` gives a benchmark the machine to itself,
+  and a named lease does the same for another machine (`--host`).
+- **A shared view and a record:** what runs, what waits, what is held but
+  idle (`cpuq status`, Cpuq.app), and the history that shows each kind of
+  job's real use.
+- **Safety valves** on load and memory pressure.
+
+On one 10-CPU Mac shared by three agent sessions, this took the load average
+from 36 to 120 down to 5 to 9, with most jobs starting at once.
+
+A job still says roughly how many cores it can use (`--cores 1` for a
+single-threaded run, `--cores 2-4` for a build), as every scheduler asks for
+a request. That is a property of the job, not a guess about everyone else,
+and a range lets cpuq size the grant to what is free.
+
+cpuq earns its keep when independent jobs share a machine: several shells,
+sessions, agents or CI runners. One person running one job at a time gains
+little from it.
+
 ## Install
 
 macOS and Linux, arm64 and x86-64:
