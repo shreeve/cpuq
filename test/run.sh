@@ -523,7 +523,10 @@ t_backfill() {
   local got; got=$(tr '\n' ' ' <"$f")
   echo "  order: $got (small started after ${dt}s)"
   check "a small job goes ahead on the free cores, taking them all (got: $got)" "[[ '$got' == 'small 2 '* ]] && python3 -c 'import sys; sys.exit(0 if $dt < 3 else 1)'"
-  check "after the head's patience, nobody goes ahead (got: $got)" "[[ '$got' == *'head late '* ]]"
+  # head and late start together once the holder ends, so their order in the
+  # file is a race: history says whether late went ahead.
+  local late_ahead; late_ahead=$(grep '"event":"started"' "$CPUQ_DIR/history.jsonl" | grep '"label":"late"' | grep -c '"ahead":true')
+  check "after the head's patience, nobody goes ahead (late went ahead: $late_ahead)" "[ '$late_ahead' = 0 ]"
   local ahead; ahead=$("$CPUQ" history --json | python3 -c 'import json, sys; print(sum(1 for j in json.load(sys.stdin) if j["label"] == "small"))')
   check "history keeps the job that went ahead" "[ '$ahead' = 1 ]"
 }
