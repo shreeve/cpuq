@@ -192,12 +192,13 @@ struct GraphsView: View {
         let top = max(budget, samples.map { Double($0.held.values.reduce(0, +)) }.max() ?? 0, samples.compactMap(\.used).max() ?? 0) + 1
         let x = { (d: Date) in TimeAxis.x(end.timeIntervalSince(d)) }
         let spans = Self.spans(samples, end: end)
+        let lines = Self.spans(samples, end: end, shortest: 15)
         // The sample under the pointer, if there is one near it: none where the chart is empty.
         let pointed = hover.map { h in end.addingTimeInterval(-TimeAxis.age(h)) }
             .flatMap { at in samples.min { abs($0.at.timeIntervalSince(at)) < abs($1.at.timeIntervalSince(at)) }
                 .flatMap { abs($0.at.timeIntervalSince(at)) <= 1.5 * max(end.timeIntervalSince(at).squareRoot(), 3) ? $0 : nil } }
         let waits = Self.waits(samples, end: end)
-        let last = spans.last
+        let last = Self.spans(samples, end: end, shortest: 15).last
         return VStack(alignment: .leading, spacing: 12) {
             summary(pointed, end: end)
             Chart {
@@ -215,27 +216,29 @@ struct GraphsView: View {
                     .annotation(position: .top, alignment: .leading) { Text("budget \(Int(budget))").font(.caption).foregroundStyle(.secondary) }
                 // Someone waiting: a red bar just above the budget line.
                 ForEach(Array(waits.enumerated()), id: \.offset) { i, w in
-                    RectangleMark(xStart: .value("Time", x(w.0)), xEnd: .value("Time", x(w.1)),
+                    RectangleMark(xStart: .value("Time", x(w.from)), xEnd: .value("Time", x(w.to)),
                                   yStart: .value("Cores", budget + 0.25), yEnd: .value("Cores", budget + 0.55))
                         .foregroundStyle(.red.opacity(0.8))
                         .annotation(position: .top, alignment: .trailing) {
-                            if i == waits.count - 1 {
-                                Text(w.1 >= end && (model.status?.waiters.count ?? 0) > 0 ? "\(model.status!.waiters.count) waiting" : "waiting")
-                                    .font(.caption).foregroundStyle(.red)
+                            // Each bar wide enough to hold it says how many waited at once.
+                            if x(w.to) - x(w.from) >= 2.5 || i == waits.count - 1 {
+                                Text("\(w.most) waiting").font(.caption).foregroundStyle(.red).fixedSize()
                             }
                         }
                 }
                 // Cores active: measured, so lines, averaged over spans as wide on screen as each
                 // other, each labelled at its right end.
-                ForEach(spans) { p in
+                ForEach(lines) { p in
                     if let used = p.used {
                         LineMark(x: .value("Time", x(p.at)), y: .value("Cores", used), series: .value("Line", "active"))
                             .foregroundStyle(Color.primary)
-                            .lineStyle(StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+                            .interpolationMethod(.monotone)
+                            .lineStyle(StrokeStyle(lineWidth: 1.75, lineCap: .round, lineJoin: .round))
                     }
                     if let other = p.other {
                         LineMark(x: .value("Time", x(p.at)), y: .value("Cores", other), series: .value("Line", "outside"))
                             .foregroundStyle(Color.secondary)
+                            .interpolationMethod(.monotone)
                             .lineStyle(StrokeStyle(lineWidth: 1.5, lineCap: .round, dash: [2, 3]))
                     }
                 }
@@ -330,14 +333,18 @@ struct GraphsView: View {
         .monospacedDigit()
     }
 
-    /// The spans in which someone waited.
-    static func waits(_ s: [GraphModel.Sample], end: Date) -> [(Date, Date)] {
-        var out: [(Date, Date)] = []
+    /// The spans in which someone waited, each with the most that waited at once.
+    static func waits(_ s: [GraphModel.Sample], end: Date) -> [(from: Date, to: Date, most: Int)] {
+        var out: [(from: Date, to: Date, most: Int)] = []
         var from: Date?
+        var most = 0
         for (i, x) in s.enumerated() {
-            if x.waiting > 0, from == nil { from = x.at }
-            if x.waiting == 0, let f = from { out.append((f, x.at)); from = nil }
-            if i == s.count - 1, let f = from { out.append((f, end)) }
+            if x.waiting > 0 {
+                if from == nil { from = x.at; most = 0 }
+                most = max(most, x.waiting)
+            }
+            if x.waiting == 0, let f = from { out.append((f, x.at, most)); from = nil }
+            if i == s.count - 1, let f = from { out.append((f, end, most)) }
         }
         return out
     }
@@ -357,7 +364,9 @@ struct GraphsView: View {
         let other: Double?
     }
 
-    static func spans(_ s: [GraphModel.Sample], end: Date) -> [Span] {
+    /// `shortest` is the narrowest span in seconds: one sample for the steps, wider for the
+    /// measured lines, which a single 3-second reading would make jitter.
+    static func spans(_ s: [GraphModel.Sample], end: Date, shortest: TimeInterval = 3) -> [Span] {
         var out: [Span] = []
         var group: [GraphModel.Sample] = []
         func flush() {
@@ -373,7 +382,7 @@ struct GraphsView: View {
         }
         // From the oldest: a span closes once it is as long as the square root of its age.
         for x in s {
-            if let first = group.first, x.at.timeIntervalSince(first.at) >= max(end.timeIntervalSince(first.at).squareRoot(), 3) { flush() }
+            if let first = group.first, x.at.timeIntervalSince(first.at) >= max(end.timeIntervalSince(first.at).squareRoot(), shortest) { flush() }
             group.append(x)
         }
         flush()

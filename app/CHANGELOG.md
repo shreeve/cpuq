@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.2.2 — 2026-10-05
+
+- Every red bar wide enough to hold it says how many waited at once ("2 waiting").
+- The active and outside lines are smooth curves, averaged over at least 15 seconds, instead of
+  jittering with each 3-second reading; the cores in use stay exact steps.
+
 ## 0.2.1 — 2026-10-05
 
 - The chart labels its own lines and bars: the active line ends in "4.2 active", the dotted one
