@@ -177,3 +177,35 @@ public func supportsWatch(version: String) -> Bool {
     guard parts.count >= 2 else { return false }
     return parts[0] > 0 || parts[1] >= 4
 }
+
+/// One job from `cpuq history --json`.
+public struct Job: Decodable, Sendable, Equatable {
+    public var state = ""
+    public var pool = ""
+    public var label = ""
+    public var cores: Int?
+    public var started: Double?
+    public var ended: Double?
+    public var waited: Double?
+    public var ran: Double?
+    public var used: Double?
+
+    private enum Keys: String, CodingKey { case state, pool, label, cores, started, ended, waited, ran, used }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        state = try c.decodeIfPresent(String.self, forKey: .state) ?? ""
+        pool = try c.decodeIfPresent(String.self, forKey: .pool) ?? ""
+        label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
+        cores = try c.decodeIfPresent(Int.self, forKey: .cores)
+        started = try c.decodeIfPresent(Double.self, forKey: .started)
+        ended = try c.decodeIfPresent(Double.self, forKey: .ended)
+        waited = try c.decodeIfPresent(Double.self, forKey: .waited)
+        ran = try c.decodeIfPresent(Double.self, forKey: .ran)
+        used = try c.decodeIfPresent(Double.self, forKey: .used)
+    }
+
+    public static func decodeList(_ data: Data) throws -> [Job] {
+        try JSONDecoder().decode([Job].self, from: data)
+    }
+}

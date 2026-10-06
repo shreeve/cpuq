@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>Cpuq</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.github.shreeve.cpuq</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Cpuq</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSMultipleInstancesProhibited</key>
+	<true/>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 Steve Shreeve. MIT License.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Cpuq opens Terminal to show cpuq status --watch when you ask for the live view.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUEnableInstallerLauncherService</key>
+	<false/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/shreeve/cpuq/releases/download/cpuq-app-updates/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>fb6RUBfMDV6VWb9InCQI7D9byqQ926HnclnS7S0cBag=</string>
+</dict>
+</plist>

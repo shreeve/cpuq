@@ -14,11 +14,18 @@ let package = Package(
     products: [
         .executable(name: "Cpuq", targets: ["Cpuq"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.10.0")
+    ],
     targets: [
         // What the app knows about cpuq: `cpuq status --json`, the meter rule, where cpuq lives.
         .target(name: "CpuqCore", swiftSettings: strict),
-        // The menu-bar app.
-        .executableTarget(name: "Cpuq", dependencies: ["CpuqCore"], swiftSettings: app),
+        // The menu-bar app; Sparkle updates it in place.
+        .executableTarget(
+            name: "Cpuq",
+            dependencies: ["CpuqCore", .product(name: "Sparkle", package: "Sparkle")],
+            swiftSettings: app
+        ),
         .testTarget(name: "CpuqCoreTests", dependencies: ["CpuqCore"], swiftSettings: strict),
     ]
 )

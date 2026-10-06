@@ -1,5 +1,7 @@
 import AppKit
 import CpuqCore
+import Sparkle
+import SwiftUI
 
 /// The cpuq menu-bar app: the chip in the menu bar fills a cell per quarter
 /// of the budget held, and its menu shows the queue. It only reads
@@ -11,6 +13,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var problem: String?
     private var timer: Timer?
     private var polling = false
+    private let graphs = GraphModel()
+    private var graphsWindow: NSWindow?
+    private var historyTimer: Timer?
+    /// Sparkle, running only in a Cpuq.app bundle: a binary run from the build folder never offers
+    /// to replace itself.
+    private let updater = SPUStandardUpdaterController(
+        startingUpdater: Bundle.main.bundleURL.pathExtension == "app",
+        updaterDelegate: nil,
+        userDriverDelegate: nil
+    )
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         item.button?.image = chip(level: 0)
@@ -41,6 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 case .success(let s):
                     self.status = s
                     self.problem = nil
+                    self.graphs.add(s)
                 case .failure(let e):
                     self.status = nil
                     self.problem = e.message
@@ -57,12 +70,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     struct Problem: Error { let message: String }
 
     nonisolated private static func readStatus() -> Result<Status, Problem> {
+        switch run(["status", "--json"]) {
+        case .success(let data):
+            do { return .success(try Status.decode(data)) } catch {
+                return .failure(Problem(message: "cannot read cpuq status: \(error.localizedDescription)"))
+            }
+        case .failure(let e): return .failure(e)
+        }
+    }
+
+    nonisolated private static func readHistory() -> [Job] {
+        guard case .success(let data) = run(["history", "--json", "--limit", "500"]) else { return [] }
+        return (try? Job.decodeList(data)) ?? []
+    }
+
+    /// Runs cpuq with `arguments` and returns what it printed.
+    nonisolated private static func run(_ arguments: [String]) -> Result<Data, Problem> {
         guard let path = findCpuq() else {
             return .failure(Problem(message: "cpuq is not installed (~/.local/bin, /opt/homebrew/bin or /usr/local/bin)"))
         }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
-        p.arguments = ["status", "--json"]
+        p.arguments = arguments
         let out = Pipe()
         p.standardOutput = out
         p.standardError = FileHandle.nullDevice
@@ -73,12 +102,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let data = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        guard p.terminationStatus == 0 else { return .failure(Problem(message: "cpuq status failed (\(p.terminationStatus))")) }
-        do {
-            return .success(try Status.decode(data))
-        } catch {
-            return .failure(Problem(message: "cannot read cpuq status: \(error.localizedDescription)"))
-        }
+        guard p.terminationStatus == 0 else { return .failure(Problem(message: "cpuq \(arguments.first ?? "") failed (\(p.terminationStatus))")) }
+        return .success(data)
     }
 
     // MARK: - The menu
@@ -130,8 +155,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         menu.addItem(.separator())
+        menu.addItem(withTitle: "Show Graphs…", action: #selector(showGraphs), keyEquivalent: "g").target = self
         menu.addItem(withTitle: "Open Live View in Terminal", action: #selector(openLiveView), keyEquivalent: "l").target = self
+        if Bundle.main.bundleURL.pathExtension == "app" {
+            let check = NSMenuItem(title: "Check for Updates…", action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)), keyEquivalent: "")
+            check.target = updater
+            menu.addItem(check)
+        }
         menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    }
+
+    // MARK: - The graphs window
+
+    @objc private func showGraphs() {
+        if graphsWindow == nil {
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 640, height: 600),
+                styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                backing: .buffered, defer: false)
+            window.title = "cpuq"
+            window.isReleasedWhenClosed = false
+            window.contentView = NSHostingView(rootView: GraphsView(model: graphs))
+            window.center()
+            graphsWindow = window
+            // History changes slowly: read it now and each minute while the window is open.
+            historyTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshHistory() }
+            }
+        }
+        refreshHistory()
+        NSApp.activate()
+        graphsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    private func refreshHistory() {
+        guard graphsWindow?.isVisible ?? true else { return }
+        Task.detached(priority: .utility) {
+            let jobs = Self.readHistory()
+            await MainActor.run { self.graphs.setHistory(jobs) }
+        }
     }
 
     private func name(_ label: String, _ command: String) -> String {
