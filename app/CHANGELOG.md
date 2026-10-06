@@ -5,6 +5,9 @@ notes, shown by the update dialog too.
 
 ## 0.8.1 — 2026-10-06
 
+- Back to the bright system colors for projects, as before 0.8.0, still without red, orange,
+  pink, teal or cyan (red and orange mean waiting and a shut gate; teal and cyan sit too near
+  blue), and still assigned so the projects on screen together never share one.
 - The top line fits: memory shows only when its pressure is high, CPUs read as a bare
   percentage, and the line shrinks a little before it would cut off.
 - The waiting row no longer writes job counts under its bars, where they collided; pointing at
