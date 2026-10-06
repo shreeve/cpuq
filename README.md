@@ -191,9 +191,10 @@ directory when `CPUQ_DIR` is set; `CPUQ_HISTORY` names the file), outside
 pool (cores or a lease), cores in use, how long each waited and ran, the
 cores it kept active on average (its CPU time, from the kernel, over its run
 time), and
-how it ended: an exit status, a signal, `gave up` (`--max-wait`) or `lost`,
-a job that never finished because its cpuq was killed or the machine
-restarted. A summary follows: the median and longest wait, and the cores
+how it ended: an exit status, a signal, `gave up` (`--max-wait`, `cpuq
+cancel`, or a hangup, ^C or kill while it waited) or `lost`, a job that
+never finished because its cpuq died uncaught (SIGKILL, a crash) or the
+machine restarted. A `--hold` lease killed while held ends by that signal. A summary follows: the median and longest wait, and the cores
 active of the cores in use on average, which says how to size `--cores`.
 `--label` filters (`rig:*` for a prefix), `--limit` sets how many (20), and
 `--json` gives the jobs to a program. A program that waits without

@@ -638,6 +638,42 @@ t_lease_host_hold() {
   check "others wait while it is held, and get it once it is closed" "echo '$out' | grep -qx 'other 75' && echo '$out' | grep -qx 'after 0'"
 }
 
+t_last_words() {
+  setup last-words
+  local bin=$T/bin
+  mkdir -p "$bin"
+  printf '#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done\nshift\nexec sh -c "$*"\n' >"$bin/ssh"
+  chmod +x "$bin/ssh"
+  ln -sf "$CPUQ" "$bin/cpuq"
+  "$CPUQ" run --cores 9 --label holder -- sleep 30.731 & local holder=$!
+  wait_held 9
+  # Killed while it waits, a run gave up.
+  "$CPUQ" run --cores 2 --label waiter -- true & local w=$!
+  wait_waiters 1
+  kill -TERM $w; wait $w; local rc_w=$?
+  # Killed while they hold, a hold here and one on a host ended by the signal.
+  mkfifo "$T/in1" "$T/in2"
+  "$CPUQ" lease near --hold --label near <"$T/in1" >/dev/null & local h1=$!
+  exec 7>"$T/in1"
+  wait_lease_holder near
+  kill -HUP $h1; wait $h1; local rc_h1=$?
+  exec 7>&-
+  PATH="$bin:$PATH" "$CPUQ" lease far --host far --hold --label far <"$T/in2" >/dev/null & local h2=$!
+  exec 6>"$T/in2"
+  wait_lease_holder far
+  kill -TERM $h2; wait $h2; local rc_h2=$?
+  exec 6>&-
+  kill $holder; wait $holder
+  local i=0
+  while "$CPUQ" status --json --no-usage | grep -q '"holders": \[$'; do i=$((i + 1)); [ $i -gt 50 ] && break; sleep 0.1; done
+  local got; got=$("$CPUQ" history --json | python3 -c 'import json, sys
+print(" ".join("%s%s:%s:%s" % (j["label"], "@" + j["host"] if j["host"] else "", j["state"], j["signal"]) for j in sorted(json.load(sys.stdin), key=lambda j: j["queued"])))')
+  echo "  exits $rc_w $rc_h1 $rc_h2; history: $got"
+  check "killed while waiting, a run exits by the signal and gave up (not lost)" "[ $rc_w = 143 ] && [[ '$got' == *'waiter:gave_up:15'* ]]"
+  check "killed while held, a --hold lease ends by the signal, here and on a host" "[ $rc_h1 = 129 ] && [ $rc_h2 = 143 ] && [[ '$got' == *'near:done:1 '* && '$got' == *'far@far:done:15'* ]]"
+  check "nothing is lost" "[[ '$got' != *lost* ]]"
+}
+
 t_controls() {
   setup controls
   local f=$T/order
@@ -914,7 +950,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold last_words wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

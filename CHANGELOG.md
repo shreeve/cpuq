@@ -2,6 +2,14 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.7.3 — 2026-10-06
+
+- A job killed while it waits (hangup, ^C, ^\ or SIGTERM) is recorded in
+  the history as `gave up`, with the signal, and a `--hold` lease killed
+  while held as ended by that signal, here and on the remote host. Both
+  read as `lost` before, as if cpuq had crashed; `lost` now means a cpuq
+  that died uncaught (SIGKILL, a crash) or a restart.
+
 ## 0.7.2 — 2026-10-06
 
 - Fix: a range request (`--cores 1-2`) whose label had 44 or more runs in

@@ -218,6 +218,88 @@ extern "c" fn tcgetpgrp(fd: c_int) c.pid_t;
 extern "c" fn getpgrp() c.pid_t;
 var pending_signal = std.atomic.Value(u32).init(0);
 
+/// Last words: the history line cpuq appends if a signal kills it while it
+/// waits, or holds a lease with no command, so the job reads as ended by
+/// that signal and not as lost. The line is `head`, the time, `tail` and
+/// the signal, rendered ahead of time so the handler only writes.
+var last_path: [1024]u8 = undefined;
+var last_head: [256]u8 = undefined;
+var last_head_len: usize = 0;
+var last_tail: [64]u8 = undefined;
+var last_tail_len: usize = 0;
+var last_armed = std.atomic.Value(bool).init(false);
+
+/// Arms the last words, catching hangup, ^C, ^\ and kill. A signal cpuq was
+/// started with ignored stays ignored.
+pub fn armLastWords(path: []const u8, head: []const u8, tail: []const u8) void {
+    last_armed.store(false, .release);
+    if (path.len >= last_path.len or head.len > last_head.len or tail.len > last_tail.len) return;
+    @memcpy(last_path[0..path.len], path);
+    last_path[path.len] = 0;
+    @memcpy(last_head[0..head.len], head);
+    last_head_len = head.len;
+    @memcpy(last_tail[0..tail.len], tail);
+    last_tail_len = tail.len;
+    last_armed.store(true, .release);
+    var sa: c.Sigaction = .{ .handler = .{ .handler = onFatal }, .mask = undefined, .flags = 0 };
+    _ = c.sigemptyset(&sa.mask);
+    for ([_]c.SIG{ .HUP, .INT, .QUIT, .TERM }) |sig| {
+        var old: c.Sigaction = undefined;
+        if (c.sigaction(sig, null, &old) == 0 and old.handler.handler == c.SIG.IGN) continue;
+        _ = c.sigaction(sig, &sa, null);
+    }
+}
+
+/// From here on cpuq logs its own end; a fatal signal just kills it.
+pub fn disarmLastWords() void {
+    last_armed.store(false, .release);
+}
+
+fn onFatal(sig: c.SIG) callconv(.c) void {
+    if (last_armed.swap(false, .acq_rel)) {
+        var buf: [last_head.len + last_tail.len + 64]u8 = undefined;
+        var n: usize = 0;
+        @memcpy(buf[n..][0..last_head_len], last_head[0..last_head_len]);
+        n += last_head_len;
+        var ts: c.timespec = undefined;
+        _ = c.clock_gettime(.REALTIME, &ts);
+        n += putUint(buf[n..], @intCast(ts.sec));
+        const ms: u64 = @intCast(@divTrunc(ts.nsec, 1_000_000));
+        buf[n..][0..4].* = .{ '.', '0' + @as(u8, @intCast(ms / 100)), '0' + @as(u8, @intCast(ms / 10 % 10)), '0' + @as(u8, @intCast(ms % 10)) };
+        n += 4;
+        @memcpy(buf[n..][0..last_tail_len], last_tail[0..last_tail_len]);
+        n += last_tail_len;
+        const key = ",\"signal\":";
+        @memcpy(buf[n..][0..key.len], key);
+        n += key.len;
+        n += putUint(buf[n..], @backingInt(sig));
+        buf[n..][0..2].* = "}\n".*;
+        n += 2;
+        const fd = c.open(@ptrCast(&last_path), .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c.mode_t, 0o644));
+        if (fd >= 0) {
+            _ = c.write(fd, &buf, n);
+            _ = c.close(fd);
+        }
+    }
+    dieBySignal(sig);
+}
+
+/// Writes `v` in decimal at the start of `out`; returns its length.
+fn putUint(out: []u8, v: u64) usize {
+    var digits: [20]u8 = undefined;
+    var i: usize = digits.len;
+    var x = v;
+    while (true) {
+        i -= 1;
+        digits[i] = '0' + @as(u8, @intCast(x % 10));
+        x /= 10;
+        if (x == 0) break;
+    }
+    const len = digits.len - i;
+    @memcpy(out[0..len], digits[i..]);
+    return len;
+}
+
 fn senderPid(info: *const c.siginfo_t) c.pid_t {
     if (is_darwin) return info.pid;
     return info.fields.common.first.piduid.pid;

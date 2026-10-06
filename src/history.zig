@@ -185,6 +185,7 @@ pub fn load(io: Io, a: std.mem.Allocator, path: []const u8, boot: f64, alive: *c
                 j.state = .done;
             } else if (std.mem.eql(u8, ev.event, "gave_up")) {
                 j.ended = ev.t;
+                j.signal = ev.signal;
                 j.state = .gave_up;
             }
         }
