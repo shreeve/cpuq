@@ -25,11 +25,21 @@ final class GraphModel {
         let jobs: Int
     }
 
+    /// The samples of one bucket, averaged: what the live charts draw.
+    struct Point: Identifiable {
+        var id: Date { at }
+        let at: Date
+        let inUse: Double
+        let active: Double
+        let load: Double
+        let projects: [String: Double]
+    }
+
     struct ProjectPoint: Identifiable {
         var id: String { "\(project) \(at.timeIntervalSince1970)" }
         let project: String
         let at: Date
-        let cores: Int
+        let cores: Double
     }
 
     struct Wait: Identifiable {
@@ -41,6 +51,10 @@ final class GraphModel {
 
     /// An hour at one sample per poll.
     static let keep: TimeInterval = 3600
+    /// The live charts average the samples over this long: an hour in 120
+    /// points, so a brief job or a one-poll spike blends into its
+    /// neighbours instead of drawing a spike of its own.
+    static let bucket: TimeInterval = 30
 
     private(set) var samples: [Sample] = []
     private(set) var projects: [ProjectUse] = []
@@ -73,22 +87,37 @@ final class GraphModel {
         }.suffix(60)
     }
 
-    /// Every sample's cores in use for every project seen in the window, 0
-    /// where a project held nothing, so the stacked areas share every point
-    /// and a project's band ends where it ended, rather than sloping to the
-    /// next sample that names it.
-    var projectSeries: [ProjectPoint] {
-        let names = Set(samples.flatMap { $0.projects.keys }).sorted()
-        return samples.flatMap { s in names.map { ProjectPoint(project: $0, at: s.at, cores: s.projects[$0] ?? 0) } }
+    /// The samples averaged per `bucket`, each point at its samples' mean
+    /// time, so the newest one is never ahead of now.
+    var points: [Point] {
+        var out: [Point] = []
+        var i = 0
+        while i < samples.count {
+            let key = (samples[i].at.timeIntervalSince1970 / Self.bucket).rounded(.down)
+            var j = i
+            while j < samples.count && (samples[j].at.timeIntervalSince1970 / Self.bucket).rounded(.down) == key { j += 1 }
+            let group = samples[i..<j]
+            let n = Double(group.count)
+            var by: [String: Double] = [:]
+            for s in group { for (k, v) in s.projects { by[k, default: 0] += Double(v) / n } }
+            out.append(Point(
+                at: Date(timeIntervalSince1970: group.reduce(0) { $0 + $1.at.timeIntervalSince1970 } / n),
+                inUse: group.reduce(0) { $0 + Double($1.inUse) } / n,
+                active: group.reduce(0) { $0 + $1.active } / n,
+                load: group.reduce(0) { $0 + $1.load } / n,
+                projects: by))
+            i = j
+        }
+        return out
     }
 
-    /// The window the live charts share.
-    var span: ClosedRange<Date> {
-        guard let first = samples.first?.at, let last = samples.last?.at, first < last else {
-            let now = Date()
-            return now.addingTimeInterval(-60)...now
-        }
-        return first...last
+    /// Every point's cores in use for every project seen in the window, 0
+    /// where a project held nothing, so the stacked areas share every point
+    /// and a project's band ends where it ended, rather than sloping to the
+    /// next point that names it.
+    static func projectSeries(_ points: [Point]) -> [ProjectPoint] {
+        let names = Set(points.flatMap { $0.projects.keys }).sorted()
+        return points.flatMap { p in names.map { ProjectPoint(project: $0, at: p.at, cores: p.projects[$0] ?? 0) } }
     }
 
     private func project(_ label: String) -> String {
@@ -118,19 +147,29 @@ struct GraphsView: View {
     // MARK: Live
 
     private var live: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        let points = model.points
+        let span: ClosedRange<Date> = {
+            guard let first = points.first?.at, let last = points.last?.at, first < last else { return Date().addingTimeInterval(-60)...Date() }
+            return first...last
+        }()
+        return VStack(alignment: .leading, spacing: 16) {
             Text("Cores, the last hour").font(.headline)
             Chart {
-                ForEach(model.samples) { s in
-                    AreaMark(x: .value("Time", s.at), y: .value("Cores", s.inUse))
+                // Monotone curves: soft, yet never overshooting a point, so
+                // they stay at 0 or above and peak where the data peaks.
+                ForEach(points) { p in
+                    AreaMark(x: .value("Time", p.at), y: .value("Cores", p.inUse))
                         .foregroundStyle(by: .value("Series", "in use"))
-                        .interpolationMethod(.stepEnd)
+                        .interpolationMethod(.monotone)
                         .opacity(0.35)
-                    LineMark(x: .value("Time", s.at), y: .value("Cores", s.active))
+                    LineMark(x: .value("Time", p.at), y: .value("Cores", p.active))
                         .foregroundStyle(by: .value("Series", "active"))
-                    LineMark(x: .value("Time", s.at), y: .value("Cores", s.load))
+                        .interpolationMethod(.monotone)
+                        .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                    LineMark(x: .value("Time", p.at), y: .value("Cores", p.load))
                         .foregroundStyle(by: .value("Series", "load"))
-                        .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                        .interpolationMethod(.monotone)
+                        .lineStyle(StrokeStyle(lineWidth: 1.5, lineCap: .round, dash: [4, 3]))
                 }
                 if let last = model.samples.last {
                     RuleMark(y: .value("Budget", last.budget))
@@ -139,21 +178,21 @@ struct GraphsView: View {
                 }
             }
             .chartForegroundStyleScale(["in use": Color.teal, "active": Color.green, "load": Color.orange])
-            .chartXScale(domain: model.span)
+            .chartXScale(domain: span)
             .frame(minHeight: 200)
 
             Text("In use by project").font(.headline)
             Chart {
-                ForEach(model.projectSeries) { p in
+                ForEach(GraphModel.projectSeries(points)) { p in
                     AreaMark(x: .value("Time", p.at), y: .value("Cores", p.cores), stacking: .standard)
                         .foregroundStyle(by: .value("Project", p.project))
-                        .interpolationMethod(.stepEnd)
+                        .interpolationMethod(.monotone)
                 }
             }
-            .chartXScale(domain: model.span)
+            .chartXScale(domain: span)
             .frame(minHeight: 160)
             if model.samples.isEmpty {
-                Text("Samples appear every 3 seconds while Cpuq runs.").font(.caption).foregroundStyle(.secondary)
+                Text("Samples appear every 3 seconds while Cpuq runs; the charts average them over 30 seconds.").font(.caption).foregroundStyle(.secondary)
             }
         }
     }
