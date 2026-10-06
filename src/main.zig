@@ -7,9 +7,12 @@ const policy = @import("policy.zig");
 const state = @import("state.zig");
 const sys = @import("sys.zig");
 
+const history = @import("history.zig");
+
 test {
     _ = policy;
     _ = state;
+    _ = history;
 }
 
 const version = @import("build_options").version;
@@ -19,6 +22,7 @@ const usage =
     \\       cpuq lease NAME [--slots N] [--host HOST] [lease options] [--] CMD [ARGS...]
     \\       cpuq wait --label PATTERN [--max-wait SECONDS]
     \\       cpuq status [--json] [--no-usage]
+    \\       cpuq history [--label PATTERN] [--limit N] [--json]
     \\       cpuq budget
     \\       cpuq qos
     \\
@@ -88,6 +92,7 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
     loadConfig(ctx);
     if (std.mem.eql(u8, cmd, "status")) return cmdStatus(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "wait")) return cmdWait(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "history")) return cmdHistory(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "budget")) {
         const m = machine(ctx);
         ctx.out.print("{d}\n", .{budgetNow(ctx, m)}) catch {};
@@ -340,7 +345,79 @@ const Lease = struct {
     name: []const u8,
     file: Io.File,
     tokens: []Io.File,
+    job: JobLog,
 };
+
+/// The history's record of the job this cpuq runs: its id and the fields
+/// every one of its events carries.
+const JobLog = struct {
+    id: []const u8,
+    base: history.Event,
+};
+
+/// Unix time in seconds, with a fraction.
+fn nowFloat(io: Io) f64 {
+    return @as(f64, @floatFromInt(Io.Clock.real.now(io).toNanoseconds())) / 1e9;
+}
+
+/// The history file: CPUQ_HISTORY; else beside an explicit CPUQ_DIR, so a
+/// separate queue keeps a separate history; else under XDG_STATE_HOME or
+/// ~/.local/state, outside /tmp, so it outlives a reboot.
+fn historyPath(ctx: *Ctx) []const u8 {
+    if (ctx.env.get("CPUQ_HISTORY")) |p| return p;
+    if (ctx.env.get("CPUQ_DIR")) |d| return std.mem.concat(ctx.arena, u8, &.{ d, "/history.jsonl" }) catch "";
+    if (ctx.env.get("XDG_STATE_HOME")) |x| return std.mem.concat(ctx.arena, u8, &.{ x, "/cpuq/history.jsonl" }) catch "";
+    const home = ctx.env.get("HOME") orelse return "";
+    return std.mem.concat(ctx.arena, u8, &.{ home, "/.local/state/cpuq/history.jsonl" }) catch "";
+}
+
+fn newJobLog(ctx: *Ctx, o: RunOptions) JobLog {
+    const pid = sys.getpid();
+    const t = nowFloat(ctx.io);
+    return .{
+        .id = ctx.arena.print("{d}-{d}", .{ pid, @as(i64, @intFromFloat(t * 1000)) }) catch "0",
+        .base = .{
+            .pid = pid,
+            .pool = o.lease orelse "cores",
+            .host = o.host,
+            .label = o.label,
+            .cmd = joinCommand(ctx, o.cmd),
+            .priority = @tagName(o.priority),
+            .exclusive = o.exclusive,
+            .min = o.request.min,
+            .max = o.request.max,
+        },
+    };
+}
+
+const EventExtra = struct {
+    cores: ?u32 = null,
+    exit: ?u8 = null,
+    signal: ?u32 = null,
+    cpu: ?f64 = null,
+};
+
+fn logEvent(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra) void {
+    const path = historyPath(ctx);
+    if (path.len == 0) return;
+    var ev = job.base;
+    ev.event = event;
+    ev.id = job.id;
+    ev.t = nowFloat(ctx.io);
+    ev.cores = extra.cores;
+    ev.exit = extra.exit;
+    ev.signal = extra.signal;
+    ev.cpu = extra.cpu;
+    history.append(ctx.io, path, ev);
+}
+
+/// Logs how a command ended.
+fn logEnded(ctx: *Ctx, job: JobLog, cores: u32, w: sys.Waited) void {
+    switch (w.exit) {
+        .code => |code| logEvent(ctx, job, "ended", .{ .cores = cores, .exit = code, .cpu = w.cpu_s }),
+        .signal => |sig| logEvent(ctx, job, "ended", .{ .cores = cores, .signal = @intCast(@backingInt(sig)), .cpu = w.cpu_s }),
+    }
+}
 
 fn lockOrFail(st: *state.State) void {
     st.lock() catch |err| fail("admission lock: {t}", .{err});
@@ -372,6 +449,8 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
     const ticket_name = state.ticketName(&name_buf, o.priority, rec.ticket);
     const ticket = st.createTicket(rec, ticket_name) catch |err| fail("ticket: {t}", .{err});
     st.unlock();
+    const job = newJobLog(ctx, o);
+    logEvent(ctx, job, "queued", .{});
 
     var next_note = start + cfg.note_s;
     var last_gate: policy.Gate = .open;
@@ -390,7 +469,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
         // Out of time: give up, but only after the head has tried once, so
         // --max-wait 0 takes what is free now and otherwise gives up.
         const out_of_time = if (o.max_wait) |mw| now - start >= mw else false;
-        if (out_of_time and pos > 0) giveUp(io, st, ticket_name, now - start);
+        if (out_of_time and pos > 0) giveUp(ctx, st, ticket_name, now - start, job);
         if (now >= next_note) {
             note(ctx, st, a, now - start, queue, pos, last_gate, o.lease);
             next_note = now + cfg.note_s;
@@ -442,19 +521,21 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
                 st.queue.deleteFile(io, ticket_name) catch {};
                 ticket.close(io);
                 st.unlock();
-                return .{ .record = rec, .name = lease_name, .file = lease, .tokens = tokens };
+                logEvent(ctx, job, "started", .{ .cores = rec.cores });
+                return .{ .record = rec, .name = lease_name, .file = lease, .tokens = tokens, .job = job };
             }
         }
-        if (out_of_time) giveUp(io, st, ticket_name, now - start);
+        if (out_of_time) giveUp(ctx, st, ticket_name, now - start, job);
         st.unlock();
         io.sleep(.fromMilliseconds(cfg.poll_ms), .awake) catch {};
     }
 }
 
 /// Leaves the queue and exits 75. Call with the admission lock held.
-fn giveUp(io: Io, st: *state.State, ticket_name: []const u8, waited: i64) noreturn {
-    st.queue.deleteFile(io, ticket_name) catch {};
+fn giveUp(ctx: *Ctx, st: *state.State, ticket_name: []const u8, waited: i64, job: JobLog) noreturn {
+    st.queue.deleteFile(ctx.io, ticket_name) catch {};
     st.unlock();
+    logEvent(ctx, job, "gave_up", .{});
     std.debug.print("cpuq: gave up after waiting {d}s\n", .{waited});
     std.process.exit(exit_timeout);
 }
@@ -495,6 +576,12 @@ fn ordinal(buf: []u8, n: usize) []const u8 {
         else => "th",
     };
     return std.mem.print(buf, "{d}{s}", .{ n, suffix }) catch "?";
+}
+
+/// A duration: tenths of a second under 10 s, else as `age` puts it.
+fn duration(buf: []u8, seconds: f64) []const u8 {
+    if (seconds < 10) return std.mem.print(buf, "{d:.1}s", .{@max(seconds, 0)}) catch "?";
+    return age(buf, @intFromFloat(seconds));
 }
 
 fn age(buf: []u8, seconds: i64) []const u8 {
@@ -585,19 +672,20 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
     const spawned = sys.spawn(exe, argv.ptr, @ptrCast(envp.slice.ptr), qos);
     if (pipe[0] >= 0) sys.closeFd(pipe[0]);
     if (pipe[1] >= 0) sys.closeFd(pipe[1]);
-    const exit: sys.Exit = if (spawned) |pid| blk: {
+    const waited: sys.Waited = if (spawned) |pid| blk: {
         sys.setChild(pid);
         lease.record.child = pid;
         rewriteRecord(io, lease.file, lease.record);
         break :blk sys.waitChild(pid);
     } else |err| blk: {
         std.debug.print("cpuq: {s}: {t}\n", .{ o.cmd[0], err });
-        break :blk .{ .code = if (err == error.FileNotFound) exit_notfound else exit_noexec };
+        break :blk .{ .exit = .{ .code = if (err == error.FileNotFound) exit_notfound else exit_noexec } };
     };
 
     release(io, st, lease);
+    logEnded(ctx, lease.job, k, waited);
     ctx.out.flush() catch {};
-    switch (exit) {
+    switch (waited.exit) {
         .code => |c| return c,
         .signal => |sig| sys.dieBySignal(sig),
     }
@@ -717,6 +805,7 @@ fn holdAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, lease: Lease) u8 {
         break;
     }
     release(ctx.io, st, lease);
+    logEvent(ctx, lease.job, "ended", .{ .cores = lease.record.cores, .exit = 0 });
     return 0;
 }
 
@@ -737,6 +826,8 @@ fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
     if (o.label.len != 0) remote.print(a, " --label {s}", .{shellQuote(a, o.label)}) catch fail("out of memory", .{});
     if (o.max_wait) |mw| remote.print(a, " --max-wait {d}", .{mw}) catch fail("out of memory", .{});
     const argv = [_][]const u8{ "ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4", host, remote.items };
+    const job = newJobLog(ctx, o);
+    logEvent(ctx, job, "queued", .{});
     var child = std.process.spawn(io, .{ .argv = &argv, .stdin = .pipe, .stdout = .pipe, .stderr = .inherit }) catch |err|
         fail("ssh {s}: {t}", .{ host, err });
 
@@ -756,10 +847,16 @@ fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
             .exited => |c| if (c == 0) exit_failure else c,
             else => exit_failure,
         };
-        if (code != exit_timeout) std.debug.print("cpuq: could not hold lease {s} on {s} (ssh exit {d})\n", .{ o.lease.?, host, code });
+        if (code == exit_timeout) {
+            logEvent(ctx, job, "gave_up", .{});
+        } else {
+            std.debug.print("cpuq: could not hold lease {s} on {s} (ssh exit {d})\n", .{ o.lease.?, host, code });
+            logEvent(ctx, job, "ended", .{ .exit = code });
+        }
         return code;
     }
 
+    logEvent(ctx, job, "started", .{ .cores = 1 });
     var pid_buf: [16]u8 = undefined;
     const val = std.mem.concat(a, u8, &.{ id, ":", std.mem.print(&pid_buf, "{d}", .{sys.getpid()}) catch "0" }) catch fail("out of memory", .{});
     addLeaseEnv(ctx, std.mem.concat(a, u8, &.{ o.lease.?, "@", host }) catch fail("out of memory", .{}), val);
@@ -768,19 +865,20 @@ fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
     for (o.cmd, 0..) |arg, i| cargv[i] = arg.ptr;
 
     sys.installForwarding();
-    const exit: sys.Exit = if (sys.spawn(exe, cargv.ptr, @ptrCast(envp.slice.ptr), .unchanged)) |pid| blk: {
+    const waited: sys.Waited = if (sys.spawn(exe, cargv.ptr, @ptrCast(envp.slice.ptr), .unchanged)) |pid| blk: {
         sys.setChild(pid);
         break :blk sys.waitChild(pid);
     } else |err| blk: {
         std.debug.print("cpuq: {s}: {t}\n", .{ o.cmd[0], err });
-        break :blk .{ .code = if (err == error.FileNotFound) exit_notfound else exit_noexec };
+        break :blk .{ .exit = .{ .code = if (err == error.FileNotFound) exit_notfound else exit_noexec } };
     };
     // Closing ssh's stdin ends the remote hold.
     if (child.stdin) |f| f.close(io);
     child.stdin = null;
     _ = child.wait(io) catch {};
+    logEnded(ctx, job, 1, waited);
     ctx.out.flush() catch {};
-    switch (exit) {
+    switch (waited.exit) {
         .code => |c| return c,
         .signal => |sig| sys.dieBySignal(sig),
     }
@@ -870,6 +968,173 @@ fn cmdWait(ctx: *Ctx, args: []const [:0]const u8) u8 {
         };
         io.sleep(.fromMilliseconds(1000), .awake) catch {};
     }
+}
+
+const JsonJob = struct {
+    id: []const u8,
+    state: []const u8,
+    pool: []const u8,
+    host: ?[]const u8,
+    label: []const u8,
+    command: []const u8,
+    priority: []const u8,
+    exclusive: bool,
+    min: u32,
+    max: u32,
+    cores: ?u32,
+    queued: f64,
+    started: ?f64,
+    ended: ?f64,
+    waited: ?f64,
+    ran: ?f64,
+    used: ?f64,
+    exit: ?u8,
+    signal: ?u32,
+};
+
+fn aliveForHistory(pid: i32) bool {
+    return sys.processAlive(pid);
+}
+
+/// `cpuq history [--label PATTERN] [--limit N] [--json]`: finished, lost and
+/// running jobs from the history file, newest first, with a summary.
+fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
+    var pattern: ?[]const u8 = null;
+    var limit: usize = 20;
+    var json = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--json")) {
+            json = true;
+            continue;
+        }
+        const name, const inline_value = std.mem.cutScalar(u8, arg, '=') orelse .{ arg, null };
+        const is_label = std.mem.eql(u8, name, "--label");
+        const is_limit = std.mem.eql(u8, name, "--limit");
+        if (!is_label and !is_limit) return usageError("unknown history option '{s}'", .{arg});
+        const value = inline_value orelse blk: {
+            i += 1;
+            if (i >= args.len) return usageError("{s} needs a value", .{name});
+            break :blk args[i];
+        };
+        if (is_label) pattern = value else limit = std.fmt.parseInt(usize, value, 10) catch
+            return usageError("--limit needs a whole number, not '{s}'", .{value});
+    }
+    const io = ctx.io;
+    const a = ctx.arena;
+    const path = historyPath(ctx);
+    const all = history.load(io, a, path, sys.bootTime(io), &aliveForHistory);
+
+    // Newest first, filtered, limited.
+    var picked: std.ArrayList(history.Job) = .empty;
+    var k = all.len;
+    while (k > 0 and picked.items.len < limit) {
+        k -= 1;
+        const j = all[k];
+        if (pattern) |p| if (!history.labelMatches(p, j.label)) continue;
+        picked.append(a, j) catch break;
+    }
+    std.mem.sortUnstable(history.Job, picked.items, {}, struct {
+        fn newer(_: void, x: history.Job, y: history.Job) bool {
+            return x.last() > y.last();
+        }
+    }.newer);
+
+    const w = ctx.out;
+    if (json) {
+        var out: std.ArrayList(JsonJob) = .empty;
+        for (picked.items) |j| out.append(a, .{
+            .id = j.id,
+            .state = @tagName(j.state),
+            .pool = j.pool,
+            .host = j.host,
+            .label = j.label,
+            .command = j.cmd,
+            .priority = j.priority,
+            .exclusive = j.exclusive,
+            .min = j.min,
+            .max = j.max,
+            .cores = j.cores,
+            .queued = j.queued,
+            .started = j.started,
+            .ended = j.ended,
+            .waited = j.waited(),
+            .ran = j.ran(),
+            .used = j.used(),
+            .exit = j.exit,
+            .signal = j.signal,
+        }) catch {};
+        std.json.Stringify.value(out.items, .{ .whitespace = .indent_2 }, w) catch {};
+        w.writeAll("\n") catch {};
+        return 0;
+    }
+    if (picked.items.len == 0) {
+        w.print("no jobs in {s}{s}\n", .{ path, if (pattern != null) " with that label" else "" }) catch {};
+        return 0;
+    }
+
+    const now = nowFloat(io);
+    var lw: usize = 5;
+    var pw: usize = 4;
+    for (picked.items) |j| {
+        lw = @max(lw, @min(dash(j.label).len, 32));
+        pw = @max(pw, @min(j.pool.len, 20));
+    }
+    var lbuf: [40]u8 = undefined;
+    var pbuf: [24]u8 = undefined;
+    w.print("  WHEN     {s} {s} CORES  WAITED   RAN      USED  EXIT\n", .{ pad(&lbuf, "LABEL", lw), pad(&pbuf, "POOL", pw) }) catch {};
+    for (picked.items) |j| {
+        var b1: [16]u8 = undefined;
+        var b2: [16]u8 = undefined;
+        var b3: [16]u8 = undefined;
+        var b4: [16]u8 = undefined;
+        var b5: [16]u8 = undefined;
+        var b6: [24]u8 = undefined;
+        const cores_text = if (j.cores) |c| std.mem.print(&b2, "{d}", .{c}) catch "?" else if (j.max > j.min) std.mem.print(&b2, "{d}-{d}", .{ j.min, j.max }) catch "?" else "-";
+        const waited_text = if (j.waited()) |x| duration(&b3, x) else "-";
+        const ran_text = if (j.ran()) |x| duration(&b4, x) else "-";
+        const used_text = if (j.used()) |x| std.mem.print(&b5, "{d:.1}", .{x}) catch "?" else "-";
+        const exit_text: []const u8 = switch (j.state) {
+            .done => if (j.signal) |sig| std.mem.print(&b6, "signal {d}", .{sig}) catch "signal" else std.mem.print(&b6, "{d}", .{j.exit orelse 0}) catch "?",
+            .gave_up => "gave up",
+            .lost => "lost",
+            .active => if (j.started != null) "running" else "waiting",
+        };
+        w.print("  {s:<8} {s} {s} {s:<6} {s:<8} {s:<8} {s:<5} {s}\n", .{
+            age(&b1, @intFromFloat(now - j.last())), pad(&lbuf, dash(j.label), lw), pad(&pbuf, j.pool, pw),
+            cores_text,                              waited_text,                   ran_text,
+            used_text,                               exit_text,
+        }) catch {};
+    }
+
+    // The summary: how long jobs waited, and what they used of what they got.
+    var waits: std.ArrayList(f64) = .empty;
+    var granted: f64 = 0;
+    var used: f64 = 0;
+    var measured: usize = 0;
+    var lost: usize = 0;
+    for (picked.items) |j| {
+        if (j.waited()) |x| waits.append(a, x) catch {};
+        if (j.state == .lost) lost += 1;
+        if (j.used()) |u| if (j.cores) |c| if (std.mem.eql(u8, j.pool, "cores")) {
+            used += u;
+            granted += @floatFromInt(c);
+            measured += 1;
+        };
+    }
+    var longest: f64 = 0;
+    for (waits.items) |x| longest = @max(longest, x);
+    var b1: [16]u8 = undefined;
+    var b2: [16]u8 = undefined;
+    w.print("\n{d} jobs; waited {s} median, {s} longest", .{ picked.items.len, duration(&b1, history.median(waits.items)), duration(&b2, longest) }) catch {};
+    if (measured != 0) {
+        const m: f64 = @floatFromInt(measured);
+        w.print("; used {d:.1} of {d:.1} cores granted on average", .{ used / m, granted / m }) catch {};
+    }
+    if (lost != 0) w.print("; {d} lost (the machine restarted or cpuq was killed)", .{lost}) catch {};
+    w.writeAll("\n") catch {};
+    return 0;
 }
 
 const JsonHolder = struct {

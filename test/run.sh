@@ -460,6 +460,37 @@ t_wait() {
   wait
 }
 
+t_history() {
+  setup history
+  "$CPUQ" run --cores 2-4 --priority high --label h:build -- python3 -c 'import os, time
+def spin():
+    e = time.time() + 1
+    while time.time() < e: pass
+if os.fork() == 0: spin(); os._exit(0)
+spin(); os.wait()'
+  "$CPUQ" run --label h:fail -- sh -c 'exit 3'
+  "$CPUQ" run --cores 9 --label h:hog -- sleep 1.5 & wait_held 9
+  "$CPUQ" run --label h:impatient --max-wait 0 -- true 2>/dev/null
+  wait
+  "$CPUQ" run --label h:crash -- sleep 30 & local p=$!
+  wait_held 2
+  kill -9 $p; pkill -f '^sleep 30$' 2>/dev/null; sleep 0.2
+  local got; got=$("$CPUQ" history --json | python3 -c 'import json, sys
+j = {x["label"]: x for x in json.load(sys.stdin)}
+b = j["h:build"]
+print(b["state"], b["cores"], "%.1f" % (b["used"] or 0), j["h:fail"]["exit"], j["h:impatient"]["state"], j["h:crash"]["state"], j["h:hog"]["exit"])')
+  echo "  history: $got"
+  check "history records grant, use, exit, give-up and loss (got: $got)" "python3 -c '
+import sys
+f = \"$got\".split()
+ok = f[0] == \"done\" and f[1] == \"4\" and 1.5 < float(f[2]) < 2.5 and f[3:] == [\"3\", \"gave_up\", \"lost\", \"0\"]
+sys.exit(0 if ok else 1)'"
+  local n; n=$("$CPUQ" history --label 'h:b*' --json | python3 -c 'import json, sys; print(len(json.load(sys.stdin)))')
+  check "history --label filters by prefix (got $n)" "[ '$n' = 1 ]"
+  local text; text=$("$CPUQ" history)
+  check "history prints a summary with the lost job" "[[ '$text' == *'5 jobs; waited'* && '$text' == *'1 lost'* ]]"
+}
+
 t_lost_seq() {
   setup lost-seq
   "$CPUQ" run --cores 5 --label holder -- sleep 2 & local h=$!
@@ -593,7 +624,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host wait lost_seq max_wait waiters_cpu qos jobserver status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host wait history lost_seq max_wait waiters_cpu qos jobserver status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

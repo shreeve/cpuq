@@ -220,18 +220,46 @@ pub fn setChild(pid: c.pid_t) void {
 
 pub const Exit = union(enum) { code: u8, signal: c.SIG };
 
-pub fn waitChild(pid: c.pid_t) Exit {
+/// How a command ended, and the CPU seconds it and the descendants it
+/// reaped used (the kernel's own total, from wait4).
+pub const Waited = struct { exit: Exit, cpu_s: f64 = 0 };
+
+pub fn waitChild(pid: c.pid_t) Waited {
     var status: c_int = 0;
+    var ru: c.rusage = undefined;
     while (true) {
-        const r = c.waitpid(pid, &status, 0);
+        const r = c.wait4(pid, &status, 0, &ru);
         if (r == pid) break;
         if (r < 0 and c.errno(r) == .INTR) continue;
-        return .{ .code = 125 };
+        return .{ .exit = .{ .code = 125 } };
     }
+    const cpu_s = seconds(ru.utime) + seconds(ru.stime);
     const s: u32 = @bitCast(status);
-    if (c.W.IFEXITED(s)) return .{ .code = c.W.EXITSTATUS(s) };
-    if (c.W.IFSIGNALED(s)) return .{ .signal = c.W.TERMSIG(s) };
-    return .{ .code = 125 };
+    if (c.W.IFEXITED(s)) return .{ .exit = .{ .code = c.W.EXITSTATUS(s) }, .cpu_s = cpu_s };
+    if (c.W.IFSIGNALED(s)) return .{ .exit = .{ .signal = c.W.TERMSIG(s) }, .cpu_s = cpu_s };
+    return .{ .exit = .{ .code = 125 }, .cpu_s = cpu_s };
+}
+
+fn seconds(tv: c.timeval) f64 {
+    return @as(f64, @floatFromInt(tv.sec)) + @as(f64, @floatFromInt(tv.usec)) / 1e6;
+}
+
+/// When this machine last booted, in Unix seconds: macOS kern.boottime;
+/// Linux now minus /proc/uptime (/proc/stat's btime follows lines that run
+/// to many kilobytes on a big machine).
+pub fn bootTime(io: Io) f64 {
+    if (is_darwin) {
+        var tv: c.timeval = undefined;
+        var len: usize = @sizeOf(c.timeval);
+        if (c.sysctlbyname("kern.boottime", &tv, &len, null, 0) != 0) return 0;
+        return seconds(tv);
+    }
+    var buf: [128]u8 = undefined;
+    const text = Io.Dir.cwd().readFile(io, "/proc/uptime", &buf) catch return 0;
+    const first = std.mem.sliceTo(text, ' ');
+    const up = std.fmt.parseFloat(f64, first) catch return 0;
+    const now: f64 = @floatFromInt(Io.Clock.real.now(io).toNanoseconds());
+    return now / 1e9 - up;
 }
 
 /// Ends this process the way the command ended: by the same signal, so the
