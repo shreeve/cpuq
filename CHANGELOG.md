@@ -2,6 +2,11 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.4.3 — 2026-10-05
+
+- `cpuq status` fades the load averages with age: the 1-minute load bold and
+  colored, the 5-minute plain, the 15-minute dim.
+
 ## 0.4.2 — 2026-10-05
 
 - `cpuq status` shows the current (1-minute) load in bold, green under half

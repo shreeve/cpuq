@@ -1421,16 +1421,21 @@ fn showOutside(outside: []const JsonOutside, g: policy.Gate) bool {
 }
 
 /// The load averages: the 1-minute one bold, in green under half the CPUs
-/// online, yellow up to one and a half times them, red beyond; the 5- and
-/// 15-minute ones dim.
+/// online, yellow up to one and a half times them, red beyond; the 5-minute
+/// one plain and the 15-minute one dim, fading with age.
 fn loadCell(a: std.mem.Allocator, load: [3]f64, online: u32) table.Cell {
     const cpus: f64 = @floatFromInt(@max(online, 1));
     const tint: table.Tint = if (load[0] < 0.5 * cpus) .good else if (load[0] <= 1.5 * cpus) .warn else .bad;
     const now = a.print("{d:.1}", .{load[0]}) catch "?";
-    const rest = a.print(" {d:.1} {d:.1}", .{ load[1], load[2] }) catch "";
+    const five = a.print(" {d:.1}", .{load[1]}) catch "";
+    const fifteen = a.print(" {d:.1}", .{load[2]}) catch "";
     return .{
-        .text = std.mem.concat(a, u8, &.{ now, rest }) catch now,
-        .parts = a.dupe(table.Part, &.{ .{ .text = now, .tint = tint, .bold = true }, .{ .text = rest, .tint = .dim } }) catch null,
+        .text = std.mem.concat(a, u8, &.{ now, five, fifteen }) catch now,
+        .parts = a.dupe(table.Part, &.{
+            .{ .text = now, .tint = tint, .bold = true },
+            .{ .text = five },
+            .{ .text = fifteen, .tint = .dim },
+        }) catch null,
     };
 }
 
