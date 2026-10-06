@@ -11,7 +11,7 @@ with or without it. It finds cpuq where install.sh and Homebrew put it
 (`~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`), since an app does not
 inherit a shell's `PATH`.
 
-Build and run (Xcode 27 or its command-line tools):
+Build and run (Swift 6.2 or later: Xcode 26 or its command-line tools):
 
     swift build -c release
     .build/release/Cpuq &
