@@ -447,14 +447,18 @@ struct GraphsView: View {
                 }
                 .toggleStyle(.button).controlSize(.small)
             }
+            // Air between the views, so each reads as its own; the waiting row and the Mac strip
+            // sit together.
             VStack(spacing: 4) {
                 if showStacked {
                     stackChart(axis: axis, machine: machine)
                         .frame(minHeight: 150, maxHeight: .infinity)
+                        .padding(.bottom, 18)
                 }
                 if showLanes {
                     lanesChart(axis: axis, lanes: lanes, cells: cells)
                         .frame(minHeight: 170, maxHeight: .infinity)
+                        .padding(.bottom, 14)
                 }
                 waitingChart(axis: axis, waits: waitCells, labels: !showMac)
                     .frame(height: showMac ? 42 : 62)

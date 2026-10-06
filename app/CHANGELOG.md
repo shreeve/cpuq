@@ -3,6 +3,11 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.7.1 — 2026-10-06
+
+- More room between the views: a clear gap under the stacked chart and under the lanes, so the
+  stacked chart's 0 no longer meets the top lane's 10 and each view reads as its own.
+
 ## 0.7.0 — 2026-10-06
 
 - One page instead of a switch: the stacked chart on top, the lanes under it, then the waiting
