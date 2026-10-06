@@ -1201,6 +1201,9 @@ const JsonHolder = struct {
 };
 
 const JsonWaiter = struct {
+    /// Seconds until it is expected to start, from the history of jobs
+    /// with its holders' and the waiters ahead's labels; null when unknown.
+    eta: ?f64 = null,
     order: usize,
     ticket: u64,
     pid: i32,
@@ -1223,6 +1226,92 @@ const JsonGate = struct {
     load: ?f64,
     text: []const u8,
 };
+
+/// Typical run times from the history: the median run of finished jobs by
+/// label, and by project (the label up to its first ':').
+const RunTimes = struct {
+    by_label: std.StringHashMapUnmanaged(f64) = .empty,
+    by_project: std.StringHashMapUnmanaged(f64) = .empty,
+
+    fn load(ctx: *Ctx, a: std.mem.Allocator) RunTimes {
+        var rt: RunTimes = .{};
+        const jobs = history.load(ctx.io, a, historyPath(ctx), sys.bootTime(ctx.io), &aliveForHistory);
+        var label_runs: std.StringHashMapUnmanaged(std.ArrayList(f64)) = .empty;
+        var project_runs: std.StringHashMapUnmanaged(std.ArrayList(f64)) = .empty;
+        for (jobs) |j| {
+            const r = j.ran() orelse continue;
+            if (j.label.len == 0 or !std.mem.eql(u8, j.pool, "cores")) continue;
+            for ([_]struct { m: *std.StringHashMapUnmanaged(std.ArrayList(f64)), k: []const u8 }{
+                .{ .m = &label_runs, .k = j.label },
+                .{ .m = &project_runs, .k = std.mem.sliceTo(j.label, ':') },
+            }) |e| {
+                const gop = e.m.getOrPut(a, e.k) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                gop.value_ptr.append(a, r) catch {};
+            }
+        }
+        var it = label_runs.iterator();
+        while (it.next()) |e| rt.by_label.put(a, e.key_ptr.*, history.median(e.value_ptr.items)) catch {};
+        var it2 = project_runs.iterator();
+        while (it2.next()) |e| rt.by_project.put(a, e.key_ptr.*, history.median(e.value_ptr.items)) catch {};
+        return rt;
+    }
+
+    fn typical(rt: RunTimes, label: []const u8) ?f64 {
+        if (label.len == 0) return null;
+        return rt.by_label.get(label) orelse rt.by_project.get(std.mem.sliceTo(label, ':'));
+    }
+};
+
+/// Fills in each waiter's ETA by playing the queue forward: holders free
+/// their cores at their typical end, and each waiter, in order, starts once
+/// its minimum fits and then holds it for its own typical run. An unknown
+/// run time ahead of a waiter leaves its ETA unknown.
+fn estimate(rt: RunTimes, budget: u32, holders: []const JsonHolder, waiters: []JsonWaiter, now: i64) void {
+    const Release = struct { at: ?f64, cores: u32 };
+    var pending: [256]Release = undefined;
+    var n: usize = 0;
+    var free: i64 = @intCast(budget);
+    for (holders) |h| {
+        free -= h.cores;
+        if (n == pending.len) return;
+        const at: ?f64 = if (rt.typical(h.label)) |t| @max(@as(f64, @floatFromInt(h.since)) + t - @as(f64, @floatFromInt(now)), 0) else null;
+        pending[n] = .{ .at = at, .cores = h.cores };
+        n += 1;
+    }
+    var clock: f64 = 0;
+    var known = true;
+    for (waiters) |*q| {
+        const need: i64 = if (q.exclusive) @intCast(budget) else @min(q.cores, budget);
+        while (free < need and n != 0) {
+            // The next release: the earliest known one; an unknown one only
+            // when no known one is left.
+            var pick: usize = 0;
+            for (pending[0..n], 0..) |r, i| {
+                const best = pending[pick].at;
+                if (r.at) |at| {
+                    if (best == null or at < best.?) pick = i;
+                }
+            }
+            const r = pending[pick];
+            pending[pick] = pending[n - 1];
+            n -= 1;
+            if (r.at) |at| clock = @max(clock, at) else known = false;
+            free += r.cores;
+        }
+        if (free < need or !known) {
+            q.eta = null;
+            known = false;
+            continue;
+        }
+        q.eta = clock;
+        free -= need;
+        if (n < pending.len) {
+            pending[n] = .{ .at = if (rt.typical(q.label)) |t| clock + t else null, .cores = @intCast(need) };
+            n += 1;
+        }
+    }
+}
 
 /// `cpuq status --json`. `schema` changes only when a field is removed or
 /// changes meaning; new fields may appear in any version.
@@ -1415,6 +1504,7 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
                 .{ .text = if (q.max > q.cores) a.print("{d}-{d}", .{ q.cores, q.max }) catch "?" else a.print("{d}", .{q.cores}) catch "?" },
                 .{ .text = prio },
                 .{ .text = a.dupe(u8, age(&b, v.now - q.since)) catch "?" },
+                if (q.eta) |e| (if (e < 1) C{ .text = "now", .tint = .good } else C{ .text = a.print("~{s}", .{age(&b, @intFromFloat(e))}) catch "?" }) else C{ .text = "?", .tint = .dim },
                 .{ .text = q.command },
             }) catch continue) catch {};
         }
@@ -1426,6 +1516,7 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
                 .{ .head = "CORES", .alignment = .right },
                 .{ .head = "PRIO" },
                 .{ .head = "WAITING" },
+                .{ .head = "ETA" },
                 .{ .head = "COMMAND", .flexible = true },
             },
             .rows = rows.items,
@@ -1640,6 +1731,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
 
     const holders = toHolders(a, leases, busy);
     const waiters = toWaiters(a, queue);
+    if (waiters.len != 0) estimate(RunTimes.load(ctx, a), budget, holders, waiters, now);
 
     // The named leases: each a pool of one with its own holder and waiters.
     var named: std.ArrayList(JsonLease) = .empty;
