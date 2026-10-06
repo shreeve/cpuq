@@ -3,11 +3,11 @@
 The cpuq menu-bar companion for macOS 14 and later on Apple silicon. The chip in the menu bar
 fills a cell per quarter of the core budget in use (none when idle, all four when the budget is
 full). Its menu shows what runs (cores in use and active), what waits and when it should start,
-the named leases, and any load outside cpuq. **Show Graphs** (⌘G) opens a window with the last
-hour as two stacks of one band per project: the cores in use against the budget, each band
-lighter where its cores sit idle and darker where it runs more threads than cores, and the cores
-active with the machine's load over them, averaged over 30 seconds. From `cpuq history` it shows
-each project's active cores against its cores in use and the latest waits. **Open Live View in Terminal** runs `cpuq status --watch`.
+the named leases, and any load outside cpuq. **Show Graphs** (⌘G) opens a window that leads with one line (cores
+held of the budget, CPU used, how many wait), then charts the last hour: the cores each project
+holds as stacked steps against the budget, the CPU used as a line, and a red bar while anyone
+waits, with the recent minutes wide on the right. A table under it lists who holds what and who
+waits; its History tab sums `cpuq history` per project. **Open Live View in Terminal** runs `cpuq status --watch`.
 
 The app only reads `cpuq status --json` (every 3 seconds) and `cpuq history --json`, so cpuq
 works the same with or without it. It finds cpuq where install.sh and Homebrew put it

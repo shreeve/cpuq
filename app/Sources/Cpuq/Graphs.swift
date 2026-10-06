@@ -2,320 +2,352 @@ import Charts
 import CpuqCore
 import SwiftUI
 
-/// What the graphs window draws: the last hour of the queue, sampled with every poll, and the
-/// jobs `cpuq history` remembers.
+/// What the activity window shows: the last hour of the queue, sampled with every poll, and
+/// the jobs `cpuq history` remembers.
 @Observable
 final class GraphModel {
     struct Sample: Identifiable {
-        let id = UUID()
-        let at: Date
-        let budget: Int
-        let load: Double
-        /// Per project (the label up to its first ':'): cores in use, and cores active.
-        let inUse: [String: Int]
-        let active: [String: Double]
-    }
-
-    struct ProjectUse: Identifiable {
-        var id: String { project }
-        let project: String
-        let inUse: Double
-        let active: Double
-        let jobs: Int
-    }
-
-    /// The samples of one bucket, averaged: what the live charts draw.
-    struct Point: Identifiable {
         var id: Date { at }
         let at: Date
-        let load: Double
-        let inUse: [String: Double]
-        let active: [String: Double]
+        let budget: Int
+        /// Cores held per project (the label up to its first ':').
+        let held: [String: Int]
+        /// CPU used by cpuq's jobs, in cores, measured.
+        let used: Double
+        /// CPU used by the busiest processes outside cpuq, in cores.
+        let other: Double
+        let waiting: Int
     }
 
-    /// One project's slice of the stack at one point: from `low` to `high`
-    /// cores, with `busy` its cores active per core in use (1 when they
-    /// match, more when it runs more threads than it was given).
-    struct Slice: Identifiable {
-        var id: String { "\(project) \(at.timeIntervalSince1970)" }
+    /// A project running now: what it holds and what it uses.
+    struct Row: Identifiable {
+        var id: String { project }
         let project: String
-        let at: Date
-        let low: Double
-        let high: Double
-        let busy: Double?
+        let held: Int
+        let used: Double
     }
 
-    /// One project's cores at one point, for a stacked chart.
-    struct Band: Identifiable {
-        var id: String { "\(project) \(at.timeIntervalSince1970)" }
-        let project: String
-        let at: Date
-        let cores: Double
-    }
-
-    struct Wait: Identifiable {
-        let id = UUID()
+    struct Waiting: Identifiable {
+        let id: Int
         let label: String
-        let ended: Date
-        let waited: Double
+        let cores: String
+        let since: Int
     }
 
-    /// An hour at one sample per poll.
+    /// A project's finished jobs, summed.
+    struct Totals: Identifiable {
+        var id: String { project }
+        let project: String
+        let jobs: Int
+        /// Core-hours held and used.
+        let held: Double
+        let used: Double
+        var efficiency: Double { held > 0 ? used / held : 0 }
+        let medianWait: Double
+        let longestWait: Double
+    }
+
     static let keep: TimeInterval = 3600
-    /// The live charts average the samples over this long: an hour in 120
-    /// points, so a brief job or a one-poll spike blends into its
-    /// neighbours instead of drawing a spike of its own.
-    static let bucket: TimeInterval = 30
 
     private(set) var samples: [Sample] = []
-    private(set) var budget = 0
-    private(set) var projects: [ProjectUse] = []
-    private(set) var waits: [Wait] = []
+    private(set) var status: Status?
+    private(set) var totals: [Totals] = []
+    /// Each project's palette slot, assigned the first time it is seen and kept across launches,
+    /// so a project's color never changes as others come and go.
+    private var slots: [String: Int] = (UserDefaults.standard.dictionary(forKey: "projectColors") as? [String: Int]) ?? [:]
 
     func add(_ s: Status, at now: Date = Date()) {
-        var inUse: [String: Int] = [:]
-        var active: [String: Double] = [:]
-        for h in s.holders {
-            inUse[project(h.label), default: 0] += h.cores
-            active[project(h.label), default: 0] += h.using ?? 0
+        var held: [String: Int] = [:]
+        for h in s.holders { held[Self.project(h.label), default: 0] += h.cores }
+        for p in held.keys.sorted() where slots[p] == nil {
+            slots[p] = slots.count
+            UserDefaults.standard.set(slots, forKey: "projectColors")
         }
-        budget = s.budget
-        samples.append(Sample(at: now, budget: s.budget, load: s.load.first ?? 0, inUse: inUse, active: active))
+        status = s
+        samples.append(Sample(
+            at: now, budget: s.budget, held: held,
+            used: s.holders.reduce(0) { $0 + ($1.using ?? 0) },
+            other: s.outside.reduce(0) { $0 + $1.using },
+            waiting: s.waiters.count))
         samples.removeAll { now.timeIntervalSince($0.at) > Self.keep }
     }
 
     func setHistory(_ jobs: [Job]) {
-        var sums: [String: (inUse: Double, active: Double, n: Int)] = [:]
+        var by: [String: (jobs: Int, held: Double, used: Double, waits: [Double])] = [:]
         for j in jobs where j.state == "done" && j.pool == "cores" {
-            guard let cores = j.cores, let used = j.used else { continue }
-            let key = project(j.label)
-            var e = sums[key] ?? (0, 0, 0)
-            e.inUse += Double(cores)
-            e.active += used
-            e.n += 1
-            sums[key] = e
+            guard let cores = j.cores, let ran = j.ran else { continue }
+            var e = by[Self.project(j.label)] ?? (0, 0, 0, [])
+            e.jobs += 1
+            e.held += Double(cores) * ran / 3600
+            e.used += (j.used ?? 0) * ran / 3600
+            if let w = j.waited { e.waits.append(w) }
+            by[Self.project(j.label)] = e
         }
-        projects = sums.map { ProjectUse(project: $0.key, inUse: $0.value.inUse / Double($0.value.n), active: $0.value.active / Double($0.value.n), jobs: $0.value.n) }
-            .sorted { $0.project < $1.project }
-        waits = jobs.compactMap { j in
-            guard let w = j.waited, let end = j.ended ?? j.started else { return nil }
-            return Wait(label: j.label.isEmpty ? "-" : j.label, ended: Date(timeIntervalSince1970: end), waited: w)
-        }.suffix(60)
+        totals = by.map { k, v in
+            let waits = v.waits.sorted()
+            return Totals(project: k, jobs: v.jobs, held: v.held, used: v.used,
+                          medianWait: waits.isEmpty ? 0 : waits[waits.count / 2], longestWait: waits.last ?? 0)
+        }.sorted { $0.held > $1.held }
     }
 
-    /// The samples averaged per `bucket`, each point at its samples' mean
-    /// time, so the newest one is never ahead of now.
-    var points: [Point] {
-        var out: [Point] = []
-        var i = 0
-        while i < samples.count {
-            let key = (samples[i].at.timeIntervalSince1970 / Self.bucket).rounded(.down)
-            var j = i
-            while j < samples.count && (samples[j].at.timeIntervalSince1970 / Self.bucket).rounded(.down) == key { j += 1 }
-            let group = samples[i..<j]
-            let n = Double(group.count)
-            var inUse: [String: Double] = [:]
-            var active: [String: Double] = [:]
-            for s in group {
-                for (k, v) in s.inUse { inUse[k, default: 0] += Double(v) / n }
-                for (k, v) in s.active { active[k, default: 0] += v / n }
-            }
-            out.append(Point(
-                at: Date(timeIntervalSince1970: group.reduce(0) { $0 + $1.at.timeIntervalSince1970 } / n),
-                load: group.reduce(0) { $0 + $1.load } / n,
-                inUse: inUse, active: active))
-            i = j
+    func color(_ project: String) -> Color {
+        let palette: [Color] = [.blue, .orange, .green, .purple, .red, .teal, .yellow, .brown, .indigo, .pink, .mint, .cyan]
+        return palette[(slots[project] ?? 0) % palette.count]
+    }
+
+    /// The projects running now, the most cores first.
+    var rows: [Row] {
+        guard let s = status else { return [] }
+        var held: [String: Int] = [:]
+        var used: [String: Double] = [:]
+        for h in s.holders {
+            held[Self.project(h.label), default: 0] += h.cores
+            used[Self.project(h.label), default: 0] += h.using ?? 0
         }
-        return out
+        return held.map { Row(project: $0.key, held: $0.value, used: used[$0.key] ?? 0) }
+            .sorted { $0.held != $1.held ? $0.held > $1.held : $0.project < $1.project }
     }
 
-    /// Every project seen in these points, in the order the charts stack and color them.
-    static func names(_ points: [Point]) -> [String] {
-        Set(points.flatMap { $0.inUse.keys }).sorted()
-    }
-
-    /// Every point's cores for every project, 0 where a project had none, so
-    /// the stacked areas share every point and a project's band ends where
-    /// it ended rather than sloping to the next point that names it.
-    static func bands(_ points: [Point], _ names: [String], _ value: (Point) -> [String: Double]) -> [Band] {
-        points.flatMap { p in names.map { Band(project: $0, at: p.at, cores: value(p)[$0] ?? 0) } }
-    }
-
-    /// The cores in use stacked by hand, project on project in `names`
-    /// order, so each project's band can carry a style of its own.
-    static func slices(_ points: [Point], _ names: [String]) -> [Slice] {
-        points.flatMap { p -> [Slice] in
-            var low = 0.0
-            return names.map { n in
-                let cores = p.inUse[n] ?? 0
-                defer { low += cores }
-                return Slice(project: n, at: p.at, low: low, high: low + cores, busy: cores >= 0.05 ? (p.active[n] ?? 0) / cores : nil)
-            }
+    var waiting: [Waiting] {
+        (status?.waiters ?? []).map { w in
+            Waiting(id: w.order, label: w.label.isEmpty ? w.command : w.label,
+                    cores: w.exclusive ? "every core" : (w.max > w.cores ? "\(w.cores)–\(w.max) cores" : "\(w.cores) cores"),
+                    since: w.since)
         }
     }
 
-    private func project(_ label: String) -> String {
+    static func project(_ label: String) -> String {
         label.isEmpty ? "unlabelled" : String(label.split(separator: ":", maxSplits: 1).first ?? "")
     }
+}
+
+/// The time axis: an hour, with the recent past wide on the right and the older past narrow on
+/// the left. A moment `age` seconds ago sits at -√age, so the last minute takes an eighth of
+/// the width and the last 15 minutes half.
+enum TimeAxis {
+    static func x(_ age: TimeInterval) -> Double { -max(age, 0).squareRoot() }
+    static func age(_ x: Double) -> TimeInterval { x * x }
+    static let start = x(GraphModel.keep)
+    static let ticks: [(age: TimeInterval, label: String)] = [(3600, "1h ago"), (1800, "30m"), (900, "15m"), (300, "5m"), (60, "1m"), (0, "now")]
 }
 
 struct GraphsView: View {
     let model: GraphModel
     @State private var tab = 0
+    @State private var hover: Double?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Picker("", selection: $tab) {
-                Text("Live").tag(0)
+                Text("Now").tag(0)
                 Text("History").tag(1)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(maxWidth: 240)
-            if tab == 0 { live } else { history }
+            .frame(maxWidth: 200)
+            if tab == 0 { now } else { history }
         }
         .padding(16)
-        .frame(minWidth: 560, minHeight: 520)
+        .frame(minWidth: 560, minHeight: 480)
     }
 
-    // MARK: Live
+    // MARK: Now
 
-    /// The projects' colors, and what the shades of a band in use mean.
-    private func legend(_ names: [String]) -> some View {
-        let colors = Self.colors(names.count)
-        return HStack(spacing: 12) {
-            ForEach(Array(names.enumerated()), id: \.element) { i, name in
-                HStack(spacing: 4) {
-                    Circle().fill(colors[i]).frame(width: 8, height: 8)
-                    Text(name).font(.caption).foregroundStyle(.secondary)
-                }
-            }
-            Spacer()
-            if !names.isEmpty {
-                Text("lighter: less active than its cores · darker: more").font(.caption).foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    /// A project's band in use, shaded along time by how busy its cores are:
-    /// its color where cores active match cores in use, lighter toward idle,
-    /// darker toward twice as busy. The gradient runs across the band's
-    /// extent, which is the whole span, since every point has a slice.
-    static func shading(_ slices: [GraphModel.Slice], base: Color, span: ClosedRange<Date>) -> LinearGradient {
-        let width = span.upperBound.timeIntervalSince(span.lowerBound)
-        let stops: [Gradient.Stop] = slices.compactMap { sl in
-            guard let busy = sl.busy, width > 0 else { return nil }
-            return .init(color: shade(base, busy), location: sl.at.timeIntervalSince(span.lowerBound) / width)
-        }
-        return LinearGradient(stops: stops.isEmpty ? [.init(color: base, location: 0)] : stops, startPoint: .leading, endPoint: .trailing)
-    }
-
-    static func shade(_ base: Color, _ busy: Double) -> Color {
-        let c = NSColor(base).usingColorSpace(.sRGB) ?? .gray
-        if busy < 1 { return Color(nsColor: c.blended(withFraction: 0.65 * (1 - max(busy, 0)), of: .white) ?? c) }
-        return Color(nsColor: c.blended(withFraction: 0.5 * min(busy - 1, 1), of: .black) ?? c)
-    }
-
-    /// Distinct colors for the projects, in order, repeating only past a dozen.
-    static func colors(_ n: Int) -> [Color] {
-        let palette: [Color] = [.blue, .orange, .green, .purple, .red, .teal, .yellow, .brown, .indigo, .pink, .mint, .gray]
-        return (0..<max(n, 1)).map { palette[$0 % palette.count] }
-    }
-
-    /// Two charts, each a stack of one band per project in the same colors: the cores cpuq has
-    /// handed out against the budget, and the cores those jobs keep busy with the machine's load
-    /// over them. Monotone curves are soft yet never overshoot a point, so a band stays at 0 or
-    /// above and peaks where the data peaks.
-    private var live: some View {
-        let points = model.points
-        let names = GraphModel.names(points)
-        let span: ClosedRange<Date> = {
-            guard let first = points.first?.at, let last = points.last?.at, first < last else { return Date().addingTimeInterval(-60)...Date() }
-            return first...last
-        }()
-        let top = Double(max(model.budget, 1))
-        let loadTop = points.map(\.load).max() ?? 0
-        let slices = GraphModel.slices(points, names)
-        return VStack(alignment: .leading, spacing: 16) {
-            Text("Cores in use, by project").font(.headline)
+    private var now: some View {
+        let end = model.samples.last?.at ?? Date()
+        let samples = model.samples
+        let budget = Double(max(model.status?.budget ?? 0, 1))
+        let names = Set(samples.flatMap { $0.held.keys }).sorted()
+        let top = max(budget, samples.map { Double($0.held.values.reduce(0, +)) }.max() ?? 0, samples.map(\.used).max() ?? 0) + 1
+        let x = { (d: Date) in TimeAxis.x(end.timeIntervalSince(d)) }
+        let spans = Self.spans(samples, end: end)
+        let pointed = hover.map { h in end.addingTimeInterval(-TimeAxis.age(h)) }
+            .flatMap { at in samples.min { abs($0.at.timeIntervalSince(at)) < abs($1.at.timeIntervalSince(at)) } }
+        return VStack(alignment: .leading, spacing: 12) {
+            summary(pointed, end: end)
             Chart {
-                ForEach(Array(names.enumerated()), id: \.element) { i, name in
-                    let mine = slices.filter { $0.project == name }
-                    ForEach(mine) { sl in
-                        AreaMark(x: .value("Time", sl.at), yStart: .value("Cores", sl.low), yEnd: .value("Cores", sl.high), series: .value("Project", name))
-                            .foregroundStyle(Self.shading(mine, base: Self.colors(names.count)[i], span: span))
-                            .interpolationMethod(.monotone)
+                // Cores held: steps, as cores are handed out whole.
+                ForEach(spans) { s in
+                    ForEach(names, id: \.self) { name in
+                        AreaMark(x: .value("Time", x(s.from)), y: .value("Cores", s.held[name] ?? 0), stacking: .standard)
+                            .foregroundStyle(by: .value("Project", name))
+                            .interpolationMethod(.stepEnd)
                     }
                 }
-                RuleMark(y: .value("Budget", top))
+                RuleMark(y: .value("Cores", budget))
                     .foregroundStyle(.secondary)
                     .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
-                    .annotation(position: .top, alignment: .trailing) { Text("budget \(model.budget)").font(.caption).foregroundStyle(.secondary) }
-            }
-            .chartXScale(domain: span)
-            .chartYScale(domain: 0...top + 1)
-            .frame(minHeight: 170)
-            legend(names)
-
-            Text("Cores active, by project").font(.headline)
-            Chart {
-                ForEach(GraphModel.bands(points, names, \.active)) { b in
-                    AreaMark(x: .value("Time", b.at), y: .value("Cores", b.cores), stacking: .standard)
-                        .foregroundStyle(by: .value("Project", b.project))
-                        .interpolationMethod(.monotone)
+                    .annotation(position: .top, alignment: .leading) { Text("budget \(Int(budget))").font(.caption).foregroundStyle(.secondary) }
+                // Someone waiting: a red bar just above the budget line.
+                ForEach(Self.waits(samples, end: end), id: \.0) { from, to in
+                    RectangleMark(xStart: .value("Time", x(from)), xEnd: .value("Time", x(to)),
+                                  yStart: .value("Cores", budget + 0.25), yEnd: .value("Cores", budget + 0.55))
+                        .foregroundStyle(.red.opacity(0.8))
                 }
-                ForEach(points) { p in
-                    LineMark(x: .value("Time", p.at), y: .value("Cores", p.load), series: .value("Series", "load"))
-                        .foregroundStyle(Color.primary.opacity(0.55))
-                        .interpolationMethod(.monotone)
-                        .lineStyle(StrokeStyle(lineWidth: 1.5, lineCap: .round, dash: [4, 3]))
+                // CPU used: measured, so lines, averaged over spans as wide on screen as each other.
+                ForEach(spans) { p in
+                    LineMark(x: .value("Time", x(p.at)), y: .value("Cores", p.used), series: .value("Line", "used"))
+                        .foregroundStyle(Color.primary)
+                        .lineStyle(StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+                    LineMark(x: .value("Time", x(p.at)), y: .value("Cores", p.other), series: .value("Line", "other"))
+                        .foregroundStyle(Color.secondary)
+                        .lineStyle(StrokeStyle(lineWidth: 1.5, lineCap: .round, dash: [2, 3]))
                 }
-                if let last = points.last {
-                    PointMark(x: .value("Time", last.at), y: .value("Cores", last.load))
-                        .opacity(0)
-                        .annotation(position: .top, alignment: .trailing) { Text("load").font(.caption).foregroundStyle(.secondary) }
+                if let hover {
+                    RuleMark(x: .value("Time", hover)).foregroundStyle(.secondary.opacity(0.6))
                 }
             }
-            .chartForegroundStyleScale(domain: names, range: Self.colors(names.count))
-            .chartXScale(domain: span)
-            .chartYScale(domain: 0...max(top, loadTop) + 1)
+            .chartForegroundStyleScale(domain: names, range: names.map(model.color))
             .chartLegend(.hidden)
-            .frame(minHeight: 170)
-            if model.samples.isEmpty {
-                Text("Samples appear every 3 seconds while Cpuq runs; the charts average them over 30 seconds.").font(.caption).foregroundStyle(.secondary)
+            .chartXScale(domain: TimeAxis.start...0)
+            .chartXAxis {
+                AxisMarks(values: TimeAxis.ticks.map { TimeAxis.x($0.age) }) { v in
+                    AxisGridLine()
+                    AxisValueLabel {
+                        if let d = v.as(Double.self), let t = TimeAxis.ticks.first(where: { abs(TimeAxis.x($0.age) - d) < 0.01 }) { Text(t.label) }
+                    }
+                }
+            }
+            .chartYScale(domain: 0...top)
+            .chartYAxisLabel("cores")
+            .chartXSelection(value: $hover)
+            .frame(minHeight: 220)
+            key
+            table
+        }
+    }
+
+    /// One line on what the machine is doing now, or at the moment under the pointer.
+    private func summary(_ at: GraphModel.Sample?, end: Date) -> some View {
+        let s = model.status
+        let held = at.map { $0.held.values.reduce(0, +) } ?? s?.held ?? 0
+        let budget = at?.budget ?? s?.budget ?? 0
+        let used = at?.used ?? s?.holders.reduce(0) { $0 + ($1.using ?? 0) } ?? 0
+        let waiting = at?.waiting ?? s?.waiters.count ?? 0
+        var line = Text(at.map { age(end.timeIntervalSince($0.at)) + " ago   " } ?? "")
+        line = line + Text("\(held) of \(budget) cores held").bold()
+        line = line + Text(String(format: " · %.1f used", used))
+        line = line + Text(" · \(waiting) waiting").foregroundColor(waiting > 0 ? .red : nil)
+        if at == nil, let load = s?.load.first { line = line + Text(String(format: " · load %.1f", load)).foregroundColor(.secondary) }
+        return line.font(.title3).monospacedDigit()
+    }
+
+    private var key: some View {
+        HStack(spacing: 16) {
+            Label { Text("cores held, by project") } icon: { RoundedRectangle(cornerRadius: 2).fill(.secondary.opacity(0.5)).frame(width: 14, height: 9) }
+            Label { Text("CPU used by cpuq's jobs") } icon: { Rectangle().fill(Color.primary).frame(width: 14, height: 1.5) }
+            Label { Text("other processes") } icon: { Rectangle().fill(Color.secondary).frame(width: 14, height: 1.5) }
+            Label { Text("waiting") } icon: { Rectangle().fill(.red.opacity(0.8)).frame(width: 14, height: 4) }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+
+    /// Who holds what now, and who waits: the legend and the numbers in one.
+    private var table: some View {
+        Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 4) {
+            GridRow {
+                Text("Project")
+                Text("Held").gridColumnAlignment(.trailing)
+                Text("Used").gridColumnAlignment(.trailing)
+                Text("Of held").gridColumnAlignment(.trailing)
+            }
+            .font(.caption.bold()).foregroundStyle(.secondary)
+            ForEach(model.rows) { r in
+                GridRow {
+                    HStack(spacing: 6) { Circle().fill(model.color(r.project)).frame(width: 8, height: 8); Text(r.project) }
+                    Text("\(r.held)")
+                    Text(String(format: "%.1f", r.used))
+                    Text(r.held > 0 ? "\(Int((r.used / Double(r.held) * 100).rounded()))%" : "–")
+                        .foregroundStyle(r.used * 2 < Double(r.held) ? Color.orange : Color.secondary)
+                }
+            }
+            ForEach(model.waiting) { w in
+                GridRow {
+                    HStack(spacing: 6) { Circle().strokeBorder(.red, lineWidth: 1.5).frame(width: 8, height: 8); Text(w.label) }
+                    Text("waiting \(age(Date().timeIntervalSince1970 - Double(w.since))) for \(w.cores)")
+                        .foregroundStyle(.red).gridCellColumns(3)
+                }
+            }
+            if model.rows.isEmpty && model.waiting.isEmpty {
+                GridRow { Text("Nothing running or waiting.").foregroundStyle(.secondary).gridCellColumns(4) }
             }
         }
+        .font(.callout)
+        .monospacedDigit()
+    }
+
+    /// The spans in which someone waited.
+    static func waits(_ s: [GraphModel.Sample], end: Date) -> [(Date, Date)] {
+        var out: [(Date, Date)] = []
+        var from: Date?
+        for (i, x) in s.enumerated() {
+            if x.waiting > 0, from == nil { from = x.at }
+            if x.waiting == 0, let f = from { out.append((f, x.at)); from = nil }
+            if i == s.count - 1, let f = from { out.append((f, end)) }
+        }
+        return out
+    }
+
+    /// The samples averaged over spans about √age seconds wide: one sample (3 s) near now, a
+    /// minute an hour ago, so each span takes about as much of the axis as the next. Near now a
+    /// span's cores held are the whole numbers handed out; further back, a busy stretch of short
+    /// jobs averages into one block rather than a sliver per job. The last span is repeated at
+    /// `end`, so the steps reach the right edge.
+    struct Span: Identifiable {
+        var id: Date { from }
+        let from: Date
+        /// The mean time of its samples, where its measured values are drawn.
+        let at: Date
+        let held: [String: Double]
+        let used: Double
+        let other: Double
+    }
+
+    static func spans(_ s: [GraphModel.Sample], end: Date) -> [Span] {
+        var out: [Span] = []
+        var group: [GraphModel.Sample] = []
+        func flush() {
+            guard let first = group.first else { return }
+            let n = Double(group.count)
+            var held: [String: Double] = [:]
+            for x in group { for (k, v) in x.held { held[k, default: 0] += Double(v) / n } }
+            out.append(Span(from: first.at, at: Date(timeIntervalSince1970: group.reduce(0) { $0 + $1.at.timeIntervalSince1970 } / n),
+                            held: held, used: group.reduce(0) { $0 + $1.used } / n, other: group.reduce(0) { $0 + $1.other } / n))
+            group = []
+        }
+        // From the oldest: a span closes once it is as long as the square root of its age.
+        for x in s {
+            if let first = group.first, x.at.timeIntervalSince(first.at) >= max(end.timeIntervalSince(first.at).squareRoot(), 3) { flush() }
+            group.append(x)
+        }
+        flush()
+        if let last = out.last, last.from < end {
+            out.append(Span(from: end, at: end, held: last.held, used: last.used, other: last.other))
+        }
+        return out
     }
 
     // MARK: History
 
     private var history: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Active of in use, per project (average per job)").font(.headline)
-            Chart {
-                ForEach(model.projects) { p in
-                    // Active drawn over in use, both from 0: overlaid, not stacked.
-                    BarMark(xStart: .value("Cores", 0), xEnd: .value("Cores", p.inUse), y: .value("Project", p.project), height: .ratio(0.6))
-                        .foregroundStyle(Color.teal.opacity(0.35))
-                        .annotation(position: .trailing) {
-                            Text(String(format: "%.1f of %.1f · %d %@", p.active, p.inUse, p.jobs, p.jobs == 1 ? "job" : "jobs")).font(.caption).foregroundStyle(.secondary)
-                        }
-                    BarMark(xStart: .value("Cores", 0), xEnd: .value("Cores", p.active), y: .value("Project", p.project), height: .ratio(0.6))
-                        .foregroundStyle(p.active * 2 < p.inUse ? Color.yellow : Color.green)
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Finished jobs by project, from cpuq history").font(.headline)
+            Table(model.totals) {
+                TableColumn("Project") { t in
+                    HStack(spacing: 6) { Circle().fill(model.color(t.project)).frame(width: 8, height: 8); Text(t.project) }
                 }
-            }
-            .frame(minHeight: 160)
-
-            Text("Waits, the latest jobs").font(.headline)
-            Chart {
-                ForEach(model.waits) { w in
-                    BarMark(x: .value("Ended", w.ended), y: .value("Seconds", w.waited))
-                        .foregroundStyle(by: .value("Label", w.label))
+                TableColumn("Jobs") { t in Text("\(t.jobs)").monospacedDigit() }.width(50)
+                TableColumn("Core-hours held") { t in Text(String(format: "%.2f", t.held)).monospacedDigit() }
+                TableColumn("Used") { t in Text(String(format: "%.2f", t.used)).monospacedDigit() }
+                TableColumn("Of held") { t in
+                    Text("\(Int((t.efficiency * 100).rounded()))%").monospacedDigit()
+                        .foregroundStyle(t.efficiency < 0.5 ? Color.orange : Color.primary)
                 }
+                TableColumn("Median wait") { t in Text(age(t.medianWait)).monospacedDigit() }
+                TableColumn("Longest wait") { t in Text(age(t.longestWait)).monospacedDigit() }
             }
-            .chartLegend(.hidden)
-            .frame(minHeight: 160)
-            if model.projects.isEmpty && model.waits.isEmpty {
+            if model.totals.isEmpty {
                 Text("cpuq history has no finished jobs yet.").font(.caption).foregroundStyle(.secondary)
             }
         }
