@@ -573,6 +573,26 @@ t_lend() {
   export CPUQ_BUDGET=9
 }
 
+t_config_reload() {
+  setup config_reload "budget = 9"
+  # A waiter takes up a budget raised while it waits (from the config, not
+  # CPUQ_BUDGET, which the environment would fix for the run).
+  unset CPUQ_BUDGET
+  "$CPUQ" run --cores 9 -- sleep 6 & local h=$!
+  wait_held 9
+  local t0; t0=$(now)
+  "$CPUQ" run --cores 2 -- true & local w=$!
+  wait_waiters 1
+  sleep 0.6
+  echo "budget = 11" >>"$CPUQ_CONFIG"
+  wait $w
+  local dt; dt=$(python3 -c "print('%.1f' % ($(now) - $t0))")
+  kill $h 2>/dev/null; wait $h 2>/dev/null
+  export CPUQ_BUDGET=9
+  echo "  the waiter started after ${dt}s (the holder runs 6s)"
+  check "a waiter takes up a budget raised in the config while it waits (${dt}s)" "python3 -c 'import sys; sys.exit(0 if $dt < 4 else 1)'"
+}
+
 t_zombie() {
   setup zombie
   # A child spins a second, then waits as a zombie until its parent reaps
@@ -785,7 +805,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host wait history zombie fixed_hint backfill backfill_known lend outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host wait history zombie fixed_hint backfill backfill_known lend config_reload outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

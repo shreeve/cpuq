@@ -507,7 +507,9 @@ struct GraphsView: View {
                         .foregroundStyle(Color.secondary.opacity(0.35))
                 }
             }
-            RuleMark(y: .value("Core", y(budget))).foregroundStyle(.secondary.opacity(0.5)).lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+            if abs(budget - cpus) >= 0.5 {
+                RuleMark(y: .value("Core", y(budget))).foregroundStyle(.secondary.opacity(0.5)).lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+            }
             RuleMark(y: .value("Core", y(cpus))).foregroundStyle(.secondary.opacity(0.6)).lineStyle(StrokeStyle(lineWidth: 1))
             if let h = hover { RuleMark(x: .value("Time", Double(h.x))).foregroundStyle(.secondary.opacity(0.6)) }
         }
@@ -520,8 +522,12 @@ struct GraphsView: View {
                 AxisValueLabel { if let d = v.as(Double.self) { Text("\(Int(d) + 1)") } }
             }
             AxisMarks(position: .leading, values: [-1.4]) { _ in AxisValueLabel { Text("waiting").foregroundStyle(.red) } }
-            AxisMarks(position: .leading, values: [y(budget), y(cpus)]) { v in
-                AxisValueLabel { if let d = v.as(Double.self) { Text(abs(d - y(cpus)) < 0.01 ? "\(Int(cpus)) CPUs" : "\(Int(budget))").font(.caption2) } }
+            AxisMarks(position: .leading, values: abs(budget - cpus) < 0.5 ? [y(cpus)] : [y(budget), y(cpus)]) { v in
+                AxisValueLabel {
+                    if let d = v.as(Double.self) {
+                        Text(abs(budget - cpus) < 0.5 ? "\(Int(cpus)) = budget" : abs(d - y(cpus)) < 0.01 ? "\(Int(cpus)) CPUs" : "\(Int(budget))").font(.caption2)
+                    }
+                }
             }
             AxisMarks(position: .trailing, values: [base + height * 0.3]) { _ in AxisValueLabel { Text("Mac").foregroundStyle(.secondary) } }
         }
@@ -610,10 +616,16 @@ struct GraphsView: View {
                 }
             }
             waitingRow(waits)
-            RuleMark(y: .value("Cores", budget)).foregroundStyle(.secondary.opacity(0.6)).lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
-                .annotation(position: .top, alignment: .leading, spacing: 1) { Text("budget \(Int(budget))").font(.caption2).foregroundStyle(.secondary) }
-            RuleMark(y: .value("Cores", cpus)).foregroundStyle(.secondary.opacity(0.6))
-                .annotation(position: .top, alignment: .leading, spacing: 1) { Text("\(Int(cpus)) CPUs").font(.caption2).foregroundStyle(.secondary) }
+            // One line when the budget is the CPU count, so the labels never overlap.
+            if abs(budget - cpus) < 0.5 {
+                RuleMark(y: .value("Cores", cpus)).foregroundStyle(.secondary.opacity(0.6))
+                    .annotation(position: .top, alignment: .leading, spacing: 1) { Text("budget \(Int(budget)) = CPUs").font(.caption2).foregroundStyle(.secondary) }
+            } else {
+                RuleMark(y: .value("Cores", budget)).foregroundStyle(.secondary.opacity(0.6)).lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                    .annotation(position: .top, alignment: .leading, spacing: 1) { Text("budget \(Int(budget))").font(.caption2).foregroundStyle(.secondary) }
+                RuleMark(y: .value("Cores", cpus)).foregroundStyle(.secondary.opacity(0.6))
+                    .annotation(position: .top, alignment: .trailing, spacing: 1) { Text("\(Int(cpus)) CPUs").font(.caption2).foregroundStyle(.secondary) }
+            }
             if let h = hover { RuleMark(x: .value("Time", Double(h.x))).foregroundStyle(.secondary.opacity(0.6)) }
         }
         .chartLegend(.hidden)

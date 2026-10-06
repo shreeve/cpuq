@@ -3,6 +3,11 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.4.3 — 2026-10-06
+
+- When the budget is the CPU count, the chart draws one line, "budget 10 = CPUs", instead of
+  two labels on top of each other.
+
 ## 0.4.2 — 2026-10-05
 
 - Right-click the chart to clear what is older than the point clicked, or to keep only the last

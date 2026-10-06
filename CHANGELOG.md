@@ -2,6 +2,12 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.6.2 — 2026-10-06
+
+- A run already waiting re-reads the config file when it changes, so a new
+  budget or margin applies at once instead of only to runs started after
+  it. An invalid file keeps the settings in force and says so.
+
 ## 0.6.1 — 2026-10-06
 
 - Lending is no longer capped at the CPU count: only idle cores are lent,

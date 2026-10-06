@@ -233,7 +233,9 @@ count oversubscribes it on purpose. The config file is `CPUQ_CONFIG`, default
 | `lend` | on | lend the head the cores a running job leaves idle |
 | `lend_after` | 60 | seconds a core must stay idle before it is lent |
 
-An invalid line is an error naming the file and line.
+An invalid line is an error naming the file and line. A run already
+waiting re-reads the file when it changes, so a new budget applies at once;
+an invalid edit keeps the settings in force and says so.
 
 ### Priority and scheduling class
 

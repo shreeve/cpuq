@@ -67,6 +67,8 @@ const Ctx = struct {
     out: *Io.Writer,
     cfg: policy.Config = .{},
     cfg_path: []const u8 = "",
+    /// The config file's modification time when last read (0: none read).
+    cfg_mtime: i96 = 0,
 };
 
 pub fn main(init: std.process.Init) void {
@@ -130,6 +132,7 @@ fn loadConfig(ctx: *Ctx) void {
         break :blk std.mem.concat(ctx.arena, u8, &.{ home, "/.config/cpuq/config" }) catch fail("out of memory", .{});
     };
     ctx.cfg_path = path;
+    if (Io.Dir.cwd().statFile(ctx.io, path, .{})) |st| ctx.cfg_mtime = st.mtime.nanoseconds else |_| {}
     const text = Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.arena, .limited(1 << 20)) catch |err| switch (err) {
         error.FileNotFound => return,
         else => fail("{s}: {t}", .{ path, err }),
@@ -139,6 +142,31 @@ fn loadConfig(ctx: *Ctx) void {
         std.debug.print("cpuq: {s}:{d}: {s} ({s})\n", .{ path, diag.line, diag.message, diag.key });
         std.process.exit(exit_usage);
     };
+}
+
+/// Re-reads the config file when it has changed since it was read, so a run
+/// already waiting takes up a new budget or margin. An invalid file keeps
+/// the settings in force, and says so once.
+fn reloadConfig(ctx: *Ctx) void {
+    if (ctx.cfg_path.len == 0) return;
+    const st = Io.Dir.cwd().statFile(ctx.io, ctx.cfg_path, .{}) catch {
+        // Gone: back to the defaults, once.
+        if (ctx.cfg_mtime != 0) {
+            ctx.cfg = .{};
+            ctx.cfg_mtime = 0;
+        }
+        return;
+    };
+    if (st.mtime.nanoseconds == ctx.cfg_mtime) return;
+    ctx.cfg_mtime = st.mtime.nanoseconds;
+    const text = Io.Dir.cwd().readFileAlloc(ctx.io, ctx.cfg_path, ctx.arena, .limited(1 << 20)) catch return;
+    var cfg: policy.Config = .{};
+    var diag: policy.Diagnostic = .{};
+    policy.parseConfig(text, &cfg, &diag) catch {
+        std.debug.print("cpuq: {s}:{d}: {s} ({s}); keeping the settings in force\n", .{ ctx.cfg_path, diag.line, diag.message, diag.key });
+        return;
+    };
+    ctx.cfg = cfg;
 }
 
 /// The state directory: CPUQ_DIR, else /tmp/cpuq-UID with /tmp resolved
@@ -440,7 +468,7 @@ fn lockOrFail(st: *state.State) void {
 /// machine gates.
 fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
     const io = ctx.io;
-    const cfg = ctx.cfg;
+    var cfg = ctx.cfg;
     const named = o.lease != null;
     const cores: u32 = if (named) o.slots else sys.totalCpus(io);
     const start = nowSeconds(io);
@@ -471,6 +499,8 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
     // Run times from history, read once when backfill first needs them.
     var run_times: ?RunTimes = null;
     while (true) {
+        reloadConfig(ctx);
+        cfg = ctx.cfg;
         var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
         defer scratch.deinit();
         const a = scratch.allocator();
