@@ -222,9 +222,9 @@ final class GraphModel {
     /// A project's place in the palette, which also orders the stacked chart.
     func slot(_ project: String) -> Int { slots[project] ?? Int.max }
 
-    /// Project colors: the system's bright hues, less red, orange and pink (they mean waiting
-    /// and a shut gate), and less teal and cyan, too near blue; grey means work outside cpuq.
-    static let palette: [Color] = [.blue, .green, .purple, .yellow, .mint, .brown, .indigo]
+    /// Project colors: the system's bright hues, less red and pink (red means waiting), the most
+    /// distinct first; grey means work outside cpuq.
+    static let palette: [Color] = [.blue, .orange, .green, .purple, .yellow, .cyan, .mint, .brown, .indigo, .teal]
 
     func color(_ project: String) -> Color {
         Self.palette[(slots[project] ?? 0) % Self.palette.count]
@@ -504,30 +504,9 @@ struct GraphsView: View {
         }
     }
 
-    /// A project's held but idle cores: its color in diagonal stripes over a pale wash, so waste
-    /// stands apart from free cores and from busy ones.
-    @MainActor private static var hatches: [Int: ImagePaint] = [:]
-    static func hatch(_ color: Color) -> ImagePaint {
-        let key = color.hashValue
-        if let h = hatches[key] { return h }
-        let n = 7.0
-        let image = NSImage(size: NSSize(width: n, height: n), flipped: false) { r in
-            NSColor(color).withAlphaComponent(0.16).setFill()
-            r.fill()
-            NSColor(color).withAlphaComponent(0.85).setStroke()
-            let p = NSBezierPath()
-            p.lineWidth = 1.4
-            for o in [-n, 0, n] {
-                p.move(to: NSPoint(x: o, y: 0))
-                p.line(to: NSPoint(x: o + n, y: n))
-            }
-            p.stroke()
-            return true
-        }
-        let paint = ImagePaint(image: Image(nsImage: image))
-        hatches[key] = paint
-        return paint
-    }
+    /// How strongly a held core's color shows: pale while idle, full while busy, never so pale
+    /// it reads as free.
+    static func shade(_ busy: Double) -> Double { 0.3 + 0.65 * min(max(busy, 0), 1) }
 
     /// Stretches the gate was shut (by memory pressure or the load valve; spacing, a pause of
     /// seconds between admissions, is left out), shaded across a chart from `low` to `high`, and
@@ -554,13 +533,13 @@ struct GraphsView: View {
     }
 
     /// What the marks mean. States are drawn in grey here, since every project has its own
-    /// color: solid where busy, striped where held but idle.
+    /// color: solid where busy, pale where held but idle.
     private var key: some View {
         let swatch = { (c: Color, h: CGFloat) in RoundedRectangle(cornerRadius: 2).fill(c).frame(width: 14, height: h) }
         let grey = Color(white: 0.45)
         let cores = Group {
             Label { Text("busy") } icon: { swatch(grey, 10) }
-            Label { Text("held, idle") } icon: { RoundedRectangle(cornerRadius: 2).fill(Self.hatch(grey)).frame(width: 14, height: 10) }
+            Label { Text("held, idle") } icon: { swatch(grey.opacity(Self.shade(0)), 10) }
             Label { Text("held, not measured") } icon: { swatch(grey.opacity(0.6), 3) }
             Label { Text("borrowed (edge: owner)") } icon: { VStack(spacing: 0) { swatch(.primary.opacity(0.8), 3); swatch(grey.opacity(0.7), 7) } }
             Label { Text("free") } icon: { swatch(.secondary.opacity(0.12), 10) }
@@ -682,8 +661,8 @@ struct GraphsView: View {
 
     // MARK: Lanes
 
-    /// The lanes, one per core of the budget: a held core striped in its project's color,
-    /// filled in as far as the job keeps it busy.
+    /// The lanes, one per core of the budget: a held core in its project's color, pale while
+    /// idle and full as far as the job keeps it busy.
     private func lanesChart(axis: TimeAxis, lanes: Int, cells: [Cell], machine: [MachineColumn?], labelGate: Bool) -> some View {
         Chart {
             gateBands(machine, low: 0, high: Double(lanes), label: labelGate)
@@ -692,12 +671,7 @@ struct GraphsView: View {
                 if let p = c.project, c.measured {
                     RectangleMark(xStart: .value("Time", x0), xEnd: .value("Time", x1),
                                   yStart: .value("Core", Double(c.lane) + 0.1), yEnd: .value("Core", Double(c.lane) + 0.9))
-                        .foregroundStyle(Self.hatch(model.color(p)))
-                    if c.busy > 0.02 {
-                        RectangleMark(xStart: .value("Time", x0), xEnd: .value("Time", x1),
-                                      yStart: .value("Core", Double(c.lane) + 0.1), yEnd: .value("Core", Double(c.lane) + 0.9))
-                            .foregroundStyle(model.color(p).opacity(min(1, 0.15 + c.busy)))
-                    }
+                        .foregroundStyle(model.color(p).opacity(Self.shade(c.busy)))
                 } else if let p = c.project {
                     RectangleMark(xStart: .value("Time", x0), xEnd: .value("Time", x1),
                                   yStart: .value("Core", Double(c.lane) + 0.4), yEnd: .value("Core", Double(c.lane) + 0.6))
@@ -832,7 +806,7 @@ struct GraphsView: View {
 
     /// Each column's cores held, stacked: every project's busy cores first, from the floor, in
     /// palette order, so the busy total reads off one edge; then every project's idle cores
-    /// above them, striped, so the waste sits on top where it shows.
+    /// above them, pale, so the waste sits on top where it shows.
     static func bands(_ m: GraphModel, columns: [(from: Date, to: Date)], end: Date) -> [Band] {
         var out: [Band] = []
         for (c, column) in columns.enumerated() {
@@ -868,7 +842,7 @@ struct GraphsView: View {
         return out
     }
 
-    /// The cores held, stacked (busy solid from the floor, idle striped above), with the
+    /// The cores held, stacked (busy solid from the floor, idle pale above), with the
     /// budget. It shares the time axis of the views around it.
     private func stackChart(axis: TimeAxis, machine: [MachineColumn?], labelGate: Bool) -> some View {
         let cpus = Double(ProcessInfo.processInfo.activeProcessorCount)
@@ -881,8 +855,7 @@ struct GraphsView: View {
             ForEach(bands) { b in
                 RectangleMark(xStart: .value("Time", Double(b.column) + 0.06), xEnd: .value("Time", Double(b.column) + 0.94),
                               yStart: .value("Cores", b.low), yEnd: .value("Cores", b.high))
-                    .foregroundStyle(b.kind == .idle ? AnyShapeStyle(Self.hatch(model.color(b.project)))
-                                     : AnyShapeStyle(model.color(b.project).opacity(b.kind == .busy ? 0.95 : 0.5)))
+                    .foregroundStyle(model.color(b.project).opacity(b.kind == .busy ? 0.95 : b.kind == .idle ? Self.shade(0) : 0.5))
             }
             RuleMark(y: .value("Cores", budget)).foregroundStyle(Color.primary.opacity(0.35))
             if abs(budget - cpus) >= 0.5 {

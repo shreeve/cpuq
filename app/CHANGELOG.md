@@ -3,6 +3,13 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.8.2 — 2026-10-06
+
+- No more stripes: a held but idle core is a pale tint of its project's color (a little
+  stronger than before 0.8.0, so it never reads as a free core), filling in as it gets busy.
+- Orange, cyan and mint are back among the project colors; only red and pink stay out, since
+  red means waiting.
+
 ## 0.8.1 — 2026-10-06
 
 - Back to the bright system colors for projects, as before 0.8.0, still without red, orange,
