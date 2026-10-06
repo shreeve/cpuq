@@ -7,19 +7,19 @@ notes, shown by the update dialog too.
 
 The graphs window, redone to read at a glance.
 
-- Now leads with one line: cores held of the budget, CPU used, how many wait, and the load.
-- One chart instead of two: the cores each project holds as stacked steps (cores are handed out
-  whole) against the budget, the CPU cpuq's jobs use as one line, other processes as a dotted
-  one, and a red bar above the budget while anyone waits.
+- Now leads with one line: cores in use of the budget, cores active, how many wait, and the load.
+- One chart instead of two: the cores each project has in use as stacked steps (cores are handed
+  out whole) against the budget, the cores active in cpuq's jobs as one line, those active
+  outside cpuq as a dotted one, and a red bar above the budget while anyone waits.
 - The time axis shows the whole hour with the recent past wide on the right and the older past
   narrow on the left: the last minute takes an eighth of the width, the last 15 minutes half.
-- Under the chart, a table of who holds what now, what they use and what share of it, and who
-  waits for how many cores and how long. It is the legend too.
+- Under the chart, a table of what each project has in use now, how much of it is active (the
+  share), and who waits for how many cores and how long. It is the legend too.
 - Pointing at the chart shows that moment in the top line.
 - A project keeps its color for good, assigned when first seen; colors no longer shift as
   projects come and go.
-- History is a table per project: jobs, core-hours held and used, the share used, the median
-  and longest wait.
+- History is a table per project: jobs, core-hours in use and active, the share active, the
+  median and longest wait.
 - Gone: the second chart, the shading, the load line (load is a number in the top line, as it
   counts waiting threads rather than CPU) and the History charts.
 
