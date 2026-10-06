@@ -48,6 +48,8 @@ pub const Event = struct {
     /// How many of its cores were lent by holders that left them idle
     /// (started).
     lent: ?u32 = null,
+    /// Started by hand past the queue and its gates (`cpuq start`).
+    forced: ?bool = null,
 };
 
 /// The longest command kept in a line, so a line stays well under 4 KB.

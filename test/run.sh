@@ -564,12 +564,14 @@ t_lend() {
   "$CPUQ" run --cores 2 --label idle -- sleep 12 & local h=$!
   wait_held 2
   local t0; t0=$(now)
-  local out; out=$("$CPUQ" run --cores 1 --label borrower -- true 2>&1)
+  local out; out=$("$CPUQ" run --cores 1 --label borrower -- "$CPUQ" qos 2>&1)
   local dt; dt=$(python3 -c "print('%.1f' % ($(now) - $t0))")
   kill $h 2>/dev/null; wait $h 2>/dev/null
   local lent; lent=$(grep '"event":"started"' "$CPUQ_DIR/history.jsonl" | grep '"label":"borrower"' | sed -n 's/.*"lent":\([0-9]*\).*/\1/p')
   echo "  borrower started after ${dt}s, lent $lent; said: $(echo "$out" | grep lent)"
   check "a core a holder leaves idle is lent to the head (after ${dt}s, lent $lent)" "[ '$lent' = 1 ] && python3 -c 'import sys; sys.exit(0 if $dt < 9 else 1)'"
+  local qos; qos=$(echo "$out" | tail -1)
+  check "a borrower runs at background priority, so the lender comes first (got: $qos)" "[ '$qos' = background ] || [ '$qos' = 'nice 19' ] || [ '$qos' = 'nice 15' ] || [ '$qos' = 'nice 10' ]"
   export CPUQ_BUDGET=9
 }
 
@@ -625,6 +627,62 @@ t_lease_host_hold() {
   check "--hold --host prints the held entry" "echo '$out' | grep -qE '^held bench@far bench@far=[0-9]+:[0-9]+\$'"
   check "inside the hold, the lease starts at once, and holding it again holds nothing" "echo '$out' | grep -qx nested && echo '$out' | grep -qE '^again held bench@far bench@far='"
   check "others wait while it is held, and get it once it is closed" "echo '$out' | grep -qx 'other 75' && echo '$out' | grep -qx 'after 0'"
+}
+
+t_controls() {
+  setup controls
+  local f=$T/order
+  # first: b moves ahead of a.
+  "$CPUQ" run --cores 9 -- sleep 3 & wait_held 9
+  "$CPUQ" run --cores 2 --label ctl:a -- sh -c "echo a >>$f" & wait_waiters 1
+  "$CPUQ" run --cores 2 --label ctl:b -- sh -c "echo b >>$f" & wait_waiters 2
+  "$CPUQ" first ctl:b >/dev/null
+  wait
+  local order; order=$(tr '\n' ' ' <"$f")
+  check "first moves a waiter ahead (got: $order)" "[ '$order' = 'b a ' ]"
+  # start: past a full budget, at once; cancel: out of the queue with 75.
+  "$CPUQ" run --cores 9 -- sleep 6 & local h=$!
+  wait_held 9
+  local t0; t0=$(now)
+  "$CPUQ" run --cores 2 --label ctl:now -- true & local s=$!
+  "$CPUQ" run --cores 2 --label ctl:never -- true 2>/dev/null & local c=$!
+  wait_waiters 2
+  "$CPUQ" start ctl:now >/dev/null; "$CPUQ" cancel ctl:never >/dev/null
+  wait $s; local rs=$?; wait $c; local rc=$?
+  local dt; dt=$(python3 -c "print('%.1f' % ($(now) - $t0))")
+  kill $h 2>/dev/null; wait $h 2>/dev/null
+  local forced; forced=$(grep '"event":"started"' "$CPUQ_DIR/history.jsonl" | grep '"label":"ctl:now"' | grep -c '"forced":true')
+  check "start runs a waiter past a full budget at once, cancel takes one out (start $rs, cancel $rc, ${dt}s, forced $forced)" "[ $rs = 0 ] && [ $rc = 75 ] && [ '$forced' = 1 ] && python3 -c 'import sys; sys.exit(0 if $dt < 4 else 1)'"
+  # pause and resume a running job's whole tree; stop ends it.
+  "$CPUQ" run --cores 1 --label ctl:spin -- sh -c 'sleep 20' & local p=$!
+  wait_held 1
+  "$CPUQ" pause ctl:spin >/dev/null
+  local child; child=$(pgrep -f '^sleep 20$' | head -1)
+  local paused; paused=$(ps -o stat= -p "$child" | tr -d ' ')
+  local flag; flag=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print(json.load(sys.stdin)["holders"][0]["paused"])')
+  "$CPUQ" resume ctl:spin >/dev/null
+  local resumed; resumed=$(ps -o stat= -p "$child" | tr -d ' ')
+  "$CPUQ" stop ctl:spin >/dev/null
+  wait $p; local rp=$?
+  echo "  sleep while paused: $paused, after resume: $resumed; status paused: $flag; stopped with $rp"
+  check "pause stops the job's tree and status says so; resume continues it; stop ends it" "[[ '$paused' == T* ]] && [[ '$resumed' != T* ]] && [ '$flag' = True ] && [ $rp != 0 ]"
+}
+
+t_right_size() {
+  setup right_size
+  local h=$CPUQ_DIR/history.jsonl
+  mkdir -p "$CPUQ_DIR"
+  # History: "serial" uses about 0.8 of a core, "wide" about 3.5.
+  local i
+  for i in 1 2 3; do
+    printf '{"v":1,"event":"started","id":"s%s","t":1,"pid":1,"label":"serial","cores":4}\n{"v":1,"event":"ended","id":"s%s","t":11,"pid":1,"label":"serial","cores":4,"exit":0,"cpu":8}\n' $i $i >>"$h"
+    printf '{"v":1,"event":"started","id":"w%s","t":1,"pid":1,"label":"wide","cores":4}\n{"v":1,"event":"ended","id":"w%s","t":11,"pid":1,"label":"wide","cores":4,"exit":0,"cpu":35}\n' $i $i >>"$h"
+  done
+  local serial wide fixed
+  serial=$("$CPUQ" run --cores 1-4 --label serial -- sh -c 'echo $CPUQ_CORES' 2>/dev/null)
+  wide=$("$CPUQ" run --cores 1-4 --label wide -- sh -c 'echo $CPUQ_CORES' 2>/dev/null)
+  fixed=$("$CPUQ" run --cores 3 --label serial -- sh -c 'echo $CPUQ_CORES' 2>/dev/null)
+  check "a range is capped near its label's measured use (serial $serial, wide $wide), a fixed count stands ($fixed)" "[ '$serial' = 1 ] && [ '$wide' = 4 ] && [ '$fixed' = 3 ]"
 }
 
 t_zombie() {
@@ -839,7 +897,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold wait history zombie fixed_hint backfill backfill_known lend config_reload outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

@@ -25,6 +25,8 @@ const usage =
     \\       cpuq wait --label PATTERN [--max-wait SECONDS]
     \\       cpuq status [--host HOST]... [--json] [--no-usage] [--watch[=SECONDS]]
     \\       cpuq history [--label PATTERN] [--limit N] [--json]
+    \\       cpuq first|start|cancel LABEL|PID [--all]    (a waiting job)
+    \\       cpuq pause|resume|stop LABEL|PID [--all]     (a running job)
     \\       cpuq budget
     \\       cpuq qos
     \\
@@ -101,6 +103,9 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
     if (std.mem.eql(u8, cmd, "status")) return cmdStatus(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "wait")) return cmdWait(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "history")) return cmdHistory(ctx, args[1..]);
+    inline for (.{ "first", "start", "cancel", "pause", "resume", "stop" }) |action| {
+        if (std.mem.eql(u8, cmd, action)) return cmdControl(ctx, action, args[1..]);
+    }
     if (std.mem.eql(u8, cmd, "budget")) {
         const m = machine(ctx);
         ctx.out.print("{d}\n", .{budgetNow(ctx, m)}) catch {};
@@ -380,6 +385,10 @@ const Lease = struct {
     file: Io.File,
     tokens: []Io.File,
     job: JobLog,
+    /// Cores of the grant lent by holders that leave them idle: the command
+    /// then runs at background priority, so a lender that gets busy again
+    /// has its CPUs back at once.
+    borrowed: u32 = 0,
 };
 
 /// The history's record of the job this cpuq runs: its id and the fields
@@ -430,6 +439,8 @@ const EventExtra = struct {
     ahead: ?bool = null,
     /// Cores of the grant lent by holders that leave them idle.
     lent: ?u32 = null,
+    /// Started by hand past the queue (`cpuq start`).
+    forced: ?bool = null,
     slots: ?[]const u32 = null,
     exit: ?u8 = null,
     signal: ?u32 = null,
@@ -450,6 +461,7 @@ fn logEvent(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra) void {
     ev.slots = extra.slots;
     ev.ahead = extra.ahead;
     ev.lent = extra.lent;
+    ev.forced = extra.forced;
     history.append(ctx.io, path, ev);
 }
 
@@ -468,10 +480,27 @@ fn lockOrFail(st: *state.State) void {
 /// Queues this run and returns once it holds its cores, or for a named
 /// lease, one of its slots: a pool of `--slots` (1 by default), with no
 /// machine gates.
-fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
+fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
     const io = ctx.io;
     var cfg = ctx.cfg;
+    var o = asked;
     const named = o.lease != null;
+    // Run times from history, read once when right-sizing or backfill first
+    // needs them.
+    var run_times: ?RunTimes = null;
+    // Right-sizing: a range request capped near what its label has used.
+    if (!named and !o.exclusive and cfg.right_size and !o.request.fixed() and o.label.len != 0) {
+        run_times = RunTimes.load(ctx, ctx.arena);
+        if (run_times.?.uses.get(o.label)) |uses| {
+            const sized = policy.rightSize(o.request, uses.items);
+            if (sized.max < o.request.max) {
+                std.debug.print("cpuq: asked for {d}-{d} cores; {s} has used about {d:.1}, so up to {d}\n", .{ o.request.min, o.request.max, o.label, history.median(uses.items), sized.max });
+                o.request = sized;
+            }
+        }
+    }
+    // The CPUs' busy share is measured between polls.
+    var ticks = sys.cpuTicks(io);
     const cores: u32 = if (named) o.slots else sys.totalCpus(io);
     const start = nowSeconds(io);
 
@@ -498,11 +527,15 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
     var last_gate: policy.Gate = .open;
     var hinted = false;
     var hinted_fixed = false;
-    // Run times from history, read once when backfill first needs them.
-    var run_times: ?RunTimes = null;
     while (true) {
         reloadConfig(ctx);
         cfg = ctx.cfg;
+        const now_ticks = sys.cpuTicks(io);
+        var mach = machine(ctx);
+        if (ticks) |t0| if (now_ticks) |t1| {
+            mach.busy = sys.busyBetween(t0, t1);
+        };
+        ticks = now_ticks;
         var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
         defer scratch.deinit();
         const a = scratch.allocator();
@@ -513,6 +546,32 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
         const pos = for (queue, 0..) |e, i| {
             if (std.mem.eql(u8, e.name, ticket_name)) break i;
         } else fail("ticket {s} vanished from the queue", .{ticket_name});
+
+        // A hand-given order (`cpuq first`, `start`, `cancel`).
+        if (!named) if (st.takeControl(ticket_name)) |action| {
+            if (std.mem.eql(u8, action, "cancel")) {
+                std.debug.print("cpuq: cancelled by hand\n", .{});
+                giveUp(ctx, st, ticket_name, now - start, job);
+            } else if (std.mem.eql(u8, action, "first")) {
+                rec.first = true;
+                rewriteRecord(io, ticket, rec);
+                std.debug.print("cpuq: moved to the front by hand\n", .{});
+            } else if (std.mem.eql(u8, action, "start")) {
+                // Past the queue, the budget and the gates, but never into an
+                // exclusive run: that is a timing window.
+                if ((state.scanLeases(st, a, true) catch @as([]state.Entry, &.{})).len != 0) {
+                    std.debug.print("cpuq: not started by hand: an exclusive run holds the machine; still waiting\n", .{});
+                } else {
+                    const over: u32 = @intCast(heldCores(st, a) + o.request.max);
+                    const got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, over, @max(cores, over), false, 0) catch |err| fail("tokens: {t}", .{err});
+                    if (got) |grant| {
+                        std.debug.print("cpuq: started by hand on {d} {s}, past the queue\n", .{ grant.files.len, if (grant.files.len == 1) "core" else "cores" });
+                        forced_now = true;
+                        return admitted(ctx, st, o, &rec, grant, ticket, ticket_name, job, now, false);
+                    }
+                }
+            }
+        };
 
         // Out of time: give up, but only after the head has tried once, so
         // --max-wait 0 takes what is free now and otherwise gives up.
@@ -538,9 +597,9 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
             // gate), else block on the waiter just ahead until it is
             // admitted or gone.
             if (!named and !o.exclusive and cfg.backfill) {
-                const budget: u32 = budgetNow(ctx, machine(ctx));
+                const budget: u32 = budgetNow(ctx, mach);
                 var v = st.readValve();
-                const g = policy.gate(cfg, machine(ctx), budget, if (o.load_check) &v else null, now);
+                const g = policy.gate(cfg, mach, budget, if (o.load_check) &v else null, now);
                 if (g == .open) if (goAhead(ctx, st, a, o, queue, pos, budget, now, &run_times)) |req| {
                     const got = state.takeTokens(st, ctx.arena, req, false, budget, @max(cores, budget), false, 0) catch |err| fail("tokens: {t}", .{err});
                     if (got) |grant| {
@@ -567,8 +626,8 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
         }
 
         var valve = st.readValve();
-        const budget: u32 = if (named) o.slots else budgetNow(ctx, machine(ctx));
-        last_gate = if (named) .open else policy.gate(cfg, machine(ctx), budget, if (o.load_check) &valve else null, now);
+        const budget: u32 = if (named) o.slots else budgetNow(ctx, mach);
+        last_gate = if (named) .open else policy.gate(cfg, mach, budget, if (o.load_check) &valve else null, now);
         const check_load = !named and o.load_check and cfg.load_check;
         if (check_load) st.writeValve(valve);
         if (last_gate == .open) {
@@ -583,14 +642,23 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
             // again, the load valve holds further admissions. Measuring takes a
             // process snapshot, so only a head that cannot start does it.
             if (got == null and !named and !o.exclusive and cfg.lend) {
-                const lent = measureIdle(ctx, st, a);
+                // Only into CPUs the machine really has to spare: by the load,
+                // and by the measured busy share when there is one (the load
+                // checks, so not with load_check off or --no-load-check).
+                const cpus = sys.activeCpus();
+                var room: u32 = std.math.maxInt(u32);
+                if (cfg.load_check and o.load_check) {
+                    room = policy.lendRoom(mach.load1, cpus);
+                    if (mach.busy) |b| room = @min(room, @as(u32, @intFromFloat(@floor(@as(f64, @floatFromInt(cpus)) * (1 - b)))));
+                }
+                const lent = @min(measureIdle(ctx, st, a), room);
                 if (lent > 0) got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, budget + lent, @max(cores, budget) + lent, exclusive_running, reserve) catch |err| fail("tokens: {t}", .{err});
             }
             if (got) |grant| {
                 valve.last_admit = now;
                 if (check_load) st.writeValve(valve);
                 const borrowed: u32 = @intCast(@min(grant.files.len, (held_before + grant.files.len) -| budget));
-                if (borrowed > 0) std.debug.print("cpuq: starting on {d} {s} lent by jobs that leave them idle\n", .{ borrowed, if (borrowed == 1) "core" else "cores" });
+                if (borrowed > 0) std.debug.print("cpuq: starting on {d} {s} lent by jobs that leave them idle, at background priority so the lenders come first\n", .{ borrowed, if (borrowed == 1) "core" else "cores" });
                 return admittedLent(ctx, st, o, &rec, grant, ticket, ticket_name, job, now, borrowed);
             }
             // First in line for a fixed count while fewer cores sit free: say
@@ -631,6 +699,11 @@ fn measureIdle(ctx: *Ctx, st: *state.State, a: std.mem.Allocator) u32 {
     var lent: u32 = 0;
     for (leases) |l| {
         if (l.record.child <= 0 or l.record.exclusive) continue;
+        // Paused by hand: every core it holds is idle now.
+        if (st.isPaused(l.name)) {
+            lent += l.record.cores;
+            continue;
+        }
         var u = old.get(l.name) orelse policy.Use{};
         u.observe(sys.treeCpu(procs, l.record.child), now_ms, l.record.cores, ctx.cfg.lend_after_s);
         fresh.put(a, l.name, u) catch {};
@@ -643,11 +716,15 @@ fn measureIdle(ctx: *Ctx, st: *state.State, a: std.mem.Allocator) u32 {
 /// `admitted`, logging the cores lent to it.
 fn admittedLent(ctx: *Ctx, st: *state.State, o: RunOptions, rec: *state.Record, grant: state.Grant, ticket: Io.File, ticket_name: []const u8, job: JobLog, now: i64, lent: u32) Lease {
     lent_now = lent;
-    return admitted(ctx, st, o, rec, grant, ticket, ticket_name, job, now, false);
+    var lease = admitted(ctx, st, o, rec, grant, ticket, ticket_name, job, now, false);
+    lease.borrowed = lent;
+    return lease;
 }
 
 /// The cores the grant being logged borrowed (read by `admitted`).
 var lent_now: u32 = 0;
+/// Whether the grant being logged was given by hand (read by `admitted`).
+var forced_now = false;
 
 /// Takes the grant: writes the lease, leaves the queue, and logs the start.
 /// Call with the admission lock held; returns with it released.
@@ -672,7 +749,7 @@ fn admitted(ctx: *Ctx, st: *state.State, o: RunOptions, rec: *state.Record, gran
     st.queue.deleteFile(io, ticket_name) catch {};
     ticket.close(io);
     st.unlock();
-    logEvent(ctx, job, "started", .{ .cores = rec.cores, .slots = grant.slots, .ahead = if (ahead) true else null, .lent = if (lent_now > 0) lent_now else null });
+    logEvent(ctx, job, "started", .{ .cores = rec.cores, .slots = grant.slots, .ahead = if (ahead) true else null, .lent = if (lent_now > 0) lent_now else null, .forced = if (forced_now) true else null });
     return .{ .record = rec.*, .name = lease_name, .file = lease, .tokens = grant.files, .job = job };
 }
 
@@ -859,7 +936,8 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
     for (o.cmd, 0..) |a, i| argv[i] = a.ptr;
 
     sys.installForwarding();
-    const qos = policy.qosFor(o.priority, o.exclusive, ctx.cfg.qos and o.qos and o.lease == null);
+    const qos_enabled = ctx.cfg.qos and o.qos and o.lease == null;
+    const qos: policy.Qos = if (lease.borrowed > 0 and qos_enabled) .background else policy.qosFor(o.priority, o.exclusive, qos_enabled);
     const spawned = sys.spawn(exe, argv.ptr, @ptrCast(envp.slice.ptr), qos);
     if (pipe[0] >= 0) sys.closeFd(pipe[0]);
     if (pipe[1] >= 0) sys.closeFd(pipe[1]);
@@ -1159,6 +1237,78 @@ fn namedLeases(ctx: *Ctx, a: std.mem.Allocator) []const []const u8 {
 
 /// `cpuq wait --label PATTERN [--max-wait S]`: blocks until no job whose
 /// label matches holds cores or a lease, or waits for either.
+/// `cpuq first|start|cancel|pause|resume|stop TARGET [--all]`: a hand at the
+/// queue. TARGET is a label (`PATTERN*` for a prefix) or a cpuq pid. first,
+/// start and cancel act on waiters: each leaves an order its waiter takes at
+/// its next look (the head looks every `poll`, the next waiters every 2
+/// seconds). pause, resume and stop act on running jobs: SIGSTOP or SIGCONT
+/// to the command's whole process tree, or SIGTERM to its cpuq, which passes
+/// it on. A paused job's cores count as idle, so they are lent at once.
+/// Nothing touches an exclusive run. Several matches need --all.
+fn cmdControl(ctx: *Ctx, comptime action: []const u8, args: []const [:0]const u8) u8 {
+    var target: ?[]const u8 = null;
+    var all = false;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--all")) all = true else if (target == null) target = arg else return usageError("{s} takes one label or pid", .{action});
+    }
+    const t = target orelse return usageError("{s} needs a label (PATTERN* for a prefix) or a cpuq pid", .{action});
+    const pid: ?i32 = std.fmt.parseInt(i32, t, 10) catch null;
+    var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var st = openState(ctx);
+    lockOrFail(&st);
+    defer st.unlock();
+    const for_waiters = comptime (std.mem.eql(u8, action, "first") or std.mem.eql(u8, action, "start") or std.mem.eql(u8, action, "cancel"));
+    const entries = if (for_waiters)
+        state.scanQueue(&st, a, null, .{}, nowSeconds(ctx.io), ctx.cfg.aging_s) catch @as([]state.Entry, &.{})
+    else
+        state.scanLeases(&st, a, false) catch @as([]state.Entry, &.{});
+    var hits: std.ArrayList(state.Entry) = .empty;
+    for (entries) |e| {
+        const matched = if (pid) |p| e.record.pid == p else labelMatches(t, e.record.label);
+        if (matched) hits.append(a, e) catch {};
+    }
+    if (hits.items.len == 0) {
+        std.debug.print("cpuq: no {s} job matches '{s}'\n", .{ if (for_waiters) "waiting" else "running", t });
+        return exit_failure;
+    }
+    if (hits.items.len > 1 and !all) {
+        std.debug.print("cpuq: '{s}' matches {d} jobs; name one, or add --all:\n", .{ t, hits.items.len });
+        for (hits.items) |e| std.debug.print("  {d}  {s}\n", .{ e.record.pid, e.record.label });
+        return exit_usage;
+    }
+    const procs = if (for_waiters) &[_]sys.Proc{} else sys.processes(ctx.io, a);
+    for (hits.items) |e| {
+        const r = e.record;
+        const who = if (r.label.len != 0) r.label else r.cmd;
+        if (for_waiters) {
+            st.giveControl(e.name, action);
+            ctx.out.print("{s}: {s} (pid {d})\n", .{ action, who, r.pid }) catch {};
+            continue;
+        }
+        if (r.exclusive) {
+            std.debug.print("cpuq: {s} is an exclusive run, a timing window; left alone\n", .{who});
+            continue;
+        }
+        if (comptime std.mem.eql(u8, action, "stop")) {
+            _ = std.c.kill(r.pid, .TERM);
+        } else if (r.child > 0) {
+            const in_tree = a.alloc(bool, procs.len) catch continue;
+            @memset(in_tree, false);
+            sys.markTree(procs, r.child, in_tree);
+            const sig: std.c.SIG = if (comptime std.mem.eql(u8, action, "pause")) .STOP else .CONT;
+            for (procs, in_tree) |p, mine| if (mine) {
+                _ = std.c.kill(p.pid, sig);
+            };
+            st.setPaused(e.name, comptime std.mem.eql(u8, action, "pause"));
+        }
+        ctx.out.print("{s}: {s} (pid {d})\n", .{ action, who, r.pid }) catch {};
+    }
+    ctx.out.flush() catch {};
+    return 0;
+}
+
 fn cmdWait(ctx: *Ctx, args: []const [:0]const u8) u8 {
     var pattern: ?[]const u8 = null;
     var max_wait: ?i64 = null;
@@ -1426,6 +1576,8 @@ const JsonHolder = struct {
     cores: u32 = 0,
     /// The core tokens it holds, by number: which of the budget's cores.
     slots: []const u32 = &.{},
+    /// Paused by hand (`cpuq pause`).
+    paused: bool = false,
     /// Cores the command's process tree kept busy over the sample: CPU time
     /// over wall time; null when there is no command to measure.
     using: ?f64 = null,
@@ -1468,6 +1620,8 @@ const JsonGate = struct {
 const RunTimes = struct {
     by_label: std.StringHashMapUnmanaged(f64) = .empty,
     by_project: std.StringHashMapUnmanaged(f64) = .empty,
+    /// Each label's finished runs' average active cores, oldest first.
+    uses: std.StringHashMapUnmanaged(std.ArrayList(f64)) = .empty,
 
     fn load(ctx: *Ctx, a: std.mem.Allocator) RunTimes {
         var rt: RunTimes = .{};
@@ -1477,6 +1631,11 @@ const RunTimes = struct {
         for (jobs) |j| {
             const r = j.ran() orelse continue;
             if (j.label.len == 0 or !std.mem.eql(u8, j.pool, "cores")) continue;
+            if (j.used()) |u| {
+                const gop = rt.uses.getOrPut(a, j.label) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                gop.value_ptr.append(a, u) catch {};
+            }
             for ([_]struct { m: *std.StringHashMapUnmanaged(std.ArrayList(f64)), k: []const u8 }{
                 .{ .m = &label_runs, .k = j.label },
                 .{ .m = &project_runs, .k = std.mem.sliceTo(j.label, ':') },
@@ -2111,6 +2270,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
     const busy = smp.busy;
 
     const holders = toHolders(a, leases, busy);
+    for (holders, leases) |*h, l| h.paused = st.isPaused(l.name);
     const waiters = toWaiters(a, queue);
     if (waiters.len != 0) estimate(RunTimes.load(ctx, a), budget, holders, waiters, now);
 

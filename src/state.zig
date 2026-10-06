@@ -144,6 +144,39 @@ pub const State = struct {
         s.dir.writeFile(s.io, .{ .sub_path = "usage", .data = out.items }) catch {};
     }
 
+    /// A hand-given order for a waiter (`cpuq first`, `start`, `cancel`),
+    /// left as "control-TICKET" for the waiter to take; null when none.
+    pub fn takeControl(s: *State, ticket: []const u8) ?[]const u8 {
+        var name_buf: [96]u8 = undefined;
+        const name = std.mem.print(&name_buf, "control-{s}", .{ticket}) catch return null;
+        var buf: [16]u8 = undefined;
+        const text = s.dir.readFile(s.io, name, &buf) catch return null;
+        s.dir.deleteFile(s.io, name) catch {};
+        const t = std.mem.trim(u8, text, " \n");
+        inline for (.{ "first", "start", "cancel" }) |known| if (std.mem.eql(u8, t, known)) return known;
+        return null;
+    }
+
+    pub fn giveControl(s: *State, ticket: []const u8, action: []const u8) void {
+        var name_buf: [96]u8 = undefined;
+        const name = std.mem.print(&name_buf, "control-{s}", .{ticket}) catch return;
+        s.dir.writeFile(s.io, .{ .sub_path = name, .data = action }) catch {};
+    }
+
+    /// Whether a holder is paused by hand (`cpuq pause`): "paused-LEASE".
+    pub fn isPaused(s: *State, lease: []const u8) bool {
+        var name_buf: [96]u8 = undefined;
+        const name = std.mem.print(&name_buf, "paused-{s}", .{lease}) catch return false;
+        _ = s.dir.statFile(s.io, name, .{}) catch return false;
+        return true;
+    }
+
+    pub fn setPaused(s: *State, lease: []const u8, on: bool) void {
+        var name_buf: [96]u8 = undefined;
+        const name = std.mem.print(&name_buf, "paused-{s}", .{lease}) catch return;
+        if (on) s.dir.writeFile(s.io, .{ .sub_path = name, .data = "" }) catch {} else s.dir.deleteFile(s.io, name) catch {};
+    }
+
     pub fn writeValve(s: *State, v: policy.Valve) void {
         var out: [128]u8 = undefined;
         const text = std.mem.print(&out, "{d} {d} {d} {d}\n", .{ @intFromBool(v.tripped), v.calm_since, v.last_admit, v.last_check }) catch return;
@@ -191,6 +224,9 @@ pub const Record = struct {
     /// The core tokens a holder took, by number, comma-separated ("0,1,2"):
     /// which of the budget's cores are its own.
     slots: []const u8 = "",
+    /// A waiter moved to the front by hand (`cpuq first`): it goes ahead of
+    /// every waiter not so moved.
+    first: bool = false,
 
     pub fn write(r: Record, w: *Io.Writer) Io.Writer.Error!void {
         try w.print("ticket={d}\npid={d}\nchild={d}\ncores={d}\nmax={d}\npriority={t}\nexclusive={d}\nsince={d}\n", .{
@@ -201,6 +237,7 @@ pub const Record = struct {
         try w.writeAll("cmd=");
         try writeLine(w, r.cmd);
         if (r.slots.len != 0) try w.print("slots={s}\n", .{r.slots});
+        if (r.first) try w.writeAll("first=1\n");
     }
 
     fn writeLine(w: *Io.Writer, text: []const u8) Io.Writer.Error!void {
@@ -224,6 +261,7 @@ pub const Record = struct {
             if (std.mem.eql(u8, k, "label")) r.label = v;
             if (std.mem.eql(u8, k, "cmd")) r.cmd = v;
             if (std.mem.eql(u8, k, "slots")) r.slots = v;
+            if (std.mem.eql(u8, k, "first")) r.first = std.mem.eql(u8, v, "1");
         }
         return r;
     }
@@ -325,6 +363,7 @@ pub fn scanQueue(s: *State, arena: std.mem.Allocator, own: ?[]const u8, own_reco
 }
 
 fn lessEntry(_: void, a: Entry, b: Entry) bool {
+    if (a.record.first != b.record.first) return a.record.first;
     if (a.class != b.class) return a.class < b.class;
     return a.record.ticket < b.record.ticket;
 }

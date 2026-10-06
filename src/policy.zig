@@ -60,6 +60,8 @@ pub const Config = struct {
     /// How long, in seconds, a core must stay idle before it is lent
     /// (`lend_after`).
     lend_after_s: u32 = 60,
+    /// Cap a range request near what its label has used (`right_size`).
+    right_size: bool = true,
 };
 
 pub const Diagnostic = struct {
@@ -112,6 +114,8 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             cfg.note_s = parseCount(value) orelse return bad(diag, "note must be a whole number of seconds, at least 1");
         } else if (std.mem.eql(u8, key, "backfill")) {
             cfg.backfill = parseBool(value) orelse return bad(diag, "backfill must be on or off");
+        } else if (std.mem.eql(u8, key, "right_size")) {
+            cfg.right_size = parseBool(value) orelse return bad(diag, "right_size must be on or off");
         } else if (std.mem.eql(u8, key, "lend_after")) {
             cfg.lend_after_s = parseCount(value) orelse return bad(diag, "lend_after must be a whole number of seconds, at least 1");
         } else if (std.mem.eql(u8, key, "lend")) {
@@ -186,11 +190,20 @@ pub const Valve = struct {
 
     pub const Verdict = enum { open, tripped, spacing };
 
-    pub fn check(v: *Valve, now: i64, load: f64, budget: u32, margin: f64) Verdict {
+    /// `busy` is the measured share of all CPUs busy: the load average
+    /// counts threads and lags a minute, so a high load with the CPUs
+    /// measurably below 90% busy does not trip the valve, and a tripped
+    /// valve reopens as soon as they fall below 75%.
+    pub fn check(v: *Valve, now: i64, load: f64, budget: u32, margin: f64, busy: ?f64) Verdict {
         const unchecked_s = now - v.last_check;
         v.last_check = now;
         const b: f64 = @floatFromInt(budget);
-        if (load > b + margin) {
+        const full = if (busy) |f| f >= 0.9 else true;
+        if (v.tripped and busy != null and busy.? < 0.75) {
+            v.tripped = false;
+            v.calm_since = 0;
+        }
+        if (load > b + margin and full) {
             v.tripped = true;
             v.calm_since = 0;
             return .tripped;
@@ -270,6 +283,9 @@ pub const Machine = struct {
     active: u32,
     load1: f64,
     pressure: Pressure,
+    /// The share of all CPUs busy since the last look, 0 to 1; null when
+    /// not measured.
+    busy: ?f64 = null,
 };
 
 pub const Gate = union(enum) {
@@ -283,7 +299,7 @@ pub const Gate = union(enum) {
 /// check is off.
 pub fn gate(cfg: Config, m: Machine, budget: u32, valve: ?*Valve, now: i64) Gate {
     if (cfg.pressure_check and m.pressure == .high) return .pressure;
-    if (valve) |v| if (cfg.load_check) switch (v.check(now, m.load1, budget, cfg.load_margin)) {
+    if (valve) |v| if (cfg.load_check) switch (v.check(now, m.load1, budget, cfg.load_margin, m.busy)) {
         .open => {},
         .tripped => return .{ .load = m.load1 },
         .spacing => return .{ .spacing = m.load1 },
@@ -438,6 +454,66 @@ test "a holder lends the cores it leaves idle for a minute" {
         u.observe(cpu, t, 3, 60);
     }
     try std.testing.expectEqual(@as(u32, 0), u.lendable(3, @divFloor(t, 1000), 60));
+}
+
+/// How many cores may be lent: lending uses idle reservations, but only
+/// while the machine has CPUs to spare, so it never pushes the load past
+/// the CPU count.
+pub fn lendRoom(load1: f64, cpus: u32) u32 {
+    const spare = @as(f64, @floatFromInt(cpus)) - load1;
+    return if (spare >= 1) @intFromFloat(@floor(spare)) else 0;
+}
+
+/// Right-sizing: a range request capped near what jobs with its label have
+/// used. `uses` are the label's past runs' average active cores; with fewer
+/// than 3 the request stands. The cap is the 75th percentile plus 0.3,
+/// rounded, kept within the request: a job that uses 0.8 asking 1-4 gets
+/// 1-1, one that uses 3.5 keeps 1-4. A fixed count is never changed.
+pub fn rightSize(req: Request, uses: []const f64) Request {
+    if (req.fixed() or uses.len < 3) return req;
+    var sorted: [64]f64 = undefined;
+    const n = @min(uses.len, sorted.len);
+    @memcpy(sorted[0..n], uses[uses.len - n ..]);
+    std.mem.sort(f64, sorted[0..n], {}, std.sort.asc(f64));
+    const p75 = sorted[(n - 1) * 3 / 4];
+    const cap: u32 = @intFromFloat(@max(@round(p75 + 0.3), 1));
+    return .{ .min = req.min, .max = std.math.clamp(cap, req.min, req.max) };
+}
+
+test "right-sizing caps a range near the label's measured use" {
+    const r: Request = .{ .min = 1, .max = 4 };
+    try std.testing.expectEqual(Request{ .min = 1, .max = 1 }, rightSize(r, &.{ 0.8, 0.9, 0.7 }));
+    try std.testing.expectEqual(Request{ .min = 1, .max = 1 }, rightSize(r, &.{ 1.0, 0.98, 1.0 }));
+    try std.testing.expectEqual(Request{ .min = 1, .max = 2 }, rightSize(r, &.{ 1.6, 1.8, 1.5 }));
+    try std.testing.expectEqual(Request{ .min = 1, .max = 4 }, rightSize(r, &.{ 3.5, 3.9, 3.6 }));
+    // Too few runs to judge by, a fixed count, or a minimum above the use.
+    try std.testing.expectEqual(r, rightSize(r, &.{ 0.5, 0.5 }));
+    try std.testing.expectEqual(Request{ .min = 3, .max = 3 }, rightSize(.{ .min = 3, .max = 3 }, &.{ 0.5, 0.5, 0.5 }));
+    try std.testing.expectEqual(Request{ .min = 2, .max = 2 }, rightSize(.{ .min = 2, .max = 4 }, &.{ 0.5, 0.5, 0.5 }));
+}
+
+test "lending only into spare CPUs" {
+    try std.testing.expectEqual(@as(u32, 0), lendRoom(12.8, 10));
+    try std.testing.expectEqual(@as(u32, 0), lendRoom(9.5, 10));
+    try std.testing.expectEqual(@as(u32, 2), lendRoom(7.6, 10));
+}
+
+test "the valve trips only when the CPUs are measurably full" {
+    const cfg: Config = .{}; // budget 8, margin 4: trips above 12
+    var v: Valve = .{};
+    const at = struct {
+        fn m(load: f64, busy: ?f64) Machine {
+            return .{ .active = 10, .load1 = load, .pressure = .normal, .busy = busy };
+        }
+    };
+    // A high load average with CPUs to spare: open.
+    try std.testing.expectEqual(Gate.open, gate(cfg, at.m(13, 0.7), 8, &v, 100));
+    // High load and full CPUs: tripped.
+    try std.testing.expectEqual(Gate{ .load = 13 }, gate(cfg, at.m(13, 0.95), 8, &v, 101));
+    // The CPUs fall well below full: reopens at once (spacing still applies above the budget).
+    v.last_admit = 0;
+    try std.testing.expectEqual(Gate.open, gate(cfg, at.m(12.5, 0.6), 8, &v, 102));
+    try std.testing.expect(!v.tripped);
 }
 
 /// MAKEFLAGS for a command whose jobserver pipe is (r, w): the caller's

@@ -2,6 +2,26 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.7.1 — 2026-10-06
+
+- Right-sizing: a range request is capped near what jobs with its label
+  have used (the 75th percentile of their average active cores plus 0.3,
+  rounded), once the label has three finished runs. A fixed count is never
+  changed. Config: `right_size = on|off`.
+- Lending only into spare CPUs: by the load and by the CPUs' measured busy
+  share, so lending never pushes the load past the CPU count.
+- Borrowers yield: a job started on lent cores runs at background priority
+  (macOS QoS background, Linux nice 15), so a lender that gets busy again
+  has its CPUs back at once.
+- The load valve looks at the CPUs as well: it trips only when they are
+  measured at least 90% busy, and reopens as soon as they fall below 75%,
+  since the load average counts threads and lags a minute.
+- A hand at the queue: `cpuq first|start|cancel` for a waiting job (move it
+  to the front, start it now past the queue and gates, take it out), and
+  `cpuq pause|resume|stop` for a running one (its whole process tree). A
+  paused job's cores are lent at once; nothing touches an exclusive run;
+  history marks a forced start, status a paused job.
+
 ## 0.7.0 — 2026-10-06
 
 - `cpuq lease NAME --host HOST --hold`, with no command, holds a lease on

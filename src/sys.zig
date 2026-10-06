@@ -59,6 +59,46 @@ pub fn loadAverage() [3]f64 {
     return l;
 }
 
+extern "c" fn mach_host_self() c_uint;
+extern "c" fn host_statistics(host: c_uint, flavor: c_int, info: [*]c_uint, count: *c_uint) c_int;
+
+/// The machine's CPU time so far, in ticks: busy (user, system, nice) and
+/// total. Two readings give the share of all CPUs busy between them. macOS
+/// host_statistics HOST_CPU_LOAD_INFO; Linux the first line of /proc/stat.
+pub const Ticks = struct { busy: u64, total: u64 };
+
+pub fn cpuTicks(io: Io) ?Ticks {
+    if (is_darwin) {
+        var info: [4]c_uint = undefined; // user, system, idle, nice
+        var count: c_uint = info.len;
+        if (host_statistics(mach_host_self(), 3, &info, &count) != 0) return null;
+        const busy: u64 = @as(u64, info[0]) + info[1] + info[3];
+        return .{ .busy = busy, .total = busy + info[2] };
+    }
+    var buf: [512]u8 = undefined;
+    const text = Io.Dir.cwd().readFile(io, "/proc/stat", &buf) catch return null;
+    const line = std.mem.sliceTo(text, '\n');
+    var f = std.mem.tokenizeScalar(u8, line, ' ');
+    if (!std.mem.eql(u8, f.next() orelse return null, "cpu")) return null;
+    var total: u64 = 0;
+    var idle: u64 = 0;
+    var i: usize = 0;
+    // user nice system idle iowait irq softirq steal: idle and iowait are not busy.
+    while (f.next()) |v| : (i += 1) {
+        if (i >= 8) break;
+        const n = std.fmt.parseInt(u64, v, 10) catch 0;
+        total += n;
+        if (i == 3 or i == 4) idle += n;
+    }
+    return .{ .busy = total - idle, .total = total };
+}
+
+/// The share of all CPUs busy between two readings, 0 to 1.
+pub fn busyBetween(a: Ticks, b: Ticks) ?f64 {
+    if (b.total <= a.total) return null;
+    return @as(f64, @floatFromInt(b.busy -| a.busy)) / @as(f64, @floatFromInt(b.total - a.total));
+}
+
 /// macOS kern.memorystatus_vm_pressure_level; Linux /proc/pressure/memory
 /// when present.
 pub fn memoryPressure(io: Io, psi_threshold: f64) policy.Pressure {

@@ -191,6 +191,37 @@ active of the cores in use on average, which says how to size `--cores`.
 `--max-wait` and without a terminal (an agent's tool call) is told once that
 its own timeout may end the wait first.
 
+### Right-sizing
+
+A grant is fixed for the whole run, so a range request that takes everything
+free up to its maximum wastes cores whenever the job uses fewer. cpuq caps a
+range near what jobs with the same label have used: once a label has three
+finished runs in the history, `--cores MIN-MAX` takes at most the 75th
+percentile of their average active cores plus 0.3, rounded, never below MIN.
+A test run that keeps 0.8 of a core busy and asks for `1-4` gets 1; a build
+that uses 3.5 keeps `1-4`. It says so when it caps. A fixed `--cores K` is
+never changed; `right_size = off` turns it off. A job with phases of
+different width (a parallel compile, then a single-threaded test) is best
+run as one cpuq job per phase, each sized for its phase.
+
+### A hand at the queue
+
+    cpuq first  LABEL|PID     move a waiting job to the front
+    cpuq start  LABEL|PID     start a waiting job now, past the queue, the budget and the gates
+    cpuq cancel LABEL|PID     take a waiting job out of the queue (it exits 75)
+    cpuq pause  LABEL|PID     stop a running job's whole process tree (SIGSTOP)
+    cpuq resume LABEL|PID     continue it (SIGCONT)
+    cpuq stop   LABEL|PID     end a running job (SIGTERM to its cpuq, passed on)
+
+LABEL may end in `*` for a prefix; a target that matches several jobs needs
+`--all`. A waiting job takes its order at its next look: the head within
+`poll`, the next waiters within 2 seconds. `start` never goes into an
+`--exclusive` run, and nothing here touches one: those are timing windows.
+A job started by hand is marked `"forced": true` in its history; a paused job
+shows as paused in `cpuq status --json`, and its cores are lent at once. A
+paused job keeps its memory and its cores' reservation, and a network peer
+may time out on it, so pause suits builds and tests best.
+
 ### Quiet windows
 
 A benchmark that needs the machine to itself runs under `--exclusive`: it
@@ -294,6 +325,7 @@ count oversubscribes it on purpose. The config file is `CPUQ_CONFIG`, default
 | `patience` | 30 | the least seconds the head lets others go ahead without run times to judge by |
 | `lend` | on | lend the head the cores a running job leaves idle |
 | `lend_after` | 60 | seconds a core must stay idle before it is lent |
+| `right_size` | on | cap a range request near what its label has used |
 
 An invalid line is an error naming the file and line. A run already
 waiting re-reads the file when it changes, so a new budget applies at once;
@@ -322,9 +354,11 @@ The head of the queue admits nothing while:
   reads the machine's whole 1-minute load, cpuq's own jobs included, so it
   catches load from outside cpuq and jobs that use more cores than they were
   granted (a `zig build` whose compiler processes ignore `-j`) alike. It
-  trips when the load exceeds budget + `load_margin`, reopens once the load
-  has stayed at or under budget + `load_margin`/2 (10 for a budget of 8) for
-  15 seconds, and while the load is above the budget it admits at most one
+  trips when the load exceeds budget + `load_margin` and the CPUs are
+  measured at least 90% busy (the load average counts threads and lags a
+  minute, so a high load with CPUs to spare does not trip it), reopens as
+  soon as the CPUs fall below 75% busy, or once the load has stayed at or
+  under budget + `load_margin`/2 (10 for a budget of 8) for 15 seconds, and while the load is above the budget it admits at most one
   job per 10 seconds, so waiters never stampede into a lagging load average.
   A tripped valve nobody has checked for over a minute reopens at once when
   the load is at or under that level, since the 1-minute average already
@@ -409,7 +443,14 @@ lent, so the work running stays within the budget. Nothing is taken from the len
 machine runs over the budget until someone finishes, and the load valve
 stops further admissions meanwhile. A job started on lent cores says so,
 and its history marks how many (`"lent": N`). Nothing is lent to an
-exclusive run or a named lease; `lend = off` turns it off. Once the head's minimum fits,
+exclusive run or a named lease; `lend = off` turns it off. Lending goes only
+into CPUs the machine has to spare, judged by the load and by the CPUs'
+measured busy share, so it never pushes the load past the CPU count. A job
+started on lent cores runs at background priority (macOS QoS background,
+Linux nice 15), so a lender that gets busy again has its CPUs back at once.
+A job paused by hand (`cpuq pause`) lends all its cores at once.
+
+Once the head's minimum fits,
 the head takes up to its maximum of the free cores, but leaves the next
 waiter's minimum free when it can still get its own, so a wide request does
 not stall the job behind it. `--exclusive` takes the whole budget at the
