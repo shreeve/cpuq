@@ -225,8 +225,8 @@ struct GraphsView: View {
         let used = at?.used ?? s?.holders.reduce(0) { $0 + ($1.using ?? 0) } ?? 0
         let waiting = at?.waiting ?? s?.waiters.count ?? 0
         var line = Text(at.map { age(end.timeIntervalSince($0.at)) + " ago   " } ?? "")
-        line = line + Text("\(held) of \(budget) cores held").bold()
-        line = line + Text(String(format: " · %.1f used", used))
+        line = line + Text("\(held) of \(budget) cores in use").bold()
+        line = line + Text(String(format: " · %.1f active", used))
         line = line + Text(" · \(waiting) waiting").foregroundColor(waiting > 0 ? .red : nil)
         if at == nil, let load = s?.load.first { line = line + Text(String(format: " · load %.1f", load)).foregroundColor(.secondary) }
         return line.font(.title3).monospacedDigit()
@@ -234,9 +234,9 @@ struct GraphsView: View {
 
     private var key: some View {
         HStack(spacing: 16) {
-            Label { Text("cores held, by project") } icon: { RoundedRectangle(cornerRadius: 2).fill(.secondary.opacity(0.5)).frame(width: 14, height: 9) }
-            Label { Text("CPU used by cpuq's jobs") } icon: { Rectangle().fill(Color.primary).frame(width: 14, height: 1.5) }
-            Label { Text("other processes") } icon: { Rectangle().fill(Color.secondary).frame(width: 14, height: 1.5) }
+            Label { Text("cores in use, by project") } icon: { RoundedRectangle(cornerRadius: 2).fill(.secondary.opacity(0.5)).frame(width: 14, height: 9) }
+            Label { Text("cores active in cpuq's jobs") } icon: { Rectangle().fill(Color.primary).frame(width: 14, height: 1.5) }
+            Label { Text("active outside cpuq") } icon: { Rectangle().fill(Color.secondary).frame(width: 14, height: 1.5) }
             Label { Text("waiting") } icon: { Rectangle().fill(.red.opacity(0.8)).frame(width: 14, height: 4) }
         }
         .font(.caption)
@@ -248,9 +248,9 @@ struct GraphsView: View {
         Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 4) {
             GridRow {
                 Text("Project")
-                Text("Held").gridColumnAlignment(.trailing)
-                Text("Used").gridColumnAlignment(.trailing)
-                Text("Of held").gridColumnAlignment(.trailing)
+                Text("In use").gridColumnAlignment(.trailing)
+                Text("Active").gridColumnAlignment(.trailing)
+                Text("Share").gridColumnAlignment(.trailing)
             }
             .font(.caption.bold()).foregroundStyle(.secondary)
             ForEach(model.rows) { r in
@@ -338,9 +338,9 @@ struct GraphsView: View {
                     HStack(spacing: 6) { Circle().fill(model.color(t.project)).frame(width: 8, height: 8); Text(t.project) }
                 }
                 TableColumn("Jobs") { t in Text("\(t.jobs)").monospacedDigit() }.width(50)
-                TableColumn("Core-hours held") { t in Text(String(format: "%.2f", t.held)).monospacedDigit() }
-                TableColumn("Used") { t in Text(String(format: "%.2f", t.used)).monospacedDigit() }
-                TableColumn("Of held") { t in
+                TableColumn("Core-hours in use") { t in Text(String(format: "%.2f", t.held)).monospacedDigit() }
+                TableColumn("Active") { t in Text(String(format: "%.2f", t.used)).monospacedDigit() }
+                TableColumn("Share") { t in
                     Text("\(Int((t.efficiency * 100).rounded()))%").monospacedDigit()
                         .foregroundStyle(t.efficiency < 0.5 ? Color.orange : Color.primary)
                 }
