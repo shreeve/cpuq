@@ -1775,14 +1775,16 @@ fn sample(io: Io, a: std.mem.Allocator, leases: []const state.Entry, measure: bo
         sys.markTree(after, l.record.pid, in_job);
         if (l.record.child > 0) sys.markTree(after, l.record.child, in_job);
     }
+    // A process's own CPU only: its reaped children were counted while they
+    // ran (see sys.Proc.own_ns).
     var cpu_before: std.AutoHashMapUnmanaged(i32, u64) = .empty;
-    for (before) |p| cpu_before.put(a, p.pid, p.cpu_ns) catch {};
+    for (before) |p| cpu_before.put(a, p.pid, p.own_ns) catch {};
     const self = sys.getpid();
     var outside: std.ArrayList(JsonOutside) = .empty;
     for (after, 0..) |p, i| {
         if (in_job[i] or p.pid == self) continue;
         const was = cpu_before.get(p.pid) orelse continue;
-        const rate = @as(f64, @floatFromInt(p.cpu_ns -| was)) / wall_ns;
+        const rate = @as(f64, @floatFromInt(p.own_ns -| was)) / wall_ns;
         if (rate >= 0.3) outside.append(a, .{ .pid = p.pid, .name = p.name, .using = rate }) catch {};
     }
     std.mem.sortUnstable(JsonOutside, outside.items, {}, struct {

@@ -295,6 +295,11 @@ pub const Proc = struct {
     /// process's own and that of its children it has already reaped, so the
     /// many short processes a build or test run starts are counted too.
     cpu_ns: u64,
+    /// The process's own CPU time alone, in nanoseconds. Work outside cpuq
+    /// is measured by this: a parent's reaped-children time arrives all at
+    /// once when it reaps (launchd reaps every orphan), though those
+    /// children were already counted while they ran.
+    own_ns: u64 = 0,
 };
 
 /// Every process the caller can see, with its parent and its CPU time so
@@ -318,6 +323,8 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
             if (proc_pid_rusage(pid, 1, &ru) != 0) continue;
             var ticks: u64 = 0;
             for ([_]usize{ 16, 24, 96, 104 }) |at| ticks +%= std.mem.readInt(u64, ru[at..][0..8], .little);
+            var own: u64 = 0;
+            for ([_]usize{ 16, 24 }) |at| own +%= std.mem.readInt(u64, ru[at..][0..8], .little);
             var bsd: [136]u8 align(8) = undefined;
             var ppid: i32 = undefined;
             var name: []const u8 = "";
@@ -338,6 +345,7 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
                 .ppid = ppid,
                 .name = arena.dupe(u8, name) catch "",
                 .cpu_ns = @intCast(@as(u128, ticks) * tb.numer / tb.denom),
+                .own_ns = @intCast(@as(u128, own) * tb.numer / tb.denom),
             }) catch break;
         }
         return list.items;
@@ -360,16 +368,22 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
         var fields = std.mem.tokenizeScalar(u8, text[close + 1 ..], ' ');
         var ppid: i32 = 0;
         var ticks: u64 = 0;
+        var own: u64 = 0;
         var i: usize = 0;
         while (fields.next()) |f| : (i += 1) {
             switch (i) {
                 1 => ppid = std.fmt.parseInt(i32, f, 10) catch 0,
-                11, 12, 13, 14 => ticks += std.fmt.parseInt(u64, f, 10) catch 0,
+                11, 12 => {
+                    const t = std.fmt.parseInt(u64, f, 10) catch 0;
+                    ticks += t;
+                    own += t;
+                },
+                13, 14 => ticks += std.fmt.parseInt(u64, f, 10) catch 0,
                 else => {},
             }
             if (i == 14) break;
         }
-        list.append(arena, .{ .pid = pid, .ppid = ppid, .name = arena.dupe(u8, text[open + 1 .. close]) catch "", .cpu_ns = ticks * std.time.ns_per_s / tick_hz }) catch break;
+        list.append(arena, .{ .pid = pid, .ppid = ppid, .name = arena.dupe(u8, text[open + 1 .. close]) catch "", .cpu_ns = ticks * std.time.ns_per_s / tick_hz, .own_ns = own * std.time.ns_per_s / tick_hz }) catch break;
     }
     return list.items;
 }

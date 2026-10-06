@@ -256,12 +256,13 @@ The head of the queue admits nothing while:
   reads the machine's whole 1-minute load, cpuq's own jobs included, so it
   catches load from outside cpuq and jobs that use more cores than they were
   granted (a `zig build` whose compiler processes ignore `-j`) alike. It
-  trips when the load exceeds budget + `load_margin`, reopens only after the
-  load has stayed at or under the budget for 30 seconds, and while the load
-  is above the budget it admits at most one job per 10 seconds, so waiters
-  never stampede into a lagging load average. A tripped valve nobody has
-  checked for over a minute reopens at once when the load is at or under the
-  budget, since the 1-minute average already covers that calm.
+  trips when the load exceeds budget + `load_margin`, reopens once the load
+  has stayed at or under budget + `load_margin`/2 (10 for a budget of 8) for
+  15 seconds, and while the load is above the budget it admits at most one
+  job per 10 seconds, so waiters never stampede into a lagging load average.
+  A tripped valve nobody has checked for over a minute reopens at once when
+  the load is at or under that level, since the 1-minute average already
+  covers that calm.
 
 The budget is capped by the cores active now (macOS `hw.activecpu`, Linux the
 process's CPU affinity). On Apple Silicon `hw.activecpu` does not appear to

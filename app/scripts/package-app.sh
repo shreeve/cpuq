@@ -15,7 +15,8 @@ mkdir -p "$scratch"
 scratch="$(cd "$scratch" && pwd)"
 
 config="${CONFIG:-debug}"
-swift build -c "$config" --scratch-path "$scratch" >&2
+# Within a cpuq job, build on the cores it was granted, not every core.
+swift build -c "$config" --scratch-path "$scratch" ${CPUQ_CORES:+-j "$CPUQ_CORES"} >&2
 bin_dir="$(swift build -c "$config" --scratch-path "$scratch" --show-bin-path)"
 app="$scratch/Cpuq.app"
 

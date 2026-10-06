@@ -2,6 +2,17 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.5.1 — 2026-10-05
+
+- The load valve reopens sooner: once the load has stayed at or under
+  budget + `load_margin`/2 (10 for a budget of 8) for 15 seconds, where it
+  waited for the budget itself for 30. The 1-minute load lags, so the old
+  rule kept free cores idle for a minute or two after a spike. Above the
+  budget it still admits one job per 10 seconds.
+- Work outside cpuq is measured by each process's own CPU. Counting the
+  children a process reaps made a parent (launchd reaps every orphan) leap
+  by a child's whole lifetime at once.
+
 ## 0.5.0 — 2026-10-05
 
 - Backfill: a waiter behind the head starts at once on cores the head

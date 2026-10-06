@@ -33,7 +33,7 @@ out="$root/.build/release-$version"
 # --- Preflight -------------------------------------------------------------------------------
 security find-identity -v -p codesigning | grep -qF "\"$sign\"" || fail "the keychain has no \"$sign\""
 xcrun notarytool history --keychain-profile "$profile" >/dev/null 2>&1 || fail "notarytool cannot sign in with keychain profile \"$profile\""
-swift build -c release >&2
+swift build -c release ${CPUQ_CORES:+-j "$CPUQ_CORES"} >&2
 bin=$(find .build/artifacts -type d -path '*Sparkle/bin' | head -1)
 [ -x "$bin/generate_keys" ] || fail "no Sparkle tools under .build/artifacts"
 keychain_key=$("$bin/generate_keys" --account cpuq -p 2>/dev/null | tail -1)

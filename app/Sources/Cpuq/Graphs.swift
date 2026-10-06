@@ -47,6 +47,9 @@ final class GraphModel {
         let outside: Double
         let load: Double
         let waiting: Int
+        /// Whether cpuq's gate admitted work then; when shut (load, memory pressure or spacing),
+        /// jobs wait even beside free cores.
+        let gateOpen: Bool
     }
 
     /// A project running now: what it holds and what it uses.
@@ -123,7 +126,8 @@ final class GraphModel {
         for i in waits.indices where waits[i].to == nil && !queued.contains(waits[i].id) { waits[i].to = now }
 
         samples.append(Sample(at: now, inUse: s.held, active: s.holders.reduce(0) { $0 + ($1.using ?? 0) },
-                              outside: s.outside.reduce(0) { $0 + $1.using }, load: s.load.first ?? 0, waiting: s.waiters.count))
+                              outside: s.outside.reduce(0) { $0 + $1.using }, load: s.load.first ?? 0, waiting: s.waiters.count,
+                              gateOpen: s.gate.state == "open"))
         let cutoff = now.addingTimeInterval(-Self.keep)
         samples.removeAll { $0.at < cutoff }
         blocks.removeAll { ($0.to ?? now) < cutoff }
@@ -346,6 +350,8 @@ struct GraphsView: View {
         var id: Int { column }
         let column: Int
         let count: Int
+        /// cpuq's gate was shut for most of the column: the wait was the gate's, not a full budget.
+        var gated = false
         /// Whether it carries the count of its stretch: the middle of a run of more than one.
         var label = false
     }
@@ -375,12 +381,33 @@ struct GraphsView: View {
                 }
             }
             .frame(minHeight: 280)
-            Text(style == "stack"
-                 ? "Cores, stacked by project: solid where busy, pale where held but idle; grey is work outside cpuq. The dashed line is the budget, the solid one the Mac's CPUs. Columns near now are 5 seconds, growing to a minute half an hour back."
-                 : "Each lane is one of the budget's cores: empty when free, pale when a job holds it, solid while it is busy, a thin bar where it ran before Cpuq was watching. Under the waiting row, the Mac's CPUs busy: cpuq's jobs dark, other work grey. Columns near now are 5 seconds, growing to a minute half an hour back.")
-                .font(.caption).foregroundStyle(.secondary)
+            key
             table
         }
+    }
+
+    /// What the marks mean, as swatches.
+    private var key: some View {
+        let swatch = { (c: Color, h: CGFloat) in RoundedRectangle(cornerRadius: 2).fill(c).frame(width: 14, height: h) }
+        return HStack(spacing: 14) {
+            if style == "stack" {
+                Label { Text("busy") } icon: { swatch(.blue.opacity(0.9), 10) }
+                Label { Text("held, idle") } icon: { swatch(.blue.opacity(0.22), 10) }
+                Label { Text("held, not measured") } icon: { swatch(.blue.opacity(0.55), 10) }
+                Label { Text("other work") } icon: { swatch(.secondary.opacity(0.35), 10) }
+            } else {
+                Label { Text("free") } icon: { swatch(.secondary.opacity(0.12), 10) }
+                Label { Text("held, idle") } icon: { swatch(.blue.opacity(0.22), 10) }
+                Label { Text("busy") } icon: { swatch(.blue.opacity(0.9), 10) }
+                Label { Text("held, not measured") } icon: { swatch(.blue.opacity(0.6), 3) }
+            }
+            Label { Text("waiting") } icon: { swatch(.red.opacity(0.75), 8) }
+            Label { Text("waiting, gate shut") } icon: { swatch(.orange.opacity(0.75), 8) }
+            Spacer()
+            Text("recent time is widest").foregroundStyle(.tertiary)
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
     }
 
     /// The machine in each column, while the app watched: cpuq's jobs' active cores and the
@@ -390,7 +417,10 @@ struct GraphsView: View {
             let here = m.samples.filter { $0.at >= column.from && $0.at <= column.to }
             guard !here.isEmpty else { return nil }
             let n = Double(here.count)
-            return (here.reduce(0) { $0 + $1.active } / n, here.reduce(0) { $0 + $1.outside } / n)
+            // No more than the CPUs can do: a bad reading never flattens the chart.
+            let cpus = Double(ProcessInfo.processInfo.activeProcessorCount)
+            let active = min(here.reduce(0) { $0 + $1.active } / n, cpus)
+            return (active, min(here.reduce(0) { $0 + $1.outside } / n, cpus - active))
         }
     }
 
@@ -425,7 +455,7 @@ struct GraphsView: View {
     private func lanesChart(axis: TimeAxis, lanes: Int, cells: [Cell], waits: [WaitCell], machine: [(active: Double, outside: Double)?]) -> some View {
         let cpus = Double(ProcessInfo.processInfo.activeProcessorCount)
         let budget = Double(model.budget)
-        let base = -4.6, height = 3.0, cap = max(12, cpus + 2)
+        let base = -5.0, height = 3.0, cap = max(12, cpus + 2)
         let y = { (v: Double) in base + height * min(v, cap) / cap }
         return Chart {
             ForEach(cells) { c in
@@ -456,7 +486,7 @@ struct GraphsView: View {
             AxisMarks(position: .leading, values: (0..<lanes).map { Double($0) + 0.5 }) { v in
                 AxisValueLabel { if let d = v.as(Double.self) { Text("\(Int(d) + 1)") } }
             }
-            AxisMarks(position: .leading, values: [-0.85]) { _ in AxisValueLabel { Text("waiting").foregroundStyle(.red) } }
+            AxisMarks(position: .leading, values: [-1.4]) { _ in AxisValueLabel { Text("waiting").foregroundStyle(.red) } }
             AxisMarks(position: .leading, values: [y(budget), y(cpus)]) { v in
                 AxisValueLabel { if let d = v.as(Double.self) { Text(abs(d - y(cpus)) < 0.01 ? "\(Int(cpus)) CPUs" : "\(Int(budget))").font(.caption2) } }
             }
@@ -470,10 +500,10 @@ struct GraphsView: View {
     private func waitingRow(_ waits: [WaitCell]) -> some ChartContent {
         ForEach(waits) { c in
             RectangleMark(xStart: .value("Time", Double(c.column) + 0.12), xEnd: .value("Time", Double(c.column) + 0.88),
-                          yStart: .value("Core", -1.2), yEnd: .value("Core", c.count == 0 ? -1.12 : -1.2 + 0.28 * Double(min(c.count, 3))))
-                .foregroundStyle(c.count == 0 ? Color.secondary.opacity(0.12) : Color.red.opacity(0.75))
+                          yStart: .value("Core", -1.75), yEnd: .value("Core", c.count == 0 ? -1.67 : -1.75 + 0.25 * Double(min(c.count, 3))))
+                .foregroundStyle(c.count == 0 ? Color.secondary.opacity(0.12) : (c.gated ? Color.orange : Color.red).opacity(0.75))
                 .annotation(position: .top, spacing: 1) {
-                    if c.label { Text("\(c.count)").font(.system(size: 10, weight: .bold)).foregroundStyle(.red) }
+                    if c.label { Text("\(c.count)").font(.system(size: 10, weight: .bold)).foregroundStyle(c.gated ? .orange : .red) }
                 }
         }
     }
@@ -555,13 +585,13 @@ struct GraphsView: View {
         .chartLegend(.hidden)
         .chartXScale(domain: 0...max(axis.count, 1))
         .chartXAxis { timeAxis(axis) }
-        .chartYScale(domain: -1.3...max(cpus + 1, peak.rounded(.up) + 0.5))
+        .chartYScale(domain: -1.85...max(cpus + 1, peak.rounded(.up) + 0.5))
         .chartYAxis {
             AxisMarks(position: .leading, values: Array(stride(from: 0.0, through: cpus, by: 2))) { _ in
                 AxisGridLine().foregroundStyle(.secondary.opacity(0.15))
                 AxisValueLabel()
             }
-            AxisMarks(position: .leading, values: [-0.85]) { _ in AxisValueLabel { Text("waiting").foregroundStyle(.red) } }
+            AxisMarks(position: .leading, values: [-1.4]) { _ in AxisValueLabel { Text("waiting").foregroundStyle(.red) } }
         }
         .chartOverlay { hovering($0) }
     }
@@ -594,7 +624,9 @@ struct GraphsView: View {
                 cells.append(Cell(column: c, lane: lane, project: b.project, busy: min(max((active ?? 0) - rank, 0), 1), block: b.id,
                                   measured: active != nil))
             }
-            waits.append(WaitCell(column: c, count: m.waits.filter { overlap($0.from, $0.to) > 0 }.count))
+            let polls = m.samples.filter { $0.at >= t1 && $0.at <= t2 }
+            waits.append(WaitCell(column: c, count: m.waits.filter { overlap($0.from, $0.to) > 0 }.count,
+                                  gated: !polls.isEmpty && polls.filter { !$0.gateOpen }.count * 2 >= polls.count))
         }
         var i = 0
         while i < waits.count {
@@ -613,6 +645,7 @@ struct GraphsView: View {
         var line = Text("\(s?.held ?? 0) of \(s?.budget ?? 0) cores in use").bold()
         line = line + Text(String(format: " · %.1f active", s?.holders.reduce(0) { $0 + ($1.using ?? 0) } ?? 0))
         line = line + Text(" · \(waiting) waiting").foregroundColor(waiting > 0 ? .red : nil)
+        if let g = s?.gate, g.state != "open" { line = line + Text(" · gate shut: \(g.text)").foregroundColor(.orange) }
         let outside = s?.outside.reduce(0) { $0 + $1.using } ?? 0
         if outside >= 0.3 { line = line + Text(String(format: " · %.1f outside cpuq", outside)).foregroundColor(.secondary) }
         if let load = s?.load.first { line = line + Text(String(format: " · load %.1f", load)).foregroundColor(.secondary) }

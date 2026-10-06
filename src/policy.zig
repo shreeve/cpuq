@@ -156,11 +156,13 @@ pub fn effectiveClass(base: Priority, waited_s: i64, aging_s: u32) u2 {
 
 /// The load safety valve, shared by every cpuq through the state directory.
 /// It trips when the 1-minute load exceeds budget + margin. Once tripped it
-/// reopens only after the load has stayed at or under the budget for
-/// `calm_s`; while the load is above the budget (tripped or not) it admits
+/// reopens after the load has stayed at or under budget + margin/2 (10 for
+/// a budget of 8 and the default margin) for `calm_s`: the load average lags,
+/// so waiting for it to fall all the way to the budget kept free cores idle
+/// for minutes. While the load is above the budget (tripped or not) it admits
 /// at most one job per `spacing_s`, so waiters never stampede into a load
 /// average that lags. A tripped valve nobody has checked for `stale_s`
-/// reopens at once when the load is at or under the budget: the 1-minute
+/// reopens at once when the load is at or under that level: the 1-minute
 /// load average already covers that calm.
 pub const Valve = struct {
     tripped: bool = false,
@@ -168,7 +170,7 @@ pub const Valve = struct {
     last_admit: i64 = 0,
     last_check: i64 = 0,
 
-    pub const calm_s = 30;
+    pub const calm_s = 15;
     pub const spacing_s = 10;
     pub const stale_s = 60;
 
@@ -184,7 +186,7 @@ pub const Valve = struct {
             return .tripped;
         }
         if (v.tripped) {
-            if (load > b) {
+            if (load > b + margin / 2) {
                 v.calm_since = 0;
                 return .tripped;
             }
@@ -441,7 +443,7 @@ test "memory pressure gate" {
 }
 
 test "load safety valve with hysteresis" {
-    const cfg: Config = .{}; // margin 4, budget 8: trips above 12
+    const cfg: Config = .{}; // margin 4, budget 8: trips above 12, reopens at 10
     var v: Valve = .{};
     const at = struct {
         fn m(load: f64) Machine {
@@ -450,20 +452,20 @@ test "load safety valve with hysteresis" {
     };
     try testing.expectEqual(Gate.open, gate(cfg, at.m(7), 8, &v, 100));
     try testing.expectEqual(Gate{ .load = 12.5 }, gate(cfg, at.m(12.5), 8, &v, 101));
-    // Back under budget + margin but over the budget: still tripped.
+    // Back under budget + margin but over budget + margin/2: still tripped.
+    try testing.expectEqual(Gate{ .load = 11 }, gate(cfg, at.m(11), 8, &v, 105));
+    // At or under 10, but not yet for 15 s.
     try testing.expectEqual(Gate{ .load = 10 }, gate(cfg, at.m(10), 8, &v, 110));
-    // Under the budget, but not yet for 30 s.
-    try testing.expectEqual(Gate{ .load = 7 }, gate(cfg, at.m(7), 8, &v, 120));
-    try testing.expectEqual(Gate{ .load = 7.5 }, gate(cfg, at.m(7.5), 8, &v, 149));
+    try testing.expectEqual(Gate{ .load = 9.5 }, gate(cfg, at.m(9.5), 8, &v, 120));
     // A load spike restarts the calm period.
-    try testing.expectEqual(Gate{ .load = 9 }, gate(cfg, at.m(9), 8, &v, 150));
-    try testing.expectEqual(Gate{ .load = 7 }, gate(cfg, at.m(7), 8, &v, 151));
-    try testing.expectEqual(Gate.open, gate(cfg, at.m(7), 8, &v, 181));
+    try testing.expectEqual(Gate{ .load = 10.5 }, gate(cfg, at.m(10.5), 8, &v, 122));
+    try testing.expectEqual(Gate{ .load = 9 }, gate(cfg, at.m(9), 8, &v, 123));
+    try testing.expectEqual(Gate.open, gate(cfg, at.m(9), 8, &v, 138));
     try testing.expect(!v.tripped);
     // Over the budget (not tripped): one admission per 10 s.
-    v.last_admit = 181;
-    try testing.expectEqual(Gate{ .spacing = 9 }, gate(cfg, at.m(9), 8, &v, 185));
-    try testing.expectEqual(Gate.open, gate(cfg, at.m(9), 8, &v, 191));
+    v.last_admit = 138;
+    try testing.expectEqual(Gate{ .spacing = 9 }, gate(cfg, at.m(9), 8, &v, 142));
+    try testing.expectEqual(Gate.open, gate(cfg, at.m(9), 8, &v, 148));
     // --no-load-check (no valve) or load_check = off.
     try testing.expectEqual(Gate.open, gate(cfg, at.m(30), 8, null, 200));
     try testing.expectEqual(Gate.open, gate(.{ .load_check = false }, at.m(30), 8, &v, 200));
@@ -478,7 +480,7 @@ test "load safety valve with hysteresis" {
 test "a stale tripped valve reopens at once when the load is calm" {
     const cfg: Config = .{};
     const calm: Machine = .{ .active = 10, .load1 = 3, .pressure = .normal };
-    const busy: Machine = .{ .active = 10, .load1 = 9, .pressure = .normal };
+    const busy: Machine = .{ .active = 10, .load1 = 11, .pressure = .normal };
     // Tripped and unchecked for an hour: open at once if the load is calm.
     var v: Valve = .{ .tripped = true, .last_check = 1000 };
     try testing.expectEqual(Gate.open, gate(cfg, calm, 8, &v, 4600));
@@ -487,9 +489,9 @@ test "a stale tripped valve reopens at once when the load is calm" {
     // Left by a file without a check time: the same.
     v = Valve.parse("1 0 0\n");
     try testing.expectEqual(Gate.open, gate(cfg, calm, 8, &v, 4600));
-    // Stale, but the load is over the budget: still tripped.
+    // Stale, but the load is over budget + margin/2: still tripped.
     v = .{ .tripped = true, .last_check = 1000 };
-    try testing.expectEqual(Gate{ .load = 9 }, gate(cfg, busy, 8, &v, 4600));
+    try testing.expectEqual(Gate{ .load = 11 }, gate(cfg, busy, 8, &v, 4600));
     // Checked a moment ago: the calm period still applies.
     v = .{ .tripped = true, .last_check = 4590 };
     try testing.expectEqual(Gate{ .load = 3 }, gate(cfg, calm, 8, &v, 4600));

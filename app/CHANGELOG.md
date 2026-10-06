@@ -3,6 +3,16 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.4.1 — 2026-10-05
+
+- The waiting row turns orange when cpuq's gate (the load valve, memory pressure or spacing)
+  is why jobs wait, rather than a full budget, and the top line says "gate shut".
+- A key under the chart names each mark: free, held and idle, busy, held but not measured,
+  waiting, waiting with the gate shut.
+- Work outside cpuq is capped at what the CPUs can do, so one bad reading cannot flatten the
+  chart; the waiting row sits lower, clear of the counts above it.
+- The release build uses only the cores cpuq granted it.
+
 ## 0.4.0 — 2026-10-05
 
 - Two views of the same hour, switched with Lanes | Stacked at the top right (remembered):
