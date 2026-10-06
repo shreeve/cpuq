@@ -2,6 +2,13 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.7.5 — 2026-10-06
+
+- Fix: cpuq could panic (integer overflow) while it read another job's
+  lease or ticket as that job was still writing it, the file growing
+  between two of the reader's looks. A waiter that hit it died and was
+  recorded as lost. Records are now read without a read-ahead buffer.
+
 ## 0.7.4 — 2026-10-06
 
 - Fix: a job paused by hand and then killed by other means than `cpuq

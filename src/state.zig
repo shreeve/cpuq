@@ -306,9 +306,36 @@ pub fn writeRecord(io: Io, file: Io.File, r: Record) !void {
 }
 
 fn readAll(io: Io, arena: std.mem.Allocator, file: Io.File) []const u8 {
-    var buf: [1024]u8 = undefined;
-    var fr = file.reader(io, &buf);
+    var fr = recordReader(io, file);
     return fr.interface.allocRemaining(arena, .limited(64 << 10)) catch "";
+}
+
+/// A reader for a record another process may still be writing. It has no
+/// buffer of its own: a buffered reader can read past the size it took at
+/// its first look, if the file has grown since, and the standard library's
+/// arithmetic then overflows (a panic, which killed waiters).
+fn recordReader(io: Io, file: Io.File) Io.File.Reader {
+    return file.reader(io, &.{});
+}
+
+test "a record that grows while it is read" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "r", .data = "ticket 1\n" });
+    const f = try tmp.dir.openFile(io, "r", .{});
+    defer f.close(io);
+    var fr = recordReader(io, f);
+    _ = try fr.getSize();
+    // Its owner writes the rest after the reader has looked at the size.
+    var long: [3000]u8 = undefined;
+    @memset(&long, 'x');
+    @memcpy(long[0..9], "ticket 1\n");
+    try tmp.dir.writeFile(io, .{ .sub_path = "r", .data = &long });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const got = fr.interface.allocRemaining(arena.allocator(), .limited(64 << 10)) catch "";
+    try std.testing.expect(std.mem.startsWith(u8, got, "ticket 1\n"));
 }
 
 /// True when the file open as `file` is still the one named `name`: a lock
