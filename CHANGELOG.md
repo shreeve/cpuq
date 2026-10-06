@@ -10,6 +10,11 @@ User-visible changes to cpuq. Each version's section is its release notes.
   guarding against signals and before it logged the end. It now records
   the hold as ended normally, and at every step from queueing to the end a
   fatal signal leaves the job's next line in the history.
+- Fix: a job ending gave its cores back one at a time before taking the
+  admission lock, so a waiter could see it half released, some of its
+  cores free while it still counted them: a wide request then took fewer
+  cores than it should, and could report cores as lent that were not. The
+  release now happens under the lock.
 
 ## 0.7.5 — 2026-10-06
 

@@ -985,15 +985,17 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
 
 /// Gives a lease back. LOCK_UN releases each lock for every holder of the
 /// open file, so a descendant that kept a descriptor (a build server, a
-/// nohup'd helper) does not keep the cores.
+/// nohup'd helper) does not keep the cores. It all happens under the
+/// admission lock, so no waiter sees a lease half given back: some of its
+/// cores free while the lease still counts them.
 fn release(io: Io, st: *state.State, lease: Lease) void {
+    lockOrFail(st);
     for (lease.tokens) |t| {
         t.unlock(io);
         t.close(io);
     }
     lease.file.unlock(io);
     lease.file.close(io);
-    lockOrFail(st);
     st.leases.deleteFile(io, lease.name) catch {};
     st.setPaused(lease.name, false);
     st.unlock();
