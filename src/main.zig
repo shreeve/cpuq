@@ -1404,6 +1404,8 @@ const StatusView = struct {
     leases: []const JsonLease,
     outside: []const JsonOutside,
     now: i64,
+    /// The CPUs online: what the load is measured against.
+    online: u32 = 0,
     /// For another host's status: its name and its cpuq's version.
     host: ?[]const u8 = null,
     version: ?[]const u8 = null,
@@ -1416,6 +1418,20 @@ fn showOutside(outside: []const JsonOutside, g: policy.Gate) bool {
     var total: f64 = 0;
     for (outside) |o| total += o.using;
     return total >= 1.0 or g != .open;
+}
+
+/// The load averages: the 1-minute one bold, in green under half the CPUs
+/// online, yellow up to one and a half times them, red beyond; the 5- and
+/// 15-minute ones dim.
+fn loadCell(a: std.mem.Allocator, load: [3]f64, online: u32) table.Cell {
+    const cpus: f64 = @floatFromInt(@max(online, 1));
+    const tint: table.Tint = if (load[0] < 0.5 * cpus) .good else if (load[0] <= 1.5 * cpus) .warn else .bad;
+    const now = a.print("{d:.1}", .{load[0]}) catch "?";
+    const rest = a.print(" {d:.1} {d:.1}", .{ load[1], load[2] }) catch "";
+    return .{
+        .text = std.mem.concat(a, u8, &.{ now, rest }) catch now,
+        .parts = a.dupe(table.Part, &.{ .{ .text = now, .tint = tint, .bold = true }, .{ .text = rest, .tint = .dim } }) catch null,
+    };
 }
 
 /// `cpuq status` on a terminal: boxed tables, colored unless NO_COLOR is set.
@@ -1452,7 +1468,7 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
             .{ .head = "BUDGET", .alignment = .right },
             .{ .head = "IN USE", .alignment = .right },
             .{ .head = "FREE", .alignment = .right },
-            .{ .head = "LOAD 1 5 15" },
+            .{ .head = "LOAD", .sub = "1 5 15" },
             .{ .head = "MEMORY" },
             .{ .head = "GATE" },
         },
@@ -1460,7 +1476,7 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
             .{ .text = a.print("{d}", .{v.budget}) catch "?" },
             .{ .text = a.print("{d}", .{v.held}) catch "?", .tint = if (v.held != 0) .accent else null },
             .{ .text = a.print("{d}", .{free}) catch "?", .tint = if (free == 0) .warn else .good },
-            .{ .text = a.print("{d:.1} {d:.1} {d:.1}", .{ v.load[0], v.load[1], v.load[2] }) catch "?", .tint = if (v.load[0] > @as(f64, @floatFromInt(v.budget))) .warn else null },
+            loadCell(a, v.load, v.online),
             mem,
             gate,
         }},
@@ -1804,6 +1820,7 @@ fn statusRemote(ctx: *Ctx, host: []const u8, json: bool, measure: bool) u8 {
         .leases = st.leases,
         .outside = st.outside,
         .now = nowSeconds(ctx.io),
+        .online = st.active_cores,
         .host = host,
         .version = st.version,
     });
@@ -1914,6 +1931,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
             .leases = named.items,
             .outside = smp.outside,
             .now = now,
+            .online = m.active,
         });
         return 0;
     }

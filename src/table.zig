@@ -35,6 +35,8 @@ pub const Tint = enum {
 
 pub const Column = struct {
     head: []const u8,
+    /// Shown dim after the bold head: units or a legend, as in "LOAD 1 5 15".
+    sub: []const u8 = "",
     alignment: Align = .left,
     tint: Tint = .none,
     /// Cut to fit the terminal; at most one column should be.
@@ -45,6 +47,14 @@ pub const Cell = struct {
     text: []const u8,
     /// Overrides the column's tint.
     tint: ?Tint = null,
+    /// Draws the cell in differently tinted parts, which together are `text`.
+    parts: ?[]const Part = null,
+};
+
+pub const Part = struct {
+    text: []const u8,
+    tint: Tint = .none,
+    bold: bool = false,
 };
 
 pub const Table = struct {
@@ -59,7 +69,7 @@ pub const Table = struct {
         const n = t.columns.len;
         const widths = a.alloc(usize, n) catch return;
         for (t.columns, 0..) |col, i| {
-            widths[i] = cols(col.head);
+            widths[i] = cols(col.head) + if (col.sub.len != 0) 1 + cols(col.sub) else 0;
             for (t.rows) |r| widths[i] = @max(widths[i], cols(r[i].text));
         }
         // Each column is "│ cell " wide, and one "│" closes the row.
@@ -157,15 +167,39 @@ fn rule(w: *Io.Writer, stops: []const usize, right: usize, left: []const u8, mid
 fn row(w: *Io.Writer, columns: []const Column, widths: []const usize, cells: ?[]const Cell, heading: bool, color: bool) Io.Writer.Error!void {
     try w.writeAll("│");
     for (columns, 0..) |col, i| {
-        const text = if (cells) |cs| cs[i].text else col.head;
-        const tint: Tint = if (heading) .bold else if (cells.?[i].tint) |t| t else col.tint;
-        var buf: [512]u8 = undefined;
-        const shown = cut(&buf, text, widths[i]);
-        const room = widths[i] -| cols(shown);
         try w.writeAll(" ");
-        if (!heading and col.alignment == .right) try repeat(w, " ", room);
+        if (heading) {
+            try paint(w, col.head, .bold, color);
+            var used = cols(col.head);
+            if (col.sub.len != 0) {
+                try w.writeAll(" ");
+                try paint(w, col.sub, .dim, color);
+                used += 1 + cols(col.sub);
+            }
+            try repeat(w, " ", widths[i] -| used);
+            try w.writeAll(" │");
+            continue;
+        }
+        const cell = cells.?[i];
+        if (cell.parts) |parts| if (cols(cell.text) <= widths[i]) {
+            const room = widths[i] - cols(cell.text);
+            if (col.alignment == .right) try repeat(w, " ", room);
+            for (parts) |part| {
+                if (part.bold and color) {
+                    try w.print("\x1b[1{s}{s}m{s}\x1b[0m", .{ if (part.tint == .none) "" else ";", part.tint.code(), part.text });
+                } else try paint(w, part.text, part.tint, color);
+            }
+            if (col.alignment == .left) try repeat(w, " ", room);
+            try w.writeAll(" │");
+            continue;
+        };
+        const tint: Tint = if (cell.tint) |t| t else col.tint;
+        var buf: [512]u8 = undefined;
+        const shown = cut(&buf, cell.text, widths[i]);
+        const room = widths[i] -| cols(shown);
+        if (col.alignment == .right) try repeat(w, " ", room);
         try paint(w, shown, tint, color);
-        if (heading or col.alignment == .left) try repeat(w, " ", room);
+        if (col.alignment == .left) try repeat(w, " ", room);
         try w.writeAll(" │");
     }
     try w.writeAll("\n");
