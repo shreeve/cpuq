@@ -461,6 +461,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
     var next_note = start + cfg.note_s;
     var last_gate: policy.Gate = .open;
     var hinted = false;
+    var hinted_fixed = false;
     while (true) {
         var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
         defer scratch.deinit();
@@ -538,6 +539,18 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
                 st.unlock();
                 logEvent(ctx, job, "started", .{ .cores = rec.cores, .slots = grant.slots });
                 return .{ .record = rec, .name = lease_name, .file = lease, .tokens = tokens, .job = job };
+            }
+            // First in line for a fixed count while fewer cores sit free: the
+            // queue is strictly in order, so this wait holds up everyone
+            // behind it too. Say once what would start it now.
+            if (!named and !hinted_fixed and pos == 0 and o.request.fixed() and o.request.min > 1) {
+                var held: u32 = 0;
+                for (state.scanLeases(st, a, false) catch &.{}) |l| held += l.record.cores;
+                const free = budget -| held;
+                if (free > 0 and free < o.request.min) {
+                    std.debug.print("cpuq: waiting for {d} cores while {d} {s} free, holding up the queue behind it; --cores {d}-{d} would start now (size the job from $CPUQ_CORES)\n", .{ o.request.min, free, if (free == 1) "is" else "are", free, o.request.min });
+                    hinted_fixed = true;
+                }
             }
         }
         if (out_of_time) giveUp(ctx, st, ticket_name, now - start, job);

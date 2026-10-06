@@ -491,6 +491,20 @@ sys.exit(0 if ok else 1)'"
   check "history prints a summary with the lost job" "[[ '$text' == *'5 jobs; waited'* && '$text' == *'1 lost'* ]]"
 }
 
+t_fixed_hint() {
+  setup fixed_hint
+  # A fixed request first in line while fewer cores are free says once what
+  # would start it now; a range does not.
+  "$CPUQ" run --cores 7 -- sleep 2 & wait_held 7
+  local fixed range
+  fixed=$("$CPUQ" run --cores 3 -- true 2>&1 | grep -c 'would start now')
+  wait
+  "$CPUQ" run --cores 7 -- sleep 1 & wait_held 7
+  range=$("$CPUQ" run --cores 1-3 -- true 2>&1 | grep -c 'would start now')
+  wait
+  check "a blocking fixed request is told once to ask for a range (got $fixed, range $range)" "[ '$fixed' = 1 ] && [ '$range' = 0 ]"
+}
+
 t_zombie() {
   setup zombie
   # A child spins a second, then waits as a zombie until its parent reaps
@@ -702,7 +716,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host wait history zombie outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host wait history zombie fixed_hint outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

@@ -275,8 +275,24 @@ struct GraphsView: View {
 
     // MARK: Now
 
-    /// The time columns the lanes are cut into, all equally wide on screen.
-    static let columns = 90
+    /// The time columns the lanes are cut into: stretches of the clock, 5 seconds long for the
+    /// last 2 minutes, then 15 seconds to 10 minutes, 30 seconds to 30, and a minute beyond, each
+    /// starting on a multiple of its length. A column covers the same seconds from one refresh
+    /// to the next, so what it shows never changes as it moves left; it only narrows, and
+    /// merges with its neighbors into a longer one as it ages.
+    static func columns(end: Date, from oldest: Date) -> [(from: Date, to: Date)] {
+        var out: [(from: Date, to: Date)] = []
+        var t = end.timeIntervalSince1970
+        let stop = oldest.timeIntervalSince1970
+        while t > stop {
+            let age = end.timeIntervalSince1970 - t
+            let length: Double = age < 120 ? 5 : age < 600 ? 15 : age < 1800 ? 30 : 60
+            let from = max(((t - 0.001) / length).rounded(.down) * length, stop)
+            out.append((Date(timeIntervalSince1970: from), Date(timeIntervalSince1970: t)))
+            t = from
+        }
+        return out.reversed()
+    }
 
     /// One core over one column: free (nil project), held, or busy by `busy` (0 to 1).
     struct Cell: Identifiable {
@@ -292,31 +308,36 @@ struct GraphsView: View {
         var id: Int { column }
         let column: Int
         let count: Int
+        /// Whether it carries the count of its stretch: the middle of a run of more than one.
+        var label = false
     }
 
     private var now: some View {
         let end = Date()
         let axis = TimeAxis(span: min(max(end.timeIntervalSince(model.oldest(now: end)), 300), GraphModel.keep))
         let lanes = max(model.budget, (model.blocks.flatMap(\.lanes).max() ?? 0) + 1)
-        let (cells, waitCells) = Self.grid(model, axis: axis, end: end, lanes: lanes)
-        let w = -axis.start / Double(Self.columns)
-        let gap = w * 0.1
-        let left = { (c: Int) in axis.start + Double(c) * w }
+        let columns = Self.columns(end: end, from: end.addingTimeInterval(-axis.span))
+        let (cells, waitCells) = Self.grid(model, columns: columns, end: end, lanes: lanes)
+        let left = { (c: Int) in axis.x(end.timeIntervalSince(columns[c].from)) }
+        let right = { (c: Int) in axis.x(end.timeIntervalSince(columns[c].to)) }
+        let gap = { (c: Int) in (right(c) - left(c)) * 0.1 }
         return VStack(alignment: .leading, spacing: 12) {
             ((hover.flatMap { describe($0, axis: axis, end: end, cells: cells) }) ?? summary())
                 .font(.title3).monospacedDigit().lineLimit(1)
             Chart {
                 ForEach(cells) { c in
-                    RectangleMark(xStart: .value("Time", left(c.column) + gap), xEnd: .value("Time", left(c.column + 1) - gap),
+                    RectangleMark(xStart: .value("Time", left(c.column) + gap(c.column)), xEnd: .value("Time", right(c.column) - gap(c.column)),
                                   yStart: .value("Core", Double(c.lane) + 0.1), yEnd: .value("Core", Double(c.lane) + 0.9))
                         .foregroundStyle(c.project.map { model.color($0).opacity(0.2 + 0.75 * c.busy) } ?? Color.secondary.opacity(0.08))
                 }
+                // Waiting: a bar as tall as the count (one, two, three or more), the count
+                // written once over each stretch of more than one.
                 ForEach(waitCells) { c in
-                    RectangleMark(xStart: .value("Time", left(c.column) + gap), xEnd: .value("Time", left(c.column + 1) - gap),
-                                  yStart: .value("Core", -1.15), yEnd: .value("Core", -0.35))
-                        .foregroundStyle(c.count == 0 ? Color.secondary.opacity(0.08) : Color.red.opacity(min(0.35 + 0.2 * Double(c.count), 0.9)))
-                        .annotation(position: .overlay) {
-                            if c.count > 1 { Text("\(c.count)").font(.system(size: 9, weight: .bold)).foregroundStyle(.white) }
+                    RectangleMark(xStart: .value("Time", left(c.column) + gap(c.column)), xEnd: .value("Time", right(c.column) - gap(c.column)),
+                                  yStart: .value("Core", -1.2), yEnd: .value("Core", c.count == 0 ? -1.12 : -1.2 + 0.28 * Double(min(c.count, 3))))
+                        .foregroundStyle(c.count == 0 ? Color.secondary.opacity(0.12) : Color.red.opacity(0.75))
+                        .annotation(position: .top, spacing: 1) {
+                            if c.label { Text("\(c.count)").font(.system(size: 10, weight: .bold)).foregroundStyle(.red) }
                         }
                 }
                 if let h = hover {
@@ -334,12 +355,12 @@ struct GraphsView: View {
                     }
                 }
             }
-            .chartYScale(domain: -1.25...Double(lanes))
+            .chartYScale(domain: -1.3...Double(lanes))
             .chartYAxis {
                 AxisMarks(position: .leading, values: (0..<lanes).map { Double($0) + 0.5 }) { v in
                     AxisValueLabel { if let d = v.as(Double.self) { Text("\(Int(d) + 1)") } }
                 }
-                AxisMarks(position: .leading, values: [-0.75]) { _ in
+                AxisMarks(position: .leading, values: [-0.85]) { _ in
                     AxisValueLabel { Text("waiting").foregroundStyle(.red) }
                 }
             }
@@ -365,13 +386,11 @@ struct GraphsView: View {
     /// Every core in every column: the job holding it longest there, and how busy; and how many
     /// waited. A job keeps its lowest cores busy first: with 2.5 active of 4, its first two
     /// cores are solid, the third half, the fourth pale.
-    static func grid(_ m: GraphModel, axis: TimeAxis, end: Date, lanes: Int) -> ([Cell], [WaitCell]) {
+    static func grid(_ m: GraphModel, columns: [(from: Date, to: Date)], end: Date, lanes: Int) -> ([Cell], [WaitCell]) {
         var cells: [Cell] = []
         var waits: [WaitCell] = []
-        let w = -axis.start / Double(columns)
-        for c in 0..<columns {
-            let t1 = end.addingTimeInterval(-axis.age(axis.start + Double(c) * w))
-            let t2 = end.addingTimeInterval(-axis.age(axis.start + Double(c + 1) * w))
+        for (c, column) in columns.enumerated() {
+            let t1 = column.from, t2 = column.to
             let length = max(t2.timeIntervalSince(t1), 0.001)
             func overlap(_ from: Date, _ to: Date?) -> Double {
                 max(0, min(t2, to ?? end).timeIntervalSince(max(t1, from))) / length
@@ -392,6 +411,13 @@ struct GraphsView: View {
                 cells.append(Cell(column: c, lane: lane, project: b.project, busy: min(max((active ?? 0) - rank, 0), 1), block: b.id))
             }
             waits.append(WaitCell(column: c, count: m.waits.filter { overlap($0.from, $0.to) > 0 }.count))
+        }
+        var i = 0
+        while i < waits.count {
+            var j = i
+            while j < waits.count && waits[j].count == waits[i].count { j += 1 }
+            if waits[i].count > 1 { waits[(i + j - 1) / 2].label = true }
+            i = j
         }
         return (cells, waits)
     }
@@ -422,12 +448,13 @@ struct GraphsView: View {
                 + Text(String(format: "%.1f active", $0.active)).foregroundColor(.secondary)
                 + Text(String(format: " · load %.1f", $0.load)).foregroundColor(.secondary)
         } ?? Text("")
-        return describeJob(p, axis: axis, at: at, a: a, end: end, cells: cells).map { $0 + machine }
+        let columns = Self.columns(end: end, from: end.addingTimeInterval(-axis.span))
+        let column = columns.firstIndex { $0.from <= at && at <= $0.to } ?? max(columns.count - 1, 0)
+        return describeJob(p, column: column, at: at, a: a, end: end, cells: cells).map { $0 + machine }
     }
 
-    private func describeJob(_ p: CGPoint, axis: TimeAxis, at: Date, a: TimeInterval, end: Date, cells: [Cell]) -> Text? {
+    private func describeJob(_ p: CGPoint, column: Int, at: Date, a: TimeInterval, end: Date, cells: [Cell]) -> Text? {
         let when = Text(a < 5 ? "now   " : age(a) + " ago   ").foregroundColor(.secondary)
-        let column = min(max(Int((p.x - axis.start) / (-axis.start / Double(Self.columns))), 0), Self.columns - 1)
         if p.y >= 0 {
             let lane = Int(p.y)
             guard let cell = cells.first(where: { $0.column == column && $0.lane == lane }), let id = cell.block,

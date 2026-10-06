@@ -3,6 +3,16 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.3.1 — 2026-10-05
+
+- The lanes' columns are fixed stretches of the clock (5 seconds for the last 2 minutes, then 15,
+  30 and 60 seconds further back), so a column shows the same thing from one refresh to the
+  next: the picture only slides left and narrows, merging columns as they age, instead of
+  changing shape.
+- The waiting row is a bar as tall as the count, one, two or three and more, with the count
+  written once over each stretch of more than one.
+- Pointing at a moment adds cpuq's cores in use and active and the load then.
+
 ## 0.3.0 — 2026-10-05
 
 The graphs window shows the budget's cores as lanes.
