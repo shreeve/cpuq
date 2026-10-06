@@ -2,6 +2,14 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.4.2 — 2026-10-05
+
+- `cpuq status` shows the current (1-minute) load in bold, green under half
+  the CPUs online, yellow up to one and a half times them, red beyond, with
+  the 5- and 15-minute loads dim.
+- Cpuq.app ships on its own: `brew install --cask shreeve/tap/cpuq-app`, or
+  the `app-v*` releases; it updates itself through Sparkle (see app/README.md).
+
 ## 0.4.1 — 2026-10-05
 
 - `cpuq status --watch` draws in place on the terminal's alternate screen,
