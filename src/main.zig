@@ -16,6 +16,8 @@ const version = @import("build_options").version;
 
 const usage =
     \\usage: cpuq run [options] [--] CMD [ARGS...]
+    \\       cpuq lease NAME [--slots N] [--host HOST] [lease options] [--] CMD [ARGS...]
+    \\       cpuq wait --label PATTERN [--max-wait SECONDS]
     \\       cpuq status [--json] [--no-usage]
     \\       cpuq budget
     \\       cpuq qos
@@ -29,6 +31,13 @@ const usage =
     \\  --max-wait SECONDS    give up (exit 75) after waiting this long
     \\  --no-load-check       ignore the load safety valve
     \\  --qos none            leave the command's scheduling class unchanged
+    \\
+    \\lease: a first-come, first-served lock on NAME (letters, digits, . _ -),
+    \\with --priority, --label and --max-wait as for run; --slots N lets N
+    \\hold it at once (default 1). --host HOST holds it on HOST's cpuq over ssh
+    \\while CMD runs here. CMD gets CPUQ_LEASES.
+    \\wait: until no job whose label matches (PATTERN* for a prefix) holds or
+    \\waits.
     \\
     \\environment: CPUQ_DIR (state directory), CPUQ_BUDGET, CPUQ_CONFIG
     \\(default ~/.config/cpuq/config). A run gets CPUQ_CORES, CPUQ_TOKEN and
@@ -75,8 +84,10 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
         return 0;
     }
     if (std.mem.eql(u8, cmd, "run")) return cmdRun(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "lease")) return cmdLease(ctx, args[1..]);
     loadConfig(ctx);
     if (std.mem.eql(u8, cmd, "status")) return cmdStatus(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "wait")) return cmdWait(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "budget")) {
         const m = machine(ctx);
         ctx.out.print("{d}\n", .{budgetNow(ctx, m)}) catch {};
@@ -164,6 +175,17 @@ const RunOptions = struct {
     load_check: bool = true,
     qos: bool = true,
     cmd: []const [:0]const u8 = &.{},
+    /// A named lease's name; null for cores.
+    lease: ?[]const u8 = null,
+    /// `cpuq lease --host HOST`: hold the lease on HOST's cpuq over ssh.
+    host: ?[]const u8 = null,
+    /// `cpuq lease --hold`: once admitted, say so and hold until stdin
+    /// closes (the other end of `--host`).
+    hold: bool = false,
+    /// `cpuq lease --slots N`: how many may hold the lease at once.
+    slots: u32 = 1,
+    /// Options only `cpuq run` takes, to reject them for a lease.
+    run_only: ?[]const u8 = null,
 };
 
 fn parseRun(args: []const [:0]const u8) ?RunOptions {
@@ -185,7 +207,7 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             name = kv[0];
             inline_value = kv[1];
         }
-        const takes_value = for ([_][]const u8{ "--cores", "--priority", "--label", "--max-wait", "--qos" }) |v| {
+        const takes_value = for ([_][]const u8{ "--cores", "--priority", "--label", "--max-wait", "--qos", "--host", "--slots" }) |v| {
             if (std.mem.eql(u8, name, v)) break true;
         } else false;
         var value: []const u8 = "";
@@ -201,6 +223,9 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
         } else if (inline_value != null) {
             _ = usageError("{s} takes no value", .{name});
             return null;
+        }
+        for ([_][]const u8{ "--cores", "--exclusive", "--no-load-check", "--qos" }) |r| {
+            if (std.mem.eql(u8, name, r)) o.run_only = r;
         }
         if (std.mem.eql(u8, name, "--cores")) {
             o.request = policy.Request.parse(value) orelse {
@@ -228,6 +253,15 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             o.exclusive = true;
         } else if (std.mem.eql(u8, name, "--no-load-check")) {
             o.load_check = false;
+        } else if (std.mem.eql(u8, name, "--host")) {
+            o.host = value;
+        } else if (std.mem.eql(u8, name, "--slots")) {
+            o.slots = policy.parseCount(value) orelse {
+                _ = usageError("--slots needs a whole number, at least 1, not '{s}'", .{value});
+                return null;
+            };
+        } else if (std.mem.eql(u8, name, "--hold")) {
+            o.hold = true;
         } else {
             _ = usageError("unknown option '{s}'", .{a});
             return null;
@@ -280,6 +314,7 @@ fn nestedGrant(ctx: *Ctx) bool {
 fn cmdRun(ctx: *Ctx, args: []const [:0]const u8) u8 {
     const o = parseRun(args) orelse return exit_usage;
     if (o.cmd.len == 0) return usageError("run needs a command", .{});
+    if (o.host != null or o.hold or o.slots != 1) return usageError("--host, --hold and --slots are options of `cpuq lease`", .{});
 
     if (nestedGrant(ctx)) {
         // Inside a running job: run at once within its grant, everything
@@ -311,11 +346,14 @@ fn lockOrFail(st: *state.State) void {
     st.lock() catch |err| fail("admission lock: {t}", .{err});
 }
 
-/// Queues this run and returns once it holds its cores.
+/// Queues this run and returns once it holds its cores, or for a named
+/// lease, one of its slots: a pool of `--slots` (1 by default), with no
+/// machine gates.
 fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
     const io = ctx.io;
     const cfg = ctx.cfg;
-    const cores = sys.totalCpus(io);
+    const named = o.lease != null;
+    const cores: u32 = if (named) o.slots else sys.totalCpus(io);
     const start = nowSeconds(io);
 
     lockOrFail(st);
@@ -349,14 +387,12 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
             if (std.mem.eql(u8, e.name, ticket_name)) break i;
         } else fail("ticket {s} vanished from the queue", .{ticket_name});
 
-        if (o.max_wait) |mw| if (now - start >= mw) {
-            st.queue.deleteFile(io, ticket_name) catch {};
-            st.unlock();
-            std.debug.print("cpuq: gave up after waiting {d}s\n", .{now - start});
-            std.process.exit(exit_timeout);
-        };
+        // Out of time: give up, but only after the head has tried once, so
+        // --max-wait 0 takes what is free now and otherwise gives up.
+        const out_of_time = if (o.max_wait) |mw| now - start >= mw else false;
+        if (out_of_time and pos > 0) giveUp(io, st, ticket_name, now - start);
         if (now >= next_note) {
-            note(ctx, st, a, now - start, queue, pos, last_gate);
+            note(ctx, st, a, now - start, queue, pos, last_gate, o.lease);
             next_note = now + cfg.note_s;
         }
         var wake_ms: i64 = @min(next_note - now, 60) * 1000;
@@ -375,11 +411,11 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
             continue;
         }
 
-        const m = machine(ctx);
-        const budget = budgetNow(ctx, m);
         var valve = st.readValve();
-        last_gate = policy.gate(cfg, m, budget, if (o.load_check) &valve else null, now);
-        if (o.load_check and cfg.load_check) st.writeValve(valve);
+        const budget: u32 = if (named) o.slots else budgetNow(ctx, machine(ctx));
+        last_gate = if (named) .open else policy.gate(cfg, machine(ctx), budget, if (o.load_check) &valve else null, now);
+        const check_load = !named and o.load_check and cfg.load_check;
+        if (check_load) st.writeValve(valve);
         if (last_gate == .open) {
             const exclusive_running = (state.scanLeases(st, a, true) catch @as([]state.Entry, &.{})).len != 0;
             // Leave the next waiter's minimum free when this grant can spare it.
@@ -402,16 +438,25 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
                     };
                 } else fail("lease: no free lease name", .{});
                 valve.last_admit = now;
-                if (o.load_check and cfg.load_check) st.writeValve(valve);
+                if (check_load) st.writeValve(valve);
                 st.queue.deleteFile(io, ticket_name) catch {};
                 ticket.close(io);
                 st.unlock();
                 return .{ .record = rec, .name = lease_name, .file = lease, .tokens = tokens };
             }
         }
+        if (out_of_time) giveUp(io, st, ticket_name, now - start);
         st.unlock();
         io.sleep(.fromMilliseconds(cfg.poll_ms), .awake) catch {};
     }
+}
+
+/// Leaves the queue and exits 75. Call with the admission lock held.
+fn giveUp(io: Io, st: *state.State, ticket_name: []const u8, waited: i64) noreturn {
+    st.queue.deleteFile(io, ticket_name) catch {};
+    st.unlock();
+    std.debug.print("cpuq: gave up after waiting {d}s\n", .{waited});
+    std.process.exit(exit_timeout);
 }
 
 fn watch(io: Io, f: Io.File, sem: *Io.Semaphore) Io.Cancelable!void {
@@ -470,26 +515,31 @@ fn gateText(buf: []u8, g: policy.Gate, budget: u32) []const u8 {
 
 /// The once-a-minute line a queued run prints, so a long wait never looks
 /// like a hang. Call with the admission lock held.
-fn note(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, waited: i64, queue: []const state.Entry, pos: usize, g: policy.Gate) void {
+fn note(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, waited: i64, queue: []const state.Entry, pos: usize, g: policy.Gate, lease: ?[]const u8) void {
     var w_buf: [512]u8 = undefined;
     var w: Io.Writer = .fixed(&w_buf);
     var b1: [16]u8 = undefined;
     var b2: [16]u8 = undefined;
     var b3: [128]u8 = undefined;
-    const m = machine(ctx);
-    const budget = budgetNow(ctx, m);
-    const held = state.heldTokens(st) catch 0;
     w.print("cpuq: waiting {s}: {s} in {s}", .{ age(&b1, waited), ordinal(&b2, pos + 1), className(queue[pos].class) }) catch {};
-    if (pos == 0 and g != .open) w.print(", {s}", .{gateText(&b3, g, budget)}) catch {};
-    w.print("; {d}/{d} cores held", .{ held, budget }) catch {};
     const leases = state.scanLeases(st, a, false) catch @as([]state.Entry, &.{});
+    if (lease) |name| {
+        w.print(" for lease {s}", .{name}) catch {};
+    } else {
+        const m = machine(ctx);
+        const budget = budgetNow(ctx, m);
+        const held = state.heldTokens(st) catch 0;
+        if (pos == 0 and g != .open) w.print(", {s}", .{gateText(&b3, g, budget)}) catch {};
+        w.print("; {d}/{d} cores held", .{ held, budget }) catch {};
+    }
     for (leases, 0..) |l, i| {
-        w.print("{s} {s} (pid {d}, {d})", .{
-            if (i == 0) " by" else ",",
+        w.print("{s} {s} (pid {d}", .{
+            if (i == 0) (if (lease != null) ", held by" else " by") else ",",
             if (l.record.label.len != 0) l.record.label else std.mem.sliceTo(l.record.cmd, ' '),
             l.record.pid,
-            l.record.cores,
         }) catch break;
+        if (lease == null) w.print(", {d}", .{l.record.cores}) catch break;
+        w.writeAll(")") catch break;
     }
     std.debug.print("{s}\n", .{w.buffered()});
 }
@@ -512,22 +562,29 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
     for (lease.tokens) |t| sys.inherit(t.handle);
     sys.inherit(lease.file.handle);
 
-    var num: [16]u8 = undefined;
-    ctx.env.put("CPUQ_CORES", std.mem.print(&num, "{d}", .{k}) catch "1") catch fail("out of memory", .{});
-    ctx.env.put("CPUQ_TOKEN", lease.name) catch fail("out of memory", .{});
-    const pipe = sys.jobserverPipe(k - 1) catch |err| fail("jobserver: {t}", .{err});
-    const flags = policy.makeflags(ctx.arena, ctx.env.get("MAKEFLAGS"), pipe[0], pipe[1]) catch fail("out of memory", .{});
-    ctx.env.put("MAKEFLAGS", flags) catch fail("out of memory", .{});
+    // A lease adds itself to CPUQ_LEASES and leaves the cores, the
+    // jobserver and the scheduling class as they are.
+    var pipe: [2]std.c.fd_t = .{ -1, -1 };
+    if (o.lease) |name| {
+        addLeaseEnv(ctx, name, lease.name);
+    } else {
+        var num: [16]u8 = undefined;
+        ctx.env.put("CPUQ_CORES", std.mem.print(&num, "{d}", .{k}) catch "1") catch fail("out of memory", .{});
+        ctx.env.put("CPUQ_TOKEN", lease.name) catch fail("out of memory", .{});
+        pipe = sys.jobserverPipe(k - 1) catch |err| fail("jobserver: {t}", .{err});
+        const flags = policy.makeflags(ctx.arena, ctx.env.get("MAKEFLAGS"), pipe[0], pipe[1]) catch fail("out of memory", .{});
+        ctx.env.put("MAKEFLAGS", flags) catch fail("out of memory", .{});
+    }
     const envp = ctx.env.createPosixBlock(ctx.arena, .{}) catch fail("out of memory", .{});
 
     const argv = ctx.arena.allocSentinel(?[*:0]const u8, o.cmd.len, null) catch fail("out of memory", .{});
     for (o.cmd, 0..) |a, i| argv[i] = a.ptr;
 
     sys.installForwarding();
-    const qos = policy.qosFor(o.priority, o.exclusive, ctx.cfg.qos and o.qos);
+    const qos = policy.qosFor(o.priority, o.exclusive, ctx.cfg.qos and o.qos and o.lease == null);
     const spawned = sys.spawn(exe, argv.ptr, @ptrCast(envp.slice.ptr), qos);
-    sys.closeFd(pipe[0]);
-    sys.closeFd(pipe[1]);
+    if (pipe[0] >= 0) sys.closeFd(pipe[0]);
+    if (pipe[1] >= 0) sys.closeFd(pipe[1]);
     const exit: sys.Exit = if (spawned) |pid| blk: {
         sys.setChild(pid);
         lease.record.child = pid;
@@ -538,9 +595,18 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
         break :blk .{ .code = if (err == error.FileNotFound) exit_notfound else exit_noexec };
     };
 
-    // LOCK_UN releases each lock for every holder of the open file, so a
-    // descendant that kept a descriptor (a build server, a nohup'd helper)
-    // does not keep the cores.
+    release(io, st, lease);
+    ctx.out.flush() catch {};
+    switch (exit) {
+        .code => |c| return c,
+        .signal => |sig| sys.dieBySignal(sig),
+    }
+}
+
+/// Gives a lease back. LOCK_UN releases each lock for every holder of the
+/// open file, so a descendant that kept a descriptor (a build server, a
+/// nohup'd helper) does not keep the cores.
+fn release(io: Io, st: *state.State, lease: Lease) void {
     for (lease.tokens) |t| {
         t.unlock(io);
         t.close(io);
@@ -550,11 +616,259 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
     lockOrFail(st);
     st.leases.deleteFile(io, lease.name) catch {};
     st.unlock();
+}
 
+/// A lease name: letters, digits, `.`, `_` and `-`.
+fn validLeaseName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64 or name[0] == '.' or name[0] == '-') return false;
+    for (name) |ch| switch (ch) {
+        'a'...'z', 'A'...'Z', '0'...'9', '.', '_', '-' => {},
+        else => return false,
+    };
+    return true;
+}
+
+/// The state of the named lease NAME: a pool of one in the state directory.
+fn openNamed(ctx: *Ctx, name: []const u8) state.State {
+    const dir = std.mem.concat(ctx.arena, u8, &.{ stateDir(ctx), "/named/", name }) catch fail("out of memory", .{});
+    return state.State.open(ctx.io, dir) catch |err| fail("state directory {s}: {t}", .{ dir, err });
+}
+
+/// Adds an entry to CPUQ_LEASES, the leases a command runs inside: `NAME=ID`
+/// for a lease held on this machine, `NAME@HOST=ID:PID` for one held on
+/// HOST by the local cpuq PID.
+fn addLeaseEnv(ctx: *Ctx, name: []const u8, id: []const u8) void {
+    const old = ctx.env.get("CPUQ_LEASES") orelse "";
+    const entry = ctx.arena.print("{s}{s}{s}={s}", .{ old, if (old.len == 0) "" else " ", name, id }) catch fail("out of memory", .{});
+    ctx.env.put("CPUQ_LEASES", entry) catch fail("out of memory", .{});
+}
+
+/// True when this run is inside a holder of the lease NAME (on HOST, for
+/// `--host`), so it must not queue behind itself. A local entry counts
+/// while its lease file is still held here, which also covers an entry
+/// passed through ssh to the host that holds it; a remote entry counts
+/// while the local cpuq holding it lives.
+fn nestedLease(ctx: *Ctx, name: []const u8, host: ?[]const u8) bool {
+    const leases = ctx.env.get("CPUQ_LEASES") orelse return false;
+    var entries = std.mem.tokenizeScalar(u8, leases, ' ');
+    while (entries.next()) |entry| {
+        const key, const val = std.mem.cutScalar(u8, entry, '=') orelse continue;
+        const entry_name, const entry_host = std.mem.cutScalar(u8, key, '@') orelse .{ key, "" };
+        if (!std.mem.eql(u8, entry_name, name)) continue;
+        const id, const pid_text = std.mem.cutScalar(u8, val, ':') orelse .{ val, "" };
+        if (host) |h| {
+            if (std.mem.eql(u8, entry_host, h)) {
+                const pid = std.fmt.parseInt(i32, pid_text, 10) catch continue;
+                if (sys.processAlive(pid)) return true;
+            }
+            continue;
+        }
+        if (id.len == 0 or std.mem.findScalar(u8, id, '/') != null) continue;
+        const path = std.mem.concat(ctx.arena, u8, &.{ stateDir(ctx), "/named/", name, "/leases/", id }) catch continue;
+        const f = Io.Dir.cwd().openFile(ctx.io, path, .{}) catch continue;
+        defer f.close(ctx.io);
+        const free = f.tryLock(ctx.io, .shared) catch continue;
+        if (free) f.unlock(ctx.io) else return true;
+    }
+    return false;
+}
+
+fn cmdLease(ctx: *Ctx, args: []const [:0]const u8) u8 {
+    if (args.len == 0 or args[0].len == 0 or args[0][0] == '-') return usageError("lease needs a name", .{});
+    const name = args[0];
+    if (!validLeaseName(name)) return usageError("a lease name is letters, digits, '.', '_' and '-', not '{s}'", .{name});
+    var o = parseRun(args[1..]) orelse return exit_usage;
+    o.lease = name;
+    o.request = .{ .min = 1, .max = 1 };
+    if (o.run_only) |r| return usageError("{s} is an option of `cpuq run`, not `cpuq lease`", .{r});
+    if (o.hold) {
+        if (o.cmd.len != 0 or o.host != null) return usageError("--hold takes no command and no --host", .{});
+    } else if (o.cmd.len == 0) return usageError("lease needs a command", .{});
+    if (o.host) |h| if (h.len == 0 or h[0] == '-') return usageError("--host needs a host name", .{});
+
+    if (!o.hold and nestedLease(ctx, name, o.host)) {
+        const err = std.process.replace(ctx.io, .{ .argv = @ptrCast(o.cmd) });
+        std.debug.print("cpuq: {s}: {t}\n", .{ o.cmd[0], err });
+        return if (err == error.FileNotFound) exit_notfound else exit_noexec;
+    }
+    loadConfig(ctx);
+    if (o.host) |host| return runRemote(ctx, o, host);
+    const exe: [:0]const u8 = if (o.hold) "" else findExecutable(ctx, o.cmd[0]) orelse {
+        std.debug.print("cpuq: {s}: command not found\n", .{o.cmd[0]});
+        return exit_notfound;
+    };
+    var st = openNamed(ctx, name);
+    const lease = waitTurn(ctx, &st, o);
+    if (o.hold) return holdAdmitted(ctx, &st, o, lease);
+    return runAdmitted(ctx, &st, o, exe, lease);
+}
+
+/// The far end of `cpuq lease --host`: once admitted, prints `held NAME ID`
+/// and holds the lease until stdin closes. If the connection dies instead,
+/// this process dies with it and the kernel frees the lease.
+fn holdAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, lease: Lease) u8 {
+    ctx.out.print("held {s} {s}\n", .{ o.lease.?, lease.name }) catch {};
+    ctx.out.flush() catch {};
+    var buf: [256]u8 = undefined;
+    while (true) {
+        const n = std.c.read(0, &buf, buf.len);
+        if (n > 0) continue;
+        if (n < 0 and std.c.errno(n) == .INTR) continue;
+        break;
+    }
+    release(ctx.io, st, lease);
+    return 0;
+}
+
+/// `cpuq lease NAME --host HOST -- CMD`: holds NAME on HOST's cpuq through
+/// `ssh HOST cpuq lease NAME --hold` and runs CMD here meanwhile. Closing
+/// the connection gives the lease back, and so does the connection dying.
+fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
+    const io = ctx.io;
+    const a = ctx.arena;
+    const exe = findExecutable(ctx, o.cmd[0]) orelse {
+        std.debug.print("cpuq: {s}: command not found\n", .{o.cmd[0]});
+        return exit_notfound;
+    };
+    // ssh joins its arguments into one command line for the remote shell,
+    // so everything after the host is quoted for it.
+    var remote: std.ArrayList(u8) = .empty;
+    remote.print(a, "cpuq lease {s} --hold --slots {d} --priority {t}", .{ o.lease.?, o.slots, o.priority }) catch fail("out of memory", .{});
+    if (o.label.len != 0) remote.print(a, " --label {s}", .{shellQuote(a, o.label)}) catch fail("out of memory", .{});
+    if (o.max_wait) |mw| remote.print(a, " --max-wait {d}", .{mw}) catch fail("out of memory", .{});
+    const argv = [_][]const u8{ "ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4", host, remote.items };
+    var child = std.process.spawn(io, .{ .argv = &argv, .stdin = .pipe, .stdout = .pipe, .stderr = .inherit }) catch |err|
+        fail("ssh {s}: {t}", .{ host, err });
+
+    // The held line: `held NAME ID`.
+    var rbuf: [256]u8 = undefined;
+    var r = child.stdout.?.readerStreaming(io, &rbuf);
+    const line = r.interface.takeDelimiterExclusive('\n') catch "";
+    var words = std.mem.tokenizeScalar(u8, line, ' ');
+    const word = words.next() orelse "";
+    _ = words.next();
+    const id = words.next() orelse "";
+    if (!std.mem.eql(u8, word, "held") or id.len == 0) {
+        if (child.stdin) |f| f.close(io);
+        child.stdin = null;
+        const term = child.wait(io) catch std.process.Child.Term{ .unknown = 0 };
+        const code: u8 = switch (term) {
+            .exited => |c| if (c == 0) exit_failure else c,
+            else => exit_failure,
+        };
+        if (code != exit_timeout) std.debug.print("cpuq: could not hold lease {s} on {s} (ssh exit {d})\n", .{ o.lease.?, host, code });
+        return code;
+    }
+
+    var pid_buf: [16]u8 = undefined;
+    const val = std.mem.concat(a, u8, &.{ id, ":", std.mem.print(&pid_buf, "{d}", .{sys.getpid()}) catch "0" }) catch fail("out of memory", .{});
+    addLeaseEnv(ctx, std.mem.concat(a, u8, &.{ o.lease.?, "@", host }) catch fail("out of memory", .{}), val);
+    const envp = ctx.env.createPosixBlock(a, .{}) catch fail("out of memory", .{});
+    const cargv = a.allocSentinel(?[*:0]const u8, o.cmd.len, null) catch fail("out of memory", .{});
+    for (o.cmd, 0..) |arg, i| cargv[i] = arg.ptr;
+
+    sys.installForwarding();
+    const exit: sys.Exit = if (sys.spawn(exe, cargv.ptr, @ptrCast(envp.slice.ptr), .unchanged)) |pid| blk: {
+        sys.setChild(pid);
+        break :blk sys.waitChild(pid);
+    } else |err| blk: {
+        std.debug.print("cpuq: {s}: {t}\n", .{ o.cmd[0], err });
+        break :blk .{ .code = if (err == error.FileNotFound) exit_notfound else exit_noexec };
+    };
+    // Closing ssh's stdin ends the remote hold.
+    if (child.stdin) |f| f.close(io);
+    child.stdin = null;
+    _ = child.wait(io) catch {};
     ctx.out.flush() catch {};
     switch (exit) {
         .code => |c| return c,
         .signal => |sig| sys.dieBySignal(sig),
+    }
+}
+
+/// `s` in single quotes for a POSIX shell.
+fn shellQuote(a: std.mem.Allocator, s: []const u8) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    out.append(a, '\'') catch fail("out of memory", .{});
+    for (s) |ch| {
+        if (ch == '\'') out.appendSlice(a, "'\\''") catch fail("out of memory", .{}) else out.append(a, ch) catch fail("out of memory", .{});
+    }
+    out.append(a, '\'') catch fail("out of memory", .{});
+    return out.items;
+}
+
+/// True when a label matches a `cpuq wait --label` pattern: exactly, or by
+/// prefix when the pattern ends in `*`.
+fn labelMatches(pattern: []const u8, label: []const u8) bool {
+    if (std.mem.endsWith(u8, pattern, "*")) return std.mem.startsWith(u8, label, pattern[0 .. pattern.len - 1]);
+    return std.mem.eql(u8, pattern, label);
+}
+
+/// The names of the named leases in the state directory.
+fn namedLeases(ctx: *Ctx, a: std.mem.Allocator) []const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    const path = std.mem.concat(a, u8, &.{ stateDir(ctx), "/named" }) catch return &.{};
+    var dir = Io.Dir.cwd().openDir(ctx.io, path, .{ .iterate = true }) catch return &.{};
+    defer dir.close(ctx.io);
+    var it = dir.iterate();
+    while (it.next(ctx.io) catch null) |e| {
+        if (e.kind != .directory or !validLeaseName(e.name)) continue;
+        names.append(a, a.dupe(u8, e.name) catch continue) catch continue;
+    }
+    std.mem.sortUnstable([]const u8, names.items, {}, struct {
+        fn less(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.less);
+    return names.items;
+}
+
+/// `cpuq wait --label PATTERN [--max-wait S]`: blocks until no job whose
+/// label matches holds cores or a lease, or waits for either.
+fn cmdWait(ctx: *Ctx, args: []const [:0]const u8) u8 {
+    var pattern: ?[]const u8 = null;
+    var max_wait: ?i64 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        const name, const inline_value = std.mem.cutScalar(u8, arg, '=') orelse .{ arg, null };
+        const is_label = std.mem.eql(u8, name, "--label");
+        const is_wait = std.mem.eql(u8, name, "--max-wait");
+        if (!is_label and !is_wait) return usageError("unknown wait option '{s}'", .{arg});
+        const value = inline_value orelse blk: {
+            i += 1;
+            if (i >= args.len) return usageError("{s} needs a value", .{name});
+            break :blk args[i];
+        };
+        if (is_label) pattern = value else max_wait = std.fmt.parseInt(i64, value, 10) catch
+            return usageError("--max-wait needs whole seconds, not '{s}'", .{value});
+    }
+    const pat = pattern orelse return usageError("wait needs --label PATTERN", .{});
+    const io = ctx.io;
+    const start = nowSeconds(io);
+    while (true) {
+        var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var found = false;
+        var pools: std.ArrayList(state.State) = .empty;
+        pools.append(a, openState(ctx)) catch {};
+        for (namedLeases(ctx, a)) |n| pools.append(a, openNamed(ctx, n)) catch {};
+        const now = nowSeconds(io);
+        for (pools.items) |*st| {
+            lockOrFail(st);
+            const leases = state.scanLeases(st, a, false) catch @as([]state.Entry, &.{});
+            const queue = state.scanQueue(st, a, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{});
+            st.unlock();
+            for (leases) |e| found = found or labelMatches(pat, e.record.label);
+            for (queue) |e| found = found or labelMatches(pat, e.record.label);
+        }
+        if (!found) return 0;
+        if (max_wait) |mw| if (now - start >= mw) {
+            std.debug.print("cpuq: gave up after waiting {d}s for '{s}'\n", .{ now - start, pat });
+            return exit_timeout;
+        };
+        io.sleep(.fromMilliseconds(1000), .awake) catch {};
     }
 }
 
@@ -600,6 +914,56 @@ const JsonGate = struct {
 
 /// `cpuq status --json`. `schema` changes only when a field is removed or
 /// changes meaning; new fields may appear in any version.
+/// A named lease in `cpuq status --json`: its holders (one per slot taken)
+/// and waiters.
+const JsonLease = struct {
+    name: []const u8,
+    holders: []const JsonHolder,
+    waiters: []const JsonWaiter,
+};
+
+fn toHolders(a: std.mem.Allocator, leases: []const state.Entry, busy: []const ?f64) []JsonHolder {
+    var out: std.ArrayList(JsonHolder) = .empty;
+    for (leases, 0..) |l, i| {
+        const r = l.record;
+        out.append(a, .{
+            .ticket = r.ticket,
+            .pid = r.pid,
+            .holder_alive = sys.processAlive(r.pid),
+            .child = r.child,
+            .cores = r.cores,
+            .using = if (i < busy.len) busy[i] else null,
+            .priority = @tagName(r.priority),
+            .exclusive = r.exclusive,
+            .label = r.label,
+            .command = r.cmd,
+            .since = r.since,
+        }) catch {};
+    }
+    return out.items;
+}
+
+fn toWaiters(a: std.mem.Allocator, queue: []const state.Entry) []JsonWaiter {
+    var out: std.ArrayList(JsonWaiter) = .empty;
+    for (queue, 0..) |e, i| {
+        const r = e.record;
+        out.append(a, .{
+            .order = i + 1,
+            .ticket = r.ticket,
+            .pid = r.pid,
+            .cores = r.cores,
+            .max = @max(r.max, r.cores),
+            .priority = @tagName(r.priority),
+            .class = className(e.class),
+            .exclusive = r.exclusive,
+            .label = r.label,
+            .command = r.cmd,
+            .since = r.since,
+        }) catch {};
+    }
+    return out.items;
+}
+
 const JsonStatus = struct {
     schema: u32 = 1,
     version: []const u8 = version,
@@ -614,6 +978,8 @@ const JsonStatus = struct {
     gate: JsonGate,
     holders: []const JsonHolder,
     waiters: []const JsonWaiter,
+    /// Named leases that are held or waited for.
+    leases: []const JsonLease,
 };
 
 /// How long `cpuq status` watches the holders to measure their use.
@@ -677,39 +1043,20 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
     // over wall time between two snapshots.
     const busy = if (measure) sampleUsage(io, a, leases) else nullUsage(a, leases.len);
 
-    var holders: std.ArrayList(JsonHolder) = .empty;
-    for (leases) |l| {
-        const r = l.record;
-        holders.append(a, .{
-            .ticket = r.ticket,
-            .pid = r.pid,
-            .holder_alive = sys.processAlive(r.pid),
-            .child = r.child,
-            .cores = r.cores,
-            .using = busy[holders.items.len],
-            .priority = @tagName(r.priority),
-            .exclusive = r.exclusive,
-            .label = r.label,
-            .command = r.cmd,
-            .since = r.since,
-        }) catch {};
-    }
-    var waiters: std.ArrayList(JsonWaiter) = .empty;
-    for (queue, 0..) |e, i| {
-        const r = e.record;
-        waiters.append(a, .{
-            .order = i + 1,
-            .ticket = r.ticket,
-            .pid = r.pid,
-            .cores = r.cores,
-            .max = @max(r.max, r.cores),
-            .priority = @tagName(r.priority),
-            .class = className(e.class),
-            .exclusive = r.exclusive,
-            .label = r.label,
-            .command = r.cmd,
-            .since = r.since,
-        }) catch {};
+    const holders = toHolders(a, leases, busy);
+    const waiters = toWaiters(a, queue);
+
+    // The named leases: each a pool of one with its own holder and waiters.
+    var named: std.ArrayList(JsonLease) = .empty;
+    for (namedLeases(ctx, a)) |name| {
+        var ns = openNamed(ctx, name);
+        lockOrFail(&ns);
+        const nl = state.scanLeases(&ns, a, false) catch @as([]state.Entry, &.{});
+        const nq = state.scanQueue(&ns, a, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{});
+        ns.unlock();
+        if (nl.len == 0 and nq.len == 0) continue;
+        const nh = toHolders(a, nl, nullUsage(a, nl.len));
+        named.append(a, .{ .name = name, .holders = nh, .waiters = toWaiters(a, nq) }) catch {};
     }
     const pressure = @tagName(m.pressure);
     const w = ctx.out;
@@ -731,8 +1078,9 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
                 },
                 .text = gate_text,
             },
-            .holders = holders.items,
-            .waiters = waiters.items,
+            .holders = holders,
+            .waiters = waiters,
+            .leases = named.items,
         };
         std.json.Stringify.value(s, .{ .whitespace = .indent_2 }, w) catch {};
         w.writeAll("\n") catch {};
@@ -743,13 +1091,13 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
     w.print("load    {d:.2} {d:.2} {d:.2}; memory pressure {s}; gate {s}\n", .{ load[0], load[1], load[2], pressure, gate_text }) catch {};
     // The label column fits the longest label, within reason.
     var lw: usize = 5;
-    for (holders.items) |h| lw = @max(lw, @min(dash(h.label).len, 32));
-    for (waiters.items) |q| lw = @max(lw, @min(dash(q.label).len, 32));
+    for (holders) |h| lw = @max(lw, @min(dash(h.label).len, 32));
+    for (waiters) |q| lw = @max(lw, @min(dash(q.label).len, 32));
     var b1: [16]u8 = undefined;
-    w.print("\nholders ({d})\n", .{holders.items.len}) catch {};
+    w.print("\nholders ({d})\n", .{holders.len}) catch {};
     var lbuf: [40]u8 = undefined;
-    if (holders.items.len != 0) w.print("  PID      CMD-PID  CORES  USING  PRIO    SINCE    {s} COMMAND\n", .{pad(&lbuf, "LABEL", lw)}) catch {};
-    for (holders.items) |h| {
+    if (holders.len != 0) w.print("  PID      CMD-PID  CORES  USING  PRIO    SINCE    {s} COMMAND\n", .{pad(&lbuf, "LABEL", lw)}) catch {};
+    for (holders) |h| {
         var pid_buf: [16]u8 = undefined;
         const pid_text = std.mem.print(&pid_buf, "{d}{s}", .{ h.pid, if (h.holder_alive) "" else "*" }) catch "?";
         var child_buf: [16]u8 = undefined;
@@ -761,9 +1109,9 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
             age(&b1, now - h.since), pad(&lbuf, dash(h.label), lw), h.command, if (h.holder_alive) "" else "  (cpuq gone; the command still holds the cores)",
         }) catch {};
     }
-    w.print("\nwaiters ({d})\n", .{waiters.items.len}) catch {};
-    if (waiters.items.len != 0) w.print("  #    PID      CORES  PRIO    WAITING  {s} COMMAND\n", .{pad(&lbuf, "LABEL", lw)}) catch {};
-    for (waiters.items) |q| {
+    w.print("\nwaiters ({d})\n", .{waiters.len}) catch {};
+    if (waiters.len != 0) w.print("  #    PID      CORES  PRIO    WAITING  {s} COMMAND\n", .{pad(&lbuf, "LABEL", lw)}) catch {};
+    for (waiters) |q| {
         var prio_buf: [24]u8 = undefined;
         const prio = if (q.exclusive) "excl" else if (std.mem.eql(u8, q.class, q.priority)) q.priority else std.mem.print(&prio_buf, "{s}>{s}", .{ q.priority, q.class }) catch q.priority;
         var pid_buf: [16]u8 = undefined;
@@ -771,6 +1119,23 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
         var cores_buf: [24]u8 = undefined;
         const cores_text = if (q.max > q.cores) std.mem.print(&cores_buf, "{d}-{d}", .{ q.cores, q.max }) catch "?" else std.mem.print(&cores_buf, "{d}", .{q.cores}) catch "?";
         w.print("  {d:<4} {s:<8} {s:<6} {s:<7} {s:<8} {s} {s}\n", .{ q.order, pid_text, cores_text, prio, age(&b1, now - q.since), pad(&lbuf, dash(q.label), lw), q.command }) catch {};
+    }
+    if (named.items.len != 0) {
+        w.print("\nleases ({d})\n", .{named.items.len}) catch {};
+        var nw: usize = 4;
+        for (named.items) |l| nw = @max(nw, l.name.len);
+        var nbuf: [80]u8 = undefined;
+        w.print("  {s} HELD BY (PID, SINCE)  WAITING\n", .{pad(&nbuf, "NAME", nw)}) catch {};
+        for (named.items) |l| {
+            w.print("  {s} ", .{pad(&nbuf, l.name, nw)}) catch {};
+            for (l.holders, 0..) |h, k| {
+                w.print("{s}{s} ({d}{s}, {s})", .{ if (k == 0) "" else ", ", dash(h.label), h.pid, if (h.holder_alive) "" else "*", age(&b1, now - h.since) }) catch {};
+            }
+            if (l.holders.len == 0) w.writeAll("-") catch {};
+            w.print("  {d}", .{l.waiters.len}) catch {};
+            for (l.waiters, 0..) |q, k| w.print("{s}{s}", .{ if (k == 0) ": " else ", ", dash(q.label) }) catch {};
+            w.writeAll("\n") catch {};
+        }
     }
     return 0;
 }

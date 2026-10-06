@@ -57,6 +57,28 @@ wait_held() {
   done
 }
 
+# wait_lease_holder NAME: until the named lease is held.
+wait_lease_holder() {
+  local i=0
+  until "$CPUQ" status --json --no-usage | python3 -c 'import json, sys
+s = json.load(sys.stdin)
+sys.exit(0 if any(l["name"] == sys.argv[1] and l["holders"] for l in s["leases"]) else 1)' "$1"; do
+    i=$((i + 1)); [ $i -gt 100 ] && return 1
+    sleep 0.1
+  done
+}
+
+# wait_lease_waiters NAME N: until the named lease has N waiters.
+wait_lease_waiters() {
+  local i=0
+  until "$CPUQ" status --json --no-usage | python3 -c 'import json, sys
+s = json.load(sys.stdin)
+sys.exit(0 if sum(len(l["waiters"]) for l in s["leases"] if l["name"] == sys.argv[1]) == int(sys.argv[2]) else 1)' "$1" "$2"; do
+    i=$((i + 1)); [ $i -gt 100 ] && return 1
+    sleep 0.1
+  done
+}
+
 # Wait until the queue holds N waiters.
 wait_waiters() {
   local i=0
@@ -352,6 +374,89 @@ u = dict(p.split(\"=\") for p in \"$u\".split())
 sys.exit(0 if 0.7 < float(u[\"spin\"]) < 1.3 and float(u[\"idle\"]) < 0.2 else 1)'"
 }
 
+t_lease() {
+  setup lease
+  local f=$T/log
+  "$CPUQ" lease bench --label first -- sh -c "echo first >>$f; sleep 1; echo first-done >>$f" & wait_lease_holder bench
+  "$CPUQ" lease bench --label second -- sh -c "echo second >>$f" & wait_lease_waiters bench 1
+  "$CPUQ" lease bench --priority high --label urgent -- sh -c "echo urgent >>$f" & wait_lease_waiters bench 2
+  wait
+  local got; got=$(tr '\n' ' ' <"$f")
+  check "a named lease is one at a time, high before normal (got: $got)" "[ '$got' = 'first first-done urgent second ' ]"
+  local env; env=$("$CPUQ" lease bench -- sh -c 'echo "$CPUQ_LEASES"')
+  check "the command gets CPUQ_LEASES (got '$env')" "[[ '$env' == bench=* ]]"
+  local t0; t0=$(now)
+  local inner; inner=$("$CPUQ" lease bench -- "$CPUQ" lease bench -- sh -c 'echo inner')
+  local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
+  check "a lease inside the same lease starts at once (${dt}s, '$inner')" "[ '$inner' = inner ] && python3 -c 'import sys; sys.exit(0 if $dt < 1 else 1)'"
+  "$CPUQ" lease bench -- sleep 2 & wait_lease_holder bench
+  "$CPUQ" lease bench --max-wait 1 -- true; local rc=$?
+  check "--max-wait gives up on a held lease with 75 (got $rc)" "[ $rc = 75 ]"
+  "$CPUQ" lease bench --cores 2 -- true 2>/dev/null; rc=$?
+  check "run's options are refused for a lease (got $rc)" "[ $rc = 2 ]"
+  local held; held=$(held)
+  check "a lease holds no cores (held $held)" "[ '$held' = 0 ]"
+  wait
+  local g=$T/slots
+  "$CPUQ" lease db --slots 2 -- sh -c "echo a >>$g; sleep 1" &
+  "$CPUQ" lease db --slots 2 -- sh -c "echo b >>$g; sleep 1" &
+  sleep 0.5
+  local two; two=$(wc -l <"$g" | tr -d ' ')
+  "$CPUQ" lease db --slots 2 --max-wait 0 -- true; rc=$?
+  wait
+  check "--slots 2 lets two hold at once and a third waits (holding: $two, third: $rc)" "[ '$two' = 2 ] && [ $rc = 75 ]"
+}
+
+t_lease_host() {
+  setup lease-host
+  # A stand-in ssh: drops its options and the host, and runs the remote
+  # command here, so the "remote" cpuq shares this test's queue.
+  local bin=$T/bin
+  mkdir -p "$bin"
+  printf '#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done\nshift\nexec sh -c "$*"\n' >"$bin/ssh"
+  chmod +x "$bin/ssh"
+  ln -sf "$CPUQ" "$bin/cpuq"
+  local f=$T/log
+  PATH="$bin:$PATH" "$CPUQ" lease bench --host far --label mac-gate -- sh -c "echo \"\$CPUQ_LEASES\" >$T/env; echo gate >>$f; sleep 1; echo gate-done >>$f" &
+  wait_lease_holder bench
+  "$CPUQ" lease bench --label far-local -- sh -c "echo far-local >>$f" & wait_lease_waiters bench 1
+  wait
+  local got; got=$(tr '\n' ' ' <"$f")
+  check "a lease held from another machine queues with that machine's own users (got: $got)" "[ '$got' = 'gate gate-done far-local ' ]"
+  check "the command gets NAME@HOST=ID:PID in CPUQ_LEASES ($(cat $T/env))" "grep -q '^bench@far=[0-9]*:[0-9]*\$' $T/env"
+  local t0; t0=$(now)
+  local inner; inner=$(PATH="$bin:$PATH" "$CPUQ" lease bench --host far -- "$CPUQ" lease bench --host far -- sh -c 'echo inner')
+  local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
+  check "a --host lease inside the same one starts at once (${dt}s, '$inner')" "[ '$inner' = inner ] && python3 -c 'import sys; sys.exit(0 if $dt < 2 else 1)'"
+  PATH="$bin:$PATH" "$CPUQ" lease bench --host far -- sleep 30 & local p=$!
+  wait_lease_holder bench
+  t0=$(now)
+  kill -9 $p
+  "$CPUQ" lease bench --max-wait 5 -- true; local rc=$?
+  dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
+  check "a killed --host holder frees the remote lease at once (exit $rc after ${dt}s)" "[ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if $dt < 2 else 1)'"
+  pkill -f "$T" 2>/dev/null
+  "$CPUQ" lease bench -- sleep 2 & wait_lease_holder bench
+  PATH="$bin:$PATH" "$CPUQ" lease bench --host far --max-wait 1 -- true 2>/dev/null; rc=$?
+  check "--max-wait on a --host lease gives 75 (got $rc)" "[ $rc = 75 ]"
+  wait
+}
+
+t_wait() {
+  setup wait
+  "$CPUQ" run --cores 2 --label job:a -- sleep 1.5 &
+  "$CPUQ" lease bench --label job:b -- sleep 0.5 &
+  wait_held 2
+  local t0; t0=$(now)
+  "$CPUQ" wait --label 'job:*'; local rc=$?
+  local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
+  check "cpuq wait --label 'job:*' returns when the last matching job ends (exit $rc after ${dt}s)" "[ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if 0.8 < $dt < 3 else 1)'"
+  "$CPUQ" run --label long -- sleep 3 & wait_held 2
+  "$CPUQ" wait --label long --max-wait 1; rc=$?
+  check "cpuq wait --max-wait gives up with 75 (got $rc)" "[ $rc = 75 ]"
+  wait
+}
+
 t_lost_seq() {
   setup lost-seq
   "$CPUQ" run --cores 5 --label holder -- sleep 2 & local h=$!
@@ -376,6 +481,8 @@ t_max_wait() {
   "$CPUQ" run --max-wait 1 -- true; local rc=$?
   wait
   check "--max-wait gives up with 75 (got $rc)" "[ $rc = 75 ]"
+  "$CPUQ" run --max-wait 0 -- true; rc=$?
+  check "--max-wait 0 takes free cores at once (got $rc)" "[ $rc = 0 ]"
 }
 
 t_waiters_cpu() {
@@ -483,7 +590,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lost_seq max_wait waiters_cpu qos jobserver status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host wait lost_seq max_wait waiters_cpu qos jobserver status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"
