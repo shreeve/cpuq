@@ -2,6 +2,14 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.4.4 — 2026-10-05
+
+- A job's active cores on macOS no longer leap when it reaps a child: a
+  child that has exited but not been reaped (a zombie) is invisible to
+  proc_pidinfo, so its CPU dropped out of the job's tree and then returned
+  all at once in the parent's reaped-children time. A 1-core job could show
+  5 cores active, and a 4-core one 14. Zombies now count until reaped.
+
 ## 0.4.3 — 2026-10-05
 
 - `cpuq status` fades the load averages with age: the 1-minute load bold and

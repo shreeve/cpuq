@@ -491,6 +491,30 @@ sys.exit(0 if ok else 1)'"
   check "history prints a summary with the lost job" "[[ '$text' == *'5 jobs; waited'* && '$text' == *'1 lost'* ]]"
 }
 
+t_zombie() {
+  setup zombie
+  # A child spins a second, then waits as a zombie until its parent reaps
+  # it. Its CPU must count while it is a zombie: missed, the parent's
+  # reaped-children time leaps by the child's whole second at the reap.
+  "$CPUQ" run --cores 1 --label zombie -- python3 -c 'import os, time
+for _ in range(3):
+    pid = os.fork()
+    if pid == 0:
+        e = time.time() + 1
+        while time.time() < e: pass
+        os._exit(0)
+    time.sleep(1.6)
+    os.waitpid(pid, 0)' & local job=$!
+  wait_held 1
+  local top=0 u
+  while kill -0 $job 2>/dev/null; do
+    u=$("$CPUQ" status --json | python3 -c 'import json, sys; print(max([h.get("using") or 0 for h in json.load(sys.stdin)["holders"]] or [0]))')
+    top=$(python3 -c "print(max($top, $u))")
+  done
+  echo "  zombie: highest active $top"
+  check "a reaped zombie's CPU does not leap into its parent's (got $top)" "python3 -c 'import sys; sys.exit(0 if $top < 1.6 else 1)'"
+}
+
 t_outside() {
   setup outside
   python3 -c 'import time
@@ -678,7 +702,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host wait history outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host wait history zombie outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

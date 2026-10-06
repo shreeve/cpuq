@@ -9,6 +9,7 @@ const policy = @import("policy.zig");
 const os = builtin.target.os.tag;
 const is_darwin = os.isDarwin();
 
+extern "c" fn sysctl(name: [*]c_int, namelen: c_uint, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*anyopaque, newlen: usize) c_int;
 extern "c" fn getloadavg(loadavg: [*]f64, nelem: c_int) c_int;
 extern "c" fn getpriority(which: c_int, who: c_uint) c_int;
 extern "c" fn setpriority(which: c_int, who: c_uint, prio: c_int) c_int;
@@ -313,18 +314,28 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
         const n = proc_listallpids(pids.ptr, @intCast(pids.len * @sizeOf(c_int)));
         if (n <= 0) return &.{};
         for (pids[0..@min(@as(usize, @intCast(n)), pids.len)]) |pid| {
-            var bsd: [136]u8 align(8) = undefined;
-            if (proc_pidinfo(pid, 3, 0, &bsd, bsd.len) != bsd.len) continue;
             var ru: [144]u8 align(8) = undefined;
             if (proc_pid_rusage(pid, 1, &ru) != 0) continue;
             var ticks: u64 = 0;
             for ([_]usize{ 16, 24, 96, 104 }) |at| ticks +%= std.mem.readInt(u64, ru[at..][0..8], .little);
-            // pbi_name (32 bytes at 64) when set, else pbi_comm (16 at 48).
-            const long = std.mem.sliceTo(bsd[64..96], 0);
-            const name = if (long.len != 0) long else std.mem.sliceTo(bsd[48..64], 0);
+            var bsd: [136]u8 align(8) = undefined;
+            var ppid: i32 = undefined;
+            var name: []const u8 = "";
+            if (proc_pidinfo(pid, 3, 0, &bsd, bsd.len) == bsd.len) {
+                ppid = @bitCast(std.mem.readInt(u32, bsd[16..20], .little));
+                // pbi_name (32 bytes at 64) when set, else pbi_comm (16 at 48).
+                const long = std.mem.sliceTo(bsd[64..96], 0);
+                name = if (long.len != 0) long else std.mem.sliceTo(bsd[48..64], 0);
+            } else {
+                // A zombie: exited, not yet reaped, and invisible to
+                // proc_pidinfo. Its CPU still counts until its parent reaps
+                // it and takes it over as child time; left out, a job's
+                // CPU would leap by the zombie's whole lifetime at the reap.
+                ppid = zombieParent(pid) orelse continue;
+            }
             list.append(arena, .{
                 .pid = pid,
-                .ppid = @bitCast(std.mem.readInt(u32, bsd[16..20], .little)),
+                .ppid = ppid,
                 .name = arena.dupe(u8, name) catch "",
                 .cpu_ns = @intCast(@as(u128, ticks) * tb.numer / tb.denom),
             }) catch break;
@@ -382,6 +393,16 @@ pub fn markTree(procs: []const Proc, root: i32, in_tree: []bool) void {
 }
 
 /// The CPU time of `root` and all its descendants in a snapshot.
+/// The parent of a macOS process, zombies included, from sysctl's
+/// kern.proc.pid: struct kinfo_proc (648 bytes), e_ppid at 560.
+fn zombieParent(pid: c_int) ?i32 {
+    var mib = [4]c_int{ 1, 14, 1, pid }; // CTL_KERN, KERN_PROC, KERN_PROC_PID
+    var info: [648]u8 align(8) = undefined;
+    var len: usize = info.len;
+    if (sysctl(&mib, mib.len, &info, &len, null, 0) != 0 or len != info.len) return null;
+    return @bitCast(std.mem.readInt(u32, info[560..564], .little));
+}
+
 pub fn treeCpu(procs: []const Proc, root: i32) u64 {
     var total: u64 = 0;
     var frontier: [512]i32 = undefined;

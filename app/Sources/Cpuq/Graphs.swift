@@ -25,6 +25,13 @@ final class GraphModel {
         let jobs: Int
     }
 
+    struct ProjectPoint: Identifiable {
+        var id: String { "\(project) \(at.timeIntervalSince1970)" }
+        let project: String
+        let at: Date
+        let cores: Int
+    }
+
     struct Wait: Identifiable {
         let id = UUID()
         let label: String
@@ -66,6 +73,24 @@ final class GraphModel {
         }.suffix(60)
     }
 
+    /// Every sample's cores in use for every project seen in the window, 0
+    /// where a project held nothing, so the stacked areas share every point
+    /// and a project's band ends where it ended, rather than sloping to the
+    /// next sample that names it.
+    var projectSeries: [ProjectPoint] {
+        let names = Set(samples.flatMap { $0.projects.keys }).sorted()
+        return samples.flatMap { s in names.map { ProjectPoint(project: $0, at: s.at, cores: s.projects[$0] ?? 0) } }
+    }
+
+    /// The window the live charts share.
+    var span: ClosedRange<Date> {
+        guard let first = samples.first?.at, let last = samples.last?.at, first < last else {
+            let now = Date()
+            return now.addingTimeInterval(-60)...now
+        }
+        return first...last
+    }
+
     private func project(_ label: String) -> String {
         label.isEmpty ? "unlabelled" : String(label.split(separator: ":", maxSplits: 1).first ?? "")
     }
@@ -99,6 +124,7 @@ struct GraphsView: View {
                 ForEach(model.samples) { s in
                     AreaMark(x: .value("Time", s.at), y: .value("Cores", s.inUse))
                         .foregroundStyle(by: .value("Series", "in use"))
+                        .interpolationMethod(.stepEnd)
                         .opacity(0.35)
                     LineMark(x: .value("Time", s.at), y: .value("Cores", s.active))
                         .foregroundStyle(by: .value("Series", "active"))
@@ -113,17 +139,18 @@ struct GraphsView: View {
                 }
             }
             .chartForegroundStyleScale(["in use": Color.teal, "active": Color.green, "load": Color.orange])
+            .chartXScale(domain: model.span)
             .frame(minHeight: 200)
 
             Text("In use by project").font(.headline)
             Chart {
-                ForEach(model.samples) { s in
-                    ForEach(s.projects.sorted(by: { $0.key < $1.key }), id: \.key) { project, cores in
-                        AreaMark(x: .value("Time", s.at), y: .value("Cores", cores), stacking: .standard)
-                            .foregroundStyle(by: .value("Project", project))
-                    }
+                ForEach(model.projectSeries) { p in
+                    AreaMark(x: .value("Time", p.at), y: .value("Cores", p.cores), stacking: .standard)
+                        .foregroundStyle(by: .value("Project", p.project))
+                        .interpolationMethod(.stepEnd)
                 }
             }
+            .chartXScale(domain: model.span)
             .frame(minHeight: 160)
             if model.samples.isEmpty {
                 Text("Samples appear every 3 seconds while Cpuq runs.").font(.caption).foregroundStyle(.secondary)
@@ -138,13 +165,14 @@ struct GraphsView: View {
             Text("Active of in use, per project (average per job)").font(.headline)
             Chart {
                 ForEach(model.projects) { p in
-                    BarMark(x: .value("Cores", p.inUse), y: .value("Project", p.project))
+                    // Active drawn over in use, both from 0: overlaid, not stacked.
+                    BarMark(xStart: .value("Cores", 0), xEnd: .value("Cores", p.inUse), y: .value("Project", p.project), height: .ratio(0.6))
                         .foregroundStyle(Color.teal.opacity(0.35))
-                    BarMark(x: .value("Cores", p.active), y: .value("Project", p.project))
-                        .foregroundStyle(p.active * 2 < p.inUse ? Color.yellow : Color.green)
                         .annotation(position: .trailing) {
-                            Text(String(format: "%.1f of %.1f · %d jobs", p.active, p.inUse, p.jobs)).font(.caption).foregroundStyle(.secondary)
+                            Text(String(format: "%.1f of %.1f · %d %@", p.active, p.inUse, p.jobs, p.jobs == 1 ? "job" : "jobs")).font(.caption).foregroundStyle(.secondary)
                         }
+                    BarMark(xStart: .value("Cores", 0), xEnd: .value("Cores", p.active), y: .value("Project", p.project), height: .ratio(0.6))
+                        .foregroundStyle(p.active * 2 < p.inUse ? Color.yellow : Color.green)
                 }
             }
             .frame(minHeight: 160)
