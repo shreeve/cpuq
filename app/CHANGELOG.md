@@ -3,6 +3,29 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.8.0 — 2026-10-06
+
+A redesign from three reviews of the window (visual design, prior art, and the questions it is
+opened to answer). If it reads worse than 0.7.2, it goes back.
+
+- The top line always says whether cpuq is admitting work: "● admitting", or "● gate shut:
+  memory pressure for 5m" with the reason, then cores in use and active, who waits, the load
+  against the load valve's trip level, how busy the CPUs are, and memory pressure. What is under
+  the pointer goes on a line of its own below it instead of replacing it.
+- Stretches the gate was shut (by memory pressure or the load valve) are shaded across every
+  view and named where they start, so a wait inside one explains itself.
+- All CPUs adds the 1-minute load as a line, the valve's trip level dashed, and a red edge while
+  memory pressure is high (needs cpuq 0.7.7 for the valve line).
+- Held but idle cores are striped in the project's color instead of pale, so waste stands
+  apart from free cores; in the lanes a core fills in as far as its job keeps it busy.
+- Stacked puts every project's busy cores first, from the floor, and the idle ones above, so
+  the busy total reads off one edge and the waste sits on top; other work is left to All CPUs.
+- Waiting shows the cores the waiting jobs ask for, hanging down from the line.
+- New project colors: distinct hues with no red or orange (which mean waiting and a shut gate)
+  and only one blue, assigned so the projects on screen together never share one. The key
+  draws states in grey.
+- The table's Share is now Efficiency.
+
 ## 0.7.2 — 2026-10-06
 
 - The Mac strip is now called All CPUs and leads the page: the views run from widest to

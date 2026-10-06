@@ -21,6 +21,11 @@ public struct Status: Decodable, Sendable, Equatable {
         public var state = "open"
         public var load: Double?
         public var text = "open"
+        /// The load valve's thresholds (cpuq 0.7.7 and later, with the load check on): it trips
+        /// above `trip` while the CPUs are at least `busyTrip` busy, and reopens at `reopen`.
+        public var trip: Double?
+        public var reopen: Double?
+        public var busyTrip: Double?
     }
 
     public struct Holder: Decodable, Sendable, Equatable {
@@ -95,12 +100,15 @@ extension Status {
 }
 
 extension Status.Gate {
-    private enum Keys: String, CodingKey { case state, load, text }
+    private enum Keys: String, CodingKey { case state, load, text, trip, reopen, busyTrip }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         state = try c.decodeIfPresent(String.self, forKey: .state) ?? "open"
         load = try c.decodeIfPresent(Double.self, forKey: .load)
         text = try c.decodeIfPresent(String.self, forKey: .text) ?? state
+        trip = try c.decodeIfPresent(Double.self, forKey: .trip)
+        reopen = try c.decodeIfPresent(Double.self, forKey: .reopen)
+        busyTrip = try c.decodeIfPresent(Double.self, forKey: .busyTrip)
     }
 }
 

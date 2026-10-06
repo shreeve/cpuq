@@ -3,13 +3,16 @@
 The cpuq menu-bar companion for macOS 14 and later on Apple silicon. The chip in the menu bar
 fills a cell per quarter of the core budget in use (none when idle, all four when the budget is
 full). Its menu shows what runs (cores in use and active), what waits and when it should start,
-the named leases, and any load outside cpuq. **Show Graphs** (⌘G) opens a window that leads with one line (cores
-in use of the budget, cores active, how many wait), then shows the last hour as views stacked
+the named leases, and any load outside cpuq. **Show Graphs** (⌘G) opens a window that leads with one line saying
+whether cpuq is admitting work (or why its gate is shut, and for how long), with cores in use of
+the budget, cores active, who waits, the load against the load valve, how busy the CPUs are and
+memory pressure, then shows the last hour as views stacked
 over one time axis, widest first, each turned on or off at the top right (remembered): All
-CPUs, the Mac's CPUs busy with cpuq's jobs and with other work; Stacked, each column's cores
-stacked by project, busy solid and idle pale, other work grey on top; Lanes, one lane per core
-of the budget, each cell empty while free, pale while held and solid while busy; and a red row
-counting who waited (always shown). Pointing at any of them says what was there then; recent
+CPUs, the Mac's CPUs busy with cpuq's jobs and with other work, with the load, the valve's trip
+level and high memory pressure; Stacked, each column's cores stacked busy first, from the floor,
+and idle (striped) above; Lanes, one lane per core of the budget, a held core striped in its
+project's color and filled in as far as it is busy; and the cores waiting jobs ask for (always
+shown). Stretches the gate was shut are shaded through all of them. Pointing at any of them says what was there then; recent
 time is widest. A table under it lists what each project has in use
 and active, and who waits; its History tab sums `cpuq history` per project. Each running job in the menu has Pause or Resume and Stop, and each waiting job Move to Front,
 Start Now and Cancel (with cpuq 0.7.1 or later); the graphs window offers the same on a right

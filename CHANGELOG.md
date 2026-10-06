@@ -2,6 +2,12 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.7.7 — 2026-10-06
+
+- `cpuq status --json` gives the load valve's thresholds in `gate`: `trip` (the load above
+  which it trips while the CPUs are busy), `reopen` and `busy_trip`, so a display can show how
+  near the valve the load is. Cpuq.app 0.8.0 draws them.
+
 ## 0.7.6 — 2026-10-06
 
 - Fix: a `--hold` lease released the way a script naturally does it (close

@@ -1653,6 +1653,12 @@ const JsonGate = struct {
     state: []const u8 = "",
     load: ?f64 = null,
     text: []const u8 = "",
+    /// The load valve's thresholds, when the load check is on: it trips above
+    /// `trip` while the CPUs are at least `busy_trip` busy, and reopens at
+    /// `reopen` (or as soon as they are under three quarters busy).
+    trip: ?f64 = null,
+    reopen: ?f64 = null,
+    busy_trip: ?f64 = null,
 };
 
 /// Typical run times from the history: the median run of finished jobs by
@@ -2345,6 +2351,9 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
                     .open, .pressure => null,
                 },
                 .text = gate_text,
+                .trip = if (ctx.cfg.load_check) @as(f64, @floatFromInt(budget)) + ctx.cfg.load_margin else null,
+                .reopen = if (ctx.cfg.load_check) @as(f64, @floatFromInt(budget)) + ctx.cfg.load_margin / 2 else null,
+                .busy_trip = if (ctx.cfg.load_check) 0.9 else null,
             },
             .holders = holders,
             .waiters = waiters,

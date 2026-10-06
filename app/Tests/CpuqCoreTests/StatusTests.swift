@@ -86,3 +86,20 @@ import Testing
     #expect(!supportsControls(version: "0.6.2"))
     #expect(!supportsControls(version: ""))
 }
+
+@Test func gateCarriesTheValveThresholds() throws {
+    // cpuq 0.7.7 and later, with the load check on.
+    let json = #"{"gate": {"state": "open", "load": null, "text": "open", "trip": 12, "reopen": 11, "busy_trip": 0.9}}"#
+    let s = try Status.decode(Data(json.utf8))
+    #expect(s.gate.trip == 12 && s.gate.reopen == 11 && s.gate.busyTrip == 0.9)
+    // Older cpuq leaves them out.
+    let old = try Status.decode(Data(#"{"gate": {"state": "open", "text": "open"}}"#.utf8))
+    #expect(old.gate.trip == nil && old.gate.busyTrip == nil)
+}
+
+@Test func busyShareBetweenTwoReadings() {
+    let a = CPUTicks(busy: 1000, total: 4000)
+    #expect(CPUTicks.busy(from: a, to: CPUTicks(busy: 1750, total: 5000)) == 0.75)
+    #expect(CPUTicks.busy(from: a, to: a) == nil)
+    #expect(CPUTicks.now() != nil)
+}
