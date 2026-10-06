@@ -491,6 +491,60 @@ sys.exit(0 if ok else 1)'"
   check "history prints a summary with the lost job" "[[ '$text' == *'5 jobs; waited'* && '$text' == *'1 lost'* ]]"
 }
 
+t_outside() {
+  setup outside
+  python3 -c 'import time
+e = time.time() + 3
+while time.time() < e: pass' & local stray=$!
+  "$CPUQ" run --cores 2 --priority high --label inside -- python3 -c 'import time
+e = time.time() + 3
+while time.time() < e: pass' &
+  wait_held 2
+  sleep 0.5
+  local got; got=$("$CPUQ" status --json | python3 -c 'import json, sys
+s = json.load(sys.stdin)
+print(" ".join(str(o["pid"]) for o in s["outside"]), "|", " ".join("%.1f" % h["using"] for h in s["holders"]))' )
+  wait
+  echo "  outside pids | holder use: $got (stray pid $stray)"
+  check "status names an outside process and leaves the job's own out" "[[ ' ${got%%|*} ' == *' $stray '* ]] && python3 -c 'import sys; sys.exit(0 if float(\"${got##*| }\") > 0.6 else 1)'"
+}
+
+t_eta() {
+  setup eta
+  "$CPUQ" run --cores 9 --label build -- sleep 1
+  "$CPUQ" run --cores 9 --label build -- sleep 1
+  "$CPUQ" run --cores 9 --label build -- sleep 2 & wait_held 9
+  "$CPUQ" run --cores 9 --label build -- true & wait_waiters 1
+  "$CPUQ" run --cores 9 --label other -- true & wait_waiters 2
+  local got; got=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys
+print(" ".join("%.1f" % w["eta"] if w["eta"] is not None else "none" for w in json.load(sys.stdin)["waiters"]))')
+  wait
+  echo "  waiter ETAs: $got"
+  check "waiters get ETAs from the history's typical run times (got $got)" "python3 -c '
+import sys
+a, b = (float(x) for x in \"$got\".split())
+sys.exit(0 if 0 <= a <= 1.2 and 0.8 <= b - a <= 1.2 else 1)'"
+}
+
+t_status_host() {
+  setup status-host
+  local bin=$T/bin
+  mkdir -p "$bin"
+  printf '#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done\nshift\nexec sh -c "$*"\n' >"$bin/ssh"
+  chmod +x "$bin/ssh"
+  ln -sf "$CPUQ" "$bin/cpuq"
+  "$CPUQ" run --cores 2 --label far:job -- sleep 2 & wait_held 2
+  local got; got=$(PATH="$bin:$PATH" "$CPUQ" status --json --no-usage --host local --host far | python3 -c 'import json, sys
+d = json.load(sys.stdin)
+print(" ".join("%s:%d" % (h, d[h]["held"]) for h in sorted(d)))')
+  check "status --host gives one JSON object keyed by host (got $got)" "[ '$got' = 'far:2 local:2' ]"
+  local text; text=$(PATH="$bin:$PATH" "$CPUQ" status --no-usage --host far)
+  check "status --host passes the host's own text through when piped" "[[ '$text' == *'held 2'* ]]"
+  "$CPUQ" status --watch >/dev/null 2>&1; local rc=$?
+  check "status --watch refuses when not on a terminal (got $rc)" "[ $rc = 2 ]"
+  wait
+}
+
 t_lost_seq() {
   setup lost-seq
   "$CPUQ" run --cores 5 --label holder -- sleep 2 & local h=$!
@@ -624,7 +678,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host wait history lost_seq max_wait waiters_cpu qos jobserver status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host wait history outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"
