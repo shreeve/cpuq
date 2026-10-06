@@ -541,13 +541,17 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
         if (check_load) st.writeValve(valve);
         if (last_gate == .open) {
             const exclusive_running = (state.scanLeases(st, a, true) catch @as([]state.Entry, &.{})).len != 0;
-            // Cores the holders have left idle for a minute, lent to the head
-            // on top of the budget, up to the CPUs.
-            const lent: u32 = if (!named and !o.exclusive and cfg.lend) @min(measureIdle(ctx, st, a), @max(cores, budget) -| budget) else 0;
             // Leave the next waiter's minimum free when this grant can spare it.
             const reserve: u32 = if (queue.len > 1 and !queue[1].record.exclusive) @min(queue[1].record.cores, budget) else 0;
             const held_before = heldCores(st, a);
-            const got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, budget + lent, @max(cores, budget), exclusive_running, reserve) catch |err| fail("tokens: {t}", .{err});
+            var got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, budget, @max(cores, budget), exclusive_running, reserve) catch |err| fail("tokens: {t}", .{err});
+            // Not enough free: borrow the cores the holders have left idle for
+            // a minute, on top of the budget, up to the CPUs. Measuring takes a
+            // process snapshot, so only a head that cannot start does it.
+            if (got == null and !named and !o.exclusive and cfg.lend) {
+                const lent = @min(measureIdle(ctx, st, a), @max(cores, budget) -| budget);
+                if (lent > 0) got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, budget + lent, @max(cores, budget), exclusive_running, reserve) catch |err| fail("tokens: {t}", .{err});
+            }
             if (got) |grant| {
                 valve.last_admit = now;
                 if (check_load) st.writeValve(valve);
