@@ -3,6 +3,13 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.1.3 — 2026-10-05
+
+- The live tab is two charts, each a stack of one band per project in the same colors: the cores
+  in use against the budget, and the cores active with the machine's load as one dashed line over
+  them. Nothing is drawn over anything else.
+- Projects get distinct colors (a dozen before any repeats).
+
 ## 0.1.2 — 2026-10-05
 
 - The live charts are smooth: they average the 3-second samples over 30 seconds and draw soft

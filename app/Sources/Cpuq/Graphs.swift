@@ -10,11 +10,10 @@ final class GraphModel {
         let id = UUID()
         let at: Date
         let budget: Int
-        let inUse: Int
-        let active: Double
         let load: Double
-        /// Cores in use per project (the label up to its first ':').
-        let projects: [String: Int]
+        /// Per project (the label up to its first ':'): cores in use, and cores active.
+        let inUse: [String: Int]
+        let active: [String: Double]
     }
 
     struct ProjectUse: Identifiable {
@@ -29,13 +28,13 @@ final class GraphModel {
     struct Point: Identifiable {
         var id: Date { at }
         let at: Date
-        let inUse: Double
-        let active: Double
         let load: Double
-        let projects: [String: Double]
+        let inUse: [String: Double]
+        let active: [String: Double]
     }
 
-    struct ProjectPoint: Identifiable {
+    /// One project's cores at one point, for a stacked chart.
+    struct Band: Identifiable {
         var id: String { "\(project) \(at.timeIntervalSince1970)" }
         let project: String
         let at: Date
@@ -57,14 +56,19 @@ final class GraphModel {
     static let bucket: TimeInterval = 30
 
     private(set) var samples: [Sample] = []
+    private(set) var budget = 0
     private(set) var projects: [ProjectUse] = []
     private(set) var waits: [Wait] = []
 
     func add(_ s: Status, at now: Date = Date()) {
-        var by: [String: Int] = [:]
-        for h in s.holders { by[project(h.label), default: 0] += h.cores }
-        let active = s.holders.reduce(0) { $0 + ($1.using ?? 0) }
-        samples.append(Sample(at: now, budget: s.budget, inUse: s.held, active: active, load: s.load.first ?? 0, projects: by))
+        var inUse: [String: Int] = [:]
+        var active: [String: Double] = [:]
+        for h in s.holders {
+            inUse[project(h.label), default: 0] += h.cores
+            active[project(h.label), default: 0] += h.using ?? 0
+        }
+        budget = s.budget
+        samples.append(Sample(at: now, budget: s.budget, load: s.load.first ?? 0, inUse: inUse, active: active))
         samples.removeAll { now.timeIntervalSince($0.at) > Self.keep }
     }
 
@@ -98,26 +102,31 @@ final class GraphModel {
             while j < samples.count && (samples[j].at.timeIntervalSince1970 / Self.bucket).rounded(.down) == key { j += 1 }
             let group = samples[i..<j]
             let n = Double(group.count)
-            var by: [String: Double] = [:]
-            for s in group { for (k, v) in s.projects { by[k, default: 0] += Double(v) / n } }
+            var inUse: [String: Double] = [:]
+            var active: [String: Double] = [:]
+            for s in group {
+                for (k, v) in s.inUse { inUse[k, default: 0] += Double(v) / n }
+                for (k, v) in s.active { active[k, default: 0] += v / n }
+            }
             out.append(Point(
                 at: Date(timeIntervalSince1970: group.reduce(0) { $0 + $1.at.timeIntervalSince1970 } / n),
-                inUse: group.reduce(0) { $0 + Double($1.inUse) } / n,
-                active: group.reduce(0) { $0 + $1.active } / n,
                 load: group.reduce(0) { $0 + $1.load } / n,
-                projects: by))
+                inUse: inUse, active: active))
             i = j
         }
         return out
     }
 
-    /// Every point's cores in use for every project seen in the window, 0
-    /// where a project held nothing, so the stacked areas share every point
-    /// and a project's band ends where it ended, rather than sloping to the
-    /// next point that names it.
-    static func projectSeries(_ points: [Point]) -> [ProjectPoint] {
-        let names = Set(points.flatMap { $0.projects.keys }).sorted()
-        return points.flatMap { p in names.map { ProjectPoint(project: $0, at: p.at, cores: p.projects[$0] ?? 0) } }
+    /// Every project seen in these points, in the order the charts stack and color them.
+    static func names(_ points: [Point]) -> [String] {
+        Set(points.flatMap { $0.inUse.keys }).sorted()
+    }
+
+    /// Every point's cores for every project, 0 where a project had none, so
+    /// the stacked areas share every point and a project's band ends where
+    /// it ended rather than sloping to the next point that names it.
+    static func bands(_ points: [Point], _ names: [String], _ value: (Point) -> [String: Double]) -> [Band] {
+        points.flatMap { p in names.map { Band(project: $0, at: p.at, cores: value(p)[$0] ?? 0) } }
     }
 
     private func project(_ label: String) -> String {
@@ -146,51 +155,68 @@ struct GraphsView: View {
 
     // MARK: Live
 
+    /// Distinct colors for the projects, in order, repeating only past a dozen.
+    static func colors(_ n: Int) -> [Color] {
+        let palette: [Color] = [.blue, .orange, .green, .purple, .red, .teal, .yellow, .brown, .indigo, .pink, .mint, .gray]
+        return (0..<max(n, 1)).map { palette[$0 % palette.count] }
+    }
+
+    /// Two charts, each a stack of one band per project in the same colors: the cores cpuq has
+    /// handed out against the budget, and the cores those jobs keep busy with the machine's load
+    /// over them. Monotone curves are soft yet never overshoot a point, so a band stays at 0 or
+    /// above and peaks where the data peaks.
     private var live: some View {
         let points = model.points
+        let names = GraphModel.names(points)
         let span: ClosedRange<Date> = {
             guard let first = points.first?.at, let last = points.last?.at, first < last else { return Date().addingTimeInterval(-60)...Date() }
             return first...last
         }()
+        let top = Double(max(model.budget, 1))
+        let loadTop = points.map(\.load).max() ?? 0
         return VStack(alignment: .leading, spacing: 16) {
-            Text("Cores, the last hour").font(.headline)
+            Text("Cores in use, by project").font(.headline)
             Chart {
-                // Monotone curves: soft, yet never overshooting a point, so
-                // they stay at 0 or above and peak where the data peaks.
+                ForEach(GraphModel.bands(points, names, \.inUse)) { b in
+                    AreaMark(x: .value("Time", b.at), y: .value("Cores", b.cores), stacking: .standard)
+                        .foregroundStyle(by: .value("Project", b.project))
+                        .interpolationMethod(.monotone)
+                }
+                RuleMark(y: .value("Budget", top))
+                    .foregroundStyle(.secondary)
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                    .annotation(position: .top, alignment: .trailing) { Text("budget \(model.budget)").font(.caption).foregroundStyle(.secondary) }
+            }
+            .chartForegroundStyleScale(domain: names, range: Self.colors(names.count))
+            .chartXScale(domain: span)
+            .chartYScale(domain: 0...top + 1)
+            .chartLegend(position: .bottom, alignment: .leading)
+            .frame(minHeight: 170)
+
+            Text("Cores active, by project").font(.headline)
+            Chart {
+                ForEach(GraphModel.bands(points, names, \.active)) { b in
+                    AreaMark(x: .value("Time", b.at), y: .value("Cores", b.cores), stacking: .standard)
+                        .foregroundStyle(by: .value("Project", b.project))
+                        .interpolationMethod(.monotone)
+                }
                 ForEach(points) { p in
-                    AreaMark(x: .value("Time", p.at), y: .value("Cores", p.inUse))
-                        .foregroundStyle(by: .value("Series", "in use"))
-                        .interpolationMethod(.monotone)
-                        .opacity(0.35)
-                    LineMark(x: .value("Time", p.at), y: .value("Cores", p.active))
-                        .foregroundStyle(by: .value("Series", "active"))
-                        .interpolationMethod(.monotone)
-                        .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
-                    LineMark(x: .value("Time", p.at), y: .value("Cores", p.load))
-                        .foregroundStyle(by: .value("Series", "load"))
+                    LineMark(x: .value("Time", p.at), y: .value("Cores", p.load), series: .value("Series", "load"))
+                        .foregroundStyle(Color.primary.opacity(0.55))
                         .interpolationMethod(.monotone)
                         .lineStyle(StrokeStyle(lineWidth: 1.5, lineCap: .round, dash: [4, 3]))
                 }
-                if let last = model.samples.last {
-                    RuleMark(y: .value("Budget", last.budget))
-                        .foregroundStyle(.secondary)
-                        .annotation(position: .top, alignment: .trailing) { Text("budget \(last.budget)").font(.caption).foregroundStyle(.secondary) }
+                if let last = points.last {
+                    PointMark(x: .value("Time", last.at), y: .value("Cores", last.load))
+                        .opacity(0)
+                        .annotation(position: .top, alignment: .trailing) { Text("load").font(.caption).foregroundStyle(.secondary) }
                 }
             }
-            .chartForegroundStyleScale(["in use": Color.teal, "active": Color.green, "load": Color.orange])
+            .chartForegroundStyleScale(domain: names, range: Self.colors(names.count))
             .chartXScale(domain: span)
-            .frame(minHeight: 200)
-
-            Text("In use by project").font(.headline)
-            Chart {
-                ForEach(GraphModel.projectSeries(points)) { p in
-                    AreaMark(x: .value("Time", p.at), y: .value("Cores", p.cores), stacking: .standard)
-                        .foregroundStyle(by: .value("Project", p.project))
-                        .interpolationMethod(.monotone)
-                }
-            }
-            .chartXScale(domain: span)
-            .frame(minHeight: 160)
+            .chartYScale(domain: 0...max(top, loadTop) + 1)
+            .chartLegend(.hidden)
+            .frame(minHeight: 170)
             if model.samples.isEmpty {
                 Text("Samples appear every 3 seconds while Cpuq runs; the charts average them over 30 seconds.").font(.caption).foregroundStyle(.secondary)
             }
