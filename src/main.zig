@@ -1706,7 +1706,10 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
     }
     const every = watch_s orelse return statusHosts(ctx, hosts.items, json, measure);
     if (json or std.c.isatty(1) == 0) return usageError("--watch draws on a terminal; for a program, poll `cpuq status --json`", .{});
-    // Redraw in place until ^C, each round on its own scratch memory.
+    // Redraw in place until ^C, on the terminal's alternate screen (as top
+    // does: the scrollback is left alone and the view goes on exit), each
+    // round on its own scratch memory.
+    watchScreen(true);
     const process_arena = ctx.arena;
     while (true) {
         var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
@@ -1718,8 +1721,18 @@ fn cmdStatus(ctx: *Ctx, args: []const [:0]const u8) u8 {
         ctx.out = &buf.writer;
         _ = statusHosts(ctx, hosts.items, false, measure);
         ctx.out = out;
-        out.writeAll("\x1b[H\x1b[2J") catch {};
-        out.writeAll(buf.written()) catch {};
+        // Home, then each line over the last frame's, its rest erased, and
+        // everything below the new frame erased: no clear, so no flicker
+        // and nothing pushed into scrollback.
+        out.writeAll("\x1b[H") catch {};
+        var lines = std.mem.splitScalar(u8, buf.written(), '\n');
+        var first = true;
+        while (lines.next()) |line| {
+            if (!first) out.writeAll("\x1b[K\n") catch {};
+            out.writeAll(line) catch {};
+            first = false;
+        }
+        out.writeAll("\x1b[K\x1b[J") catch {};
         out.flush() catch {};
         ctx.arena = process_arena;
         ctx.io.sleep(.fromSeconds(every), .awake) catch {};
@@ -1795,6 +1808,28 @@ fn statusRemote(ctx: *Ctx, host: []const u8, json: bool, measure: bool) u8 {
         .version = st.version,
     });
     return 0;
+}
+
+/// Enters (or leaves) the alternate screen with the cursor hidden. Leaving
+/// happens on ^C, a kill or a hangup too, so the terminal is never left on
+/// the alternate screen.
+fn watchScreen(enter: bool) void {
+    const on = "\x1b[?1049h\x1b[?25l";
+    const off = "\x1b[?25h\x1b[?1049l";
+    if (!enter) {
+        _ = std.c.write(1, off, off.len);
+        return;
+    }
+    _ = std.c.write(1, on, on.len);
+    var sa: std.c.Sigaction = .{ .handler = .{ .handler = leaveWatch }, .mask = undefined, .flags = 0 };
+    _ = std.c.sigemptyset(&sa.mask);
+    for ([_]std.c.SIG{ .INT, .TERM, .HUP, .QUIT }) |sig| _ = std.c.sigaction(sig, &sa, null);
+}
+
+fn leaveWatch(_: std.c.SIG) callconv(.c) void {
+    const off = "\x1b[?25h\x1b[?1049l";
+    _ = std.c.write(1, off, off.len);
+    std.c._exit(0);
 }
 
 fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {

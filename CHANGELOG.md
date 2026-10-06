@@ -2,6 +2,13 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.4.1 — 2026-10-05
+
+- `cpuq status --watch` draws in place on the terminal's alternate screen,
+  as `top` does: each refresh overwrites the last, nothing piles up in the
+  scrollback (Terminal.app pushed every cleared screen there), the cursor is
+  hidden, and ^C, a kill or a hangup puts the terminal back.
+
 ## 0.4.0 — 2026-10-05
 
 - History: every job is recorded as it queues, starts and ends, outside
