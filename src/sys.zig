@@ -288,6 +288,8 @@ const MachTimebase = extern struct { numer: u32, denom: u32 };
 pub const Proc = struct {
     pid: i32,
     ppid: i32,
+    /// The program's short name (macOS pbi_name or pbi_comm, Linux comm).
+    name: []const u8 = "",
     /// CPU time used so far, user plus system, in nanoseconds: the
     /// process's own and that of its children it has already reaped, so the
     /// many short processes a build or test run starts are counted too.
@@ -317,9 +319,13 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
             if (proc_pid_rusage(pid, 1, &ru) != 0) continue;
             var ticks: u64 = 0;
             for ([_]usize{ 16, 24, 96, 104 }) |at| ticks +%= std.mem.readInt(u64, ru[at..][0..8], .little);
+            // pbi_name (32 bytes at 64) when set, else pbi_comm (16 at 48).
+            const long = std.mem.sliceTo(bsd[64..96], 0);
+            const name = if (long.len != 0) long else std.mem.sliceTo(bsd[48..64], 0);
             list.append(arena, .{
                 .pid = pid,
                 .ppid = @bitCast(std.mem.readInt(u32, bsd[16..20], .little)),
+                .name = arena.dupe(u8, name) catch "",
                 .cpu_ns = @intCast(@as(u128, ticks) * tb.numer / tb.denom),
             }) catch break;
         }
@@ -339,6 +345,7 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
         // spaces: state, ppid, ..., utime, stime, cutime, cstime (12th to
         // 15th; cutime and cstime are the reaped children's).
         const close = std.mem.findScalarLast(u8, text, ')') orelse continue;
+        const open = std.mem.findScalar(u8, text, '(') orelse continue;
         var fields = std.mem.tokenizeScalar(u8, text[close + 1 ..], ' ');
         var ppid: i32 = 0;
         var ticks: u64 = 0;
@@ -351,9 +358,27 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
             }
             if (i == 14) break;
         }
-        list.append(arena, .{ .pid = pid, .ppid = ppid, .cpu_ns = ticks * std.time.ns_per_s / tick_hz }) catch break;
+        list.append(arena, .{ .pid = pid, .ppid = ppid, .name = arena.dupe(u8, text[open + 1 .. close]) catch "", .cpu_ns = ticks * std.time.ns_per_s / tick_hz }) catch break;
     }
     return list.items;
+}
+
+/// Marks `root` and all its descendants in `in_tree` (indexed like `procs`).
+pub fn markTree(procs: []const Proc, root: i32, in_tree: []bool) void {
+    var frontier: [512]i32 = undefined;
+    var len: usize = 1;
+    frontier[0] = root;
+    var seen: usize = 0;
+    while (seen < len) : (seen += 1) {
+        const pid = frontier[seen];
+        for (procs, 0..) |p, i| {
+            if (p.pid == pid) in_tree[i] = true;
+            if (p.ppid == pid and p.pid != pid and len < frontier.len) {
+                frontier[len] = p.pid;
+                len += 1;
+            }
+        }
+    }
 }
 
 /// The CPU time of `root` and all its descendants in a snapshot.

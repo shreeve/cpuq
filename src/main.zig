@@ -1292,6 +1292,8 @@ const JsonStatus = struct {
     waiters: []const JsonWaiter,
     /// Named leases that are held or waited for.
     leases: []const JsonLease,
+    /// The busiest processes outside every cpuq job (empty with --no-usage).
+    outside: []const JsonOutside,
 };
 
 const StatusView = struct {
@@ -1304,8 +1306,18 @@ const StatusView = struct {
     holders: []const JsonHolder,
     waiters: []const JsonWaiter,
     leases: []const JsonLease,
+    outside: []const JsonOutside,
     now: i64,
 };
+
+/// Whether outside load is worth showing: a core or more of it, or a gate
+/// that is not open.
+fn showOutside(outside: []const JsonOutside, g: policy.Gate) bool {
+    if (outside.len == 0) return false;
+    var total: f64 = 0;
+    for (outside) |o| total += o.using;
+    return total >= 1.0 or g != .open;
+}
 
 /// `cpuq status` on a terminal: boxed tables, colored unless NO_COLOR is set.
 fn statusBoxed(ctx: *Ctx, v: StatusView) void {
@@ -1453,6 +1465,26 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
         t.boxed(a, w, width, color) catch {};
     }
 
+    if (showOutside(v.outside, v.gate)) {
+        var rows: std.ArrayList([]const C) = .empty;
+        var total: f64 = 0;
+        for (v.outside) |o| {
+            total += o.using;
+            rows.append(a, a.dupe(C, &.{
+                .{ .text = o.name, .tint = .accent },
+                .{ .text = a.print("{d}", .{o.pid}) catch "?", .tint = .dim },
+                .{ .text = a.print("{d:.1}", .{o.using}) catch "?", .tint = if (o.using >= 1) .warn else null },
+            }) catch continue) catch {};
+        }
+        const t: table.Table = .{
+            .title = a.print("outside cpuq: {d:.1} cores", .{total}) catch "outside cpuq",
+            .columns = &.{ .{ .head = "PROCESS", .flexible = true }, .{ .head = "PID", .alignment = .right }, .{ .head = "USING", .alignment = .right } },
+            .rows = rows.items,
+        };
+        w.writeAll("\n") catch {};
+        t.boxed(a, w, width, color) catch {};
+    }
+
     // Notes: each project's share (labels before their first ':'), and where
     // to look next.
     var notes: std.ArrayList([]const u8) = .empty;
@@ -1482,24 +1514,61 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
 /// How long `cpuq status` watches the holders to measure their use.
 const sample_ms = 500;
 
-/// Cores each lease's command keeps busy, measured over `sample_ms`; null
-/// for a lease with no command yet. Nothing is sampled when nothing is held.
-fn sampleUsage(io: Io, a: std.mem.Allocator, leases: []const state.Entry) []?f64 {
-    const out = a.alloc(?f64, leases.len) catch return &.{};
-    @memset(out, null);
-    if (leases.len == 0) return out;
+/// A busy process that is not part of any cpuq job.
+const JsonOutside = struct {
+    pid: i32,
+    name: []const u8,
+    using: f64,
+};
+
+const Sample = struct {
+    /// Cores each lease's command keeps busy; null for one with no command.
+    busy: []?f64,
+    /// The busiest processes outside every cpuq job, busiest first.
+    outside: []JsonOutside = &.{},
+};
+
+/// Watches every process for `sample_ms`: what each lease's command tree
+/// keeps busy, and the busiest processes no cpuq job accounts for. Nothing
+/// is sampled when `measure` is off.
+fn sample(io: Io, a: std.mem.Allocator, leases: []const state.Entry, measure: bool) Sample {
+    const busy = nullUsage(a, leases.len);
+    if (!measure) return .{ .busy = busy };
     const t0 = Io.Clock.awake.now(io);
     const before = sys.processes(io, a);
     io.sleep(.fromMilliseconds(sample_ms), .awake) catch {};
     const after = sys.processes(io, a);
     const wall_ns: f64 = @floatFromInt(t0.durationTo(Io.Clock.awake.now(io)).toNanoseconds());
-    if (wall_ns <= 0) return out;
-    for (leases, out) |l, *u| {
+    if (wall_ns <= 0) return .{ .busy = busy };
+    for (leases, busy) |l, *u| {
         if (l.record.child <= 0) continue;
         const used = sys.treeCpu(after, l.record.child) -| sys.treeCpu(before, l.record.child);
         u.* = @as(f64, @floatFromInt(used)) / wall_ns;
     }
-    return out;
+    // Everything else: cpuq's jobs (their cpuq and command trees) and this
+    // process are accounted for; what is left is outside load.
+    const in_job = a.alloc(bool, after.len) catch return .{ .busy = busy };
+    @memset(in_job, false);
+    for (leases) |l| {
+        sys.markTree(after, l.record.pid, in_job);
+        if (l.record.child > 0) sys.markTree(after, l.record.child, in_job);
+    }
+    var cpu_before: std.AutoHashMapUnmanaged(i32, u64) = .empty;
+    for (before) |p| cpu_before.put(a, p.pid, p.cpu_ns) catch {};
+    const self = sys.getpid();
+    var outside: std.ArrayList(JsonOutside) = .empty;
+    for (after, 0..) |p, i| {
+        if (in_job[i] or p.pid == self) continue;
+        const was = cpu_before.get(p.pid) orelse continue;
+        const rate = @as(f64, @floatFromInt(p.cpu_ns -| was)) / wall_ns;
+        if (rate >= 0.3) outside.append(a, .{ .pid = p.pid, .name = p.name, .using = rate }) catch {};
+    }
+    std.mem.sortUnstable(JsonOutside, outside.items, {}, struct {
+        fn busier(_: void, x: JsonOutside, y: JsonOutside) bool {
+            return x.using > y.using;
+        }
+    }.busier);
+    return .{ .busy = busy, .outside = outside.items[0..@min(outside.items.len, 5)] };
 }
 
 fn nullUsage(a: std.mem.Allocator, n: usize) []?f64 {
@@ -1566,7 +1635,8 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
 
     // What each holder actually uses: its command's process tree, CPU time
     // over wall time between two snapshots.
-    const busy = if (measure) sampleUsage(io, a, leases) else nullUsage(a, leases.len);
+    const smp = sample(io, a, leases, measure);
+    const busy = smp.busy;
 
     const holders = toHolders(a, leases, busy);
     const waiters = toWaiters(a, queue);
@@ -1606,6 +1676,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
             .holders = holders,
             .waiters = waiters,
             .leases = named.items,
+            .outside = smp.outside,
         };
         std.json.Stringify.value(s, .{ .whitespace = .indent_2 }, w) catch {};
         w.writeAll("\n") catch {};
@@ -1622,6 +1693,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
             .holders = holders,
             .waiters = waiters,
             .leases = named.items,
+            .outside = smp.outside,
             .now = now,
         });
         return 0;
@@ -1629,6 +1701,11 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
     w.print("dir     {s}\n", .{st.path}) catch {};
     w.print("budget  {d} cores ({d} active of {d}); held {d}, free {d}\n", .{ budget, m.active, sys.totalCpus(ctx.io), held, budget -| held }) catch {};
     w.print("load    {d:.2} {d:.2} {d:.2}; memory pressure {s}; gate {s}\n", .{ load[0], load[1], load[2], pressure, gate_text }) catch {};
+    if (showOutside(smp.outside, g)) {
+        w.writeAll("outside") catch {};
+        for (smp.outside, 0..) |o, k| w.print("{s} {s} (pid {d}, {d:.1})", .{ if (k == 0) "" else ",", o.name, o.pid, o.using }) catch {};
+        w.writeAll("\n") catch {};
+    }
     // The label column fits the longest label, within reason.
     var lw: usize = 5;
     for (holders) |h| lw = @max(lw, @min(dash(h.label).len, 32));
