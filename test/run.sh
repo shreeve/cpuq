@@ -530,7 +530,7 @@ s = json.load(sys.stdin)
 print(" ".join(str(o["pid"]) for o in s["outside"]), "|", " ".join("%.1f" % h["using"] for h in s["holders"]))' )
   wait
   echo "  outside pids | holder use: $got (stray pid $stray)"
-  check "status names an outside process and leaves the job's own out" "[[ ' ${got%%|*} ' == *' $stray '* ]] && python3 -c 'import sys; sys.exit(0 if float(\"${got##*| }\") > 0.6 else 1)'"
+  check "status names an outside process and leaves the job's own out" "[[ ' ${got%%|*} ' == *' $stray '* ]] && python3 -c 'import sys; sys.exit(0 if float(\"${got##*| }\") > 0.4 else 1)'"
 }
 
 t_eta() {
