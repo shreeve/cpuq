@@ -3,6 +3,13 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.1.4 — 2026-10-05
+
+- Each project's band of cores in use is shaded along time by how busy those cores are: its own
+  color where cores active match cores in use, lighter toward idle, darker toward twice as busy
+  (more threads than cores).
+- The menu's status lines are in full color, not grayed out, and open the graphs when chosen.
+
 ## 0.1.3 — 2026-10-05
 
 - The live tab is two charts, each a stack of one band per project in the same colors: the cores

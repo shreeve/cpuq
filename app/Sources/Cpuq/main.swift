@@ -200,11 +200,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         label.isEmpty ? String(command.split(separator: " ").first ?? "job") : label
     }
 
+    /// A line of the status. It opens the graphs when chosen, which also keeps it in full color:
+    /// a menu draws an item that does nothing grayed out.
     private func text(_ s: String, bold: Bool) -> NSMenuItem {
-        let item = NSMenuItem(title: s, action: nil, keyEquivalent: "")
+        let item = NSMenuItem(title: s, action: #selector(showGraphs), keyEquivalent: "")
+        item.target = self
         let font = bold ? NSFont.menuFont(ofSize: 0).bold : NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
         item.attributedTitle = NSAttributedString(string: s, attributes: [.font: font])
-        item.isEnabled = false
         return item
     }
 

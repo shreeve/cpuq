@@ -33,6 +33,18 @@ final class GraphModel {
         let active: [String: Double]
     }
 
+    /// One project's slice of the stack at one point: from `low` to `high`
+    /// cores, with `busy` its cores active per core in use (1 when they
+    /// match, more when it runs more threads than it was given).
+    struct Slice: Identifiable {
+        var id: String { "\(project) \(at.timeIntervalSince1970)" }
+        let project: String
+        let at: Date
+        let low: Double
+        let high: Double
+        let busy: Double?
+    }
+
     /// One project's cores at one point, for a stacked chart.
     struct Band: Identifiable {
         var id: String { "\(project) \(at.timeIntervalSince1970)" }
@@ -129,6 +141,19 @@ final class GraphModel {
         points.flatMap { p in names.map { Band(project: $0, at: p.at, cores: value(p)[$0] ?? 0) } }
     }
 
+    /// The cores in use stacked by hand, project on project in `names`
+    /// order, so each project's band can carry a style of its own.
+    static func slices(_ points: [Point], _ names: [String]) -> [Slice] {
+        points.flatMap { p -> [Slice] in
+            var low = 0.0
+            return names.map { n in
+                let cores = p.inUse[n] ?? 0
+                defer { low += cores }
+                return Slice(project: n, at: p.at, low: low, high: low + cores, busy: cores >= 0.05 ? (p.active[n] ?? 0) / cores : nil)
+            }
+        }
+    }
+
     private func project(_ label: String) -> String {
         label.isEmpty ? "unlabelled" : String(label.split(separator: ":", maxSplits: 1).first ?? "")
     }
@@ -155,6 +180,42 @@ struct GraphsView: View {
 
     // MARK: Live
 
+    /// The projects' colors, and what the shades of a band in use mean.
+    private func legend(_ names: [String]) -> some View {
+        let colors = Self.colors(names.count)
+        return HStack(spacing: 12) {
+            ForEach(Array(names.enumerated()), id: \.element) { i, name in
+                HStack(spacing: 4) {
+                    Circle().fill(colors[i]).frame(width: 8, height: 8)
+                    Text(name).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            if !names.isEmpty {
+                Text("lighter: less active than its cores · darker: more").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// A project's band in use, shaded along time by how busy its cores are:
+    /// its color where cores active match cores in use, lighter toward idle,
+    /// darker toward twice as busy. The gradient runs across the band's
+    /// extent, which is the whole span, since every point has a slice.
+    static func shading(_ slices: [GraphModel.Slice], base: Color, span: ClosedRange<Date>) -> LinearGradient {
+        let width = span.upperBound.timeIntervalSince(span.lowerBound)
+        let stops: [Gradient.Stop] = slices.compactMap { sl in
+            guard let busy = sl.busy, width > 0 else { return nil }
+            return .init(color: shade(base, busy), location: sl.at.timeIntervalSince(span.lowerBound) / width)
+        }
+        return LinearGradient(stops: stops.isEmpty ? [.init(color: base, location: 0)] : stops, startPoint: .leading, endPoint: .trailing)
+    }
+
+    static func shade(_ base: Color, _ busy: Double) -> Color {
+        let c = NSColor(base).usingColorSpace(.sRGB) ?? .gray
+        if busy < 1 { return Color(nsColor: c.blended(withFraction: 0.65 * (1 - max(busy, 0)), of: .white) ?? c) }
+        return Color(nsColor: c.blended(withFraction: 0.5 * min(busy - 1, 1), of: .black) ?? c)
+    }
+
     /// Distinct colors for the projects, in order, repeating only past a dozen.
     static func colors(_ n: Int) -> [Color] {
         let palette: [Color] = [.blue, .orange, .green, .purple, .red, .teal, .yellow, .brown, .indigo, .pink, .mint, .gray]
@@ -174,24 +235,27 @@ struct GraphsView: View {
         }()
         let top = Double(max(model.budget, 1))
         let loadTop = points.map(\.load).max() ?? 0
+        let slices = GraphModel.slices(points, names)
         return VStack(alignment: .leading, spacing: 16) {
             Text("Cores in use, by project").font(.headline)
             Chart {
-                ForEach(GraphModel.bands(points, names, \.inUse)) { b in
-                    AreaMark(x: .value("Time", b.at), y: .value("Cores", b.cores), stacking: .standard)
-                        .foregroundStyle(by: .value("Project", b.project))
-                        .interpolationMethod(.monotone)
+                ForEach(Array(names.enumerated()), id: \.element) { i, name in
+                    let mine = slices.filter { $0.project == name }
+                    ForEach(mine) { sl in
+                        AreaMark(x: .value("Time", sl.at), yStart: .value("Cores", sl.low), yEnd: .value("Cores", sl.high), series: .value("Project", name))
+                            .foregroundStyle(Self.shading(mine, base: Self.colors(names.count)[i], span: span))
+                            .interpolationMethod(.monotone)
+                    }
                 }
                 RuleMark(y: .value("Budget", top))
                     .foregroundStyle(.secondary)
                     .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
                     .annotation(position: .top, alignment: .trailing) { Text("budget \(model.budget)").font(.caption).foregroundStyle(.secondary) }
             }
-            .chartForegroundStyleScale(domain: names, range: Self.colors(names.count))
             .chartXScale(domain: span)
             .chartYScale(domain: 0...top + 1)
-            .chartLegend(position: .bottom, alignment: .leading)
             .frame(minHeight: 170)
+            legend(names)
 
             Text("Cores active, by project").font(.headline)
             Chart {
