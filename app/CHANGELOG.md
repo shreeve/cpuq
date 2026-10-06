@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.7.2 — 2026-10-06
+
+- The Mac strip is now called All CPUs and leads the page: the views run from widest to
+  narrowest, all the CPUs (cpuq's jobs and other work), cpuq's cores by project, which cores,
+  and who waits, with the time labels under the waiting row.
+
 ## 0.7.1 — 2026-10-06
 
 - More room between the views: a clear gap under the stacked chart and under the lanes, so the

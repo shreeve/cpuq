@@ -433,23 +433,29 @@ struct GraphsView: View {
         let cells = Self.borrowed(all, budget: model.budget)
         let lanes = max(model.budget, (cells.filter { $0.project != nil }.map(\.lane).max() ?? 0) + 1)
         let machine = Self.machine(model, columns: axis.columns)
-        // Views of one thing over one time axis, each of which can be turned off: how much is
-        // held and busy by project against the CPUs; which cores; who waits; and the whole Mac.
+        // Views of one thing over one time axis, widest first, each of which can be turned off:
+        // all the CPUs, cpuq's jobs and other work; cpuq's cores by project; which cores; and,
+        // always, who waits.
         return VStack(alignment: .leading, spacing: 12) {
             HStack {
                 ((hover.flatMap { describe($0, axis: axis, cells: cells) }) ?? summary())
                     .font(.title3).monospacedDigit().lineLimit(1)
                 Spacer()
                 HStack(spacing: 2) {
+                    Toggle("All CPUs", isOn: $showMac)
                     Toggle("Stacked", isOn: $showStacked)
                     Toggle("Lanes", isOn: $showLanes)
-                    Toggle("Mac", isOn: $showMac)
                 }
                 .toggleStyle(.button).controlSize(.small)
             }
-            // Air between the views, so each reads as its own; the waiting row and the Mac strip
-            // sit together.
+            // Air between the views, so each reads as its own; the waiting row sits under the
+            // lanes, and carries the time labels.
             VStack(spacing: 4) {
+                if showMac {
+                    macChart(axis: axis, machine: machine)
+                        .frame(height: 80)
+                        .padding(.bottom, 14)
+                }
                 if showStacked {
                     stackChart(axis: axis, machine: machine)
                         .frame(minHeight: 150, maxHeight: .infinity)
@@ -460,12 +466,8 @@ struct GraphsView: View {
                         .frame(minHeight: 170, maxHeight: .infinity)
                         .padding(.bottom, 14)
                 }
-                waitingChart(axis: axis, waits: waitCells, labels: !showMac)
-                    .frame(height: showMac ? 42 : 62)
-                if showMac {
-                    macChart(axis: axis, machine: machine)
-                        .frame(height: 92)
-                }
+                waitingChart(axis: axis, waits: waitCells)
+                    .frame(height: 62)
             }
             if !showStacked && !showLanes { Spacer(minLength: 0) }
             key
@@ -473,14 +475,9 @@ struct GraphsView: View {
         }
     }
 
-    /// A leading axis label, the same width in both charts so their plots line up.
+    /// A leading axis label, the same width in every chart so their plots line up.
     private func axisLabel(_ text: Text) -> some View {
         text.frame(width: 64, alignment: .trailing)
-    }
-
-    /// A trailing axis label, likewise.
-    private func trailingLabel(_ text: Text) -> some View {
-        text.frame(width: 30, alignment: .leading)
     }
 
     /// What the marks mean, as swatches.
@@ -610,7 +607,6 @@ struct GraphsView: View {
             AxisMarks(position: .leading, values: (0..<lanes).map { Double($0) + 0.5 }) { v in
                 AxisValueLabel { if let d = v.as(Double.self) { axisLabel(Text("\(Int(d) + 1)")) } }
             }
-            AxisMarks(position: .trailing, values: [0.0]) { _ in AxisValueLabel { trailingLabel(Text("")) } }
         }
         .chartOverlay { hovering($0, .lanes) }
         .contextMenu { clearMenu(axis) }
@@ -618,7 +614,7 @@ struct GraphsView: View {
 
     /// Waiting: a bar as tall as the count (one, two, three or more), the count written once
     /// over each stretch of more than one; orange while the gate is shut.
-    private func waitingChart(axis: TimeAxis, waits: [WaitCell], labels: Bool) -> some View {
+    private func waitingChart(axis: TimeAxis, waits: [WaitCell]) -> some View {
         Chart {
             ForEach(waits) { c in
                 RectangleMark(xStart: .value("Time", Double(c.column) + 0.12), xEnd: .value("Time", Double(c.column) + 0.88),
@@ -632,18 +628,17 @@ struct GraphsView: View {
         }
         .chartLegend(.hidden)
         .chartXScale(domain: 0...max(axis.count, 1))
-        .chartXAxis { timeAxis(axis, labels: labels) }
+        .chartXAxis { timeAxis(axis) }
         .chartYScale(domain: 0...1.15)
         .chartYAxis {
             AxisMarks(position: .leading, values: [0.35]) { _ in AxisValueLabel { axisLabel(Text("waiting").foregroundColor(.red)) } }
-            AxisMarks(position: .trailing, values: [0.0]) { _ in AxisValueLabel { trailingLabel(Text("")) } }
         }
         .chartOverlay { hovering($0, .waiting) }
         .contextMenu { clearMenu(axis) }
     }
 
-    /// The whole Mac: its CPUs busy with cpuq's jobs (dark) and with other work (pale), 0 to
-    /// 12, with lines at the budget and the CPU count.
+    /// All the CPUs: busy with cpuq's jobs (dark) and with other work (pale), 0 to 12, with
+    /// lines at the budget and the CPU count.
     private func macChart(axis: TimeAxis, machine: [(active: Double, outside: Double)?]) -> some View {
         let cpus = Double(ProcessInfo.processInfo.activeProcessorCount)
         let budget = Double(model.budget)
@@ -667,7 +662,7 @@ struct GraphsView: View {
         }
         .chartLegend(.hidden)
         .chartXScale(domain: 0...max(axis.count, 1))
-        .chartXAxis { timeAxis(axis) }
+        .chartXAxis { timeAxis(axis, labels: false, grid: true) }
         .chartYScale(domain: 0...cap)
         .chartYAxis {
             AxisMarks(position: .leading, values: abs(budget - cpus) < 0.5 ? [cpus] : [budget, cpus]) { v in
@@ -677,7 +672,7 @@ struct GraphsView: View {
                     }
                 }
             }
-            AxisMarks(position: .trailing, values: [cap * 0.3]) { _ in AxisValueLabel { trailingLabel(Text("Mac").foregroundColor(.secondary)) } }
+            AxisMarks(position: .leading, values: [cap * 0.3]) { _ in AxisValueLabel { axisLabel(Text("all CPUs").foregroundColor(.secondary)) } }
         }
         .chartOverlay { hovering($0, .mac) }
         .contextMenu { clearMenu(axis) }
@@ -773,8 +768,6 @@ struct GraphsView: View {
                 AxisGridLine().foregroundStyle(.secondary.opacity(0.15))
                 AxisValueLabel { if let d = v.as(Double.self) { axisLabel(Text("\(Int(d))")) } }
             }
-            // Room on the right as wide as the Mac strip's "Mac", so the plots line up.
-            AxisMarks(position: .trailing, values: [0.0]) { _ in AxisValueLabel { trailingLabel(Text("")) } }
         }
         .chartOverlay { hovering($0, .stack) }
         .contextMenu { clearMenu(axis) }
@@ -860,7 +853,7 @@ struct GraphsView: View {
             let then = model.samples.min { abs($0.at.timeIntervalSince(at)) < abs($1.at.timeIntervalSince(at)) }
                 .flatMap { abs($0.at.timeIntervalSince(at)) < 30 ? $0 : nil }
             guard let then else { return when + Text("the app was not watching then").foregroundColor(.secondary) }
-            return when + Text("the Mac").bold() + Text(String(format: " · %.1f CPUs busy in cpuq's jobs, %.1f with other work", then.active, then.outside))
+            return when + Text("all CPUs").bold() + Text(String(format: " · %.1f busy with cpuq's jobs, %.1f with other work", then.active, then.outside))
         }
         if hoverIn == .stack {
             // The project whose band is under the pointer in that column.
