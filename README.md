@@ -339,9 +339,9 @@ says once that a range would start it now.
 for nothing, so the head of the queue measures what each running job's
 command tree actually uses, averaged over half of `lend_after` seconds.
 Cores a job has left wholly idle for `lend_after` (60) are lent to the
-head on top of the budget, up to the CPU count: a job holding 3 cores and
-keeping 1 busy for a minute lends 1 (a quarter of a core is kept as
-slack). Nothing is taken from the lender. If it gets busy again, the
+head on top of the budget: a job holding 3 cores and keeping 1 busy for a
+minute lends 1 (a quarter of a core is kept as slack). Only idle cores are
+lent, so the work running stays within the budget. Nothing is taken from the lender. If it gets busy again, the
 machine runs over the budget until someone finishes, and the load valve
 stops further admissions meanwhile. A job started on lent cores says so,
 and its history marks how many (`"lent": N`). Nothing is lent to an

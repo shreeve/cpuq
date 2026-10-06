@@ -2,6 +2,12 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.6.1 — 2026-10-06
+
+- Lending is no longer capped at the CPU count: only idle cores are lent,
+  so the work running stays within the budget, and the load valve guards
+  the rest. A budget equal to the CPU count can now lend too.
+
 ## 0.6.0 — 2026-10-06
 
 - Lending: the head of the queue measures what each running job actually

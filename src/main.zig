@@ -546,11 +546,13 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
             const held_before = heldCores(st, a);
             var got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, budget, @max(cores, budget), exclusive_running, reserve) catch |err| fail("tokens: {t}", .{err});
             // Not enough free: borrow the cores the holders have left idle for
-            // a minute, on top of the budget, up to the CPUs. Measuring takes a
+            // a minute, on top of the budget. Only idle cores are lent, so the
+            // work running stays within the budget; should a lender get busy
+            // again, the load valve holds further admissions. Measuring takes a
             // process snapshot, so only a head that cannot start does it.
             if (got == null and !named and !o.exclusive and cfg.lend) {
-                const lent = @min(measureIdle(ctx, st, a), @max(cores, budget) -| budget);
-                if (lent > 0) got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, budget + lent, @max(cores, budget), exclusive_running, reserve) catch |err| fail("tokens: {t}", .{err});
+                const lent = measureIdle(ctx, st, a);
+                if (lent > 0) got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, budget + lent, @max(cores, budget) + lent, exclusive_running, reserve) catch |err| fail("tokens: {t}", .{err});
             }
             if (got) |grant| {
                 valve.last_admit = now;
