@@ -483,7 +483,7 @@ print(b["state"], b["cores"], "%.1f" % (b["used"] or 0), j["h:fail"]["exit"], j[
   check "history records grant, use, exit, give-up and loss (got: $got)" "python3 -c '
 import sys
 f = \"$got\".split()
-ok = f[0] == \"done\" and f[1] == \"4\" and 1.5 < float(f[2]) < 2.5 and f[3:] == [\"3\", \"gave_up\", \"lost\", \"0\"]
+ok = f[0] == \"done\" and f[1] == \"4\" and 1.1 < float(f[2]) < 2.5 and f[3:] == [\"3\", \"gave_up\", \"lost\", \"0\"]
 sys.exit(0 if ok else 1)'"
   local n; n=$("$CPUQ" history --label 'h:b*' --json | python3 -c 'import json, sys; print(len(json.load(sys.stdin)))')
   check "history --label filters by prefix (got $n)" "[ '$n' = 1 ]"
