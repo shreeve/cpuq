@@ -45,6 +45,9 @@ pub const Event = struct {
     /// It started ahead of the head of the queue, on cores the head could
     /// not use yet (started).
     ahead: ?bool = null,
+    /// How many of its cores were lent by holders that left them idle
+    /// (started).
+    lent: ?u32 = null,
 };
 
 /// The longest command kept in a line, so a line stays well under 4 KB.

@@ -553,6 +553,23 @@ t_backfill_known() {
   check "a job known to be quick goes ahead with all that is free; a slow one waits (got: $got; ahead: $ahead)" "[[ '$got' == 'quick 2 '* ]] && [ '$ahead' = 'quick ' ]"
 }
 
+t_lend() {
+  setup lend "lend_after = 2"
+  # A budget under the CPU count, so there are CPUs to lend on.
+  export CPUQ_BUDGET=2
+  # The holder takes the whole budget and leaves it idle.
+  "$CPUQ" run --cores 2 --label idle -- sleep 12 & local h=$!
+  wait_held 2
+  local t0; t0=$(now)
+  local out; out=$("$CPUQ" run --cores 1 --label borrower -- true 2>&1)
+  local dt; dt=$(python3 -c "print('%.1f' % ($(now) - $t0))")
+  kill $h 2>/dev/null; wait $h 2>/dev/null
+  local lent; lent=$(grep '"event":"started"' "$CPUQ_DIR/history.jsonl" | grep '"label":"borrower"' | sed -n 's/.*"lent":\([0-9]*\).*/\1/p')
+  echo "  borrower started after ${dt}s, lent $lent; said: $(echo "$out" | grep lent)"
+  check "a core a holder leaves idle is lent to the head (after ${dt}s, lent $lent)" "[ '$lent' = 1 ] && python3 -c 'import sys; sys.exit(0 if $dt < 9 else 1)'"
+  export CPUQ_BUDGET=9
+}
+
 t_zombie() {
   setup zombie
   # A child spins a second, then waits as a zombie until its parent reaps
@@ -765,7 +782,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host wait history zombie fixed_hint backfill backfill_known outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host wait history zombie fixed_hint backfill backfill_known lend outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

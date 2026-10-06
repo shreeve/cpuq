@@ -398,6 +398,8 @@ const EventExtra = struct {
     cores: ?u32 = null,
     /// Started ahead of the head of the queue (backfill).
     ahead: ?bool = null,
+    /// Cores of the grant lent by holders that leave them idle.
+    lent: ?u32 = null,
     slots: ?[]const u32 = null,
     exit: ?u8 = null,
     signal: ?u32 = null,
@@ -417,6 +419,7 @@ fn logEvent(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra) void {
     ev.cpu = extra.cpu;
     ev.slots = extra.slots;
     ev.ahead = extra.ahead;
+    ev.lent = extra.lent;
     history.append(ctx.io, path, ev);
 }
 
@@ -538,13 +541,19 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
         if (check_load) st.writeValve(valve);
         if (last_gate == .open) {
             const exclusive_running = (state.scanLeases(st, a, true) catch @as([]state.Entry, &.{})).len != 0;
+            // Cores the holders have left idle for a minute, lent to the head
+            // on top of the budget, up to the CPUs.
+            const lent: u32 = if (!named and !o.exclusive and cfg.lend) @min(measureIdle(ctx, st, a), @max(cores, budget) -| budget) else 0;
             // Leave the next waiter's minimum free when this grant can spare it.
             const reserve: u32 = if (queue.len > 1 and !queue[1].record.exclusive) @min(queue[1].record.cores, budget) else 0;
-            const got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, budget, @max(cores, budget), exclusive_running, reserve) catch |err| fail("tokens: {t}", .{err});
+            const held_before = heldCores(st, a);
+            const got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, budget + lent, @max(cores, budget), exclusive_running, reserve) catch |err| fail("tokens: {t}", .{err});
             if (got) |grant| {
                 valve.last_admit = now;
                 if (check_load) st.writeValve(valve);
-                return admitted(ctx, st, o, &rec, grant, ticket, ticket_name, job, now, false);
+                const borrowed: u32 = @intCast(@min(grant.files.len, (held_before + grant.files.len) -| budget));
+                if (borrowed > 0) std.debug.print("cpuq: starting on {d} {s} lent by jobs that leave them idle\n", .{ borrowed, if (borrowed == 1) "core" else "cores" });
+                return admittedLent(ctx, st, o, &rec, grant, ticket, ticket_name, job, now, borrowed);
             }
             // First in line for a fixed count while fewer cores sit free: say
             // once what would start it now.
@@ -563,6 +572,44 @@ fn waitTurn(ctx: *Ctx, st: *state.State, o: RunOptions) Lease {
         io.sleep(.fromMilliseconds(cfg.poll_ms), .awake) catch {};
     }
 }
+
+/// Cores held by every lease now.
+fn heldCores(st: *state.State, a: std.mem.Allocator) usize {
+    var held: usize = 0;
+    for (state.scanLeases(st, a, false) catch &.{}) |l| held += l.record.cores;
+    return held;
+}
+
+/// Measures each holder's command tree and returns the whole cores they
+/// have left idle for a minute (`policy.Use`), keeping the measurements in
+/// the state directory so the next head carries on from them. Call with the
+/// admission lock held.
+fn measureIdle(ctx: *Ctx, st: *state.State, a: std.mem.Allocator) u32 {
+    const leases = state.scanLeases(st, a, false) catch return 0;
+    const procs = sys.processes(ctx.io, a);
+    const old = st.readUsage(a);
+    var fresh: std.StringHashMapUnmanaged(policy.Use) = .empty;
+    const now_ms: i64 = @intFromFloat(nowFloat(ctx.io) * 1000);
+    var lent: u32 = 0;
+    for (leases) |l| {
+        if (l.record.child <= 0 or l.record.exclusive) continue;
+        var u = old.get(l.name) orelse policy.Use{};
+        u.observe(sys.treeCpu(procs, l.record.child), now_ms, l.record.cores, ctx.cfg.lend_after_s);
+        fresh.put(a, l.name, u) catch {};
+        lent += u.lendable(l.record.cores, @divFloor(now_ms, 1000), ctx.cfg.lend_after_s);
+    }
+    st.writeUsage(a, fresh);
+    return lent;
+}
+
+/// `admitted`, logging the cores lent to it.
+fn admittedLent(ctx: *Ctx, st: *state.State, o: RunOptions, rec: *state.Record, grant: state.Grant, ticket: Io.File, ticket_name: []const u8, job: JobLog, now: i64, lent: u32) Lease {
+    lent_now = lent;
+    return admitted(ctx, st, o, rec, grant, ticket, ticket_name, job, now, false);
+}
+
+/// The cores the grant being logged borrowed (read by `admitted`).
+var lent_now: u32 = 0;
 
 /// Takes the grant: writes the lease, leaves the queue, and logs the start.
 /// Call with the admission lock held; returns with it released.
@@ -587,7 +634,7 @@ fn admitted(ctx: *Ctx, st: *state.State, o: RunOptions, rec: *state.Record, gran
     st.queue.deleteFile(io, ticket_name) catch {};
     ticket.close(io);
     st.unlock();
-    logEvent(ctx, job, "started", .{ .cores = rec.cores, .slots = grant.slots, .ahead = if (ahead) true else null });
+    logEvent(ctx, job, "started", .{ .cores = rec.cores, .slots = grant.slots, .ahead = if (ahead) true else null, .lent = if (lent_now > 0) lent_now else null });
     return .{ .record = rec.*, .name = lease_name, .file = lease, .tokens = grant.files, .job = job };
 }
 

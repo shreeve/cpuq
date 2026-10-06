@@ -54,6 +54,12 @@ pub const Config = struct {
     /// The least time, in seconds, the head lets others go ahead when there
     /// is no run time to judge by (`patience`).
     patience_s: u32 = 30,
+    /// Lend the cores a holder has left idle for a minute to the head of the
+    /// queue (`lend`).
+    lend: bool = true,
+    /// How long, in seconds, a core must stay idle before it is lent
+    /// (`lend_after`).
+    lend_after_s: u32 = 60,
 };
 
 pub const Diagnostic = struct {
@@ -106,6 +112,10 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             cfg.note_s = parseCount(value) orelse return bad(diag, "note must be a whole number of seconds, at least 1");
         } else if (std.mem.eql(u8, key, "backfill")) {
             cfg.backfill = parseBool(value) orelse return bad(diag, "backfill must be on or off");
+        } else if (std.mem.eql(u8, key, "lend_after")) {
+            cfg.lend_after_s = parseCount(value) orelse return bad(diag, "lend_after must be a whole number of seconds, at least 1");
+        } else if (std.mem.eql(u8, key, "lend")) {
+            cfg.lend = parseBool(value) orelse return bad(diag, "lend must be on or off");
         } else if (std.mem.eql(u8, key, "patience")) {
             cfg.patience_s = std.fmt.parseInt(u32, value, 10) catch return bad(diag, "patience must be a whole number of seconds");
         } else {
@@ -360,6 +370,74 @@ test "backfill goes ahead only when it should not delay the head" {
     // A configured least patience.
     try std.testing.expectEqual(@as(f64, 2), patience(null, 2));
     try std.testing.expectEqual(@as(f64, 600), patience(null, 600));
+}
+
+/// Lending: what a holder's command actually uses, measured by the head of
+/// the queue while it waits, and shared through the state directory.
+pub const Use = struct {
+    /// Cores active, averaged over about half of `after_s` (it starts at
+    /// the grant, so a job is taken as busy until shown otherwise).
+    avg: f64 = 0,
+    /// Since when at least one whole core has been idle; 0 when not.
+    idle_since: i64 = 0,
+    /// When last measured (ms), and the command tree's CPU then (ns).
+    at_ms: i64 = 0,
+    cpu_ns: u64 = 0,
+
+    /// Takes in a measurement: `cpu_ns` of CPU time at `now_ms`, averaging
+    /// over half of `after_s`, the time a core must stay idle to be lent.
+    pub fn observe(u: *Use, cpu_ns: u64, now_ms: i64, held: u32, after_s: u32) void {
+        const tau_s = @max(@as(f64, @floatFromInt(after_s)) / 2, 0.5);
+        const h: f64 = @floatFromInt(held);
+        if (u.at_ms == 0 or now_ms <= u.at_ms or cpu_ns < u.cpu_ns) {
+            u.* = .{ .avg = h, .at_ms = now_ms, .cpu_ns = cpu_ns };
+            return;
+        }
+        const dt = @as(f64, @floatFromInt(now_ms - u.at_ms)) / 1000;
+        const rate = @as(f64, @floatFromInt(cpu_ns - u.cpu_ns)) / 1e9 / dt;
+        u.avg += std.math.clamp(dt / tau_s, 0, 1) * (rate - u.avg);
+        u.at_ms = now_ms;
+        u.cpu_ns = cpu_ns;
+        if (h - u.avg >= 1) {
+            if (u.idle_since == 0) u.idle_since = @divFloor(now_ms, 1000);
+        } else u.idle_since = 0;
+    }
+
+    /// The whole cores it lends: those idle for `after_s`, less a quarter
+    /// of a core of slack.
+    pub fn lendable(u: Use, held: u32, now: i64, after_s: u32) u32 {
+        if (u.idle_since == 0 or now - u.idle_since < after_s) return 0;
+        const idle = @as(f64, @floatFromInt(held)) - u.avg - 0.25;
+        return if (idle >= 1) @intFromFloat(@floor(idle)) else 0;
+    }
+};
+
+test "a holder lends the cores it leaves idle for a minute" {
+    var u: Use = .{};
+    // Holds 3, uses 1: the average falls from 3 toward 1.
+    var cpu: u64 = 0;
+    var t: i64 = 1_000_000;
+    u.observe(cpu, t, 3, 60);
+    try std.testing.expectEqual(@as(f64, 3), u.avg);
+    var lent: u32 = 0;
+    var first: i64 = 0;
+    while (t < 1_000_000 + 200_000) {
+        t += 500;
+        cpu += 500_000_000; // one core
+        u.observe(cpu, t, 3, 60);
+        lent = u.lendable(3, @divFloor(t, 1000), 60);
+        if (lent > 0 and first == 0) first = t;
+    }
+    try std.testing.expectEqual(@as(u32, 1), lent); // 3 - 1 - 0.25: one whole core
+    // Not before the idle core has been idle a minute.
+    try std.testing.expect(first - 1_000_000 >= 60 * 1000);
+    // Busy again: nothing lent.
+    for (0..200) |_| {
+        t += 500;
+        cpu += 1_500_000_000; // three cores
+        u.observe(cpu, t, 3, 60);
+    }
+    try std.testing.expectEqual(@as(u32, 0), u.lendable(3, @divFloor(t, 1000), 60));
 }
 
 /// MAKEFLAGS for a command whose jobserver pipe is (r, w): the caller's

@@ -230,6 +230,8 @@ count oversubscribes it on purpose. The config file is `CPUQ_CONFIG`, default
 | `note` | 60 | seconds between "waiting" lines |
 | `backfill` | on | let a waiter start ahead of the head on cores the head cannot use yet |
 | `patience` | 30 | the least seconds the head lets others go ahead without run times to judge by |
+| `lend` | on | lend the head the cores a running job leaves idle |
+| `lend_after` | 60 | seconds a core must stay idle before it is lent |
 
 An invalid line is an error naming the file and line.
 
@@ -331,7 +333,19 @@ ahead of an `--exclusive` head (it waits for the machine to drain), and
 named leases stay strictly in order. A job that went ahead says so on stderr
 and is marked `"ahead": true` in its history. `backfill = off` restores
 strict order. A head waiting for an exact count while fewer cores are free
-says once that a range would start it now. Once the head's minimum fits,
+says once that a range would start it now.
+
+**Lending.** A job that holds cores it does not use keeps others waiting
+for nothing, so the head of the queue measures what each running job's
+command tree actually uses, averaged over half of `lend_after` seconds.
+Cores a job has left wholly idle for `lend_after` (60) are lent to the
+head on top of the budget, up to the CPU count: a job holding 3 cores and
+keeping 1 busy for a minute lends 1 (a quarter of a core is kept as
+slack). Nothing is taken from the lender. If it gets busy again, the
+machine runs over the budget until someone finishes, and the load valve
+stops further admissions meanwhile. A job started on lent cores says so,
+and its history marks how many (`"lent": N`). Nothing is lent to an
+exclusive run or a named lease; `lend = off` turns it off. Once the head's minimum fits,
 the head takes up to its maximum of the free cores, but leaves the next
 waiter's minimum free when it can still get its own, so a wide request does
 not stall the job behind it. `--exclusive` takes the whole budget at the

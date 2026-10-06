@@ -113,6 +113,37 @@ pub const State = struct {
         return policy.Valve.parse(text);
     }
 
+    /// The measured use of each holder, by lease name ("usage": one line
+    /// each, `name avg idle_since at_ms cpu_ns`). Call with the admission
+    /// lock held.
+    pub fn readUsage(s: *State, arena: std.mem.Allocator) std.StringHashMapUnmanaged(policy.Use) {
+        var map: std.StringHashMapUnmanaged(policy.Use) = .empty;
+        const text = s.dir.readFileAlloc(s.io, "usage", arena, .limited(1 << 20)) catch return map;
+        var lines = std.mem.tokenizeScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            var f = std.mem.tokenizeScalar(u8, line, ' ');
+            const name = f.next() orelse continue;
+            const u: policy.Use = .{
+                .avg = std.fmt.parseFloat(f64, f.next() orelse continue) catch continue,
+                .idle_since = std.fmt.parseInt(i64, f.next() orelse continue, 10) catch continue,
+                .at_ms = std.fmt.parseInt(i64, f.next() orelse continue, 10) catch continue,
+                .cpu_ns = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue,
+            };
+            map.put(arena, name, u) catch {};
+        }
+        return map;
+    }
+
+    pub fn writeUsage(s: *State, arena: std.mem.Allocator, map: std.StringHashMapUnmanaged(policy.Use)) void {
+        var out: std.ArrayList(u8) = .empty;
+        var it = map.iterator();
+        while (it.next()) |e| {
+            const u = e.value_ptr.*;
+            out.print(arena, "{s} {d:.3} {d} {d} {d}\n", .{ e.key_ptr.*, u.avg, u.idle_since, u.at_ms, u.cpu_ns }) catch return;
+        }
+        s.dir.writeFile(s.io, .{ .sub_path = "usage", .data = out.items }) catch {};
+    }
+
     pub fn writeValve(s: *State, v: policy.Valve) void {
         var out: [128]u8 = undefined;
         const text = std.mem.print(&out, "{d} {d} {d} {d}\n", .{ @intFromBool(v.tripped), v.calm_since, v.last_admit, v.last_check }) catch return;

@@ -2,6 +2,16 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.6.0 — 2026-10-06
+
+- Lending: the head of the queue measures what each running job actually
+  uses, and the cores a job has left wholly idle for a minute are lent to
+  the head on top of the budget, up to the CPU count. The lender loses
+  nothing; if it gets busy again, the load valve holds new admissions until
+  the machine settles. A job started on lent cores says so, and history
+  records how many (`"lent": N`). Config: `lend = on|off`,
+  `lend_after = SECONDS`.
+
 ## 0.5.1 — 2026-10-05
 
 - The load valve reopens sooner: once the load has stayed at or under
