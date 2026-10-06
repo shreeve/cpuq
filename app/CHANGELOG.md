@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.4.2 — 2026-10-05
+
+- Right-click the chart to clear what is older than the point clicked, or to keep only the last
+  5 minutes. It trims only what the window shows (cpuq's history is untouched), and holds after
+  a relaunch.
+
 ## 0.4.1 — 2026-10-05
 
 - The waiting row turns orange when cpuq's gate (the load valve, memory pressure or spacing)

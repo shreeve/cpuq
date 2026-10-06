@@ -14,7 +14,7 @@ final class GraphModel {
         let label: String
         /// Which of the budget's cores it holds, from 0.
         let lanes: [Int]
-        let from: Date
+        var from: Date
         /// Nil while it runs.
         var to: Date?
         /// Cores active, measured at every poll while the app watched it.
@@ -34,7 +34,7 @@ final class GraphModel {
         let project: String
         let label: String
         let cores: String
-        let from: Date
+        var from: Date
         var to: Date?
     }
 
@@ -166,16 +166,16 @@ final class GraphModel {
     /// average active cores, and each wait from queueing to starting.
     private func seed(_ jobs: [Job], now: Date = Date()) {
         seeded = true
-        let since = now.addingTimeInterval(-Self.keep).timeIntervalSince1970
+        let since = max(now.addingTimeInterval(-Self.keep), cleared ?? .distantPast).timeIntervalSince1970
         for j in jobs.sorted(by: { ($0.started ?? 0) < ($1.started ?? 0) }) where j.pool == "cores" && j.state != "active" {
             guard let start = j.started, let cores = j.cores, (j.ended ?? start) >= since else { continue }
             // A job the app saw start is a block already.
             if blocks.contains(where: { $0.id.hasPrefix("\(j.pid ?? -1)-") && abs($0.from.timeIntervalSince1970 - start) < 2 }) { continue }
-            let from = Date(timeIntervalSince1970: start)
+            let from = Date(timeIntervalSince1970: max(start, since))
             let to = Date(timeIntervalSince1970: j.ended ?? start)
             blocks.append(Block(id: "\(j.pid ?? 0)-\(Int(start))", project: Self.project(j.label), label: j.label.isEmpty ? "-" : j.label,
                                 lanes: j.slots ?? fit(cores, from: from, to: to), from: from, to: to, average: j.used))
-            if let w = j.waited, w >= 1 {
+            if let w = j.waited, w >= 1, start > since {
                 waits.append(Wait(id: "h\(j.id)", project: Self.project(j.label), label: j.label, cores: "\(cores) cores",
                                   from: Date(timeIntervalSince1970: start - w), to: from))
             }
@@ -210,7 +210,30 @@ final class GraphModel {
 
     /// How far back there is anything to show.
     func oldest(now: Date) -> Date {
-        ([started] + blocks.map(\.from) + waits.map(\.from)).min() ?? now
+        max(([started] + blocks.map(\.from) + waits.map(\.from)).min() ?? now, cleared ?? .distantPast)
+    }
+
+    /// Where the window's data was cleared from, if it was: nothing older is shown, after a
+    /// relaunch too (the seed from history skips it). cpuq's own history is untouched.
+    private(set) var cleared: Date? = {
+        let t = UserDefaults.standard.double(forKey: "clearedBefore")
+        return t > 0 ? Date(timeIntervalSince1970: t) : nil
+    }()
+
+    /// Forgets everything older than `cutoff`: jobs and waits that ended before it go, those
+    /// that span it are cut at it, and so are the readings.
+    func clear(before cutoff: Date) {
+        cleared = cutoff
+        UserDefaults.standard.set(cutoff.timeIntervalSince1970, forKey: "clearedBefore")
+        blocks.removeAll { ($0.to ?? .distantFuture) <= cutoff }
+        for i in blocks.indices where blocks[i].from < cutoff {
+            blocks[i].from = cutoff
+            blocks[i].active.removeAll { $0.at < cutoff }
+        }
+        waits.removeAll { ($0.to ?? .distantFuture) <= cutoff }
+        for i in waits.indices where waits[i].from < cutoff { waits[i].from = cutoff }
+        samples.removeAll { $0.at < cutoff }
+        if started < cutoff { started = cutoff }
     }
 
     /// The projects running now, the most cores first.
@@ -434,6 +457,16 @@ struct GraphsView: View {
         }
     }
 
+    /// The chart's right-click menu: forget what is older than the point clicked, or than five
+    /// minutes ago.
+    @ViewBuilder private func clearMenu(_ axis: TimeAxis) -> some View {
+        if let h = hover {
+            let at = axis.time(Double(h.x))
+            Button("Clear Data Older Than \(age(axis.end.timeIntervalSince(at))) Ago") { model.clear(before: at); hover = nil }
+        }
+        Button("Keep Only the Last 5 Minutes") { model.clear(before: Date().addingTimeInterval(-300)); hover = nil }
+    }
+
     /// The pointer, in the chart's units.
     private func hovering(_ proxy: ChartProxy) -> some View {
         GeometryReader { geo in
@@ -493,6 +526,7 @@ struct GraphsView: View {
             AxisMarks(position: .trailing, values: [base + height * 0.3]) { _ in AxisValueLabel { Text("Mac").foregroundStyle(.secondary) } }
         }
         .chartOverlay { hovering($0) }
+        .contextMenu { clearMenu(axis) }
     }
 
     /// Waiting: a bar as tall as the count (one, two, three or more), the count written once
@@ -594,6 +628,7 @@ struct GraphsView: View {
             AxisMarks(position: .leading, values: [-1.4]) { _ in AxisValueLabel { Text("waiting").foregroundStyle(.red) } }
         }
         .chartOverlay { hovering($0) }
+        .contextMenu { clearMenu(axis) }
     }
 
     /// Every core in every column: the job holding it longest there, and how busy; and how many
