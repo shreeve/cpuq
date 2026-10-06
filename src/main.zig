@@ -1291,17 +1291,23 @@ fn cmdControl(ctx: *Ctx, comptime action: []const u8, args: []const [:0]const u8
             std.debug.print("cpuq: {s} is an exclusive run, a timing window; left alone\n", .{who});
             continue;
         }
-        if (comptime std.mem.eql(u8, action, "stop")) {
-            _ = std.c.kill(r.pid, .TERM);
-        } else if (r.child > 0) {
+        if (r.child > 0) {
+            // The command's whole process tree, not just its first process: a
+            // shell's children would otherwise run on, or be left orphaned.
             const in_tree = a.alloc(bool, procs.len) catch continue;
             @memset(in_tree, false);
             sys.markTree(procs, r.child, in_tree);
-            const sig: std.c.SIG = if (comptime std.mem.eql(u8, action, "pause")) .STOP else .CONT;
+            const stop = comptime std.mem.eql(u8, action, "stop");
             for (procs, in_tree) |p, mine| if (mine) {
-                _ = std.c.kill(p.pid, sig);
+                if (stop) {
+                    // A paused process acts on SIGTERM only once continued.
+                    _ = std.c.kill(p.pid, .TERM);
+                    _ = std.c.kill(p.pid, .CONT);
+                } else _ = std.c.kill(p.pid, if (comptime std.mem.eql(u8, action, "pause")) .STOP else .CONT);
             };
             st.setPaused(e.name, comptime std.mem.eql(u8, action, "pause"));
+        } else if (comptime std.mem.eql(u8, action, "stop")) {
+            _ = std.c.kill(r.pid, .TERM);
         }
         ctx.out.print("{s}: {s} (pid {d})\n", .{ action, who, r.pid }) catch {};
     }

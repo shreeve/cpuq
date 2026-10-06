@@ -160,14 +160,15 @@ t_kill_cpuq_only() {
 
 t_leaked_descendant() {
   setup leaked-descendant
-  "$CPUQ" run --cores 9 -- sh -c 'sleep 30 >/dev/null 2>&1 & exit 0'
+  # A distinctive duration, so the cleanup below can only match this one.
+  "$CPUQ" run --cores 9 -- sh -c 'sleep 30.417 >/dev/null 2>&1 & exit 0'
   local h; h=$(held)
   local t0; t0=$(now)
   "$CPUQ" run --cores 9 -- true; local rc=$?
   local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
-  echo "  after the command exits leaving 'sleep 30' behind: held $h; next run took ${dt}s"
+  echo "  after the command exits leaving 'sleep 30.417' behind: held $h; next run took ${dt}s"
   check "a background descendant does not keep the cores" "[ '$h' = 0 ] && [ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if $dt < 1 else 1)'"
-  pkill -f '^sleep 30$' 2>/dev/null
+  pkill -f '^sleep 30.417$' 2>/dev/null
 }
 
 t_kill_waiter() {
@@ -480,9 +481,9 @@ spin(); os.wait()'
   "$CPUQ" run --cores 9 --label h:hog -- sleep 1.5 & wait_held 9
   "$CPUQ" run --label h:impatient --max-wait 0 -- true 2>/dev/null
   wait
-  "$CPUQ" run --label h:crash -- sleep 30 & local p=$!
+  "$CPUQ" run --label h:crash -- sleep 30.583 & local p=$!
   wait_held 2
-  kill -9 $p; pkill -f '^sleep 30$' 2>/dev/null; sleep 0.2
+  kill -9 $p; pkill -f '^sleep 30.583$' 2>/dev/null; sleep 0.2
   local got; got=$("$CPUQ" history --json | python3 -c 'import json, sys
 j = {x["label"]: x for x in json.load(sys.stdin)}
 b = j["h:build"]
@@ -641,13 +642,17 @@ t_controls() {
   setup controls
   local f=$T/order
   # first: b moves ahead of a.
-  "$CPUQ" run --cores 9 -- sleep 3 & wait_held 9
+  # The holder outlasts the waiters' next look (every 2 s behind the head).
+  "$CPUQ" run --cores 9 -- sleep 5 & wait_held 9
   "$CPUQ" run --cores 2 --label ctl:a -- sh -c "echo a >>$f" & wait_waiters 1
   "$CPUQ" run --cores 2 --label ctl:b -- sh -c "echo b >>$f" & wait_waiters 2
   "$CPUQ" first ctl:b >/dev/null
   wait
-  local order; order=$(tr '\n' ' ' <"$f")
-  check "first moves a waiter ahead (got: $order)" "[ '$order' = 'b a ' ]"
+  # Both fit once the holder ends, so their lines in the file race; the
+  # admission lock orders their starts, which history records.
+  local order; order=$(grep '"event":"started"' "$CPUQ_DIR/history.jsonl" | grep '"label":"ctl:[ab]"' | python3 -c 'import json, sys
+print(" ".join(e["label"][4:] for e in sorted((json.loads(l) for l in sys.stdin), key=lambda e: e["t"])))')
+  check "first moves a waiter ahead (started: $order)" "[ '$order' = 'b a' ]"
   # start: past a full budget, at once; cancel: out of the queue with 75.
   "$CPUQ" run --cores 9 -- sleep 6 & local h=$!
   wait_held 9
@@ -665,13 +670,17 @@ t_controls() {
   "$CPUQ" run --cores 1 --label ctl:spin -- sh -c 'sleep 20' & local p=$!
   wait_held 1
   "$CPUQ" pause ctl:spin >/dev/null
-  local child; child=$(pgrep -f '^sleep 20$' | head -1)
+  # The job's own sleep: the command child its cpuq recorded.
+  local child; child=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print(json.load(sys.stdin)["holders"][0]["child"])')
   local paused; paused=$(ps -o stat= -p "$child" | tr -d ' ')
   local flag; flag=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print(json.load(sys.stdin)["holders"][0]["paused"])')
   "$CPUQ" resume ctl:spin >/dev/null
   local resumed; resumed=$(ps -o stat= -p "$child" | tr -d ' ')
   "$CPUQ" stop ctl:spin >/dev/null
   wait $p; local rp=$?
+  sleep 0.3
+  local left; left=$(ps -o pid= -p "$child" | tr -d ' ')
+  check "stop ends the job's whole tree, leaving nothing behind (left: '$left')" "[ -z '$left' ]"
   echo "  sleep while paused: $paused, after resume: $resumed; status paused: $flag; stopped with $rp"
   check "pause stops the job's tree and status says so; resume continues it; stop ends it" "[[ '$paused' == T* ]] && [[ '$resumed' != T* ]] && [ '$flag' = True ] && [ $rp != 0 ]"
 }

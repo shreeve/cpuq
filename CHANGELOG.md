@@ -2,6 +2,20 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.7.2 — 2026-10-06
+
+- Fix: a range request (`--cores 1-2`) whose label had 44 or more runs in
+  the history panicked with an integer overflow while right-sizing. The
+  sample count was held in an integer too narrow for the percentile's index
+  arithmetic.
+- Fix: ^C (or ^\) at a terminal could reach the command twice. macOS can
+  name the process that wrote the keystroke to a pseudo-terminal as its
+  sender, and cpuq passed such a signal on; in the foreground of a terminal
+  cpuq now leaves ^C and ^\ to the terminal, which delivers them to the
+  command itself.
+- `cpuq stop` ends the command's whole process tree, as `pause` stops it,
+  not only its first process: a shell's children were left running.
+
 ## 0.7.1 — 2026-10-06
 
 - Right-sizing: a range request is capped near what jobs with its label

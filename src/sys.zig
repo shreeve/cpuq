@@ -211,6 +211,11 @@ pub fn spawn(
 pub const forwarded = [_]c.SIG{ .HUP, .INT, .QUIT, .TERM, .USR1, .USR2 };
 
 var child_pid = std.atomic.Value(c.pid_t).init(0);
+/// Whether cpuq runs in its terminal's foreground process group: then the
+/// terminal delivers ^C and ^\ to the command itself.
+var tty_foreground = false;
+extern "c" fn tcgetpgrp(fd: c_int) c.pid_t;
+extern "c" fn getpgrp() c.pid_t;
 var pending_signal = std.atomic.Value(u32).init(0);
 
 fn senderPid(info: *const c.siginfo_t) c.pid_t {
@@ -223,8 +228,12 @@ fn onSignal(sig: c.SIG, info: *const c.siginfo_t, _: ?*anyopaque) callconv(.c) v
     // driver (^C, ^\, hangup), which sent it to the whole foreground process
     // group, the command included; like system(3), cpuq lets the command
     // handle it alone. A signal some process sent to cpuq goes on to the
-    // command.
+    // command. ^C and ^\ in the foreground of a terminal are the terminal's
+    // whatever sender they show: macOS can name the process that wrote the
+    // keystroke to a pseudo-terminal, and passing them on would deliver them
+    // twice.
     if (senderPid(info) == 0) return;
+    if (tty_foreground and (sig == .INT or sig == .QUIT)) return;
     const pid = child_pid.load(.acquire);
     if (pid > 0) {
         _ = c.kill(pid, sig);
@@ -238,6 +247,11 @@ fn onSignal(sig: c.SIG, info: *const c.siginfo_t, _: ?*anyopaque) callconv(.c) v
 /// script) is left ignored, so the command inherits it ignored, as it would
 /// without cpuq.
 pub fn installForwarding() void {
+    for ([_]c_int{ 0, 1, 2 }) |fd| {
+        if (std.c.isatty(fd) == 0) continue;
+        tty_foreground = tcgetpgrp(fd) == getpgrp();
+        break;
+    }
     var sa: c.Sigaction = .{
         .handler = .{ .sigaction = onSignal },
         .mask = undefined,

@@ -472,7 +472,9 @@ pub fn lendRoom(load1: f64, cpus: u32) u32 {
 pub fn rightSize(req: Request, uses: []const f64) Request {
     if (req.fixed() or uses.len < 3) return req;
     var sorted: [64]f64 = undefined;
-    const n = @min(uses.len, sorted.len);
+    // usize: @min with a comptime length narrows its type (u7 for 64), and
+    // the percentile's index arithmetic below would overflow it.
+    const n: usize = @min(uses.len, sorted.len);
     @memcpy(sorted[0..n], uses[uses.len - n ..]);
     std.mem.sort(f64, sorted[0..n], {}, std.sort.asc(f64));
     const p75 = sorted[(n - 1) * 3 / 4];
@@ -490,6 +492,10 @@ test "right-sizing caps a range near the label's measured use" {
     try std.testing.expectEqual(r, rightSize(r, &.{ 0.5, 0.5 }));
     try std.testing.expectEqual(Request{ .min = 3, .max = 3 }, rightSize(.{ .min = 3, .max = 3 }, &.{ 0.5, 0.5, 0.5 }));
     try std.testing.expectEqual(Request{ .min = 2, .max = 2 }, rightSize(.{ .min = 2, .max = 4 }, &.{ 0.5, 0.5, 0.5 }));
+    // A long history: the last 64 runs count, and nothing overflows.
+    var many: [200]f64 = undefined;
+    for (&many, 0..) |*u, i| u.* = if (i < 136) 3.5 else 0.6;
+    try std.testing.expectEqual(Request{ .min = 1, .max = 1 }, rightSize(r, &many));
 }
 
 test "lending only into spare CPUs" {

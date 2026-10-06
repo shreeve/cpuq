@@ -211,7 +211,7 @@ run as one cpuq job per phase, each sized for its phase.
     cpuq cancel LABEL|PID     take a waiting job out of the queue (it exits 75)
     cpuq pause  LABEL|PID     stop a running job's whole process tree (SIGSTOP)
     cpuq resume LABEL|PID     continue it (SIGCONT)
-    cpuq stop   LABEL|PID     end a running job (SIGTERM to its cpuq, passed on)
+    cpuq stop   LABEL|PID     end a running job (SIGTERM to its whole process tree)
 
 LABEL may end in `*` for a prefix; a target that matches several jobs needs
 `--all`. A waiting job takes its order at its next look: the head within
