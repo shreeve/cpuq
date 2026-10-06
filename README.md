@@ -45,6 +45,7 @@ described in [docs/RELEASING.md](docs/RELEASING.md).
     cpuq run [--cores K|MIN-MAX] [--priority high|normal|low] [--exclusive] [--label TEXT]
              [--max-wait SECONDS] [--no-load-check] [--qos none] -- CMD ARGS...
     cpuq lease NAME [--slots N] [--host HOST] [--priority P] [--label TEXT] [--max-wait SECONDS] -- CMD ARGS...
+    cpuq lease NAME --host HOST --hold [--priority P] [--label TEXT] [--max-wait SECONDS]
     cpuq wait --label PATTERN [--max-wait SECONDS]
     cpuq status [--host HOST]... [--json] [--no-usage] [--watch[=SECONDS]]
     cpuq history [--label PATTERN] [--limit N] [--json]
@@ -189,6 +190,24 @@ HOST needs cpuq on the `PATH` of a non-interactive ssh command, and the ssh
 login must not ask for a password. A run inside a `--host` lease that calls
 `cpuq lease NAME --host HOST` again starts at once; to let a command on HOST
 see the lease as its own, pass `CPUQ_LEASES` through ssh.
+
+A script that takes the lease partway through its run, and gives it back
+later, uses `--hold` with `--host` and no command. Once HOST grants the
+lease, cpuq prints `held NAME@HOST ENTRY`, where ENTRY is the `CPUQ_LEASES`
+entry (`NAME@HOST=ID:PID`) that makes runs inside see the lease as theirs,
+and holds it until its stdin closes or it dies. In any bash, 3.2 included:
+
+    d=$(mktemp -d); mkfifo "$d/in" "$d/out"
+    cpuq lease pup-bench --host pup --hold <"$d/in" >"$d/out" & hold=$!
+    exec 8>"$d/in"
+    read -r word name entry <"$d/out"; rm -rf "$d"
+    export CPUQ_LEASES="$entry${CPUQ_LEASES:+ $CPUQ_LEASES}"
+    ...                                   # every step on pup, one lease
+    exec 8>&-; wait $hold                 # give it back (or just exit)
+
+Inside a hold of the same lease, `--hold` prints the entry already held and
+holds nothing, so a script can take the lease without knowing whether its
+caller already has.
 
 `cpuq wait --label PATTERN` returns once no job whose label matches holds or
 waits for cores or a lease (`PATTERN*` matches a prefix), so a script can

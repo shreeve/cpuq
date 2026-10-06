@@ -593,6 +593,40 @@ t_config_reload() {
   check "a waiter takes up a budget raised in the config while it waits (${dt}s)" "python3 -c 'import sys; sys.exit(0 if $dt < 4 else 1)'"
 }
 
+t_lease_host_hold() {
+  setup lease-host-hold
+  local bin=$T/bin
+  mkdir -p "$bin"
+  printf '#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done\nshift\nexec sh -c "$*"\n' >"$bin/ssh"
+  chmod +x "$bin/ssh"
+  ln -sf "$CPUQ" "$bin/cpuq"
+  # A script holds the lease from the middle of its run: a coprocess that
+  # prints the CPUQ_LEASES entry once granted and holds until closed.
+  local out
+  out=$(PATH="$bin:$PATH" /bin/bash -c '
+    # Two named pipes and a background cpuq: works in any bash, 3.2 included.
+    d=$(mktemp -d); mkfifo "$d/in" "$d/out"
+    "$1" lease bench --host far --hold <"$d/in" >"$d/out" & hold=$!
+    exec 8>"$d/in"
+    read -r word name entry <"$d/out"
+    echo "$word $name $entry"
+    export CPUQ_LEASES="$entry"
+    # Inside it, the same lease starts at once ...
+    "$1" lease bench --host far -- echo nested
+    # ... and holding it again holds nothing.
+    echo | "$1" lease bench --host far --hold | sed "s/^/again /"
+    # Someone else waits for it.
+    CPUQ_LEASES= "$1" lease bench --max-wait 1 -- true 2>/dev/null; echo "other $?"
+    exec 8>&-; wait $hold
+    CPUQ_LEASES= "$1" lease bench --max-wait 3 -- true; echo "after $?"
+    rm -rf "$d"
+  ' _ "$CPUQ")
+  echo "$out" | sed 's/^/  /'
+  check "--hold --host prints the held entry" "echo '$out' | grep -qE '^held bench@far bench@far=[0-9]+:[0-9]+\$'"
+  check "inside the hold, the lease starts at once, and holding it again holds nothing" "echo '$out' | grep -qx nested && echo '$out' | grep -qE '^again held bench@far bench@far='"
+  check "others wait while it is held, and get it once it is closed" "echo '$out' | grep -qx 'other 75' && echo '$out' | grep -qx 'after 0'"
+}
+
 t_zombie() {
   setup zombie
   # A child spins a second, then waits as a zombie until its parent reaps
@@ -805,7 +839,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host wait history zombie fixed_hint backfill backfill_known lend config_reload outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold wait history zombie fixed_hint backfill backfill_known lend config_reload outside eta status_host lost_seq max_wait waiters_cpu qos jobserver status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

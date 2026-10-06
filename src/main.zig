@@ -41,7 +41,9 @@ const usage =
     \\lease: a first-come, first-served lock on NAME (letters, digits, . _ -),
     \\with --priority, --label and --max-wait as for run; --slots N lets N
     \\hold it at once (default 1). --host HOST holds it on HOST's cpuq over ssh
-    \\while CMD runs here. CMD gets CPUQ_LEASES.
+    \\while CMD runs here. CMD gets CPUQ_LEASES. --host HOST --hold, with no
+    \\command, prints `held NAME@HOST ENTRY` once granted (ENTRY: a CPUQ_LEASES
+    \\entry) and holds the lease until stdin closes, for a script.
     \\wait: until no job whose label matches (PATTERN* for a prefix) holds or
     \\waits.
     \\
@@ -959,9 +961,17 @@ fn cmdLease(ctx: *Ctx, args: []const [:0]const u8) u8 {
     o.request = .{ .min = 1, .max = 1 };
     if (o.run_only) |r| return usageError("{s} is an option of `cpuq run`, not `cpuq lease`", .{r});
     if (o.hold) {
-        if (o.cmd.len != 0 or o.host != null) return usageError("--hold takes no command and no --host", .{});
+        if (o.cmd.len != 0) return usageError("--hold takes no command", .{});
     } else if (o.cmd.len == 0) return usageError("lease needs a command", .{});
     if (o.host) |h| if (h.len == 0 or h[0] == '-') return usageError("--host needs a host name", .{});
+
+    // `--hold --host` inside a hold of the same lease: say so, hold nothing.
+    if (o.hold) if (o.host) |host| if (heldEntry(ctx, name, host)) |entry| {
+        ctx.out.print("held {s}@{s} {s}\n", .{ name, host, entry }) catch {};
+        ctx.out.flush() catch {};
+        untilStdinCloses();
+        return 0;
+    };
 
     if (!o.hold and nestedLease(ctx, name, o.host)) {
         const err = std.process.replace(ctx.io, .{ .argv = @ptrCast(o.cmd) });
@@ -980,12 +990,9 @@ fn cmdLease(ctx: *Ctx, args: []const [:0]const u8) u8 {
     return runAdmitted(ctx, &st, o, exe, lease);
 }
 
-/// The far end of `cpuq lease --host`: once admitted, prints `held NAME ID`
-/// and holds the lease until stdin closes. If the connection dies instead,
-/// this process dies with it and the kernel frees the lease.
-fn holdAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, lease: Lease) u8 {
-    ctx.out.print("held {s} {s}\n", .{ o.lease.?, lease.name }) catch {};
-    ctx.out.flush() catch {};
+/// Blocks until stdin reaches its end: the holder of a `--hold` closed it,
+/// or died.
+fn untilStdinCloses() void {
     var buf: [256]u8 = undefined;
     while (true) {
         const n = std.c.read(0, &buf, buf.len);
@@ -993,6 +1000,31 @@ fn holdAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, lease: Lease) u8 {
         if (n < 0 and std.c.errno(n) == .INTR) continue;
         break;
     }
+}
+
+/// The CPUQ_LEASES entry by which this run already holds NAME on HOST
+/// (`NAME@HOST=ID:PID`, its cpuq alive), if it does.
+fn heldEntry(ctx: *Ctx, name: []const u8, host: []const u8) ?[]const u8 {
+    const leases = ctx.env.get("CPUQ_LEASES") orelse return null;
+    var entries = std.mem.tokenizeScalar(u8, leases, ' ');
+    while (entries.next()) |entry| {
+        const key, const val = std.mem.cutScalar(u8, entry, '=') orelse continue;
+        const entry_name, const entry_host = std.mem.cutScalar(u8, key, '@') orelse continue;
+        if (!std.mem.eql(u8, entry_name, name) or !std.mem.eql(u8, entry_host, host)) continue;
+        _, const pid_text = std.mem.cutScalar(u8, val, ':') orelse continue;
+        const pid = std.fmt.parseInt(i32, pid_text, 10) catch continue;
+        if (sys.processAlive(pid)) return entry;
+    }
+    return null;
+}
+
+/// The far end of `cpuq lease --host`: once admitted, prints `held NAME ID`
+/// and holds the lease until stdin closes. If the connection dies instead,
+/// this process dies with it and the kernel frees the lease.
+fn holdAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, lease: Lease) u8 {
+    ctx.out.print("held {s} {s}\n", .{ o.lease.?, lease.name }) catch {};
+    ctx.out.flush() catch {};
+    untilStdinCloses();
     release(ctx.io, st, lease);
     logEvent(ctx, lease.job, "ended", .{ .cores = lease.record.cores, .exit = 0 });
     return 0;
@@ -1001,10 +1033,15 @@ fn holdAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, lease: Lease) u8 {
 /// `cpuq lease NAME --host HOST -- CMD`: holds NAME on HOST's cpuq through
 /// `ssh HOST cpuq lease NAME --hold` and runs CMD here meanwhile. Closing
 /// the connection gives the lease back, and so does the connection dying.
+///
+/// With `--hold` and no command, it holds the lease for a script instead:
+/// once granted it prints `held NAME@HOST ENTRY`, ENTRY being the
+/// CPUQ_LEASES entry (`NAME@HOST=ID:PID`) that makes runs inside see the
+/// lease as theirs, and holds it until its stdin closes or it dies.
 fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
     const io = ctx.io;
     const a = ctx.arena;
-    const exe = findExecutable(ctx, o.cmd[0]) orelse {
+    const exe: [:0]const u8 = if (o.hold) "" else findExecutable(ctx, o.cmd[0]) orelse {
         std.debug.print("cpuq: {s}: command not found\n", .{o.cmd[0]});
         return exit_notfound;
     };
@@ -1048,6 +1085,16 @@ fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
     logEvent(ctx, job, "started", .{ .cores = 1 });
     var pid_buf: [16]u8 = undefined;
     const val = std.mem.concat(a, u8, &.{ id, ":", std.mem.print(&pid_buf, "{d}", .{sys.getpid()}) catch "0" }) catch fail("out of memory", .{});
+    if (o.hold) {
+        ctx.out.print("held {s}@{s} {s}@{s}={s}\n", .{ o.lease.?, host, o.lease.?, host, val }) catch {};
+        ctx.out.flush() catch {};
+        untilStdinCloses();
+        if (child.stdin) |f| f.close(io);
+        child.stdin = null;
+        _ = child.wait(io) catch {};
+        logEvent(ctx, job, "ended", .{ .cores = 1, .exit = 0 });
+        return 0;
+    }
     addLeaseEnv(ctx, std.mem.concat(a, u8, &.{ o.lease.?, "@", host }) catch fail("out of memory", .{}), val);
     const envp = ctx.env.createPosixBlock(a, .{}) catch fail("out of memory", .{});
     const cargv = a.allocSentinel(?[*:0]const u8, o.cmd.len, null) catch fail("out of memory", .{});

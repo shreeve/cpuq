@@ -2,6 +2,15 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.7.0 — 2026-10-06
+
+- `cpuq lease NAME --host HOST --hold`, with no command, holds a lease on
+  another machine for a script: once granted it prints `held NAME@HOST
+  ENTRY` (ENTRY is the `CPUQ_LEASES` entry runs inside need) and holds the
+  lease until its stdin closes or it dies. A script can then hold one lease
+  across a whole series of steps, from any point in its run; inside a hold
+  of the same lease it holds nothing. The README shows the bash 3.2 idiom.
+
 ## 0.6.2 — 2026-10-06
 
 - A run already waiting re-reads the config file when it changes, so a new
