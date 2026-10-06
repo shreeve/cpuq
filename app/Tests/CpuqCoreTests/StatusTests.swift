@@ -67,3 +67,14 @@ import Testing
     #expect(supportsWatch(version: "1.0.0"))
     #expect(!supportsWatch(version: ""))
 }
+
+@Test func decodesEachHoldersCoresAndAHistoryJob() throws {
+    // cpuq 0.4.5 names the cores each holder took; an older cpuq leaves them out.
+    let s = try Status.decode(Data(#"{"budget": 8, "held": 3, "holders": [{"pid": 7, "cores": 3, "slots": [2, 3, 4]}, {"pid": 8, "cores": 1}]}"#.utf8))
+    #expect(s.holders[0].slots == [2, 3, 4])
+    #expect(s.holders[1].slots.isEmpty)
+    let jobs = try Job.decodeList(Data(#"[{"id": "4321-1700000000.5", "state": "done", "pool": "cores", "cores": 2, "slots": [0, 1], "queued": 1700000000.5, "started": 1700000003}]"#.utf8))
+    #expect(jobs[0].pid == 4321)
+    #expect(jobs[0].slots == [0, 1])
+    #expect(jobs[0].queued == 1700000000.5)
+}

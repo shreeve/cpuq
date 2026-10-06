@@ -2,21 +2,48 @@ import Charts
 import CpuqCore
 import SwiftUI
 
-/// What the activity window shows: the last hour of the queue, sampled with every poll, and
-/// the jobs `cpuq history` remembers.
+/// What the activity window shows: the budget's cores as lanes over the recent past, each cell
+/// empty, held or busy, and the jobs `cpuq history` remembers.
 @Observable
 final class GraphModel {
-    struct Sample: Identifiable {
-        var id: Date { at }
+    /// A job's hold on its cores.
+    struct Block: Identifiable {
+        /// Its cpuq pid and the second it started.
+        let id: String
+        let project: String
+        let label: String
+        /// Which of the budget's cores it holds, from 0.
+        let lanes: [Int]
+        let from: Date
+        /// Nil while it runs.
+        var to: Date?
+        /// Cores active, measured at every poll while the app watched it.
+        var active: [Reading] = []
+        /// Its average active cores from history, for the stretch the app did not watch.
+        var average: Double?
+    }
+
+    struct Reading {
         let at: Date
-        let budget: Int
-        /// Cores held per project (the label up to its first ':').
-        let held: [String: Int]
-        /// CPU used by cpuq's jobs, in cores, measured; nil for a sample made from history,
-        /// which records no measurements.
-        let used: Double?
-        /// CPU used by the busiest processes outside cpuq, in cores; nil likewise.
-        let other: Double?
+        let cores: Double
+    }
+
+    /// A job waiting its turn.
+    struct Wait: Identifiable {
+        let id: String
+        let project: String
+        let label: String
+        let cores: String
+        let from: Date
+        var to: Date?
+    }
+
+    /// The machine at one poll, for the top line when pointing at that moment.
+    struct Sample {
+        let at: Date
+        let inUse: Int
+        let active: Double
+        let load: Double
         let waiting: Int
     }
 
@@ -50,27 +77,55 @@ final class GraphModel {
 
     static let keep: TimeInterval = 3600
 
+    private(set) var blocks: [Block] = []
+    private(set) var waits: [Wait] = []
     private(set) var samples: [Sample] = []
     private(set) var status: Status?
+    private(set) var started = Date()
     private(set) var totals: [Totals] = []
+    private var seeded = false
     /// Each project's palette slot, assigned the first time it is seen and kept across launches,
     /// so a project's color never changes as others come and go.
     private var slots: [String: Int] = (UserDefaults.standard.dictionary(forKey: "projectColors") as? [String: Int]) ?? [:]
 
+    var budget: Int { max(status?.budget ?? 8, 1) }
+
     func add(_ s: Status, at now: Date = Date()) {
-        var held: [String: Int] = [:]
-        for h in s.holders { held[Self.project(h.label), default: 0] += h.cores }
-        for p in held.keys.sorted() where slots[p] == nil {
-            slots[p] = slots.count
-            UserDefaults.standard.set(slots, forKey: "projectColors")
-        }
         status = s
-        samples.append(Sample(
-            at: now, budget: s.budget, held: held,
-            used: s.holders.reduce(0) { $0 + ($1.using ?? 0) },
-            other: s.outside.reduce(0) { $0 + $1.using },
-            waiting: s.waiters.count))
-        samples.removeAll { now.timeIntervalSince($0.at) > Self.keep }
+        var running: Set<String> = []
+        for h in s.holders {
+            let id = "\(h.pid)-\(h.since)"
+            running.insert(id)
+            if let i = blocks.firstIndex(where: { $0.id == id }) {
+                if let u = h.using { blocks[i].active.append(Reading(at: now, cores: u)) }
+            } else {
+                let from = Date(timeIntervalSince1970: Double(h.since))
+                blocks.append(Block(id: id, project: Self.project(h.label), label: Self.label(h.label, h.command),
+                                    lanes: h.slots.isEmpty ? fit(h.cores, from: from) : h.slots, from: from,
+                                    active: h.using.map { [Reading(at: now, cores: $0)] } ?? []))
+                remember(Self.project(h.label))
+            }
+        }
+        for i in blocks.indices where blocks[i].to == nil && !running.contains(blocks[i].id) { blocks[i].to = now }
+
+        var queued: Set<String> = []
+        for w in s.waiters {
+            let id = "\(w.since)-\(w.label)-\(w.command)"
+            queued.insert(id)
+            if !waits.contains(where: { $0.id == id }) {
+                waits.append(Wait(id: id, project: Self.project(w.label), label: Self.label(w.label, w.command), cores: Self.wants(w),
+                                  from: Date(timeIntervalSince1970: Double(w.since))))
+                remember(Self.project(w.label))
+            }
+        }
+        for i in waits.indices where waits[i].to == nil && !queued.contains(waits[i].id) { waits[i].to = now }
+
+        samples.append(Sample(at: now, inUse: s.held, active: s.holders.reduce(0) { $0 + ($1.using ?? 0) },
+                              load: s.load.first ?? 0, waiting: s.waiters.count))
+        let cutoff = now.addingTimeInterval(-Self.keep)
+        samples.removeAll { $0.at < cutoff }
+        blocks.removeAll { ($0.to ?? now) < cutoff }
+        waits.removeAll { ($0.to ?? now) < cutoff }
     }
 
     func setHistory(_ jobs: [Job]) {
@@ -92,38 +147,53 @@ final class GraphModel {
         }.sorted { $0.held > $1.held }
     }
 
-    private var seeded = false
-
-    /// Fills the hour before the first sample from `cpuq history`, a sample every 3 seconds:
-    /// the cores each job had in use from its start to its end, and who waited from queueing
-    /// to starting, so the chart is full from launch. History records no measurements, so
-    /// these samples carry no active cores.
+    /// The hour before the app started watching, from `cpuq history`: each finished job on the
+    /// cores it took (or, from a cpuq older than 0.4.5, the lowest that were free), with its
+    /// average active cores, and each wait from queueing to starting.
     private func seed(_ jobs: [Job], now: Date = Date()) {
         seeded = true
-        let until = samples.first?.at ?? now
-        let jobs = jobs.filter { $0.pool == "cores" && $0.started != nil }
-        var made: [Sample] = []
-        var t = now.addingTimeInterval(-Self.keep)
-        while t < until.addingTimeInterval(-1.5) {
-            let at = t.timeIntervalSince1970
-            var held: [String: Int] = [:]
-            var waiting = 0
-            for j in jobs {
-                let start = j.started!
-                if let cores = j.cores, start <= at, at < (j.ended ?? now.timeIntervalSince1970) { held[Self.project(j.label), default: 0] += cores }
-                if let w = j.waited, start - w <= at, at < start { waiting += 1 }
+        let since = now.addingTimeInterval(-Self.keep).timeIntervalSince1970
+        for j in jobs.sorted(by: { ($0.started ?? 0) < ($1.started ?? 0) }) where j.pool == "cores" && j.state != "active" {
+            guard let start = j.started, let cores = j.cores, (j.ended ?? start) >= since else { continue }
+            // A job the app saw start is a block already.
+            if blocks.contains(where: { $0.id.hasPrefix("\(j.pid ?? -1)-") && abs($0.from.timeIntervalSince1970 - start) < 2 }) { continue }
+            let from = Date(timeIntervalSince1970: start)
+            let to = Date(timeIntervalSince1970: j.ended ?? start)
+            blocks.append(Block(id: "\(j.pid ?? 0)-\(Int(start))", project: Self.project(j.label), label: j.label.isEmpty ? "-" : j.label,
+                                lanes: j.slots ?? fit(cores, from: from, to: to), from: from, to: to, average: j.used))
+            if let w = j.waited, w >= 1 {
+                waits.append(Wait(id: "h\(j.id)", project: Self.project(j.label), label: j.label, cores: "\(cores) cores",
+                                  from: Date(timeIntervalSince1970: start - w), to: from))
             }
-            made.append(Sample(at: t, budget: status?.budget ?? samples.first?.budget ?? 0, held: held, used: nil, other: nil, waiting: waiting))
-            t = t.addingTimeInterval(3)
+            remember(Self.project(j.label))
         }
-        for p in Set(made.flatMap { $0.held.keys }).sorted() where slots[p] == nil { slots[p] = slots.count }
+        blocks.sort { $0.from < $1.from }
+    }
+
+    /// The lowest `n` adjacent cores free from `from` to `to` (or on), else the lowest free ones.
+    private func fit(_ n: Int, from: Date, to: Date? = nil) -> [Int] {
+        var busy = Set<Int>()
+        for b in blocks where b.from < (to ?? .distantFuture) && (b.to ?? .distantFuture) > from { busy.formUnion(b.lanes) }
+        let width = max(budget, n)
+        for start in 0...(width - n) where (start..<start + n).allSatisfy({ !busy.contains($0) }) { return Array(start..<start + n) }
+        let free = (0..<width).filter { !busy.contains($0) }
+        return free.count >= n ? Array(free.prefix(n)) : Array(0..<n)
+    }
+
+    private func remember(_ project: String) {
+        guard slots[project] == nil else { return }
+        slots[project] = slots.count
         UserDefaults.standard.set(slots, forKey: "projectColors")
-        samples.insert(contentsOf: made, at: 0)
     }
 
     func color(_ project: String) -> Color {
         let palette: [Color] = [.blue, .orange, .green, .purple, .red, .teal, .yellow, .brown, .indigo, .pink, .mint, .cyan]
         return palette[(slots[project] ?? 0) % palette.count]
+    }
+
+    /// How far back there is anything to show.
+    func oldest(now: Date) -> Date {
+        ([started] + blocks.map(\.from) + waits.map(\.from)).min() ?? now
     }
 
     /// The projects running now, the most cores first.
@@ -140,11 +210,15 @@ final class GraphModel {
     }
 
     var waiting: [Waiting] {
-        (status?.waiters ?? []).map { w in
-            Waiting(id: w.order, label: w.label.isEmpty ? w.command : w.label,
-                    cores: w.exclusive ? "every core" : (w.max > w.cores ? "\(w.cores)–\(w.max) cores" : "\(w.cores) cores"),
-                    since: w.since)
-        }
+        (status?.waiters ?? []).map { Waiting(id: $0.order, label: Self.label($0.label, $0.command), cores: Self.wants($0), since: $0.since) }
+    }
+
+    static func label(_ label: String, _ command: String) -> String {
+        label.isEmpty ? String(command.prefix(40)) : label
+    }
+
+    static func wants(_ w: Status.Waiter) -> String {
+        w.exclusive ? "every core" : (w.max > w.cores ? "\(w.cores)–\(w.max) cores" : "\(w.cores) cores")
     }
 
     static func project(_ label: String) -> String {
@@ -152,20 +226,37 @@ final class GraphModel {
     }
 }
 
-/// The time axis: an hour, with the recent past wide on the right and the older past narrow on
-/// the left. A moment `age` seconds ago sits at -√age, so the last minute takes an eighth of
-/// the width and the last 15 minutes half.
-enum TimeAxis {
-    static func x(_ age: TimeInterval) -> Double { -max(age, 0).squareRoot() }
-    static func age(_ x: Double) -> TimeInterval { x * x }
-    static let start = x(GraphModel.keep)
-    static let ticks: [(age: TimeInterval, label: String)] = [(3600, "1h ago"), (1800, "30m"), (900, "15m"), (300, "5m"), (60, "1m"), (0, "now")]
+/// The time axis over `span` seconds (5 minutes to an hour): nearly even near now, then
+/// compressed toward the left. A moment `age` seconds ago sits at -ln(1 + age/k), even for ages
+/// well under k and squeezed beyond it; k is 6 minutes, or the whole span when it is shorter.
+struct TimeAxis {
+    let span: TimeInterval
+    var k: TimeInterval { min(span, 360) }
+    func x(_ age: TimeInterval) -> Double { -log(1 + max(age, 0) / k) }
+    func age(_ x: Double) -> TimeInterval { k * (exp(-x) - 1) }
+    var start: Double { x(span) }
+
+    /// Ticks at round ages, none crowding the next, with the left edge and now.
+    var ticks: [(x: Double, label: String)] {
+        var out: [(x: Double, label: String)] = [(0, "now")]
+        // x runs from `start` (negative) to 0; a tick keeps a tenth of the width from the last.
+        for a in [15.0, 30, 60, 120, 300, 600, 900, 1800, 3600] where a < span * 0.92 && (out.last?.x ?? 0) - x(a) > -start * 0.1 {
+            out.append((x(a), Self.short(a)))
+        }
+        if let last = out.last, last.x - start < -start * 0.1 { out.removeLast() }
+        out.append((start, Self.short(span) + " ago"))
+        return out
+    }
+
+    static func short(_ s: TimeInterval) -> String {
+        s >= 3600 ? "\(Int(s / 3600))h" : s >= 60 ? "\(Int((s / 60).rounded()))m" : "\(Int(s))s"
+    }
 }
 
 struct GraphsView: View {
     let model: GraphModel
     @State private var tab = 0
-    @State private var hover: Double?
+    @State private var hover: CGPoint?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -184,115 +275,183 @@ struct GraphsView: View {
 
     // MARK: Now
 
+    /// The time columns the lanes are cut into, all equally wide on screen.
+    static let columns = 90
+
+    /// One core over one column: free (nil project), held, or busy by `busy` (0 to 1).
+    struct Cell: Identifiable {
+        var id: Int { column * 1000 + lane }
+        let column: Int
+        let lane: Int
+        let project: String?
+        let busy: Double
+        let block: String?
+    }
+
+    struct WaitCell: Identifiable {
+        var id: Int { column }
+        let column: Int
+        let count: Int
+    }
+
     private var now: some View {
-        let end = model.samples.last?.at ?? Date()
-        let samples = model.samples
-        let budget = Double(max(model.status?.budget ?? 0, 1))
-        let names = Set(samples.flatMap { $0.held.keys }).sorted()
-        let top = max(budget, samples.map { Double($0.held.values.reduce(0, +)) }.max() ?? 0, samples.compactMap(\.used).max() ?? 0) + 1
-        let x = { (d: Date) in TimeAxis.x(end.timeIntervalSince(d)) }
-        let spans = Self.spans(samples, end: end)
-        let lines = Self.spans(samples, end: end, shortest: 15)
-        // The sample under the pointer, if there is one near it: none where the chart is empty.
-        let pointed = hover.map { h in end.addingTimeInterval(-TimeAxis.age(h)) }
-            .flatMap { at in samples.min { abs($0.at.timeIntervalSince(at)) < abs($1.at.timeIntervalSince(at)) }
-                .flatMap { abs($0.at.timeIntervalSince(at)) <= 1.5 * max(end.timeIntervalSince(at).squareRoot(), 3) ? $0 : nil } }
-        let waits = Self.waits(samples, end: end)
-        let last = Self.spans(samples, end: end, shortest: 15).last
+        let end = Date()
+        let axis = TimeAxis(span: min(max(end.timeIntervalSince(model.oldest(now: end)), 300), GraphModel.keep))
+        let lanes = max(model.budget, (model.blocks.flatMap(\.lanes).max() ?? 0) + 1)
+        let (cells, waitCells) = Self.grid(model, axis: axis, end: end, lanes: lanes)
+        let w = -axis.start / Double(Self.columns)
+        let gap = w * 0.1
+        let left = { (c: Int) in axis.start + Double(c) * w }
         return VStack(alignment: .leading, spacing: 12) {
-            summary(pointed, end: end)
+            ((hover.flatMap { describe($0, axis: axis, end: end, cells: cells) }) ?? summary())
+                .font(.title3).monospacedDigit().lineLimit(1)
             Chart {
-                // Cores held: steps, as cores are handed out whole.
-                ForEach(spans) { s in
-                    ForEach(names, id: \.self) { name in
-                        AreaMark(x: .value("Time", x(s.from)), y: .value("Cores", s.held[name] ?? 0), stacking: .standard)
-                            .foregroundStyle(by: .value("Project", name))
-                            .interpolationMethod(.stepEnd)
+                ForEach(cells) { c in
+                    RectangleMark(xStart: .value("Time", left(c.column) + gap), xEnd: .value("Time", left(c.column + 1) - gap),
+                                  yStart: .value("Core", Double(c.lane) + 0.1), yEnd: .value("Core", Double(c.lane) + 0.9))
+                        .foregroundStyle(c.project.map { model.color($0).opacity(0.2 + 0.75 * c.busy) } ?? Color.secondary.opacity(0.08))
+                }
+                ForEach(waitCells) { c in
+                    RectangleMark(xStart: .value("Time", left(c.column) + gap), xEnd: .value("Time", left(c.column + 1) - gap),
+                                  yStart: .value("Core", -1.15), yEnd: .value("Core", -0.35))
+                        .foregroundStyle(c.count == 0 ? Color.secondary.opacity(0.08) : Color.red.opacity(min(0.35 + 0.2 * Double(c.count), 0.9)))
+                        .annotation(position: .overlay) {
+                            if c.count > 1 { Text("\(c.count)").font(.system(size: 9, weight: .bold)).foregroundStyle(.white) }
+                        }
+                }
+                if let h = hover {
+                    RuleMark(x: .value("Time", Double(h.x))).foregroundStyle(.secondary.opacity(0.6))
+                }
+            }
+            .chartLegend(.hidden)
+            .chartXScale(domain: axis.start...0)
+            .chartXAxis {
+                AxisMarks(values: axis.ticks.map(\.x)) { v in
+                    let d = v.as(Double.self) ?? 0
+                    // The edge labels sit inside the chart: now ends at the right, the oldest starts at the left.
+                    AxisValueLabel(anchor: d == 0 ? .topTrailing : d == axis.start ? .topLeading : .top) {
+                        if let t = axis.ticks.first(where: { abs($0.x - d) < 0.0001 }) { Text(t.label) }
                     }
                 }
-                RuleMark(y: .value("Cores", budget))
-                    .foregroundStyle(.secondary)
-                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
-                    .annotation(position: .top, alignment: .leading) { Text("budget \(Int(budget))").font(.caption).foregroundStyle(.secondary) }
-                // Someone waiting: a red bar just above the budget line.
-                ForEach(Array(waits.enumerated()), id: \.offset) { i, w in
-                    RectangleMark(xStart: .value("Time", x(w.from)), xEnd: .value("Time", x(w.to)),
-                                  yStart: .value("Cores", budget + 0.25), yEnd: .value("Cores", budget + 0.55))
-                        .foregroundStyle(.red.opacity(0.8))
-                        .annotation(position: .top, alignment: .trailing) {
-                            // Each bar wide enough to hold it says how many waited at once.
-                            if x(w.to) - x(w.from) >= 2.5 || i == waits.count - 1 {
-                                Text("\(w.most) waiting").font(.caption).foregroundStyle(.red).fixedSize()
+            }
+            .chartYScale(domain: -1.25...Double(lanes))
+            .chartYAxis {
+                AxisMarks(position: .leading, values: (0..<lanes).map { Double($0) + 0.5 }) { v in
+                    AxisValueLabel { if let d = v.as(Double.self) { Text("\(Int(d) + 1)") } }
+                }
+                AxisMarks(position: .leading, values: [-0.75]) { _ in
+                    AxisValueLabel { Text("waiting").foregroundStyle(.red) }
+                }
+            }
+            .chartOverlay { proxy in
+                GeometryReader { geo in
+                    Rectangle().fill(.clear).contentShape(Rectangle())
+                        .onContinuousHover { phase in
+                            guard case .active(let p) = phase, let frame = proxy.plotFrame else { hover = nil; return }
+                            let origin = geo[frame].origin
+                            if let hx = proxy.value(atX: p.x - origin.x, as: Double.self), let hy = proxy.value(atY: p.y - origin.y, as: Double.self) {
+                                hover = CGPoint(x: hx, y: hy)
                             }
                         }
                 }
-                // Cores active: measured, so lines, averaged over spans as wide on screen as each
-                // other, each labelled at its right end.
-                ForEach(lines) { p in
-                    if let used = p.used {
-                        LineMark(x: .value("Time", x(p.at)), y: .value("Cores", used), series: .value("Line", "active"))
-                            .foregroundStyle(Color.primary)
-                            .interpolationMethod(.monotone)
-                            .lineStyle(StrokeStyle(lineWidth: 1.75, lineCap: .round, lineJoin: .round))
-                    }
-                    if let other = p.other {
-                        LineMark(x: .value("Time", x(p.at)), y: .value("Cores", other), series: .value("Line", "outside"))
-                            .foregroundStyle(Color.secondary)
-                            .interpolationMethod(.monotone)
-                            .lineStyle(StrokeStyle(lineWidth: 1.5, lineCap: .round, dash: [2, 3]))
-                    }
-                }
-                if let used = last?.used {
-                    PointMark(x: .value("Time", 0.0), y: .value("Cores", used))
-                        .symbolSize(0)
-                        .annotation(position: .top, alignment: .trailing) {
-                            Text(String(format: "%.1f active", used)).font(.caption.bold()).padding(.horizontal, 3)
-                                .background(.background.opacity(0.7), in: RoundedRectangle(cornerRadius: 3))
-                        }
-                }
-                if let other = last?.other, other >= 0.3 {
-                    PointMark(x: .value("Time", 0.0), y: .value("Cores", other))
-                        .symbolSize(0)
-                        .annotation(position: .top, alignment: .trailing) {
-                            Text(String(format: "%.1f outside cpuq", other)).font(.caption).foregroundStyle(.secondary)
-                        }
-                }
-                if let hover {
-                    RuleMark(x: .value("Time", hover)).foregroundStyle(.secondary.opacity(0.6))
-                }
             }
-            .chartForegroundStyleScale(domain: names, range: names.map(model.color))
-            .chartLegend(.hidden)
-            .chartXScale(domain: TimeAxis.start...0)
-            .chartXAxis {
-                AxisMarks(values: TimeAxis.ticks.map { TimeAxis.x($0.age) }) { v in
-                    AxisGridLine()
-                    AxisValueLabel {
-                        if let d = v.as(Double.self), let t = TimeAxis.ticks.first(where: { abs(TimeAxis.x($0.age) - d) < 0.01 }) { Text(t.label) }
-                    }
-                }
-            }
-            .chartYScale(domain: 0...top)
-            .chartYAxisLabel("cores")
-            .chartXSelection(value: $hover)
-            .frame(minHeight: 220)
+            .frame(minHeight: 240)
+            Text("Each lane is one of the budget's cores: empty when free, pale when a job holds it, solid while it is busy. Recent time is widest, on the right.")
+                .font(.caption).foregroundStyle(.secondary)
             table
         }
     }
 
-    /// One line on what the machine is doing now, or at the moment under the pointer.
-    private func summary(_ at: GraphModel.Sample?, end: Date) -> some View {
+    /// Every core in every column: the job holding it longest there, and how busy; and how many
+    /// waited. A job keeps its lowest cores busy first: with 2.5 active of 4, its first two
+    /// cores are solid, the third half, the fourth pale.
+    static func grid(_ m: GraphModel, axis: TimeAxis, end: Date, lanes: Int) -> ([Cell], [WaitCell]) {
+        var cells: [Cell] = []
+        var waits: [WaitCell] = []
+        let w = -axis.start / Double(columns)
+        for c in 0..<columns {
+            let t1 = end.addingTimeInterval(-axis.age(axis.start + Double(c) * w))
+            let t2 = end.addingTimeInterval(-axis.age(axis.start + Double(c + 1) * w))
+            let length = max(t2.timeIntervalSince(t1), 0.001)
+            func overlap(_ from: Date, _ to: Date?) -> Double {
+                max(0, min(t2, to ?? end).timeIntervalSince(max(t1, from))) / length
+            }
+            let here = m.blocks.compactMap { b -> (GraphModel.Block, Double)? in
+                let o = overlap(b.from, b.to)
+                return o >= 0.3 ? (b, o) : nil
+            }
+            for lane in 0..<lanes {
+                guard let (b, _) = here.filter({ $0.0.lanes.contains(lane) }).max(by: { $0.1 < $1.1 }) else {
+                    cells.append(Cell(column: c, lane: lane, project: nil, busy: 0, block: nil))
+                    continue
+                }
+                let readings = b.active.filter { $0.at >= t1 && $0.at <= t2 }
+                let active = readings.isEmpty ? (b.active.isEmpty || b.from < (b.active.first?.at ?? end) ? b.average : nil)
+                    : readings.reduce(0) { $0 + $1.cores } / Double(readings.count)
+                let rank = Double(b.lanes.sorted().firstIndex(of: lane) ?? 0)
+                cells.append(Cell(column: c, lane: lane, project: b.project, busy: min(max((active ?? 0) - rank, 0), 1), block: b.id))
+            }
+            waits.append(WaitCell(column: c, count: m.waits.filter { overlap($0.from, $0.to) > 0 }.count))
+        }
+        return (cells, waits)
+    }
+
+    /// The top line: what the machine is doing now.
+    private func summary() -> Text {
         let s = model.status
-        let held = at.map { $0.held.values.reduce(0, +) } ?? s?.held ?? 0
-        let budget = at?.budget ?? s?.budget ?? 0
-        let used = at == nil ? s?.holders.reduce(0) { $0 + ($1.using ?? 0) } : at?.used
-        let waiting = at?.waiting ?? s?.waiters.count ?? 0
-        var line = Text(at.map { age(end.timeIntervalSince($0.at)) + " ago   " } ?? "")
-        line = line + Text("\(held) of \(budget) cores in use").bold()
-        if let used { line = line + Text(String(format: " · %.1f active", used)) }
+        let waiting = s?.waiters.count ?? 0
+        var line = Text("\(s?.held ?? 0) of \(s?.budget ?? 0) cores in use").bold()
+        line = line + Text(String(format: " · %.1f active", s?.holders.reduce(0) { $0 + ($1.using ?? 0) } ?? 0))
         line = line + Text(" · \(waiting) waiting").foregroundColor(waiting > 0 ? .red : nil)
-        if at == nil, let load = s?.load.first { line = line + Text(String(format: " · load %.1f", load)).foregroundColor(.secondary) }
-        return line.font(.title3).monospacedDigit()
+        let outside = s?.outside.reduce(0) { $0 + $1.using } ?? 0
+        if outside >= 0.3 { line = line + Text(String(format: " · %.1f outside cpuq", outside)).foregroundColor(.secondary) }
+        if let load = s?.load.first { line = line + Text(String(format: " · load %.1f", load)).foregroundColor(.secondary) }
+        return line
+    }
+
+    /// The top line for the cell under the pointer: the job holding that core then, or who
+    /// waited then.
+    private func describe(_ p: CGPoint, axis: TimeAxis, end: Date, cells: [Cell]) -> Text? {
+        let a = axis.age(p.x)
+        let at = end.addingTimeInterval(-a)
+        // The machine then, when the app was watching: cpuq's cores in use and active, and the load.
+        let then = model.samples.min { abs($0.at.timeIntervalSince(at)) < abs($1.at.timeIntervalSince(at)) }
+            .flatMap { abs($0.at.timeIntervalSince(at)) < 30 ? $0 : nil }
+        let machine = then.map {
+            Text("   cpuq \($0.inUse) in use, ").foregroundColor(.secondary)
+                + Text(String(format: "%.1f active", $0.active)).foregroundColor(.secondary)
+                + Text(String(format: " · load %.1f", $0.load)).foregroundColor(.secondary)
+        } ?? Text("")
+        return describeJob(p, axis: axis, at: at, a: a, end: end, cells: cells).map { $0 + machine }
+    }
+
+    private func describeJob(_ p: CGPoint, axis: TimeAxis, at: Date, a: TimeInterval, end: Date, cells: [Cell]) -> Text? {
+        let when = Text(a < 5 ? "now   " : age(a) + " ago   ").foregroundColor(.secondary)
+        let column = min(max(Int((p.x - axis.start) / (-axis.start / Double(Self.columns))), 0), Self.columns - 1)
+        if p.y >= 0 {
+            let lane = Int(p.y)
+            guard let cell = cells.first(where: { $0.column == column && $0.lane == lane }), let id = cell.block,
+                  let b = model.blocks.first(where: { $0.id == id }) else { return when + Text("core \(lane + 1) free").foregroundColor(.secondary) }
+            let cores = runs(b.lanes).map { $0.count == 1 ? "\($0.lowerBound + 1)" : "\($0.lowerBound + 1)–\($0.upperBound)" }.joined(separator: ", ")
+            let near = b.active.min { abs($0.at.timeIntervalSince(at)) < abs($1.at.timeIntervalSince(at)) }
+            let active = near.flatMap { abs($0.at.timeIntervalSince(at)) < 30 ? $0.cores : nil } ?? b.average
+            var t = when + Text(b.label).bold() + Text(" · cores \(cores)")
+            if let active { t = t + Text(String(format: " · %.1f of %d active", active, b.lanes.count)) }
+            return t + Text(" · \(b.to == nil ? "running" : "ran") \(age((b.to ?? end).timeIntervalSince(b.from)))").foregroundColor(.secondary)
+        }
+        let waiting = model.waits.filter { $0.from <= at && at <= ($0.to ?? end) }
+        if waiting.isEmpty { return when + Text("nobody waiting").foregroundColor(.secondary) }
+        return when + Text("\(waiting.count) waiting: ").foregroundColor(.red)
+            + Text(waiting.map { "\($0.label) (\($0.cores))" }.joined(separator: ", ")).foregroundColor(.red)
+    }
+
+    /// Runs of adjacent lanes.
+    func runs(_ lanes: [Int]) -> [Range<Int>] {
+        var out: [Range<Int>] = []
+        for l in lanes.sorted() {
+            if let last = out.last, last.upperBound == l { out[out.count - 1] = last.lowerBound..<l + 1 } else { out.append(l..<l + 1) }
+        }
+        return out
     }
 
     /// Who holds what now, and who waits: the legend and the numbers in one.
@@ -331,65 +490,6 @@ struct GraphsView: View {
         }
         .font(.callout)
         .monospacedDigit()
-    }
-
-    /// The spans in which someone waited, each with the most that waited at once.
-    static func waits(_ s: [GraphModel.Sample], end: Date) -> [(from: Date, to: Date, most: Int)] {
-        var out: [(from: Date, to: Date, most: Int)] = []
-        var from: Date?
-        var most = 0
-        for (i, x) in s.enumerated() {
-            if x.waiting > 0 {
-                if from == nil { from = x.at; most = 0 }
-                most = max(most, x.waiting)
-            }
-            if x.waiting == 0, let f = from { out.append((f, x.at, most)); from = nil }
-            if i == s.count - 1, let f = from { out.append((f, end, most)) }
-        }
-        return out
-    }
-
-    /// The samples averaged over spans about √age seconds wide: one sample (3 s) near now, a
-    /// minute an hour ago, so each span takes about as much of the axis as the next. Near now a
-    /// span's cores held are the whole numbers handed out; further back, a busy stretch of short
-    /// jobs averages into one block rather than a sliver per job. The last span is repeated at
-    /// `end`, so the steps reach the right edge.
-    struct Span: Identifiable {
-        var id: Date { from }
-        let from: Date
-        /// The mean time of its samples, where its measured values are drawn.
-        let at: Date
-        let held: [String: Double]
-        let used: Double?
-        let other: Double?
-    }
-
-    /// `shortest` is the narrowest span in seconds: one sample for the steps, wider for the
-    /// measured lines, which a single 3-second reading would make jitter.
-    static func spans(_ s: [GraphModel.Sample], end: Date, shortest: TimeInterval = 3) -> [Span] {
-        var out: [Span] = []
-        var group: [GraphModel.Sample] = []
-        func flush() {
-            guard let first = group.first else { return }
-            let n = Double(group.count)
-            var held: [String: Double] = [:]
-            for x in group { for (k, v) in x.held { held[k, default: 0] += Double(v) / n } }
-            let used = group.compactMap(\.used), other = group.compactMap(\.other)
-            out.append(Span(from: first.at, at: Date(timeIntervalSince1970: group.reduce(0) { $0 + $1.at.timeIntervalSince1970 } / n), held: held,
-                            used: used.isEmpty ? nil : used.reduce(0, +) / Double(used.count),
-                            other: other.isEmpty ? nil : other.reduce(0, +) / Double(other.count)))
-            group = []
-        }
-        // From the oldest: a span closes once it is as long as the square root of its age.
-        for x in s {
-            if let first = group.first, x.at.timeIntervalSince(first.at) >= max(end.timeIntervalSince(first.at).squareRoot(), shortest) { flush() }
-            group.append(x)
-        }
-        flush()
-        if let last = out.last, last.from < end {
-            out.append(Span(from: end, at: end, held: last.held, used: last.used, other: last.other))
-        }
-        return out
     }
 
     // MARK: History

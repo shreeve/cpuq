@@ -3,6 +3,23 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.3.0 — 2026-10-05
+
+The graphs window shows the budget's cores as lanes.
+
+- One lane per core, and time cut into columns: each cell is empty while that core is free,
+  pale in the project's color while a job holds it, and solid while it is busy. A job keeps its
+  lowest cores busy first, so 2.5 active of 4 is two solid cells, one half, one pale.
+- With cpuq 0.4.5 and later, a lane is the very core cpuq handed out; with an older cpuq, the
+  window places each job on the lowest cores free when it started.
+- A waiting row under the lanes: red while anyone waits, with the count when more than one.
+- The time axis spans what there is to show, 5 minutes to an hour, nearly even near now and
+  squeezed toward the left, with ticks at round ages.
+- Pointing at a cell names the job holding that core then, its cores, how busy it was and how
+  long it ran; pointing at the waiting row names who waited. Either way the line ends with the
+  machine then: cpuq's cores in use and active, and the load (for any moment the app watched).
+- The lines and the stacked steps are gone; the top line still gives the totals now.
+
 ## 0.2.2 — 2026-10-05
 
 - Every red bar wide enough to hold it says how many waited at once ("2 waiting").

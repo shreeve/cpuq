@@ -26,6 +26,8 @@ public struct Status: Decodable, Sendable, Equatable {
     public struct Holder: Decodable, Sendable, Equatable {
         public var pid = 0
         public var cores = 0
+        /// Which of the budget's cores it holds, by number from 0 (cpuq 0.4.5 and later).
+        public var slots: [Int] = []
         public var using: Double?
         public var priority = ""
         public var exclusive = false
@@ -100,11 +102,12 @@ extension Status.Gate {
 }
 
 extension Status.Holder {
-    private enum Keys: String, CodingKey { case pid, cores, using, priority, exclusive, label, command, since }
+    private enum Keys: String, CodingKey { case pid, cores, slots, using, priority, exclusive, label, command, since }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         pid = try c.decodeIfPresent(Int.self, forKey: .pid) ?? 0
         cores = try c.decodeIfPresent(Int.self, forKey: .cores) ?? 0
+        slots = try c.decodeIfPresent([Int].self, forKey: .slots) ?? []
         using = try c.decodeIfPresent(Double.self, forKey: .using)
         priority = try c.decodeIfPresent(String.self, forKey: .priority) ?? ""
         exclusive = try c.decodeIfPresent(Bool.self, forKey: .exclusive) ?? false
@@ -183,27 +186,37 @@ public struct Job: Decodable, Sendable, Equatable {
     public var state = ""
     public var pool = ""
     public var label = ""
+    /// The job's cpuq pid and the moment it queued, as "PID-TIME".
+    public var id = ""
     public var cores: Int?
+    public var slots: [Int]?
+    public var queued: Double?
     public var started: Double?
     public var ended: Double?
     public var waited: Double?
     public var ran: Double?
     public var used: Double?
 
-    private enum Keys: String, CodingKey { case state, pool, label, cores, started, ended, waited, ran, used }
+    private enum Keys: String, CodingKey { case state, pool, label, id, cores, slots, queued, started, ended, waited, ran, used }
 
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         state = try c.decodeIfPresent(String.self, forKey: .state) ?? ""
         pool = try c.decodeIfPresent(String.self, forKey: .pool) ?? ""
         label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? ""
         cores = try c.decodeIfPresent(Int.self, forKey: .cores)
+        slots = try c.decodeIfPresent([Int].self, forKey: .slots)
+        queued = try c.decodeIfPresent(Double.self, forKey: .queued)
         started = try c.decodeIfPresent(Double.self, forKey: .started)
         ended = try c.decodeIfPresent(Double.self, forKey: .ended)
         waited = try c.decodeIfPresent(Double.self, forKey: .waited)
         ran = try c.decodeIfPresent(Double.self, forKey: .ran)
         used = try c.decodeIfPresent(Double.self, forKey: .used)
     }
+
+    /// The cpuq pid in `id`.
+    public var pid: Int? { Int(id.split(separator: "-").first ?? "") }
 
     public static func decodeList(_ data: Data) throws -> [Job] {
         try JSONDecoder().decode([Job].self, from: data)
