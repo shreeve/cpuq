@@ -54,6 +54,9 @@ pub const Config = struct {
     /// The least time, in seconds, the head lets others go ahead when there
     /// is no run time to judge by (`patience`).
     patience_s: u32 = 30,
+    /// Stop a job whose processes together use more memory than this, in
+    /// bytes (`max_memory`, e.g. 16G); 0 leaves memory unwatched.
+    max_memory: u64 = 0,
     /// Lend the cores a holder has left idle for a minute to the head of the
     /// queue (`lend`).
     lend: bool = true,
@@ -120,12 +123,40 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             cfg.lend_after_s = parseCount(value) orelse return bad(diag, "lend_after must be a whole number of seconds, at least 1");
         } else if (std.mem.eql(u8, key, "lend")) {
             cfg.lend = parseBool(value) orelse return bad(diag, "lend must be on or off");
+        } else if (std.mem.eql(u8, key, "max_memory")) {
+            cfg.max_memory = parseBytes(value) orelse return bad(diag, "max_memory must be off or a size such as 16G or 512M");
         } else if (std.mem.eql(u8, key, "patience")) {
             cfg.patience_s = std.fmt.parseInt(u32, value, 10) catch return bad(diag, "patience must be a whole number of seconds");
         } else {
             return bad(diag, "unknown key");
         }
     }
+}
+
+/// A size: off (0), or a whole number with an optional K, M or G (powers of
+/// 1024); a bare number is in bytes.
+pub fn parseBytes(s: []const u8) ?u64 {
+    if (std.mem.eql(u8, s, "off")) return 0;
+    if (s.len == 0) return null;
+    const unit: u64 = switch (s[s.len - 1]) {
+        'K', 'k' => 1 << 10,
+        'M', 'm' => 1 << 20,
+        'G', 'g' => 1 << 30,
+        '0'...'9' => 1,
+        else => return null,
+    };
+    const digits = if (unit == 1) s else s[0 .. s.len - 1];
+    const n = std.fmt.parseInt(u64, digits, 10) catch return null;
+    return std.math.mul(u64, n, unit) catch null;
+}
+
+test "sizes for max_memory" {
+    try std.testing.expectEqual(@as(?u64, 16 << 30), parseBytes("16G"));
+    try std.testing.expectEqual(@as(?u64, 512 << 20), parseBytes("512M"));
+    try std.testing.expectEqual(@as(?u64, 0), parseBytes("off"));
+    try std.testing.expectEqual(@as(?u64, 1000), parseBytes("1000"));
+    try std.testing.expectEqual(@as(?u64, null), parseBytes("lots"));
+    try std.testing.expectEqual(@as(?u64, null), parseBytes("G"));
 }
 
 fn bad(diag: *Diagnostic, message: []const u8) error{ConfigInvalid} {

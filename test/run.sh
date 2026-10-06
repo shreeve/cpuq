@@ -1006,6 +1006,28 @@ t_long_command() {
   check "a job whose command is over 1 KB still has its child pid recorded (got $child)" "[ '$child' -gt 0 ]"
 }
 
+t_max_memory() {
+  setup max-memory "max_memory = 300M"
+  # A job that keeps allocating (50 MB every 0.2 s, up to 2.5 GB) is stopped
+  # once its processes pass 300 MB; a small one runs as usual.
+  "$CPUQ" run --cores 1 --label small -- true; local small=$?
+  local t0; t0=$(now)
+  "$CPUQ" run --cores 1 --label hog -- python3 -c '
+import time
+a = []
+for _ in range(50):
+    a.append(b"x" * (50 << 20))
+    time.sleep(0.2)
+' 2>"$T/err"; local rc=$?
+  local dt; dt=$(python3 -c "print('%.1f' % ($(now) - $t0))")
+  local got; got=$("$CPUQ" history --json | python3 -c 'import json, sys
+j = {x["label"]: x for x in json.load(sys.stdin)}
+h = j["hog"]
+print(h["signal"], "%.1f" % ((h.get("memory") or 0) / 2**30), j["small"]["exit"])')
+  echo "  hog: exit $rc after ${dt}s; history: $got; $(cat "$T/err")"
+  check "a job over max_memory is stopped and recorded so; a small one is not (rc $rc, $got)" "[ $small = 0 ] && [ $rc = 143 ] && [[ '$got' == '15 0.'* ]] && [[ '$got' == *' 0' ]] && grep -q 'over max_memory' '$T/err'"
+}
+
 t_status() {
   setup status
   "$CPUQ" run --cores 4 --label build -- sleep 1.5 & wait_held 4
@@ -1020,7 +1042,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold last_words lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold last_words lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

@@ -443,6 +443,8 @@ const EventExtra = struct {
     lent: ?u32 = null,
     /// Started by hand past the queue (`cpuq start`).
     forced: ?bool = null,
+    /// Stopped for its memory, using this many bytes (`max_memory`).
+    memory: ?u64 = null,
     slots: ?[]const u32 = null,
     exit: ?u8 = null,
     signal: ?u32 = null,
@@ -464,6 +466,7 @@ fn logEvent(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra) void {
     ev.ahead = extra.ahead;
     ev.lent = extra.lent;
     ev.forced = extra.forced;
+    ev.memory = extra.memory;
     history.append(ctx.io, path, ev);
 }
 
@@ -493,8 +496,8 @@ var words_slot: u1 = 0;
 /// Logs how a command ended.
 fn logEnded(ctx: *Ctx, job: JobLog, cores: u32, w: sys.Waited) void {
     switch (w.exit) {
-        .code => |code| logEvent(ctx, job, "ended", .{ .cores = cores, .exit = code, .cpu = w.cpu_s }),
-        .signal => |sig| logEvent(ctx, job, "ended", .{ .cores = cores, .signal = @intCast(@backingInt(sig)), .cpu = w.cpu_s }),
+        .code => |code| logEvent(ctx, job, "ended", .{ .cores = cores, .exit = code, .cpu = w.cpu_s, .memory = w.memory }),
+        .signal => |sig| logEvent(ctx, job, "ended", .{ .cores = cores, .signal = @intCast(@backingInt(sig)), .cpu = w.cpu_s, .memory = w.memory }),
     }
 }
 
@@ -928,6 +931,59 @@ fn note(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, waited: i64, queue: [
     std.debug.print("{s}\n", .{w.buffered()});
 }
 
+/// Waits for the command. With `max_memory` set it also looks at the memory
+/// the command and its descendants use, every 2 seconds: over the limit, the
+/// whole tree is asked to stop (SIGTERM), and made to (SIGKILL) if any of it
+/// is still there 10 seconds on. One job that balloons would otherwise fill
+/// the swap and shut the memory gate on everyone.
+fn watchChild(ctx: *Ctx, pid: std.c.pid_t, label: []const u8) sys.Waited {
+    const limit = ctx.cfg.max_memory;
+    if (limit == 0) return sys.waitChild(pid);
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    var stopped: ?u64 = null;
+    var stopped_at: f64 = 0;
+    while (true) {
+        if (sys.reapChild(pid)) |w| return withMemory(w, stopped);
+        ctx.io.sleep(.fromMilliseconds(2000), .awake) catch {};
+        if (sys.reapChild(pid)) |w| return withMemory(w, stopped);
+        _ = arena_state.reset(.retain_capacity);
+        const a = arena_state.allocator();
+        const procs = sys.processes(ctx.io, a);
+        if (stopped != null) {
+            if (nowFloat(ctx.io) - stopped_at >= 10) signalTree(a, procs, pid, .KILL);
+            continue;
+        }
+        const used = sys.treeMem(procs, pid);
+        if (used <= limit) continue;
+        const gb = 1 << 30;
+        std.debug.print("cpuq: stopping {s}: its processes use {d:.2} GB of memory, over max_memory ({d:.2} GB)\n", .{
+            if (label.len != 0) label else "the command", @as(f64, @floatFromInt(used)) / gb, @as(f64, @floatFromInt(limit)) / gb,
+        });
+        stopped = used;
+        stopped_at = nowFloat(ctx.io);
+        signalTree(a, procs, pid, .TERM);
+    }
+}
+
+fn withMemory(w: sys.Waited, stopped: ?u64) sys.Waited {
+    var out = w;
+    out.memory = stopped;
+    return out;
+}
+
+/// Sends `sig` to `root` and all its descendants, continuing any that are
+/// stopped (paused by hand) so they can act on it.
+fn signalTree(a: std.mem.Allocator, procs: []const sys.Proc, root: std.c.pid_t, sig: std.c.SIG) void {
+    const in_tree = a.alloc(bool, procs.len) catch return;
+    @memset(in_tree, false);
+    sys.markTree(procs, root, in_tree);
+    for (procs, in_tree) |p, mine| if (mine) {
+        _ = std.c.kill(p.pid, sig);
+        _ = std.c.kill(p.pid, .CONT);
+    };
+}
+
 /// Writes a lease's record over the old one, from the start. A record has no
 /// size limit (a command can be a long inline script), so it goes through a
 /// positional writer rather than a fixed buffer, which once dropped records
@@ -991,7 +1047,7 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
             x.lease.record.child = pid;
             rewriteRecord(io, x.lease.file, x.lease.record);
         }
-        break :blk sys.waitChild(pid);
+        break :blk watchChild(ctx, pid, lease.job.base.label);
     } else |err| blk: {
         std.debug.print("cpuq: {s}: {t}\n", .{ o.cmd[0], err });
         break :blk .{ .exit = .{ .code = if (err == error.FileNotFound) exit_notfound else exit_noexec } };
@@ -1477,6 +1533,8 @@ const JsonJob = struct {
     used: ?f64,
     exit: ?u8,
     signal: ?u32,
+    /// Stopped by cpuq for using this many bytes of memory.
+    memory: ?u64 = null,
 };
 
 fn aliveForHistory(pid: i32) bool {
@@ -1552,6 +1610,7 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
             .used = j.used(),
             .exit = j.exit,
             .signal = j.signal,
+            .memory = j.memory,
         }) catch {};
         std.json.Stringify.value(out.items, .{ .whitespace = .indent_2 }, w) catch {};
         w.writeAll("\n") catch {};
@@ -1587,7 +1646,7 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
         const ran_text = if (j.ran()) |x| duration(&b4, x) else "-";
         const used_text = if (j.used()) |x| std.mem.print(&b5, "{d:.1}", .{x}) catch "?" else "-";
         const exit_text: []const u8 = switch (j.state) {
-            .done => if (j.signal) |sig| std.mem.print(&b6, "signal {d}", .{sig}) catch "signal" else std.mem.print(&b6, "{d}", .{j.exit orelse 0}) catch "?",
+            .done => if (j.memory) |m| std.mem.print(&b6, "memory {d:.1}G", .{@as(f64, @floatFromInt(m)) / (1 << 30)}) catch "memory" else if (j.signal) |sig| std.mem.print(&b6, "signal {d}", .{sig}) catch "signal" else std.mem.print(&b6, "{d}", .{j.exit orelse 0}) catch "?",
             .gave_up => "gave up",
             .lost => "lost",
             .active => if (j.started != null) "running" else "waiting",

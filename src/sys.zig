@@ -365,14 +365,29 @@ pub const Exit = union(enum) { code: u8, signal: c.SIG };
 
 /// How a command ended, and the CPU seconds it and the descendants it
 /// reaped used (the kernel's own total, from wait4).
-pub const Waited = struct { exit: Exit, cpu_s: f64 = 0 };
+pub const Waited = struct {
+    exit: Exit,
+    cpu_s: f64 = 0,
+    /// Set when cpuq stopped the command for its memory: what it used, in bytes.
+    memory: ?u64 = null,
+};
 
 pub fn waitChild(pid: c.pid_t) Waited {
+    return waitFor(pid, true).?;
+}
+
+/// The child's end if it has ended, without waiting; null while it runs.
+pub fn reapChild(pid: c.pid_t) ?Waited {
+    return waitFor(pid, false);
+}
+
+fn waitFor(pid: c.pid_t, block: bool) ?Waited {
     var status: c_int = 0;
     var ru: c.rusage = undefined;
     while (true) {
-        const r = c.wait4(pid, &status, 0, &ru);
+        const r = c.wait4(pid, &status, if (block) 0 else 1, &ru); // WNOHANG = 1
         if (r == pid) break;
+        if (r == 0) return null;
         if (r < 0 and c.errno(r) == .INTR) continue;
         return .{ .exit = .{ .code = 125 } };
     }
@@ -442,6 +457,10 @@ pub const Proc = struct {
     /// once when it reaps (launchd reaps every orphan), though those
     /// children were already counted while they ran.
     own_ns: u64 = 0,
+    /// Memory it uses, in bytes: macOS's physical footprint (what Activity
+    /// Monitor and top call Memory, compressed pages included), Linux's
+    /// resident set.
+    mem: u64 = 0,
 };
 
 /// Every process the caller can see, with its parent and its CPU time so
@@ -467,6 +486,8 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
             for ([_]usize{ 16, 24, 96, 104 }) |at| ticks +%= std.mem.readInt(u64, ru[at..][0..8], .little);
             var own: u64 = 0;
             for ([_]usize{ 16, 24 }) |at| own +%= std.mem.readInt(u64, ru[at..][0..8], .little);
+            // ri_phys_footprint, at 72.
+            const mem = std.mem.readInt(u64, ru[72..80], .little);
             var bsd: [136]u8 align(8) = undefined;
             var ppid: i32 = undefined;
             var name: []const u8 = "";
@@ -488,11 +509,13 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
                 .name = arena.dupe(u8, name) catch "",
                 .cpu_ns = @intCast(@as(u128, ticks) * tb.numer / tb.denom),
                 .own_ns = @intCast(@as(u128, own) * tb.numer / tb.denom),
+                .mem = mem,
             }) catch break;
         }
         return list.items;
     }
     const tick_hz: u64 = @intCast(@max(sysconf(2), 1)); // _SC_CLK_TCK
+    const page: u64 = @intCast(@max(sysconf(30), 4096)); // _SC_PAGESIZE
     var dir = Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch return &.{};
     defer dir.close(io);
     var it = dir.iterate();
@@ -511,6 +534,7 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
         var ppid: i32 = 0;
         var ticks: u64 = 0;
         var own: u64 = 0;
+        var rss: u64 = 0;
         var i: usize = 0;
         while (fields.next()) |f| : (i += 1) {
             switch (i) {
@@ -521,11 +545,13 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
                     own += t;
                 },
                 13, 14 => ticks += std.fmt.parseInt(u64, f, 10) catch 0,
+                // rss, in pages (the 24th field).
+                21 => rss = std.fmt.parseInt(u64, f, 10) catch 0,
                 else => {},
             }
-            if (i == 14) break;
+            if (i == 21) break;
         }
-        list.append(arena, .{ .pid = pid, .ppid = ppid, .name = arena.dupe(u8, text[open + 1 .. close]) catch "", .cpu_ns = ticks * std.time.ns_per_s / tick_hz, .own_ns = own * std.time.ns_per_s / tick_hz }) catch break;
+        list.append(arena, .{ .pid = pid, .ppid = ppid, .name = arena.dupe(u8, text[open + 1 .. close]) catch "", .cpu_ns = ticks * std.time.ns_per_s / tick_hz, .own_ns = own * std.time.ns_per_s / tick_hz, .mem = rss * page }) catch break;
     }
     return list.items;
 }
@@ -557,6 +583,26 @@ fn zombieParent(pid: c_int) ?i32 {
     var len: usize = info.len;
     if (sysctl(&mib, mib.len, &info, &len, null, 0) != 0 or len != info.len) return null;
     return @bitCast(std.mem.readInt(u32, info[560..564], .little));
+}
+
+/// The memory a process and its descendants use, in bytes.
+pub fn treeMem(procs: []const Proc, root: i32) u64 {
+    var total: u64 = 0;
+    var frontier: [512]i32 = undefined;
+    var len: usize = 1;
+    frontier[0] = root;
+    var seen: usize = 0;
+    while (seen < len) : (seen += 1) {
+        const pid = frontier[seen];
+        for (procs) |p| {
+            if (p.pid == pid) total += p.mem;
+            if (p.ppid == pid and p.pid != pid and len < frontier.len) {
+                frontier[len] = p.pid;
+                len += 1;
+            }
+        }
+    }
+    return total;
 }
 
 pub fn treeCpu(procs: []const Proc, root: i32) u64 {

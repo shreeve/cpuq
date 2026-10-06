@@ -346,6 +346,17 @@ count oversubscribes it on purpose. The config file is `CPUQ_CONFIG`, default
 | `lend` | on | lend the head the cores a running job leaves idle |
 | `lend_after` | 60 | seconds a core must stay idle before it is lent |
 | `right_size` | on | cap a range request near what its label has used |
+| `max_memory` | off | stop a job whose processes together use more memory than this (e.g. `16G`) |
+
+With `max_memory` set, each running job's cpuq looks every 2 seconds at the
+memory its command and the command's descendants use (macOS's physical
+footprint, compressed pages included, as Activity Monitor shows it; Linux's
+resident set). Over the limit, it asks the whole tree to stop (SIGTERM),
+makes it (SIGKILL) 10 seconds later if any of it remains, says so, and
+records the job as stopped for its memory (`memory` in `history --json`,
+"memory 42.0G" in `cpuq history`). One job that balloons, a compiler or a
+test caught in a loop that allocates, would otherwise fill the swap and shut
+the memory gate on everyone.
 
 An invalid line is an error naming the file and line. A run already
 waiting re-reads the file when it changes, so a new budget applies at once;

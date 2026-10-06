@@ -2,6 +2,14 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.7.9 — 2026-10-06
+
+- `max_memory` (config, off by default, e.g. `max_memory = 16G`): a running job's cpuq watches
+  the memory its command and descendants use, every 2 seconds, and stops the whole tree once
+  it passes the limit (SIGTERM, then SIGKILL 10 s later), recording the job as stopped for its
+  memory. Three runaway jobs (64, 42 and 63 GB) filled the Mac's swap on 2026-10-06 and shut
+  the memory gate on every other job until they were stopped by hand.
+
 ## 0.7.8 — 2026-10-06
 
 - `cpuq lease NAME --exclusive`: a named lease that is also a quiet window. Once it has the
