@@ -3,6 +3,13 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.8.3 — 2026-10-06
+
+- With a budget over the CPU count (cpuq handing out more cores than the Mac has, since held
+  cores are partly idle), All CPUs no longer prints the budget's label above its top, over the
+  hint line: its ceiling is the CPUs, labelled so. Stacked leaves out the tick numbers beside
+  its budget and CPU lines, where they ran into those lines' labels.
+
 ## 0.8.2 — 2026-10-06
 
 - No more stripes: a held but idle core is a pale tint of its project's color (a little

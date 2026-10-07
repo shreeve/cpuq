@@ -768,7 +768,9 @@ struct GraphsView: View {
             if let trip {
                 RuleMark(y: .value("CPUs", trip)).foregroundStyle(Color.orange.opacity(0.8)).lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
             }
-            RuleMark(y: .value("CPUs", budget)).foregroundStyle(Color.primary.opacity(0.25))
+            // The CPUs are the ceiling here; a budget over them (cores handed out beyond the CPUs,
+            // since held cores are partly idle) has no line in a chart of CPUs busy.
+            RuleMark(y: .value("CPUs", min(budget, cpus))).foregroundStyle(Color.primary.opacity(0.25))
             if let h = hover { RuleMark(x: .value("Time", Double(h.x))).foregroundStyle(.secondary.opacity(0.6)) }
         }
         .chartLegend(.hidden)
@@ -776,8 +778,10 @@ struct GraphsView: View {
         .chartXAxis { timeAxis(axis, labels: false, grid: true) }
         .chartYScale(domain: 0...cap)
         .chartYAxis {
-            AxisMarks(position: .leading, values: [budget]) { _ in
-                AxisValueLabel { axisLabel(Text(abs(budget - cpus) < 0.5 ? "\(Int(cpus)) = budget" : "budget \(Int(budget))").font(.caption2)) }
+            AxisMarks(position: .leading, values: [min(budget, cpus)]) { _ in
+                AxisValueLabel {
+                    axisLabel(Text(abs(budget - cpus) < 0.5 ? "\(Int(cpus)) = budget" : budget < cpus ? "budget \(Int(budget))" : "\(Int(cpus)) CPUs").font(.caption2))
+                }
             }
             if let trip {
                 AxisMarks(position: .leading, values: [trip]) { _ in
@@ -868,7 +872,7 @@ struct GraphsView: View {
         .chartXAxis { timeAxis(axis, labels: false, grid: true) }
         .chartYScale(domain: 0...top)
         .chartYAxis {
-            AxisMarks(position: .leading, values: Array(stride(from: 0.0, through: max(cpus, budget), by: 2)).filter { abs($0 - budget) > 1.1 }) { v in
+            AxisMarks(position: .leading, values: Array(stride(from: 0.0, through: max(cpus, budget), by: 2)).filter { abs($0 - budget) > 1.1 && abs($0 - cpus) > 1.1 }) { v in
                 AxisGridLine().foregroundStyle(.secondary.opacity(0.15))
                 AxisValueLabel { if let d = v.as(Double.self) { axisLabel(Text("\(Int(d))")) } }
             }
