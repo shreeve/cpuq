@@ -466,7 +466,9 @@ struct GraphsView: View {
         let axis = TimeAxis(span: min(max(end.timeIntervalSince(model.oldest(now: end)), 300), GraphModel.keep), end: end)
         let held = max(model.budget, (model.blocks.flatMap(\.lanes).max() ?? 0) + 1)
         let (all, waitCells) = Self.grid(model, columns: axis.columns, end: end, lanes: held)
-        let cells = Self.borrowed(all, budget: model.budget)
+        // Lending draws work over the budget on the idle cores it borrowed; measured admission
+        // lends nothing, so every job stays on its own lanes.
+        let cells = model.status?.admit == "measured" ? all : Self.borrowed(all, budget: model.budget)
         let lanes = max(model.budget, (cells.filter { $0.project != nil }.map(\.lane).max() ?? 0) + 1)
         let machine = Self.machine(model, columns: axis.columns)
         // The topmost view shown names each stretch the gate was shut.
@@ -486,13 +488,20 @@ struct GraphsView: View {
                 }
                 .toggleStyle(.button).controlSize(.small)
             }
-            // What is under the pointer, on a line of its own, so the verdict never moves.
-            ((hover.flatMap { describe($0, axis: axis, cells: cells) })
-                ?? Text("Point at the charts for what was there; right-click a job to pause or stop it.").foregroundColor(.secondary))
+            // What is under the pointer, on a line of its own, so the verdict never moves; empty
+            // until there is something to say.
+            ((hover.flatMap { describe($0, axis: axis, cells: cells) }) ?? Text(" "))
                 .font(.callout).monospacedDigit().lineLimit(1)
                 .frame(height: 18, alignment: .leading)
-            // Air between the views, so each reads as its own; the waiting row sits under the
-            // lanes, and carries the time labels.
+            // The views scroll when the window is too short for them all, so the top line and the
+            // toggles always show; given room, the stacked chart and the lanes share it.
+            GeometryReader { geo in
+                let fixed = (showMac ? 106.0 : 0) + (showPerCPU ? 110.0 : 0) + 70 + (showStacked ? 18.0 : 0) + (showLanes ? 14.0 : 0)
+                let spare = max(geo.size.height - fixed, 0)
+                let share = showStacked && showLanes ? 0.45 : 1.0
+                let stackH = max(150, spare * share)
+                let lanesH = max(170, spare * (showStacked ? 0.55 : 1.0))
+                ScrollView(.vertical) {
             VStack(spacing: 4) {
                 if showMac {
                     macChart(axis: axis, machine: machine, labelGate: top == .mac)
@@ -506,18 +515,20 @@ struct GraphsView: View {
                 }
                 if showStacked {
                     stackChart(axis: axis, machine: machine, labelGate: top == .stack)
-                        .frame(minHeight: 150, maxHeight: .infinity)
+                        .frame(height: stackH)
                         .padding(.bottom, 18)
                 }
                 if showLanes {
                     lanesChart(axis: axis, lanes: lanes, cells: cells, machine: machine, labelGate: top == .lanes)
-                        .frame(minHeight: 170, maxHeight: .infinity)
+                        .frame(height: lanesH)
                         .padding(.bottom, 14)
                 }
                 waitingChart(axis: axis, waits: waitCells, machine: machine, labelGate: top == .waiting)
                     .frame(height: 70)
             }
-            if !showStacked && !showLanes { Spacer(minLength: 0) }
+                }
+            }
+            .frame(minHeight: 240)
             key
             table
         }
@@ -535,8 +546,13 @@ struct GraphsView: View {
         var c = 0
         while c < machine.count {
             guard let shut = machine[c]?.shut else { c += 1; continue }
+            // A stretch runs on across gaps of fewer than six open columns: one name for both.
             var end = c
-            while end + 1 < machine.count, machine[end + 1]?.shut == shut { end += 1 }
+            var probe = c + 1
+            while probe < machine.count, probe - end <= 6 {
+                if machine[probe]?.shut == shut { end = probe }
+                probe += 1
+            }
             if end - c + 1 >= 4, c - last >= 14 {
                 out.insert(c)
                 last = c
@@ -576,20 +592,32 @@ struct GraphsView: View {
     private var key: some View {
         let swatch = { (c: Color, h: CGFloat) in RoundedRectangle(cornerRadius: 2).fill(c).frame(width: 14, height: h) }
         let grey = Color(white: 0.45)
+        let measured = model.status?.admit == "measured"
+        let valve = model.status?.gate.trip != nil
         let cores = Group {
-            Label { Text("busy") } icon: { swatch(grey, 10) }
-            Label { Text("held, idle") } icon: { swatch(grey.opacity(Self.shade(0)), 10) }
-            Label { Text("held, not measured") } icon: { swatch(grey.opacity(0.6), 3) }
-            Label { Text("borrowed (edge: owner)") } icon: { VStack(spacing: 0) { swatch(.primary.opacity(0.8), 3); swatch(grey.opacity(0.7), 7) } }
-            Label { Text("free") } icon: { swatch(.secondary.opacity(0.12), 10) }
+            if showStacked || showLanes {
+                Label { Text("busy") } icon: { swatch(grey, 10) }
+                Label { Text("held, idle") } icon: { swatch(grey.opacity(Self.shade(0)), 10) }
+            }
+            if showLanes {
+                Label { Text("held, not measured") } icon: { swatch(grey.opacity(0.6), 3) }
+                if !measured {
+                    Label { Text("borrowed (edge: owner)") } icon: { VStack(spacing: 0) { swatch(.primary.opacity(0.8), 3); swatch(grey.opacity(0.7), 7) } }
+                }
+                Label { Text("free") } icon: { swatch(.secondary.opacity(0.12), 10) }
+            }
         }
         let machine = Group {
-            Label { Text("other work") } icon: { swatch(.secondary.opacity(0.3), 10) }
-            Label { Text("load") } icon: { swatch(.primary.opacity(0.75), 2) }
-            Label { Text("valve") } icon: {
-                HStack(spacing: 2) { ForEach(0..<3, id: \.self) { _ in swatch(.orange.opacity(0.8), 2).frame(width: 3) } }.frame(width: 14)
+            if showMac {
+                Label { Text("other work") } icon: { swatch(.secondary.opacity(0.3), 10) }
+                Label { Text("load") } icon: { swatch(.primary.opacity(0.75), 2) }
+                if valve {
+                    Label { Text("valve") } icon: {
+                        HStack(spacing: 2) { ForEach(0..<3, id: \.self) { _ in swatch(.orange.opacity(0.8), 2).frame(width: 3) } }.frame(width: 14)
+                    }
+                }
+                Label { Text("memory pressure") } icon: { swatch(.red.opacity(0.75), 4) }
             }
-            Label { Text("memory pressure") } icon: { swatch(.red.opacity(0.75), 4) }
             Label { Text("gate shut") } icon: { swatch(.orange.opacity(0.18), 10) }
             Label { Text("jobs waiting") } icon: { swatch(.red.opacity(0.75), 8) }
         }
@@ -734,7 +762,8 @@ struct GraphsView: View {
         .chartXAxis { timeAxis(axis, labels: false) }
         .chartYScale(domain: 0...Double(lanes))
         .chartYAxis {
-            AxisMarks(position: .leading, values: (0..<lanes).map { Double($0) + 0.5 }) { v in
+            // Every lane numbered while they fit; past 16, every fourth.
+            AxisMarks(position: .leading, values: (0..<lanes).filter { lanes <= 16 || $0 % 4 == 0 }.map { Double($0) + 0.5 }) { v in
                 AxisValueLabel { if let d = v.as(Double.self) { axisLabel(Text("\(Int(d) + 1)")) } }
             }
         }
@@ -977,8 +1006,10 @@ struct GraphsView: View {
                               yStart: .value("Cores", b.low), yEnd: .value("Cores", b.high))
                     .foregroundStyle(model.color(b.project).opacity(b.kind == .busy ? 0.95 : b.kind == .idle ? Self.shade(0) : 0.5))
             }
-            RuleMark(y: .value("Cores", budget)).foregroundStyle(Color.primary.opacity(0.35))
-            if abs(budget - cpus) >= 0.5 {
+            if model.status?.admit != "measured" {
+                RuleMark(y: .value("Cores", budget)).foregroundStyle(Color.primary.opacity(0.35))
+            }
+            if abs(budget - cpus) >= 0.5 || model.status?.admit == "measured" {
                 RuleMark(y: .value("Cores", cpus)).foregroundStyle(Color.primary.opacity(0.2)).lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
             }
             if let h = hover { RuleMark(x: .value("Time", Double(h.x))).foregroundStyle(.secondary.opacity(0.6)) }
@@ -988,14 +1019,18 @@ struct GraphsView: View {
         .chartXAxis { timeAxis(axis, labels: false, grid: true) }
         .chartYScale(domain: 0...top)
         .chartYAxis {
-            AxisMarks(position: .leading, values: Array(stride(from: 0.0, through: max(cpus, budget), by: 2)).filter { abs($0 - budget) > 1.1 && abs($0 - cpus) > 1.1 }) { v in
+            // Under measured admission the budget limits nothing, so the axis marks the CPUs alone.
+            let measured = model.status?.admit == "measured"
+            AxisMarks(position: .leading, values: Array(stride(from: 0.0, through: max(cpus, measured ? cpus : budget), by: 2)).filter { (measured || abs($0 - budget) > 1.1) && abs($0 - cpus) > 1.1 }) { v in
                 AxisGridLine().foregroundStyle(.secondary.opacity(0.15))
                 AxisValueLabel { if let d = v.as(Double.self) { axisLabel(Text("\(Int(d))")) } }
             }
-            AxisMarks(position: .leading, values: [budget]) { _ in
-                AxisValueLabel { axisLabel(Text("budget \(Int(budget))")) }
+            if !measured {
+                AxisMarks(position: .leading, values: [budget]) { _ in
+                    AxisValueLabel { axisLabel(Text("budget \(Int(budget))")) }
+                }
             }
-            if abs(budget - cpus) >= 0.5 {
+            if abs(budget - cpus) >= 0.5 || measured {
                 AxisMarks(position: .leading, values: [cpus]) { _ in AxisValueLabel { axisLabel(Text("\(Int(cpus)) CPUs").font(.caption2)) } }
             }
         }

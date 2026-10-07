@@ -3,6 +3,20 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.10.0 — 2026-10-07
+
+From a design review of the window, and for cpuq 0.8's measured admission.
+
+- The views scroll when the window is too short for all of them, so the top line and the toggles
+  always show; given room, the stacked chart and the lanes share it.
+- The key lists only what the views on screen draw (and no valve when there is none, no borrowed
+  cores under measured admission).
+- Past 16 lanes, every fourth is numbered, so their labels no longer pile up.
+- Shut stretches close together share one name.
+- Under cpuq 0.8's measured admission the budget limits nothing: Stacked marks the CPUs alone,
+  and the lanes show each job on its own cores (nothing is lent).
+- The line under the verdict is empty until there is something under the pointer.
+
 ## 0.9.1 — 2026-10-07
 
 - Stretches the gate was shut are named only where there is room: the start of one at least

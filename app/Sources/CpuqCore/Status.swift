@@ -10,6 +10,10 @@ public struct Status: Decodable, Sendable, Equatable {
     public var free = 0
     public var load: [Double] = [0, 0, 0]
     public var memoryPressure = ""
+    /// How cpuq admits jobs (0.8 and later): "measured" (by the CPU they use, up to `target`
+    /// CPUs) or "cores" (by the cores they hold, up to `budget`); empty from older cpuq.
+    public var admit = ""
+    public var target: Double?
     public var gate = Gate()
     public var holders: [Holder] = []
     public var waiters: [Waiter] = []
@@ -79,7 +83,7 @@ public struct Status: Decodable, Sendable, Equatable {
 // Decoding with defaults: a missing key keeps the property's default.
 extension Status {
     private enum Keys: String, CodingKey {
-        case schema, version, budget, held, free, load, memoryPressure, gate, holders, waiters, leases, outside
+        case schema, version, budget, held, free, load, memoryPressure, gate, holders, waiters, leases, outside, admit, target
     }
 
     public init(from decoder: any Decoder) throws {
@@ -91,6 +95,8 @@ extension Status {
         free = try c.decodeIfPresent(Int.self, forKey: .free) ?? 0
         load = try c.decodeIfPresent([Double].self, forKey: .load) ?? [0, 0, 0]
         memoryPressure = try c.decodeIfPresent(String.self, forKey: .memoryPressure) ?? ""
+        admit = try c.decodeIfPresent(String.self, forKey: .admit) ?? ""
+        target = try c.decodeIfPresent(Double.self, forKey: .target)
         gate = try c.decodeIfPresent(Gate.self, forKey: .gate) ?? Gate()
         holders = try c.decodeIfPresent([Holder].self, forKey: .holders) ?? []
         waiters = try c.decodeIfPresent([Waiter].self, forKey: .waiters) ?? []
