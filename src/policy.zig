@@ -32,6 +32,16 @@ pub fn qosFor(priority: Priority, exclusive: bool, qos_enabled: bool) Qos {
     };
 }
 
+/// Whether a job started on lent cores runs at background priority, so a
+/// lender that gets busy again has its CPUs back at once. Not on macOS: there
+/// background QoS confines a job to the efficiency cores, with throttled I/O,
+/// for its whole run. On this Mac 29% of jobs started on lent cores, all held
+/// to 6 efficiency cores while the 4 performance cores sat idle. On Linux,
+/// where cores are alike, nice 15 only yields.
+pub fn borrowersYield() bool {
+    return !builtin.os.tag.isDarwin();
+}
+
 pub const Config = struct {
     /// Cores cpuq may hand out; null means the active core count minus 2.
     budget: ?u32 = null,

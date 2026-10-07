@@ -581,7 +581,12 @@ t_lend() {
   echo "  borrower started after ${dt}s, lent $lent; said: $(echo "$out" | grep lent)"
   check "a core a holder leaves idle is lent to the head (after ${dt}s, lent $lent)" "[ '$lent' = 1 ] && python3 -c 'import sys; sys.exit(0 if $dt < 9 else 1)'"
   local qos; qos=$(echo "$out" | tail -1)
-  check "a borrower runs at background priority, so the lender comes first (got: $qos)" "[ '$qos' = background ] || [ '$qos' = 'nice 19' ] || [ '$qos' = 'nice 15' ] || [ '$qos' = 'nice 10' ]"
+  if [ "$(uname)" = Darwin ]; then
+    # Background QoS would hold it to the efficiency cores for its whole run.
+    check "on macOS a borrower keeps its class, so it can use the performance cores (got: $qos)" "[ '$qos' = '$("$CPUQ" qos)' ]"
+  else
+    check "a borrower runs at a lower priority, so the lender comes first (got: $qos)" "[ '$qos' = 'nice 19' ] || [ '$qos' = 'nice 15' ] || [ '$qos' = 'nice 10' ]"
+  fi
   export CPUQ_BUDGET=9
 }
 

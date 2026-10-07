@@ -2,6 +2,14 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.7.12 — 2026-10-07
+
+- On macOS a job started on lent cores keeps its scheduling class too. It ran at background QoS
+  so that a lender getting busy again had its CPUs back at once, but on Apple silicon that held
+  the whole job to the efficiency cores, with throttled I/O, for its entire run: on this Mac 29%
+  of jobs started on lent cores, and Cpuq.app's Per CPU view showed the 6 efficiency cores
+  pinned while the 4 performance cores sat partly idle. Linux keeps nice 15 for borrowers.
+
 ## 0.7.11 — 2026-10-07
 
 - On macOS a normal-priority job keeps its scheduling class (high and normal alike; low still

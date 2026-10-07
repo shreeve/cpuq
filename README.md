@@ -484,8 +484,10 @@ and its history marks how many (`"lent": N`). Nothing is lent to an
 exclusive run or a named lease; `lend = off` turns it off. Lending goes only
 into CPUs the machine has to spare, judged by the load and by the CPUs'
 measured busy share, so it never pushes the load past the CPU count. A job
-started on lent cores runs at background priority (macOS QoS background,
-Linux nice 15), so a lender that gets busy again has its CPUs back at once.
+started on lent cores runs at nice 15 on Linux, so a lender that gets busy
+again has its CPUs back at once. On macOS it keeps its class: background QoS
+would hold it to Apple silicon's efficiency cores, with throttled I/O, for its
+whole run (it did, before 0.7.12, to 29% of the Mac's jobs).
 A job paused by hand (`cpuq pause`) lends all its cores at once.
 
 Once the head's minimum fits,

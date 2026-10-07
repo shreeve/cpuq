@@ -1051,7 +1051,7 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
 
     sys.installForwarding();
     const qos_enabled = ctx.cfg.qos and o.qos and o.lease == null;
-    const qos: policy.Qos = if (lease.borrowed > 0 and qos_enabled) .background else policy.qosFor(o.priority, o.exclusive, qos_enabled);
+    const qos: policy.Qos = if (lease.borrowed > 0 and qos_enabled and policy.borrowersYield()) .background else policy.qosFor(o.priority, o.exclusive, qos_enabled);
     const spawned = sys.spawn(exe, argv.ptr, @ptrCast(envp.slice.ptr), qos);
     if (pipe[0] >= 0) sys.closeFd(pipe[0]);
     if (pipe[1] >= 0) sys.closeFd(pipe[1]);
