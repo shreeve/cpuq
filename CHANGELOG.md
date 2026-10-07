@@ -2,6 +2,17 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.7.10 — 2026-10-06
+
+- A lease taken `--exclusive` goes next: its claim on the machine's cores queues at the
+  front (as `cpuq first` would put it), so the window opens once running work drains, not
+  behind a stream of later arrivals. On pup, a 5-minute timing check waited over an hour
+  behind other work and timed out.
+- Work the holder of an `--exclusive` lease starts on that machine over ssh runs inside the
+  window: a `cpuq run` whose CPUQ_LEASES names an exclusive lease held there starts at once
+  (with the cores it asked for, at most), instead of queueing behind its own holder forever.
+  Pass CPUQ_LEASES through ssh: `ssh HOST "CPUQ_LEASES='$CPUQ_LEASES' …"`.
+
 ## 0.7.9 — 2026-10-06
 
 - `max_memory` (config, off by default, e.g. `max_memory = 16G`): a running job's cpuq watches

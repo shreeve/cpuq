@@ -251,7 +251,11 @@ keeps both until it ends. Nothing else is admitted meanwhile; the lease's own
 command runs its `cpuq run`s inside the window. With `--host HOST --hold` the
 window is on HOST: a script that drives timing work over ssh holds HOST's
 cores for as long as it holds the lease, and other work on HOST fills the
-machine between such holders.
+machine between such holders. The window goes next: its claim on the cores
+queues at the front, and opens once running work drains. A `cpuq run` on
+HOST that carries the holder's CPUQ_LEASES (`ssh HOST "CPUQ_LEASES='$CPUQ_LEASES'
+…"`) runs inside the window at once; without it, it waits for the window to
+end.
 
 ### Named leases
 

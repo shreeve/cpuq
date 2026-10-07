@@ -232,6 +232,10 @@ const RunOptions = struct {
     slots: u32 = 1,
     /// Options only `cpuq run` takes, to reject them for a lease.
     run_only: ?[]const u8 = null,
+    /// Queue at the front, as `cpuq first` would put it: the cores of a
+    /// lease taken `--exclusive`, a timing window that goes next once
+    /// running work drains, not behind a stream of later arrivals.
+    first: bool = false,
 };
 
 fn parseRun(args: []const [:0]const u8) ?RunOptions {
@@ -366,6 +370,17 @@ fn cmdRun(ctx: *Ctx, args: []const [:0]const u8) u8 {
         // Inside a running job: run at once within its grant, everything
         // passed through untouched.
         const err = std.process.replace(ctx.io, .{ .argv = @ptrCast(o.cmd) });
+        std.debug.print("cpuq: {s}: {t}\n", .{ o.cmd[0], err });
+        return if (err == error.FileNotFound) exit_notfound else exit_noexec;
+    }
+    if (exclusiveWindow(ctx)) |token| {
+        // Inside a lease held `--exclusive` on this machine (its CPUQ_LEASES
+        // entry passed through ssh): the window is this run's own, so it
+        // starts at once with the cores it asked for, at most.
+        var num: [16]u8 = undefined;
+        ctx.env.put("CPUQ_CORES", std.mem.print(&num, "{d}", .{o.request.max}) catch "1") catch fail("out of memory", .{});
+        ctx.env.put("CPUQ_TOKEN", token) catch fail("out of memory", .{});
+        const err = std.process.replace(ctx.io, .{ .argv = @ptrCast(o.cmd), .environ_map = ctx.env });
         std.debug.print("cpuq: {s}: {t}\n", .{ o.cmd[0], err });
         return if (err == error.FileNotFound) exit_notfound else exit_noexec;
     }
@@ -543,6 +558,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
         .since = start,
         .label = o.label,
         .cmd = joinCommand(ctx, o.cmd),
+        .first = o.first,
     };
     var name_buf: [32]u8 = undefined;
     const ticket_name = state.ticketName(&name_buf, o.priority, rec.ticket);
@@ -1136,6 +1152,51 @@ fn nestedLease(ctx: *Ctx, name: []const u8, host: ?[]const u8) bool {
     return false;
 }
 
+/// When CPUQ_LEASES names a lease held here whose holder also holds the
+/// machine's cores exclusively (`cpuq lease --exclusive`), the name of that
+/// exclusive grant: work the holder starts here over ssh, passing its
+/// CPUQ_LEASES along, runs inside the window instead of queueing behind it.
+fn exclusiveWindow(ctx: *Ctx) ?[]const u8 {
+    const leases = ctx.env.get("CPUQ_LEASES") orelse return null;
+    const io = ctx.io;
+    const cwd = Io.Dir.cwd();
+    var entries = std.mem.tokenizeScalar(u8, leases, ' ');
+    while (entries.next()) |entry| {
+        const key, const val = std.mem.cutScalar(u8, entry, '=') orelse continue;
+        const name, _ = std.mem.cutScalar(u8, key, '@') orelse .{ key, "" };
+        const id, _ = std.mem.cutScalar(u8, val, ':') orelse .{ val, "" };
+        if (!validLeaseName(name) or id.len == 0 or std.mem.findScalar(u8, id, '/') != null) continue;
+        const path = std.mem.concat(ctx.arena, u8, &.{ stateDir(ctx), "/named/", name, "/leases/", id }) catch continue;
+        const holder = heldRecord(ctx, path) orelse continue;
+        // The exclusive grant the same cpuq holds.
+        const dir_path = std.mem.concat(ctx.arena, u8, &.{ stateDir(ctx), "/leases" }) catch continue;
+        var dir = cwd.openDir(io, dir_path, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch null) |e| {
+            if (!std.mem.endsWith(u8, e.name, ".x")) continue;
+            const x_path = std.mem.concat(ctx.arena, u8, &.{ dir_path, "/", e.name }) catch continue;
+            const r = heldRecord(ctx, x_path) orelse continue;
+            if (r.pid == holder.pid) return ctx.arena.dupe(u8, e.name) catch null;
+        }
+    }
+    return null;
+}
+
+/// The record in a lease file that its holder still holds.
+fn heldRecord(ctx: *Ctx, path: []const u8) ?state.Record {
+    const f = Io.Dir.cwd().openFile(ctx.io, path, .{}) catch return null;
+    defer f.close(ctx.io);
+    const free = f.tryLock(ctx.io, .shared) catch return null;
+    if (free) {
+        f.unlock(ctx.io);
+        return null;
+    }
+    var buf: [8192]u8 = undefined;
+    const n = f.readPositionalAll(ctx.io, &buf, 0) catch return null;
+    return state.Record.parse(buf[0..n]);
+}
+
 fn cmdLease(ctx: *Ctx, args: []const [:0]const u8) u8 {
     if (args.len == 0 or args[0].len == 0 or args[0][0] == '-') return usageError("lease needs a name", .{});
     const name = args[0];
@@ -1183,6 +1244,7 @@ fn cmdLease(ctx: *Ctx, args: []const [:0]const u8) u8 {
         co.hold = false;
         co.slots = 1;
         co.request = .{ .min = 1, .max = 1 };
+        co.first = true;
         words_slot = 1;
         exclusive_cores = .{ .st = &cst, .lease = waitTurn(ctx, &cst, co) };
         words_slot = 0;

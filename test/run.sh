@@ -699,14 +699,17 @@ t_lease_exclusive() {
   # A run holds 2 cores; the exclusive lease waits for it to end, then holds
   # the machine: a run started meanwhile waits for the lease, and a run
   # inside the lease's command starts at once.
-  "$CPUQ" run --cores 2 --label busy -- sh -c "sleep 1.5; echo busy-done >>$f" & local b=$!
-  wait_held 2
+  "$CPUQ" run --cores 9 --label busy -- sh -c "sleep 1.5; echo busy-done >>$f" & local b=$!
+  wait_held 9
+  # A high-priority run queued first still goes after the timing window.
+  "$CPUQ" run --cores 2 --priority high --label early -- sh -c "echo early >>$f" & local e=$!
+  wait_waiters 1
   "$CPUQ" lease bench --exclusive --label timing -- sh -c "echo timing >>$f; \"$CPUQ\" run --cores 1 -- sh -c 'echo inner >>$f'; sleep 1.5; echo timing-done >>$f" & local l=$!
   wait_lease_holder bench
   "$CPUQ" run --cores 1 --label late -- sh -c "echo late >>$f" & local r=$!
-  wait $b $l $r
+  wait $b $l $r $e
   local got; got=$(tr '\n' ' ' <"$f")
-  check "an exclusive lease waits for running work, then nothing else runs until it ends, but its own runs do (got: $got)" "[ '$got' = 'busy-done timing inner timing-done late ' ]"
+  check "an exclusive lease goes next once running work drains, ahead of earlier waiters, and nothing else runs until it ends, but its own runs do (got: $got)" "[ '$got' = 'busy-done timing inner timing-done early late ' ] || [ '$got' = 'busy-done timing inner timing-done late early ' ]"
   # Held with --hold on a host: other runs there wait; closed and killed at
   # once, it frees the machine and leaves nothing lost.
   mkfifo "$T/in"
@@ -718,6 +721,17 @@ t_lease_exclusive() {
   "$CPUQ" run --cores 1 --max-wait 3 -- true; local after=$?
   local lost; lost=$("$CPUQ" history --json | python3 -c 'import json, sys; print(sum(1 for j in json.load(sys.stdin) if j["state"] == "lost"))')
   check "while an exclusive --hold holds the machine others wait (rc $rc); after it, they run (rc $after); nothing lost ($lost)" "[ $rc = 75 ] && [ $after = 0 ] && [ '$lost' = 0 ]"
+  # The holder's own work over ssh, with its CPUQ_LEASES entry passed along,
+  # runs inside the window at once; without it, it waits.
+  mkfifo "$T/in2" "$T/out2"
+  PATH="$bin:$PATH" "$CPUQ" lease bench --host far --hold --exclusive --label kit <"$T/in2" >"$T/out2" & h=$!
+  exec 6>"$T/in2"
+  local word name entry
+  read -r word name entry <"$T/out2"
+  local inside; inside=$(CPUQ_LEASES="$entry" "$CPUQ" run --cores 2-3 --max-wait 2 -- sh -c 'echo "$CPUQ_CORES"'); local rc_in=$?
+  "$CPUQ" run --cores 1 --max-wait 1 -- true 2>/dev/null; local rc_out=$?
+  exec 6>&-; kill $h 2>/dev/null; wait $h 2>/dev/null
+  check "inside an exclusive lease (its entry passed along) a run starts at once (rc $rc_in, cores '$inside'); outside it waits (rc $rc_out)" "[ $rc_in = 0 ] && [ '$inside' = 3 ] && [ $rc_out = 75 ]"
 }
 
 t_controls() {
