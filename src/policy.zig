@@ -287,7 +287,11 @@ pub const Pressure = enum { normal, high, unknown, off };
 
 /// macOS kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical.
 pub fn macPressure(level: c_int) Pressure {
-    return if (level >= 2) .high else .normal;
+    // Critical only. The warn level (2) can last many minutes with half the
+    // memory free: on 2026-10-07 it shut the gate for 8 minutes with 46-49%
+    // free and under 1 GB of swap, holding up to 4 jobs while the CPUs sat
+    // idle. Runaway jobs are max_memory's to stop.
+    return if (level >= 4) .high else .normal;
 }
 
 /// Linux /proc/pressure/memory: pressure when `some avg10` reaches the
@@ -632,7 +636,7 @@ test "cpu lists" {
 
 test "memory pressure gate" {
     try testing.expectEqual(Pressure.normal, macPressure(1));
-    try testing.expectEqual(Pressure.high, macPressure(2));
+    try testing.expectEqual(Pressure.normal, macPressure(2));
     try testing.expectEqual(Pressure.high, macPressure(4));
     const psi_low = "some avg10=0.00 avg60=0.10 avg300=0.05 total=123\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=9\n";
     const psi_high = "some avg10=37.50 avg60=12.00 avg300=3.00 total=99999\nfull avg10=20.00 avg60=5.00 avg300=1.00 total=500\n";

@@ -385,7 +385,8 @@ slower than at the default class. Children inherit it. `--exclusive` runs (they 
 The head of the queue admits nothing while:
 
 - the OS reports memory pressure: macOS `kern.memorystatus_vm_pressure_level`
-  at 2 (warn) or more; Linux `/proc/pressure/memory` `some avg10` at
+  at 4 (critical) (warn, 2, can last many minutes with half the memory free, and
+  shut the gate on idle CPUs; a runaway job is `max_memory`'s to stop); Linux `/proc/pressure/memory` `some avg10` at
   `pressure_psi` or more, when the file exists (`pressure_check = off`);
 - the load safety valve is closed (`load_check = off`, or `--no-load-check`
   per run). The budget is what schedules work; the valve is a safety net. It

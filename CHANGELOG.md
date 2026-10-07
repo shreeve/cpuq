@@ -2,6 +2,13 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.7.13 — 2026-10-07
+
+- On macOS the memory gate shuts at the kernel's critical level only, not at warn. Warn can last
+  many minutes with half the memory free: it shut the gate for 8 minutes with 46-49% free and
+  under 1 GB of swap in use, holding up to 4 jobs while the CPUs sat mostly idle. A runaway job
+  is `max_memory`'s to stop.
+
 ## 0.7.12 — 2026-10-07
 
 - On macOS a job started on lent cores keeps its scheduling class too. It ran at background QoS
