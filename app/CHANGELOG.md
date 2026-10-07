@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.9.1 — 2026-10-07
+
+- Stretches the gate was shut are named only where there is room: the start of one at least
+  four columns wide, well clear of the last name, so two close together no longer print over
+  each other.
+
 ## 0.9.0 — 2026-10-07
 
 - Per CPU, a new view (off until you turn it on at the top right): every one of the Mac's CPUs

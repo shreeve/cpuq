@@ -527,18 +527,38 @@ struct GraphsView: View {
     /// it reads as free.
     static func shade(_ busy: Double) -> Double { 0.3 + 0.65 * min(max(busy, 0), 1) }
 
+    /// The columns where a shut stretch is named: the start of each one wide enough for its
+    /// name, and far enough from the last name that the two never run together.
+    static func gateLabels(_ machine: [MachineColumn?]) -> Set<Int> {
+        var out: Set<Int> = []
+        var last = -100
+        var c = 0
+        while c < machine.count {
+            guard let shut = machine[c]?.shut else { c += 1; continue }
+            var end = c
+            while end + 1 < machine.count, machine[end + 1]?.shut == shut { end += 1 }
+            if end - c + 1 >= 4, c - last >= 14 {
+                out.insert(c)
+                last = c
+            }
+            c = end + 1
+        }
+        return out
+    }
+
     /// Stretches the gate was shut (by memory pressure or the load valve; spacing, a pause of
     /// seconds between admissions, is left out), shaded across a chart from `low` to `high`, and
     /// named at their start in the topmost chart.
     @ChartContentBuilder
     private func gateBands(_ machine: [MachineColumn?], low: Double, high: Double, label: Bool) -> some ChartContent {
+        let named = label ? Self.gateLabels(machine) : []
         ForEach(Array(machine.enumerated()), id: \.offset) { c, m in
             if let m, let shut = m.shut {
                 RectangleMark(xStart: .value("Time", Double(c)), xEnd: .value("Time", Double(c) + 1),
                               yStart: .value("y", low), yEnd: .value("y", high))
                     .foregroundStyle(Color.orange.opacity(0.13))
                     .annotation(position: .overlay, alignment: .topLeading, spacing: 0) {
-                        if label && (c == 0 || machine[c - 1]?.shut != shut) {
+                        if named.contains(c) {
                             Text(shut).font(.system(size: 9, weight: .semibold)).foregroundStyle(.orange).fixedSize().offset(x: 3, y: 9)
                         }
                     }
