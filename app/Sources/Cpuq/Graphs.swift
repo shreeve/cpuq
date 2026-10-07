@@ -60,6 +60,8 @@ final class GraphModel {
         var memory = ""
         /// How busy the Mac's CPUs were since the poll before, 0 to 1, measured by the app.
         var busy: Double? = nil
+        /// The same for each CPU, in the kernel's order.
+        var perCPU: [Double]? = nil
     }
 
     /// A project running now: what it holds and what it uses.
@@ -101,6 +103,9 @@ final class GraphModel {
     private(set) var totals: [Totals] = []
     private var seeded = false
     private var ticks = CPUTicks.now()
+    private var cpuTicks = CPUTicks.perCPU()
+    /// The performance cores: how many (the last CPUs) and their name; nil on one kind of core.
+    let performance = CPUTicks.performanceCores()
     /// Each project's palette slot, assigned the first time it is seen and kept across launches,
     /// so a project's color never changes as others come and go.
     private var slots: [String: Int] = (UserDefaults.standard.dictionary(forKey: "projectPalette") as? [String: Int]) ?? [:]
@@ -140,9 +145,16 @@ final class GraphModel {
         let t = CPUTicks.now()
         let busy = ticks.flatMap { a in t.flatMap { CPUTicks.busy(from: a, to: $0) } }
         ticks = t
+        let each = CPUTicks.perCPU()
+        var perCPU: [Double]? = nil
+        if let a = cpuTicks, let b = each, a.count == b.count {
+            perCPU = zip(a, b).map { CPUTicks.busy(from: $0, to: $1) ?? 0 }
+        }
+        cpuTicks = each
         samples.append(Sample(at: now, inUse: s.held, active: s.holders.reduce(0) { $0 + ($1.using ?? 0) },
                               outside: s.outside.reduce(0) { $0 + $1.using }, load: s.load.first ?? 0, waiting: s.waiters.count,
-                              gate: s.gate.state, gateText: s.gate.text, trip: s.gate.trip, memory: s.memoryPressure, busy: busy))
+                              gate: s.gate.state, gateText: s.gate.text, trip: s.gate.trip, memory: s.memoryPressure, busy: busy,
+                              perCPU: perCPU))
         let cutoff = now.addingTimeInterval(-Self.keep)
         samples.removeAll { $0.at < cutoff }
         blocks.removeAll { ($0.to ?? now) < cutoff }
@@ -345,11 +357,12 @@ struct GraphsView: View {
     @State private var hover: CGPoint?
     /// Which chart the pointer is in: `hover` is in that chart's units.
     @State private var hoverIn = Pane.lanes
-    enum Pane { case stack, lanes, waiting, mac }
+    enum Pane { case stack, lanes, waiting, mac, percpu }
     /// Which of the views over time are on: each can be turned off, the waiting row stays.
     @AppStorage("showStacked") private var showStacked = true
     @AppStorage("showLanes") private var showLanes = true
     @AppStorage("showMac") private var showMac = true
+    @AppStorage("showPerCPU") private var showPerCPU = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -457,7 +470,7 @@ struct GraphsView: View {
         let lanes = max(model.budget, (cells.filter { $0.project != nil }.map(\.lane).max() ?? 0) + 1)
         let machine = Self.machine(model, columns: axis.columns)
         // The topmost view shown names each stretch the gate was shut.
-        let top: Pane = showMac ? .mac : showStacked ? .stack : showLanes ? .lanes : .waiting
+        let top: Pane = showMac ? .mac : showPerCPU ? .percpu : showStacked ? .stack : showLanes ? .lanes : .waiting
         // Views of one thing over one time axis, widest first, each of which can be turned off:
         // all the CPUs, cpuq's jobs and other work; cpuq's cores by project; which cores; and,
         // always, who waits. Stretches the gate was shut are shaded through all of them.
@@ -467,6 +480,7 @@ struct GraphsView: View {
                 Spacer()
                 HStack(spacing: 2) {
                     Toggle("All CPUs", isOn: $showMac)
+                    Toggle("Per CPU", isOn: $showPerCPU)
                     Toggle("Stacked", isOn: $showStacked)
                     Toggle("Lanes", isOn: $showLanes)
                 }
@@ -483,6 +497,11 @@ struct GraphsView: View {
                 if showMac {
                     macChart(axis: axis, machine: machine, labelGate: top == .mac)
                         .frame(height: 92)
+                        .padding(.bottom, 14)
+                }
+                if showPerCPU {
+                    perCPUChart(axis: axis, machine: machine, labelGate: top == .percpu)
+                        .frame(height: 96)
                         .padding(.bottom, 14)
                 }
                 if showStacked {
@@ -794,6 +813,83 @@ struct GraphsView: View {
         .contextMenu { clearMenu(axis) }
     }
 
+    // MARK: Per CPU
+
+    /// One CPU's row in the per-CPU heatmap, top to bottom: the performance cores, then the
+    /// efficiency cores.
+    struct CPURow {
+        let index: Int
+        let label: String
+        let performance: Bool
+        let y: Double
+    }
+
+    private static let cpuGap = 0.5
+
+    func cpuRows() -> [CPURow] {
+        let n = model.samples.last(where: { $0.perCPU != nil })?.perCPU?.count ?? ProcessInfo.processInfo.processorCount
+        let p = min(model.performance?.count ?? 0, n)
+        let e = n - p
+        // Kernel order: efficiency first (0 ..< e), then performance (e ..< n). Shown performance first.
+        let order = Array(e..<n) + Array(0..<e)
+        return order.enumerated().map { i, cpu in
+            let perf = cpu >= e && p > 0
+            let label = p == 0 ? "\(cpu + 1)" : perf ? "P\(cpu - e + 1)" : "E\(cpu + 1)"
+            // Rows from the top; the performance group sits a little apart.
+            let y = Double(n - 1 - i) + (perf && e > 0 ? Self.cpuGap : 0)
+            return CPURow(index: cpu, label: label, performance: perf, y: y)
+        }
+    }
+
+    /// Each CPU's busy share in each column, while the app watched; nil where no reading.
+    static func perCPU(_ m: GraphModel, columns: [(from: Date, to: Date)]) -> [[Double]?] {
+        columns.map { column in
+            let here = m.samples.filter { $0.at >= column.from && $0.at <= column.to }.compactMap(\.perCPU)
+            guard let first = here.first else { return nil }
+            return (0..<first.count).map { i in here.reduce(0) { $0 + (i < $1.count ? $1[i] : 0) } / Double(here.count) }
+        }
+    }
+
+    /// Every CPU as a row over time, darker the busier: the performance cores on top, the
+    /// efficiency cores under them.
+    private func perCPUChart(axis: TimeAxis, machine: [MachineColumn?], labelGate: Bool) -> some View {
+        let rows = cpuRows()
+        let grid = Self.perCPU(model, columns: axis.columns)
+        let top = (rows.map(\.y).max() ?? 0) + 1
+        let perf = rows.filter(\.performance)
+        let eff = rows.filter { !$0.performance }
+        return Chart {
+            gateBands(machine, low: 0, high: top, label: labelGate)
+            ForEach(Array(grid.enumerated()), id: \.offset) { c, cell in
+                if let cell {
+                    ForEach(rows, id: \.index) { r in
+                        let busy = r.index < cell.count ? cell[r.index] : 0
+                        RectangleMark(xStart: .value("Time", Double(c) + 0.06), xEnd: .value("Time", Double(c) + 0.94),
+                                      yStart: .value("CPU", r.y + 0.08), yEnd: .value("CPU", r.y + 0.92))
+                            .foregroundStyle(Color.primary.opacity(0.05 + 0.8 * busy))
+                    }
+                }
+            }
+            if let h = hover { RuleMark(x: .value("Time", Double(h.x))).foregroundStyle(.secondary.opacity(0.6)) }
+        }
+        .chartLegend(.hidden)
+        .chartXScale(domain: 0...max(axis.count, 1))
+        .chartXAxis { timeAxis(axis, labels: false) }
+        .chartYScale(domain: 0...top)
+        .chartYAxis {
+            if !perf.isEmpty {
+                AxisMarks(position: .leading, values: [(perf.map(\.y).min()! + perf.map(\.y).max()! + 1) / 2]) { _ in
+                    AxisValueLabel { axisLabel(Text("\(perf.count) \(model.performance?.name ?? "P")").font(.caption2).foregroundColor(.secondary)) }
+                }
+            }
+            AxisMarks(position: .leading, values: [((eff.map(\.y).min() ?? 0) + (eff.map(\.y).max() ?? 0) + 1) / 2]) { _ in
+                AxisValueLabel { axisLabel(Text(perf.isEmpty ? "per CPU" : "\(eff.count) Efficiency").font(.caption2).foregroundColor(.secondary)) }
+            }
+        }
+        .chartOverlay { hovering($0, .percpu) }
+        .contextMenu { clearMenu(axis) }
+    }
+
     // MARK: Stacked
 
     /// One project's piece of a stacked column: its busy cores, its idle ones, or (before the
@@ -991,6 +1087,16 @@ struct GraphsView: View {
             if !then.gateOpen { t = t + Text(" · \(then.gateText)").foregroundColor(.orange) }
             if then.memory == "high" { t = t + Text(" · memory pressure high").foregroundColor(.red) }
             return t
+        }
+        if hoverIn == .percpu {
+            guard let row = cpuRows().first(where: { p.y >= $0.y && p.y < $0.y + 1 }) else { return when + Text("between the core groups").foregroundColor(.secondary) }
+            let kind = row.performance ? (model.performance?.name ?? "performance").lowercased() + " core" : "efficiency core"
+            let columns = TimeAxis(span: min(max(end.timeIntervalSince(model.oldest(now: end)), 300), GraphModel.keep), end: end).columns
+            guard !columns.isEmpty else { return nil }
+            let cells = Self.perCPU(model, columns: [columns[min(column, columns.count - 1)]])
+            guard let cell = cells.first ?? nil, row.index < cell.count else { return when + Text("CPU \(row.label): the app was not watching then").foregroundColor(.secondary) }
+            return when + Text("CPU \(row.label)").bold() + Text(" (\(kind), number \(row.index))").foregroundColor(.secondary)
+                + Text(" · \(Int((cell[row.index] * 100).rounded()))% busy")
         }
         if hoverIn == .stack {
             // The project whose band is under the pointer in that column.

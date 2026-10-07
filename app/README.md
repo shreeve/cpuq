@@ -9,7 +9,8 @@ the budget, cores active, who waits, the load against the load valve, how busy t
 memory pressure, then shows the last hour as views stacked
 over one time axis, widest first, each turned on or off at the top right (remembered): All
 CPUs, the Mac's CPUs busy with cpuq's jobs and with other work, with the load, the valve's trip
-level and high memory pressure; Stacked, each column's cores stacked busy first, from the floor,
+level and high memory pressure; Per CPU (off at first), each CPU a thin row, darker the
+busier, performance cores above efficiency cores; Stacked, each column's cores stacked busy first, from the floor,
 and idle (striped) above; Lanes, one lane per core of the budget, a held core striped in its
 project's color and filled in as far as it is busy; and the cores waiting jobs ask for (always
 shown). Stretches the gate was shut are shaded through all of them. Pointing at any of them says what was there then; recent

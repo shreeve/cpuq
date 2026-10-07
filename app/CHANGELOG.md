@@ -3,6 +3,13 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.9.0 — 2026-10-07
+
+- Per CPU, a new view (off until you turn it on at the top right): every one of the Mac's CPUs
+  as a thin row over time, darker the busier, the performance cores on top and the efficiency
+  cores under them. Pointing at a cell names the CPU and how busy it was. It shows what All
+  CPUs adds up: whether the work lands on the fast cores, or which ones sit idle.
+
 ## 0.8.3 — 2026-10-06
 
 - With a budget over the CPU count (cpuq handing out more cores than the Mac has, since held

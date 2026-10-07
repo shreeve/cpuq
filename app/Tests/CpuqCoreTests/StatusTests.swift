@@ -103,3 +103,9 @@ import Testing
     #expect(CPUTicks.busy(from: a, to: a) == nil)
     #expect(CPUTicks.now() != nil)
 }
+
+@Test func everyCPUHasTicks() {
+    let all = CPUTicks.perCPU()
+    #expect(all?.count == ProcessInfo.processInfo.processorCount)
+    #expect(all?.allSatisfy { $0.total >= $0.busy } == true)
+}
