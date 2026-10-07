@@ -466,7 +466,8 @@ go), and either:
 
 A wrong estimate delays the head by at most one job's overrun, and patience
 bounds how long others may go ahead, so the head never starves. Nothing goes
-ahead of an `--exclusive` head (it waits for the machine to drain), and
+ahead of an `--exclusive` head (it waits for the machine to drain) unless
+history says it ends before the running work does (both run times known), and
 named leases stay strictly in order. A job that went ahead says so on stderr
 and is marked `"ahead": true` in its history. `backfill = off` restores
 strict order. A head waiting for an exact count while fewer cores are free

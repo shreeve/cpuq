@@ -2,6 +2,14 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.7.14 — 2026-10-07
+
+- Backfill behind an exclusive head: while a timing window waits for running work to drain, a
+  waiter may use the free cores if its history says it ends before that work does (both run
+  times known; no patience fallback, so the window is never delayed on a guess). A short timing
+  check once waited 17 minutes behind one long job while 9 of the Mac's cores sat free and three
+  jobs queued behind it.
+
 ## 0.7.13 — 2026-10-07
 
 - On macOS the memory gate shuts at the kernel's critical level only, not at warn. Warn can last

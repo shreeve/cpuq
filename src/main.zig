@@ -814,8 +814,12 @@ fn goAhead(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, o: RunOptions, que
         held += l.record.cores;
     }
     const head = queue[0].record;
-    // An exclusive head waits for the machine to drain: nobody goes ahead.
-    if (head.exclusive) return null;
+    // An exclusive head waits for the machine to drain. The free cores may
+    // still be used meanwhile, but only by a job whose history says it ends
+    // before the running work does: a timing window is never delayed on a
+    // guess. (A short check once waited 17 minutes behind one long job while
+    // 9 cores sat free and 3 jobs queued behind it.)
+    const strict = head.exclusive;
     const free = budget -| held;
     const fits = struct {
         fn need(r: state.Record, b: u32) u32 {
@@ -833,16 +837,20 @@ fn goAhead(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, o: RunOptions, que
     const head_waited: f64 = @floatFromInt(now - head.since);
     const head_typical = times.typical(head.label);
     const rule = struct {
-        fn of(t: RunTimes, label: []const u8, eta: ?f64, waited: f64, typical: ?f64, least: u32) bool {
+        fn of(t: RunTimes, label: []const u8, eta: ?f64, waited: f64, typical: ?f64, least: u32, exact: bool) bool {
+            if (exact) {
+                const run = t.typical(label) orelse return false;
+                return run <= (eta orelse return false);
+            }
             return policy.backfill(t.typical(label), eta, waited, typical, least);
         }
     };
     for (queue[1..pos]) |e| {
         if (e.record.exclusive or fits.need(e.record, budget) > free) continue;
-        if (rule.of(times, e.record.label, ahead[0].eta, head_waited, head_typical, ctx.cfg.patience_s)) return null;
+        if (rule.of(times, e.record.label, ahead[0].eta, head_waited, head_typical, ctx.cfg.patience_s, strict)) return null;
     }
     const min = fits.need(.{ .cores = o.request.min }, budget);
-    if (!rule.of(times, o.label, ahead[0].eta, head_waited, head_typical, ctx.cfg.patience_s)) return null;
+    if (!rule.of(times, o.label, ahead[0].eta, head_waited, head_typical, ctx.cfg.patience_s, strict)) return null;
     return .{ .min = min, .max = @max(min, @min(o.request.max, free)) };
 }
 

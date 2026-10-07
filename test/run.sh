@@ -695,6 +695,25 @@ print(" ".join("%s%s:%s:%s" % (j["label"], "@" + j["host"] if j["host"] else "",
   check "nothing is lost" "[[ '$got' != *lost* ]]"
 }
 
+t_backfill_exclusive() {
+  setup backfill_exclusive
+  local f=$T/order h=$CPUQ_DIR/history.jsonl
+  mkdir -p "$CPUQ_DIR"
+  ev() { printf '{"v":1,"event":"%s","id":"%s","t":%s,"pid":1,"label":"%s","cores":%s,"min":%s,"max":%s,"exit":0}\n' "$@" >>"$h"; }
+  # History: hold runs 4 s, quick 0.2 s; unknown has no history.
+  ev started 1 1 hold 3 3 3; ev ended 1 5 hold 3 3 3
+  ev started 2 1 quick 1 1 1; ev ended 2 1.2 quick 1 1 1
+  "$CPUQ" run --cores 3 --label hold -- sleep 4 & wait_held 3
+  "$CPUQ" run --exclusive --label timing -- sh -c "echo timing >>$f" & wait_waiters 1
+  # Behind an exclusive head, only a job known to end before the machine
+  # drains uses the free cores meanwhile; one with no history waits.
+  "$CPUQ" run --cores 1 --label unknown -- sh -c "echo unknown >>$f" & wait_waiters 2
+  "$CPUQ" run --cores 1 --label quick -- sh -c "echo quick >>$f" &
+  wait
+  local got; got=$(tr '\n' ' ' <"$f")
+  check "behind an exclusive head a job known to be quick uses the free cores; an unknown one waits for the window (got: $got)" "[ '$got' = 'quick timing unknown ' ]"
+}
+
 t_lease_exclusive() {
   setup lease-exclusive
   local bin=$T/bin f=$T/log
@@ -1062,7 +1081,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold last_words lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold last_words backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"
