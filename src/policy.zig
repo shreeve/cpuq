@@ -88,6 +88,9 @@ pub const Config = struct {
     /// Stop a job whose processes together use more memory than this, in
     /// bytes (`max_memory`, e.g. 16G); 0 leaves memory unwatched.
     max_memory: u64 = 0,
+    /// Admit nothing while the memory the kernel says is available falls
+    /// under this, in bytes (`min_available`, e.g. 6G); 0 leaves it unchecked.
+    min_available: u64 = 0,
     /// Lend the cores a holder has left idle for a minute to the head of the
     /// queue (`lend`).
     lend: bool = true,
@@ -162,6 +165,8 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             cfg.target = t;
         } else if (std.mem.eql(u8, key, "settle")) {
             cfg.settle_s = parseCount(value) orelse return bad(diag, "settle must be a whole number of seconds, at least 1");
+        } else if (std.mem.eql(u8, key, "min_available")) {
+            cfg.min_available = parseBytes(value) orelse return bad(diag, "min_available must be off or a size such as 6G or 512M");
         } else if (std.mem.eql(u8, key, "max_memory")) {
             cfg.max_memory = parseBytes(value) orelse return bad(diag, "max_memory must be off or a size such as 16G or 512M");
         } else if (std.mem.eql(u8, key, "patience")) {
@@ -360,11 +365,16 @@ pub const Machine = struct {
     /// The share of all CPUs busy since the last look, 0 to 1; null when
     /// not measured.
     busy: ?f64 = null,
+    /// Memory available, in bytes (Linux MemAvailable; macOS the kernel's
+    /// free share of memory); null when not read.
+    available: ?u64 = null,
 };
 
 pub const Gate = union(enum) {
     open,
     pressure,
+    /// Available memory under `min_available`: the bytes available.
+    low_memory: u64,
     load: f64,
     spacing: f64,
 };
@@ -373,6 +383,7 @@ pub const Gate = union(enum) {
 /// check is off.
 pub fn gate(cfg: Config, m: Machine, budget: u32, valve: ?*Valve, now: i64) Gate {
     if (cfg.pressure_check and m.pressure == .high) return .pressure;
+    if (cfg.min_available > 0) if (m.available) |av| if (av < cfg.min_available) return .{ .low_memory = av };
     if (valve) |v| if (cfg.load_check) switch (v.check(now, m.load1, budget, cfg.load_margin, m.busy)) {
         .open => {},
         .tripped => return .{ .load = m.load1 },

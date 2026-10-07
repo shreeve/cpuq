@@ -200,6 +200,7 @@ fn machine(ctx: *Ctx) policy.Machine {
         .active = sys.activeCpus(),
         .load1 = sys.loadAverage()[0],
         .pressure = if (ctx.cfg.pressure_check) sys.memoryPressure(ctx.io, ctx.cfg.pressure_psi) else .off,
+        .available = if (ctx.cfg.min_available > 0) sys.memAvailable(ctx.io) else null,
     };
 }
 
@@ -1022,6 +1023,7 @@ fn gateText(buf: []u8, g: policy.Gate, budget: u32) []const u8 {
     return switch (g) {
         .open => "open",
         .pressure => "closed: memory pressure",
+        .low_memory => |av| std.mem.print(buf, "closed: memory low ({d:.1} GB available)", .{@as(f64, @floatFromInt(av)) / (1 << 30)}) catch "closed: memory low",
         .load => |l| std.mem.print(buf, "closed: load {d:.1} (valve tripped; budget {d})", .{ l, budget }) catch "closed: load",
         .spacing => |l| std.mem.print(buf, "spacing admissions: load {d:.1} over budget {d}", .{ l, budget }) catch "spacing",
     };
@@ -2190,12 +2192,13 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
     const gate: C = .{ .text = switch (v.gate) {
         .open => "open",
         .pressure => "closed: memory",
+        .low_memory => |av| a.print("closed: {d:.1} GB free", .{@as(f64, @floatFromInt(av)) / (1 << 30)}) catch "closed: memory",
         .load => |l| a.print("closed: load {d:.1}", .{l}) catch "closed",
         .spacing => |l| a.print("spacing: load {d:.1}", .{l}) catch "spacing",
     }, .tint = switch (v.gate) {
         .open => .good,
         .spacing => .warn,
-        .load, .pressure => .bad,
+        .load, .pressure, .low_memory => .bad,
     } };
     const free = v.budget -| v.held;
     const summary: table.Table = .{
@@ -2646,7 +2649,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
                 .state = @tagName(g),
                 .load = switch (g) {
                     .load, .spacing => |l| l,
-                    .open, .pressure => null,
+                    .open, .pressure, .low_memory => null,
                 },
                 .text = gate_text,
                 .trip = if (ctx.cfg.load_check) @as(f64, @floatFromInt(budget)) + ctx.cfg.load_margin else null,

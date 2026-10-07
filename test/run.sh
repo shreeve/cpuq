@@ -1108,6 +1108,15 @@ print(h["signal"], "%.1f" % ((h.get("memory") or 0) / 2**30), j["small"]["exit"]
   check "a job over max_memory is stopped and recorded so; a small one is not (rc $rc, $got)" "[ $small = 0 ] && [ $rc = 143 ] && [[ '$got' == '15 0.'* ]] && [[ '$got' == *' 0' ]] && grep -q 'over max_memory' '$T/err'"
 }
 
+t_min_available() {
+  setup min-available "min_available = 1000000G"
+  "$CPUQ" run --cores 1 --max-wait 1 -- true 2>/dev/null; local rc=$?
+  local state; state=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print(json.load(sys.stdin)["gate"]["state"])')
+  setup min-available-low "min_available = 1M"
+  "$CPUQ" run --cores 1 --max-wait 1 -- true; local rc2=$?
+  check "under min_available nothing starts (rc $rc, gate $state); above it, it does (rc $rc2)" "[ $rc = 75 ] && [ '$state' = low_memory ] && [ $rc2 = 0 ]"
+}
+
 t_status() {
   setup status
   "$CPUQ" run --cores 4 --label build -- sleep 1.5 & wait_held 4
@@ -1122,7 +1131,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold last_words measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold last_words measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory min_available status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

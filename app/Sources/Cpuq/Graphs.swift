@@ -659,8 +659,8 @@ struct GraphsView: View {
             let cpus = Double(ProcessInfo.processInfo.activeProcessorCount)
             let active = min(here.reduce(0) { $0 + $1.active } / n, cpus)
             let busy = here.compactMap(\.busy)
-            let shut = here.filter { $0.gate == "pressure" || $0.gate == "load" }
-            let reason = shut.count * 2 >= here.count ? (shut.filter { $0.gate == "pressure" }.count * 2 >= shut.count ? "memory" : "load") : nil
+            let shut = here.filter { $0.gate == "pressure" || $0.gate == "low_memory" || $0.gate == "load" }
+            let reason = shut.count * 2 >= here.count ? (shut.filter { $0.gate != "load" }.count * 2 >= shut.count ? "memory" : "load") : nil
             return MachineColumn(active: active, outside: min(here.reduce(0) { $0 + $1.outside } / n, cpus - active),
                                  load: here.reduce(0) { $0 + $1.load } / n, trip: here.last?.trip,
                                  busy: busy.isEmpty ? nil : busy.reduce(0, +) / Double(busy.count),

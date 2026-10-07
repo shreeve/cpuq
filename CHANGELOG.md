@@ -2,6 +2,15 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.8.1 — 2026-10-07
+
+- `min_available` (config, off by default, e.g. `min_available = 6G`): admit nothing while the
+  memory the kernel says is available falls under it (Linux MemAvailable; macOS the kernel's free
+  share of memory, as `memory_pressure` prints it). The gate reads "closed: memory low (N GB
+  available)", state `low_memory`. Linux's pressure gate reacts only once processes stall on
+  memory, too late for a swap that fills (pup's 8 GB of swap kept filling under concurrent
+  builds and benchmarks).
+
 ## 0.8.0 — 2026-10-07
 
 - Measured admission, the new default (`admit = measured`): jobs are admitted by the CPU they

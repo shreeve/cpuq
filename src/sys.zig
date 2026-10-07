@@ -99,6 +99,31 @@ pub fn busyBetween(a: Ticks, b: Ticks) ?f64 {
     return @as(f64, @floatFromInt(b.busy -| a.busy)) / @as(f64, @floatFromInt(b.total - a.total));
 }
 
+/// Memory available for new work, in bytes: Linux /proc/meminfo
+/// MemAvailable; macOS the kernel's free share (kern.memorystatus_level, the
+/// percentage `memory_pressure` prints) of hw.memsize. Null when unreadable.
+pub fn memAvailable(io: Io) ?u64 {
+    if (is_darwin) {
+        var level: c_int = 0;
+        var len: usize = @sizeOf(c_int);
+        if (c.sysctlbyname("kern.memorystatus_level", &level, &len, null, 0) != 0) return null;
+        var total: u64 = 0;
+        len = @sizeOf(u64);
+        if (c.sysctlbyname("hw.memsize", &total, &len, null, 0) != 0) return null;
+        return total / 100 * @as(u64, @intCast(std.math.clamp(level, 0, 100)));
+    }
+    var buf: [4096]u8 = undefined;
+    const text = Io.Dir.cwd().readFile(io, "/proc/meminfo", &buf) catch return null;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "MemAvailable:")) continue;
+        var f = std.mem.tokenizeScalar(u8, line["MemAvailable:".len..], ' ');
+        const kb = std.fmt.parseInt(u64, f.next() orelse return null, 10) catch return null;
+        return kb * 1024;
+    }
+    return null;
+}
+
 /// macOS kern.memorystatus_vm_pressure_level; Linux /proc/pressure/memory
 /// when present.
 pub fn memoryPressure(io: Io, psi_threshold: f64) policy.Pressure {

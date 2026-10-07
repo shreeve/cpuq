@@ -384,6 +384,7 @@ count oversubscribes it on purpose. The config file is `CPUQ_CONFIG`, default
 | `lend_after` | 60 | seconds a core must stay idle before it is lent |
 | `right_size` | on | cap a range request near what its label has used |
 | `max_memory` | off | stop a job whose processes together use more memory than this (e.g. `16G`) |
+| `min_available` | off | admit nothing while available memory is under this (e.g. `6G`) |
 
 With `max_memory` set, each running job's cpuq looks every 2 seconds at the
 memory its command and the command's descendants use (macOS's physical

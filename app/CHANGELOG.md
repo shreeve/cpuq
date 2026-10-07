@@ -16,6 +16,8 @@ From a design review of the window, and for cpuq 0.8's measured admission.
 - Under cpuq 0.8's measured admission the budget limits nothing: Stacked marks the CPUs alone,
   and the lanes show each job on its own cores (nothing is lent).
 - The line under the verdict is empty until there is something under the pointer.
+- A gate shut by cpuq 0.8.1's `min_available` (memory low) is shaded and named like memory
+  pressure.
 
 ## 0.9.1 — 2026-10-07
 
