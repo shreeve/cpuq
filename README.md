@@ -371,10 +371,13 @@ an invalid edit keeps the settings in force and says so.
 Waiters are served high before normal before low, in arrival order within a
 class. A waiter is promoted one class per `aging` seconds of waiting, so low
 is never starved. The command also runs in a scheduling class: on macOS,
-high leaves it unchanged, normal runs it at utility QoS and low at background
-QoS (on Apple Silicon background work stays on the efficiency cores, with
-throttled I/O), set with `posix_spawnattr_set_qos_class_np`; on Linux, nice 0,
-5 and 15. Children inherit it. `--exclusive` runs (they time benchmarks) and
+high and normal leave it unchanged and low runs at background QoS (on Apple
+silicon background work stays on the efficiency cores, with throttled I/O),
+set with `posix_spawnattr_set_qos_class_np`; on Linux, nice 0, 5 and 15.
+Normal ran at utility QoS before 0.7.11, which on Apple silicon keeps work
+mostly on the efficiency cores: four normal jobs took about 3 of the 6
+efficiency cores and left the performance cores idle, and ran about 20%
+slower than at the default class. Children inherit it. `--exclusive` runs (they time benchmarks) and
 `--qos none` never change it.
 
 ### The machine gates

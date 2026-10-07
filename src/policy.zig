@@ -2,6 +2,7 @@
 //! admission gates, the admission rule and the MAKEFLAGS rewrite. Every input
 //! is a value, so the unit tests inject them.
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Priority = enum(u2) {
     high = 0,
@@ -21,7 +22,12 @@ pub fn qosFor(priority: Priority, exclusive: bool, qos_enabled: bool) Qos {
     if (exclusive or !qos_enabled) return .unchanged;
     return switch (priority) {
         .high => .unchanged,
-        .normal => .utility,
+        // On Apple silicon utility QoS keeps work mostly on the efficiency
+        // cores: four normal jobs took about 3 of the 6 efficiency cores and
+        // left the performance cores idle, and ran about 20% slower than at
+        // the default class. So normal leaves the class alone on macOS; on
+        // Linux, where every core is alike, nice 5 only lets high win.
+        .normal => if (builtin.os.tag.isDarwin()) .unchanged else .utility,
         .low => .background,
     };
 }
@@ -745,7 +751,7 @@ test "aging promotes one class per period" {
 
 test "qos classes" {
     try testing.expectEqual(Qos.unchanged, qosFor(.high, false, true));
-    try testing.expectEqual(Qos.utility, qosFor(.normal, false, true));
+    try testing.expectEqual(if (builtin.os.tag.isDarwin()) Qos.unchanged else Qos.utility, qosFor(.normal, false, true));
     try testing.expectEqual(Qos.background, qosFor(.low, false, true));
     try testing.expectEqual(Qos.unchanged, qosFor(.low, true, true));
     try testing.expectEqual(Qos.unchanged, qosFor(.low, false, false));

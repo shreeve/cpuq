@@ -973,7 +973,7 @@ t_qos() {
   none=$("$CPUQ" run --priority low --qos none -- "$CPUQ" qos)
   echo "  outside: $outside; low: $low; normal: $normal; high: $high; exclusive low: $excl; low --qos none: $none"
   if [ "$(uname)" = Darwin ]; then
-    check "low runs at background QoS, normal at utility" "[ '$low' = background ] && [ '$normal' = utility ]"
+    check "low runs at background QoS; normal keeps the class, so it can use the performance cores" "[ '$low' = background ] && [ '$normal' = '$outside' ]"
   else
     check "low runs at nice 15, normal at nice 5" "[ '$low' = 'nice 15' ] && [ '$normal' = 'nice 5' ]"
   fi

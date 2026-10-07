@@ -2,6 +2,14 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.7.11 — 2026-10-07
+
+- On macOS a normal-priority job keeps its scheduling class (high and normal alike; low still
+  runs at background QoS, and so does a job on lent cores). It ran at utility QoS, which on
+  Apple silicon keeps work mostly on the efficiency cores: four normal jobs took about 3 of the
+  Mac's 6 efficiency cores while its 4 performance cores sat idle, and ran about 20% slower
+  than at the default class. Cpuq.app's Per CPU view showed it. Linux keeps nice 5 for normal.
+
 ## 0.7.10 — 2026-10-06
 
 - A lease taken `--exclusive` goes next: its claim on the machine's cores queues at the
