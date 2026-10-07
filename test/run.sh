@@ -731,7 +731,9 @@ open("'"$f"'", "a").write("spin-done\n")' & local s=$!
   ev() { printf '{"v":1,"event":"%s","id":"%s","t":%s,"pid":1,"label":"%s","cores":%s,"cpu":%s,"exit":0}\n' "$@" >>"$h"; }
   for n in 1 2 3; do ev started $n 1 sized 4 0; ev ended $n 11 sized 4 27; done
   local got; got=$("$CPUQ" run --label sized -- sh -c 'echo $CPUQ_CORES')
-  check "without --cores a label's history picks the cores (got $got, want 3)" "[ '$got' = 3 ]"
+  # 3 from history, at most half the CPUs (a CI runner may have only 3 or 4).
+  local want; want=$(python3 -c 'import os; print(min(3, max(os.cpu_count() // 2, 1)))')
+  check "without --cores a label's history picks the cores (got $got, want $want)" "[ '$got' = '$want' ]"
 }
 
 t_backfill_exclusive() {
