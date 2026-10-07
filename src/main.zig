@@ -214,6 +214,9 @@ fn budgetNow(ctx: *Ctx, m: policy.Machine) u32 {
 
 const RunOptions = struct {
     request: policy.Request = .{ .min = 2, .max = 2 },
+    /// Whether --cores was given; under measured admission, without it the
+    /// label's history picks the count.
+    cores_given: bool = false,
     priority: policy.Priority = .normal,
     exclusive: bool = false,
     label: []const u8 = "",
@@ -278,6 +281,7 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             if (std.mem.eql(u8, name, r)) o.run_only = r;
         }
         if (std.mem.eql(u8, name, "--cores")) {
+            o.cores_given = true;
             o.request = policy.Request.parse(value) orelse {
                 _ = usageError("--cores needs K or MIN-MAX, whole numbers of at least 1, not '{s}'", .{value});
                 return null;
@@ -532,7 +536,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
     // needs them.
     var run_times: ?RunTimes = null;
     // Right-sizing: a range request capped near what its label has used.
-    if (!named and !o.exclusive and cfg.right_size and !o.request.fixed() and o.label.len != 0) {
+    if (!named and !o.exclusive and cfg.admit == .cores and cfg.right_size and !o.request.fixed() and o.label.len != 0) {
         run_times = RunTimes.load(ctx, ctx.arena);
         if (run_times.?.uses.get(o.label)) |uses| {
             const sized = policy.rightSize(o.request, uses.items);
@@ -637,11 +641,29 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
         wake_ms = @max(wake_ms, 100);
 
         if (pos > 0) {
-            // Behind the head: start now if backfill allows (never for a
-            // named lease or an exclusive run, and only through an open
-            // gate), else block on the waiter just ahead until it is
-            // admitted or gone.
-            if (!named and !o.exclusive and cfg.backfill) {
+            // Behind the head, under measured admission: start now if this
+            // job fits the room the running ones leave and the head, which
+            // goes first, still fits after it (or has waited less than its
+            // patience); behind an exclusive head, only as backfill allows.
+            if (!named and !o.exclusive and cfg.admit == .measured and !queue[0].record.exclusive and mach.pressure != .high) {
+                if (run_times == null) run_times = RunTimes.load(ctx, ctx.arena);
+                const m = measuredLoad(ctx, st, a, &run_times.?);
+                if (!m.exclusive) {
+                    const room = targetCpus(ctx) - m.charged;
+                    const req = policy.measuredGrant(o.request, o.cores_given, labelUses(run_times.?, o.label), room, cores);
+                    const mine = policy.charge(useOf(run_times.?, o.label), null, 0, 1, req.max);
+                    const head = queue[0].record;
+                    const head_need = policy.charge(useOf(run_times.?, head.label), null, 0, 1, @max(head.cores, 1));
+                    const head_waited: f64 = @floatFromInt(now - head.since);
+                    if (mine <= room and (mine + head_need <= room or head_waited < @as(f64, @floatFromInt(cfg.patience_s)))) {
+                        if (state.takeTokens(st, ctx.arena, req, false, poolCap(ctx), poolCap(ctx), false, 0) catch |err| fail("tokens: {t}", .{err})) |grant| {
+                            std.debug.print("cpuq: starting ahead of {s} on {d} {s}: the CPUs have room\n", .{ if (head.label.len != 0) head.label else head.cmd, grant.files.len, if (grant.files.len == 1) "core" else "cores" });
+                            return admitted(ctx, st, o, &rec, grant, ticket, ticket_name, job, now, true);
+                        }
+                    }
+                }
+                if (pos < 8) wake_ms = @min(wake_ms, 2000);
+            } else if (!named and !o.exclusive and cfg.backfill) {
                 const budget: u32 = budgetNow(ctx, mach);
                 var v = st.readValve();
                 const g = policy.gate(cfg, mach, budget, if (o.load_check) &v else null, now);
@@ -672,10 +694,29 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
 
         var valve = st.readValve();
         const budget: u32 = if (named) o.slots else budgetNow(ctx, mach);
-        last_gate = if (named) .open else policy.gate(cfg, mach, budget, if (o.load_check) &valve else null, now);
-        const check_load = !named and o.load_check and cfg.load_check;
+        // Measured admission has no load valve: it reads the CPUs directly.
+        const valved = o.load_check and cfg.admit == .cores;
+        last_gate = if (named) .open else policy.gate(cfg, mach, budget, if (valved or o.exclusive and o.load_check) &valve else null, now);
+        const check_load = !named and o.load_check and cfg.load_check and (cfg.admit == .cores or o.exclusive);
         if (check_load) st.writeValve(valve);
-        if (last_gate == .open) {
+        if (last_gate == .open and !named and !o.exclusive and cfg.admit == .measured) {
+            // Measured admission: count each running job at what it uses (at
+            // its expected use while it settles) and start while that leaves
+            // room for this one, unless the CPUs are measured all but full.
+            if (run_times == null) run_times = RunTimes.load(ctx, ctx.arena);
+            const m = measuredLoad(ctx, st, a, &run_times.?);
+            const target = targetCpus(ctx);
+            const room = target - m.charged;
+            const req = policy.measuredGrant(o.request, o.cores_given, labelUses(run_times.?, o.label), room, cores);
+            const mine = policy.charge(useOf(run_times.?, o.label), null, 0, 1, req.max);
+            const saturated = if (mach.busy) |b| b >= 0.97 else false;
+            if (!m.exclusive and (m.charged == 0 or (mine <= room and !saturated))) {
+                if (state.takeTokens(st, ctx.arena, req, false, poolCap(ctx), poolCap(ctx), false, 0) catch |err| fail("tokens: {t}", .{err})) |grant| {
+                    if (o.cores_given == false and grant.files.len != 2) std.debug.print("cpuq: {d} {s} for {s}, from its history\n", .{ grant.files.len, if (grant.files.len == 1) "core" else "cores", if (o.label.len != 0) o.label else "this job" });
+                    return admitted(ctx, st, o, &rec, grant, ticket, ticket_name, job, now, false);
+                }
+            }
+        } else if (last_gate == .open) {
             const exclusive_running = (state.scanLeases(st, a, true) catch @as([]state.Entry, &.{})).len != 0;
             // Leave the next waiter's minimum free when this grant can spare it.
             const reserve: u32 = if (queue.len > 1 and !queue[1].record.exclusive) @min(queue[1].record.cores, budget) else 0;
@@ -722,6 +763,68 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
         st.unlock();
         io.sleep(.fromMilliseconds(cfg.poll_ms), .awake) catch {};
     }
+}
+
+/// The CPUs' worth of use measured admission fills: `target`, else the
+/// active CPUs.
+fn targetCpus(ctx: *Ctx) f64 {
+    return ctx.cfg.target orelse @floatFromInt(sys.activeCpus());
+}
+
+/// Under measured admission the tokens only number the cores handed out (for
+/// CPUQ_CORES, the jobserver and the app's lanes); their pool is just a
+/// sanity cap, four times the target.
+fn poolCap(ctx: *Ctx) u32 {
+    return @intFromFloat(@max(@ceil(targetCpus(ctx) * 4), 4));
+}
+
+/// A label's last runs' average active cores (`history.used`).
+fn labelUses(rt: RunTimes, label: []const u8) []const f64 {
+    if (label.len == 0) return &.{};
+    return if (rt.uses.get(label)) |u| u.items else &.{};
+}
+
+/// A label's expected use: the 75th percentile of its last runs; null with
+/// fewer than three.
+fn useOf(rt: RunTimes, label: []const u8) ?f64 {
+    return policy.typicalUse(labelUses(rt, label));
+}
+
+/// What the running jobs count for under measured admission, and whether an
+/// exclusive run holds the machine. Each job is measured (its command tree's
+/// CPU, averaged over about half of `settle`), the measurements kept in the
+/// state directory so the next head carries on from them. Call with the
+/// admission lock held.
+fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const RunTimes) struct { charged: f64, exclusive: bool } {
+    const leases = state.scanLeases(st, a, false) catch return .{ .charged = 0, .exclusive = false };
+    const procs = sys.processes(ctx.io, a);
+    const old = st.readUsage(a);
+    var fresh: std.StringHashMapUnmanaged(policy.Use) = .empty;
+    const now_ms: i64 = @intFromFloat(nowFloat(ctx.io) * 1000);
+    const now_s = @divFloor(now_ms, 1000);
+    var charged: f64 = 0;
+    for (leases) |l| {
+        if (l.record.exclusive) return .{ .charged = std.math.inf(f64), .exclusive = true };
+        if (st.isPaused(l.name)) continue;
+        const expected = useOf(rt.*, l.record.label);
+        if (l.record.child <= 0) {
+            charged += policy.charge(expected, null, 0, ctx.cfg.settle_s, l.record.cores);
+            continue;
+        }
+        var u = old.get(l.name) orelse policy.Use{};
+        const before_ms = u.at_ms;
+        u.observe(sys.treeCpu(procs, l.record.child), now_ms, l.record.cores, ctx.cfg.settle_s);
+        u.observeRunnable(sys.treeRunning(procs, l.record.child), if (before_ms == 0) 0 else @as(f64, @floatFromInt(now_ms - before_ms)) / 1000, ctx.cfg.settle_s);
+        fresh.put(a, l.name, u) catch {};
+        // What it asks of the CPUs: what it gets, or on a contended machine
+        // the threads it has ready to run, whichever is more (at most twice
+        // what it holds, so a burst of short processes cannot swamp it).
+        const asks = @max(u.avg, @min(u.runnable, 2 * @as(f64, @floatFromInt(l.record.cores))));
+        const measured: ?f64 = if (u.at_ms != 0) asks else null;
+        charged += policy.charge(expected, measured, now_s - l.record.since, ctx.cfg.settle_s, l.record.cores);
+    }
+    st.writeUsage(a, fresh);
+    return .{ .charged = charged, .exclusive = false };
 }
 
 /// Cores held by every lease now.
@@ -2000,6 +2103,10 @@ const JsonStatus = struct {
     schema: u32 = 1,
     version: []const u8 = version,
     dir: []const u8 = "",
+    /// How jobs are admitted: "measured" (by the CPU they use, up to
+    /// `target` CPUs) or "cores" (by the cores they hold, up to `budget`).
+    admit: []const u8 = "",
+    target: ?f64 = null,
     budget: u32 = 0,
     cores: u32 = 0,
     active_cores: u32 = 0,
@@ -2526,6 +2633,8 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
     if (json) {
         const s: JsonStatus = .{
             .dir = st.path,
+            .admit = @tagName(ctx.cfg.admit),
+            .target = if (ctx.cfg.admit == .measured) targetCpus(ctx) else null,
             .budget = budget,
             .cores = sys.totalCpus(ctx.io),
             .active_cores = m.active,
@@ -2571,7 +2680,9 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
         return 0;
     }
     w.print("dir     {s}\n", .{st.path}) catch {};
-    w.print("budget  {d} cores ({d} online of {d}); in use {d}, free {d}\n", .{ budget, m.active, sys.totalCpus(ctx.io), held, budget -| held }) catch {};
+    if (ctx.cfg.admit == .measured) {
+        w.print("admit   by measured use, up to {d} CPUs; {d} cores handed out ({d} online of {d})\n", .{ targetCpus(ctx), held, m.active, sys.totalCpus(ctx.io) }) catch {};
+    } else w.print("budget  {d} cores ({d} online of {d}); in use {d}, free {d}\n", .{ budget, m.active, sys.totalCpus(ctx.io), held, budget -| held }) catch {};
     w.print("load    {d:.2} {d:.2} {d:.2}; memory pressure {s}; gate {s}\n", .{ load[0], load[1], load[2], pressure, gate_text }) catch {};
     if (showOutside(smp.outside, g)) {
         w.writeAll("outside") catch {};

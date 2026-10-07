@@ -203,6 +203,36 @@ active of the cores in use on average, which says how to size `--cores`.
 `--max-wait` and without a terminal (an agent's tool call) is told once that
 its own timeout may end the wait first.
 
+### Measured admission
+
+Since 0.8, cpuq admits jobs by the CPU they use, not by the cores they hold
+(`admit = measured`, the default). A job asks for cores as before, and its
+command still gets `CPUQ_CORES` and a jobserver of that size, but what counts
+against the machine is its measured demand: for its first `settle` seconds
+(20) its expected use from history (the 75th percentile of its label's
+recent runs, else all it holds), then what it is measured asking of the CPUs,
+smoothed over about ten seconds. Demand is the larger of the CPU time it gets
+and the threads it has ready to run, so a job that a contended machine slows
+still counts in full. The head of the queue starts when its expected use fits
+under `target` (the active CPUs) beside what the running jobs count for, and
+the CPUs are not measured at 97% busy or more; a job behind the head starts
+too when it fits and leaves the head room, or the head has waited less than
+`patience`.
+
+So a job that holds 4 cores and sleeps leaves them to others within seconds;
+nothing has to be lent, and no budget has to be overbooked. Without `--cores`,
+the label's history picks the count (its 75th percentile plus 0.3, at most
+half the CPUs; 2 with fewer than three runs), and a range gives way toward
+its minimum when the CPUs are nearly full. Exclusive runs and named leases
+work as before. `admit = cores` restores the reservation model below, with
+the budget, lending and the load valve; the two can be compared on the same
+machine from `cpuq history`.
+
+On 42 hours of this Mac's jobs, replayed, the reservation model with a budget
+of 10 kept jobs waiting 223 s on average, and 14 with lending about 15 s;
+admission by measured use, about 1 s, while the cpuq jobs used about 30% of
+the CPUs throughout.
+
 ### Right-sizing
 
 A grant is fixed for the whole run, so a range request that takes everything
@@ -335,7 +365,10 @@ count oversubscribes it on purpose. The config file is `CPUQ_CONFIG`, default
 
 | key | default | meaning |
 |---|---|---|
-| `budget` | active cores - 2 | cores to hand out |
+| `admit` | measured | `measured`: by the CPU jobs use; `cores`: by the cores they hold |
+| `target` | active CPUs | measured admission: the CPUs' worth of demand to fill |
+| `settle` | 20 | measured admission: seconds a job counts at its expected use |
+| `budget` | active cores - 2 | cores to hand out (`admit = cores`, and exclusive runs) |
 | `active_cap` | on | cap the budget by the cores active now |
 | `load_check` | on | the load safety valve (below) |
 | `load_margin` | 4 | the valve trips above budget + margin |

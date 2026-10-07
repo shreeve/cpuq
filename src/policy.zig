@@ -42,8 +42,23 @@ pub fn borrowersYield() bool {
     return !builtin.os.tag.isDarwin();
 }
 
+/// How the head of the queue decides it may start: `measured` counts each
+/// running job at what it uses (its expected use while it settles), and
+/// starts the next while that leaves room on the CPUs; `cores` counts each
+/// at the cores it holds, against the budget (cpuq before 0.8).
+pub const Admit = enum { measured, cores };
+
 pub const Config = struct {
+    /// How jobs are admitted (`admit`).
+    admit: Admit = .measured,
+    /// Measured admission: the CPUs' worth of use to fill (`target`); null
+    /// means the active CPUs.
+    target: ?f64 = null,
+    /// Measured admission: seconds a job counts at its expected use before
+    /// its measured use takes over (`settle`).
+    settle_s: u32 = 20,
     /// Cores cpuq may hand out; null means the active core count minus 2.
+    /// Under measured admission, only exclusive runs and `admit = cores` use it.
     budget: ?u32 = null,
     /// Admit nothing while the 1-minute load exceeds budget + load_margin.
     load_check: bool = true,
@@ -139,6 +154,14 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             cfg.lend_after_s = parseCount(value) orelse return bad(diag, "lend_after must be a whole number of seconds, at least 1");
         } else if (std.mem.eql(u8, key, "lend")) {
             cfg.lend = parseBool(value) orelse return bad(diag, "lend must be on or off");
+        } else if (std.mem.eql(u8, key, "admit")) {
+            cfg.admit = std.meta.stringToEnum(Admit, value) orelse return bad(diag, "admit must be measured or cores");
+        } else if (std.mem.eql(u8, key, "target")) {
+            const t = parseNonNegative(value) orelse return bad(diag, "target must be a number of CPUs, more than 0");
+            if (t <= 0) return bad(diag, "target must be a number of CPUs, more than 0");
+            cfg.target = t;
+        } else if (std.mem.eql(u8, key, "settle")) {
+            cfg.settle_s = parseCount(value) orelse return bad(diag, "settle must be a whole number of seconds, at least 1");
         } else if (std.mem.eql(u8, key, "max_memory")) {
             cfg.max_memory = parseBytes(value) orelse return bad(diag, "max_memory must be off or a size such as 16G or 512M");
         } else if (std.mem.eql(u8, key, "patience")) {
@@ -450,6 +473,21 @@ pub const Use = struct {
     /// When last measured (ms), and the command tree's CPU then (ns).
     at_ms: i64 = 0,
     cpu_ns: u64 = 0,
+    /// Threads ready to run, averaged like `avg`: what the job asks of the
+    /// CPUs, which on a contended machine is more than it gets.
+    runnable: f64 = 0,
+
+    /// Takes in the runnable threads seen now, averaged over the same time as
+    /// `observe` (call it after `observe`, with that `dt`).
+    pub fn observeRunnable(u: *Use, n: u32, dt_s: f64, after_s: u32) void {
+        const tau_s = @max(@as(f64, @floatFromInt(after_s)) / 2, 0.5);
+        const r: f64 = @floatFromInt(n);
+        if (dt_s <= 0) {
+            u.runnable = r;
+            return;
+        }
+        u.runnable += std.math.clamp(dt_s / tau_s, 0, 1) * (r - u.runnable);
+    }
 
     /// Takes in a measurement: `cpu_ns` of CPU time at `now_ms`, averaging
     /// over half of `after_s`, the time a core must stay idle to be lent.
@@ -520,6 +558,63 @@ pub fn lendRoom(load1: f64, cpus: u32) u32 {
 /// than 3 the request stands. The cap is the 75th percentile plus 0.3,
 /// rounded, kept within the request: a job that uses 0.8 asking 1-4 gets
 /// 1-1, one that uses 3.5 keeps 1-4. A fixed count is never changed.
+/// The 75th percentile of a label's last 64 runs' average active cores;
+/// null with fewer than three runs to judge by.
+pub fn typicalUse(uses: []const f64) ?f64 {
+    if (uses.len < 3) return null;
+    var sorted: [64]f64 = undefined;
+    const n: usize = @min(uses.len, sorted.len);
+    @memcpy(sorted[0..n], uses[uses.len - n ..]);
+    std.mem.sort(f64, sorted[0..n], {}, std.sort.asc(f64));
+    return sorted[(n - 1) * 3 / 4];
+}
+
+/// What a running job counts for under measured admission: its expected use
+/// (from history, else all it holds) until it has run `settle_s`, then what it
+/// is measured using, however little; never less than a twentieth of a core.
+pub fn charge(expected: ?f64, measured: ?f64, age_s: i64, settle_s: u32, held: u32) f64 {
+    const h: f64 = @floatFromInt(held);
+    if (measured) |m| if (age_s >= settle_s) return @max(m, 0.05);
+    return @max(@min(expected orelse h, h), 0.05);
+}
+
+/// The cores to hand a job under measured admission, as a range for the
+/// tokens: a fixed count asked for stands; a range is capped near the label's
+/// use (as `rightSize`); with no count asked for, the label's use decides
+/// (its 75th percentile plus 0.3, rounded, at most half the CPUs), else 2.
+/// Short of room, the range gives way down to its minimum.
+pub fn measuredGrant(req: Request, asked: bool, uses: []const f64, room: f64, cpus: u32) Request {
+    var r = req;
+    if (!asked) {
+        r = if (typicalUse(uses)) |u| blk: {
+            const k: u32 = @intFromFloat(@max(@round(u + 0.3), 1));
+            break :blk .{ .min = 1, .max = std.math.clamp(k, 1, @max(cpus / 2, 1)) };
+        } else .{ .min = 2, .max = 2 };
+    } else if (!r.fixed()) r = rightSize(r, uses);
+    if (r.fixed()) return r;
+    const fit: u32 = @intFromFloat(@max(@floor(room), 0));
+    return .{ .min = r.min, .max = std.math.clamp(fit, r.min, r.max) };
+}
+
+test "measured admission charges and grants" {
+    // Settling: the expected use within what it holds; then the measured use.
+    try std.testing.expectEqual(@as(f64, 1.5), charge(1.5, 0.2, 5, 20, 4));
+    try std.testing.expectEqual(@as(f64, 4), charge(null, 0.2, 5, 20, 4));
+    try std.testing.expectEqual(@as(f64, 0.2), charge(1.5, 0.2, 30, 20, 4));
+    try std.testing.expectEqual(@as(f64, 0.05), charge(1.5, 0, 30, 20, 4));
+    try std.testing.expectEqual(@as(f64, 2), charge(3, null, 30, 20, 2));
+    // Grants: no count asked, from history; a fixed count stands; a range
+    // gives way to the room, down to its minimum.
+    const used = [_]f64{ 2.6, 2.8, 2.7 };
+    try std.testing.expectEqual(Request{ .min = 1, .max = 3 }, measuredGrant(.{ .min = 2, .max = 2 }, false, &used, 9, 10));
+    try std.testing.expectEqual(Request{ .min = 2, .max = 2 }, measuredGrant(.{ .min = 2, .max = 2 }, false, &.{}, 9, 10));
+    try std.testing.expectEqual(Request{ .min = 4, .max = 4 }, measuredGrant(.{ .min = 4, .max = 4 }, true, &used, 1, 10));
+    try std.testing.expectEqual(Request{ .min = 1, .max = 2 }, measuredGrant(.{ .min = 1, .max = 4 }, true, &.{}, 2.5, 10));
+    try std.testing.expectEqual(Request{ .min = 2, .max = 2 }, measuredGrant(.{ .min = 2, .max = 8 }, true, &.{}, 0.5, 10));
+    // At most half the CPUs from history alone.
+    try std.testing.expectEqual(Request{ .min = 1, .max = 5 }, measuredGrant(.{ .min = 2, .max = 2 }, false, &.{ 9, 9, 9 }, 20, 10));
+}
+
 pub fn rightSize(req: Request, uses: []const f64) Request {
     if (req.fixed() or uses.len < 3) return req;
     var sorted: [64]f64 = undefined;

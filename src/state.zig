@@ -128,6 +128,7 @@ pub const State = struct {
                 .idle_since = std.fmt.parseInt(i64, f.next() orelse continue, 10) catch continue,
                 .at_ms = std.fmt.parseInt(i64, f.next() orelse continue, 10) catch continue,
                 .cpu_ns = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue,
+                .runnable = if (f.next()) |r| std.fmt.parseFloat(f64, r) catch 0 else 0,
             };
             map.put(arena, name, u) catch {};
         }
@@ -139,7 +140,7 @@ pub const State = struct {
         var it = map.iterator();
         while (it.next()) |e| {
             const u = e.value_ptr.*;
-            out.print(arena, "{s} {d:.3} {d} {d} {d}\n", .{ e.key_ptr.*, u.avg, u.idle_since, u.at_ms, u.cpu_ns }) catch return;
+            out.print(arena, "{s} {d:.3} {d} {d} {d} {d:.3}\n", .{ e.key_ptr.*, u.avg, u.idle_since, u.at_ms, u.cpu_ns, u.runnable }) catch return;
         }
         s.dir.writeFile(s.io, .{ .sub_path = "usage", .data = out.items }) catch {};
     }

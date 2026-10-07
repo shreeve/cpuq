@@ -470,6 +470,9 @@ pub const Proc = struct {
     /// Monitor and top call Memory, compressed pages included), Linux's
     /// resident set.
     mem: u64 = 0,
+    /// Threads running or ready to run now (macOS pti_numrunning; Linux, 1
+    /// when the process is in state R).
+    running: u32 = 0,
 };
 
 /// Every process the caller can see, with its parent and its CPU time so
@@ -497,6 +500,12 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
             for ([_]usize{ 16, 24 }) |at| own +%= std.mem.readInt(u64, ru[at..][0..8], .little);
             // ri_phys_footprint, at 72.
             const mem = std.mem.readInt(u64, ru[72..80], .little);
+            // struct proc_taskinfo (PROC_PIDTASKINFO, 96 bytes): pti_numrunning at 88.
+            var task: [96]u8 align(8) = undefined;
+            const running: u32 = if (proc_pidinfo(pid, 4, 0, &task, task.len) == task.len)
+                @intCast(@max(std.mem.readInt(i32, task[88..92], .little), 0))
+            else
+                0;
             var bsd: [136]u8 align(8) = undefined;
             var ppid: i32 = undefined;
             var name: []const u8 = "";
@@ -519,6 +528,7 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
                 .cpu_ns = @intCast(@as(u128, ticks) * tb.numer / tb.denom),
                 .own_ns = @intCast(@as(u128, own) * tb.numer / tb.denom),
                 .mem = mem,
+                .running = running,
             }) catch break;
         }
         return list.items;
@@ -544,9 +554,11 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
         var ticks: u64 = 0;
         var own: u64 = 0;
         var rss: u64 = 0;
+        var running: u32 = 0;
         var i: usize = 0;
         while (fields.next()) |f| : (i += 1) {
             switch (i) {
+                0 => running = if (std.mem.eql(u8, f, "R")) 1 else 0,
                 1 => ppid = std.fmt.parseInt(i32, f, 10) catch 0,
                 11, 12 => {
                     const t = std.fmt.parseInt(u64, f, 10) catch 0;
@@ -560,7 +572,7 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
             }
             if (i == 21) break;
         }
-        list.append(arena, .{ .pid = pid, .ppid = ppid, .name = arena.dupe(u8, text[open + 1 .. close]) catch "", .cpu_ns = ticks * std.time.ns_per_s / tick_hz, .own_ns = own * std.time.ns_per_s / tick_hz, .mem = rss * page }) catch break;
+        list.append(arena, .{ .pid = pid, .ppid = ppid, .name = arena.dupe(u8, text[open + 1 .. close]) catch "", .cpu_ns = ticks * std.time.ns_per_s / tick_hz, .own_ns = own * std.time.ns_per_s / tick_hz, .mem = rss * page, .running = running }) catch break;
     }
     return list.items;
 }
@@ -592,6 +604,26 @@ fn zombieParent(pid: c_int) ?i32 {
     var len: usize = info.len;
     if (sysctl(&mib, mib.len, &info, &len, null, 0) != 0 or len != info.len) return null;
     return @bitCast(std.mem.readInt(u32, info[560..564], .little));
+}
+
+/// Threads ready to run in a process and its descendants.
+pub fn treeRunning(procs: []const Proc, root: i32) u32 {
+    var total: u32 = 0;
+    var frontier: [512]i32 = undefined;
+    var len: usize = 1;
+    frontier[0] = root;
+    var seen: usize = 0;
+    while (seen < len) : (seen += 1) {
+        const pid = frontier[seen];
+        for (procs) |p| {
+            if (p.pid == pid) total += p.running;
+            if (p.ppid == pid and p.pid != pid and len < frontier.len) {
+                frontier[len] = p.pid;
+                len += 1;
+            }
+        }
+    }
+    return total;
 }
 
 /// The memory a process and its descendants use, in bytes.

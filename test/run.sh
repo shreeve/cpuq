@@ -32,6 +32,7 @@ setup() {
     echo "pressure_check = off"
     echo "poll = 0.2"
     echo "active_cap = off" # a budget of 9 on a machine with fewer cores
+    echo "admit = cores" # the reservation model; t_measured tests the default
     for line in "$@"; do echo "$line"; done
   } >"$CPUQ_CONFIG"
   echo "== $CUR"
@@ -695,6 +696,44 @@ print(" ".join("%s%s:%s:%s" % (j["label"], "@" + j["host"] if j["host"] else "",
   check "nothing is lost" "[[ '$got' != *lost* ]]"
 }
 
+t_measured() {
+  # Measured admission, the default: a job counts at what it uses once it has
+  # run a second (settle), so idle holders leave room and busy ones do not.
+  setup measured "admit = measured" "target = 2" "settle = 1"
+  local f=$T/order h=$CPUQ_DIR/history.jsonl
+  mkdir -p "$CPUQ_DIR"
+  # Two holders of 4 cores each that sleep: they settle near 0.
+  "$CPUQ" run --cores 4 --label idle1 -- sleep 5 & local i1=$!
+  "$CPUQ" run --cores 4 --label idle2 -- sleep 5 & local i2=$!
+  local t0; t0=$(now)
+  sleep 2.5
+  "$CPUQ" run --cores 1 --label small -- true; local rc=$?
+  local dt; dt=$(python3 -c "print('%.1f' % ($(now) - $t0))")
+  wait $i1 $i2
+  check "beside 8 held but idle cores a job starts at once (after ${dt}s, rc $rc)" "[ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if $dt < 4.5 else 1)'"
+  # A holder keeping 2 CPUs busy fills the target: the next waits for it.
+  "$CPUQ" run --cores 2 --label spin -- python3 -c 'import os, time
+e = time.time() + 3
+if os.fork() == 0:
+    while time.time() < e: pass
+    os._exit(0)
+while time.time() < e: pass
+os.wait()
+open("'"$f"'", "a").write("spin-done\n")' & local s=$!
+  sleep 1.5
+  "$CPUQ" run --cores 1 --label after -- sh -c "echo after >>$f"
+  wait $s
+  check "a job waits while busy holders fill the target (got: $(tr '\n' ' ' <"$f"))" "[ \"\$(tr '\n' ' ' <'$f')\" = 'spin-done after ' ]"
+  # No --cores: the label's history picks the count (75th percentile + 0.3).
+  setup measured-sized "admit = measured" "target = 10" "settle = 1"
+  h=$CPUQ_DIR/history.jsonl
+  mkdir -p "$CPUQ_DIR"
+  ev() { printf '{"v":1,"event":"%s","id":"%s","t":%s,"pid":1,"label":"%s","cores":%s,"cpu":%s,"exit":0}\n' "$@" >>"$h"; }
+  for n in 1 2 3; do ev started $n 1 sized 4 0; ev ended $n 11 sized 4 27; done
+  local got; got=$("$CPUQ" run --label sized -- sh -c 'echo $CPUQ_CORES')
+  check "without --cores a label's history picks the cores (got $got, want 3)" "[ '$got' = 3 ]"
+}
+
 t_backfill_exclusive() {
   setup backfill_exclusive
   local f=$T/order h=$CPUQ_DIR/history.jsonl
@@ -1081,7 +1120,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold last_words backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold last_words measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

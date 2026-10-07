@@ -2,6 +2,24 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.8.0 — 2026-10-07
+
+- Measured admission, the new default (`admit = measured`): jobs are admitted by the CPU they
+  ask of the machine, not by the cores they hold. A running job counts at its expected use
+  from history for its first `settle` seconds (20), then at its measured demand: the larger of
+  the CPU time it gets and the threads it has ready to run, so a job a contended machine slows
+  still counts in full. The head starts when its expected use fits under `target` (the active
+  CPUs) and the CPUs are not measured at 97% busy; one behind it starts when it fits and leaves
+  the head room. Idle reservations no longer block anyone, so lending and an overbooked budget
+  are not needed. Replayed on 42 hours of this Mac's jobs: mean wait about 1 s, against 223 s
+  for the old budget of 10 and 15 s for 14 with lending.
+- Without `--cores`, under measured admission the label's history picks the count (its 75th
+  percentile of use plus 0.3, at most half the CPUs; 2 with fewer than three runs), and a range
+  gives way toward its minimum when the CPUs are nearly full.
+- `admit = cores` restores the reservation model (budget, lending, load valve, right-sizing).
+- `cpuq status` names the admission in force; `--json` adds `admit` and `target`.
+- Processes carry their runnable threads (macOS pti_numrunning; Linux state R).
+
 ## 0.7.14 — 2026-10-07
 
 - Backfill behind an exclusive head: while a timing window waits for running work to drain, a
