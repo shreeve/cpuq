@@ -238,6 +238,15 @@ var last_words: [2]Words = .{ .{}, .{} };
 /// it again replaces them. A signal cpuq was started with ignored stays
 /// ignored.
 pub fn armLastWords(slot: u1, path: []const u8, head: []const u8, tail: []const u8, with_signal: bool) void {
+    // A fatal signal arriving while the line is rewritten waits until it is
+    // in place: the kit closes a hold's stdin and kills it at once, which
+    // lands exactly as cpuq re-arms.
+    var fatal: c.sigset_t = undefined;
+    _ = c.sigemptyset(&fatal);
+    for ([_]c.SIG{ .HUP, .INT, .QUIT, .TERM }) |sig| _ = c.sigaddset(&fatal, sig);
+    var before: c.sigset_t = undefined;
+    _ = c.sigprocmask(c.SIG.BLOCK, &fatal, &before);
+    defer _ = c.sigprocmask(c.SIG.SETMASK, &before, null);
     const w = &last_words[slot];
     w.armed.store(false, .release);
     if (path.len >= last_path.len or head.len > w.head.len or tail.len > w.tail.len) return;

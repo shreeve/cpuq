@@ -473,8 +473,9 @@ t_history() {
   setup history
   "$CPUQ" run --cores 2-4 --priority high --label h:build -- python3 -c 'import os, time
 def spin():
-    e = time.time() + 1
-    while time.time() < e: pass
+    # A second of CPU time each, however busy the machine is.
+    e = time.process_time() + 1
+    while time.process_time() < e: pass
 if os.fork() == 0: spin(); os._exit(0)
 spin(); os.wait()'
   "$CPUQ" run --label h:fail -- sh -c 'exit 3'
@@ -487,12 +488,12 @@ spin(); os.wait()'
   local got; got=$("$CPUQ" history --json | python3 -c 'import json, sys
 j = {x["label"]: x for x in json.load(sys.stdin)}
 b = j["h:build"]
-print(b["state"], b["cores"], "%.1f" % (b["used"] or 0), j["h:fail"]["exit"], j["h:impatient"]["state"], j["h:crash"]["state"], j["h:hog"]["exit"])')
+print(b["state"], b["cores"], "%.1f" % ((b["used"] or 0) * (b["ran"] or 0)), j["h:fail"]["exit"], j["h:impatient"]["state"], j["h:crash"]["state"], j["h:hog"]["exit"])')
   echo "  history: $got"
-  check "history records grant, use, exit, give-up and loss (got: $got)" "python3 -c '
+  check "history records grant, CPU time (both spinners, about 2 s), exit, give-up and loss (got: $got)" "python3 -c '
 import sys
 f = \"$got\".split()
-ok = f[0] == \"done\" and f[1] == \"4\" and 1.0 < float(f[2]) < 2.5 and f[3:] == [\"3\", \"gave_up\", \"lost\", \"0\"]
+ok = f[0] == \"done\" and f[1] == \"4\" and 1.7 < float(f[2]) < 2.6 and f[3:] == [\"3\", \"gave_up\", \"lost\", \"0\"]
 sys.exit(0 if ok else 1)'"
   local n; n=$("$CPUQ" history --label 'h:b*' --json | python3 -c 'import json, sys; print(len(json.load(sys.stdin)))')
   check "history --label filters by prefix (got $n)" "[ '$n' = 1 ]"
