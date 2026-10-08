@@ -538,6 +538,8 @@ pub const Proc = struct {
     /// Threads running or ready to run now (macOS pti_numrunning; Linux, 1
     /// when the process is in state R).
     running: u32 = 0,
+    /// Stopped (SIGSTOP), or a zombie, which runs no more either.
+    stopped: bool = false,
 };
 
 /// Every process the caller can see, with its parent and its CPU time so
@@ -574,7 +576,10 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
             var bsd: [136]u8 align(8) = undefined;
             var ppid: i32 = undefined;
             var name: []const u8 = "";
+            var stopped = true;
             if (proc_pidinfo(pid, 3, 0, &bsd, bsd.len) == bsd.len) {
+                // pbi_status at 4: SSTOP is 4.
+                stopped = std.mem.readInt(u32, bsd[4..8], .little) == 4;
                 ppid = @bitCast(std.mem.readInt(u32, bsd[16..20], .little));
                 // pbi_name (32 bytes at 64) when set, else pbi_comm (16 at 48).
                 const long = std.mem.sliceTo(bsd[64..96], 0);
@@ -594,6 +599,7 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
                 .own_ns = @intCast(@as(u128, own) * tb.numer / tb.denom),
                 .mem = mem,
                 .running = running,
+                .stopped = stopped,
             }) catch break;
         }
         return list.items;
@@ -620,10 +626,15 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
         var own: u64 = 0;
         var rss: u64 = 0;
         var running: u32 = 0;
+        var stopped = false;
         var i: usize = 0;
         while (fields.next()) |f| : (i += 1) {
             switch (i) {
-                0 => running = if (std.mem.eql(u8, f, "R")) 1 else 0,
+                0 => {
+                    running = if (std.mem.eql(u8, f, "R")) 1 else 0;
+                    // T stopped, t stopped by a tracer, Z a zombie.
+                    stopped = f.len == 1 and (f[0] == 'T' or f[0] == 't' or f[0] == 'Z');
+                },
                 1 => ppid = std.fmt.parseInt(i32, f, 10) catch 0,
                 11, 12 => {
                     const t = std.fmt.parseInt(u64, f, 10) catch 0;
@@ -637,7 +648,7 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
             }
             if (i == 21) break;
         }
-        list.append(arena, .{ .pid = pid, .ppid = ppid, .name = arena.dupe(u8, text[open + 1 .. close]) catch "", .cpu_ns = ticks * std.time.ns_per_s / tick_hz, .own_ns = own * std.time.ns_per_s / tick_hz, .mem = rss * page, .running = running }) catch break;
+        list.append(arena, .{ .pid = pid, .ppid = ppid, .name = arena.dupe(u8, text[open + 1 .. close]) catch "", .cpu_ns = ticks * std.time.ns_per_s / tick_hz, .own_ns = own * std.time.ns_per_s / tick_hz, .mem = rss * page, .running = running, .stopped = stopped }) catch break;
     }
     return list.items;
 }

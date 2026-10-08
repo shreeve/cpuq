@@ -1724,6 +1724,7 @@ fn cmdControl(ctx: *Ctx, comptime action: []const u8, args: []const [:0]const u8
                     _ = std.c.kill(p.pid, .CONT);
                 } else _ = std.c.kill(p.pid, if (comptime std.mem.eql(u8, action, "pause")) .STOP else .CONT);
             };
+            if (comptime std.mem.eql(u8, action, "pause")) stopTree(ctx, a, r.child);
             st.setPaused(e.name, comptime std.mem.eql(u8, action, "pause"));
         } else if (comptime std.mem.eql(u8, action, "stop")) {
             _ = std.c.kill(r.pid, .TERM);
@@ -1732,6 +1733,27 @@ fn cmdControl(ctx: *Ctx, comptime action: []const u8, args: []const [:0]const u8
     }
     ctx.out.flush() catch {};
     return 0;
+}
+
+/// Looks at a paused job's tree again until every process in it is stopped,
+/// stopping any still running, for up to half a second. macOS drops a
+/// SIGSTOP that lands while a process execs (it suspends the task, and exec
+/// replaces the task), and a child its parent starts just as the parent
+/// stops is not there to be stopped.
+fn stopTree(ctx: *Ctx, a: std.mem.Allocator, root: std.c.pid_t) void {
+    for (0..10) |_| {
+        ctx.io.sleep(.fromMilliseconds(50), .awake) catch {};
+        const procs = sys.processes(ctx.io, a);
+        const in_tree = a.alloc(bool, procs.len) catch return;
+        @memset(in_tree, false);
+        sys.markTree(procs, root, in_tree);
+        var running = false;
+        for (procs, in_tree) |p, mine| if (mine and !p.stopped) {
+            _ = std.c.kill(p.pid, .STOP);
+            running = true;
+        };
+        if (!running) return;
+    }
 }
 
 fn cmdWait(ctx: *Ctx, args: []const [:0]const u8) u8 {
