@@ -656,7 +656,7 @@ struct HourCard: View {
     /// than five minutes ago. Only the window forgets; cpuq's history is untouched.
     @ViewBuilder private var clearMenu: some View {
         if let at = scrub, Date().timeIntervalSince(at) > 5 {
-            Button("Clear Older Data") {
+            Button("Clear Prior Data") {
                 model.clear(before: at)
                 scrub = nil
             }
