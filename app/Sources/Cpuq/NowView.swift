@@ -83,6 +83,8 @@ struct Moment {
     var window: String?
     /// The window holds the Mac now (else it waits for running work to end).
     var windowHolds = false
+    /// The 1-minute load: threads running or ready to run, the demand on the CPUs.
+    var load: Double?
 
     var total: Double { shares.reduce(0) { $0 + $1.cpu } + outside }
     var free: Double { max(cpus - total, 0) }
@@ -112,6 +114,7 @@ struct Moment {
                    asks: GraphModel.wants($0), need: $0.exclusive ? Int(cpus) : max($0.cores, 1), since: Date(timeIntervalSince1970: Double($0.since)))
         }
         out.gateShut = s.gate.state == "open" ? nil : s.gate.text
+        out.load = s.load.first
         if let h = s.holders.first(where: \.exclusive) {
             out.window = GraphModel.label(h.label, h.command)
             out.windowHolds = true
@@ -134,6 +137,7 @@ struct Moment {
         let sample = m.samples.min { abs($0.at.timeIntervalSince(t)) < abs($1.at.timeIntervalSince(t)) }
             .flatMap { abs($0.at.timeIntervalSince(t)) < 15 ? $0 : nil }
         if let sample {
+            out.load = sample.load
             out.outside = sample.busy.map { max($0 * cpus - jobs, 0) } ?? sample.outside
             if !sample.gateOpen { out.gateShut = sample.gateText }
         }
@@ -337,14 +341,23 @@ struct HeroCard: View {
                 Text("/ \(Int(cpus))").font(.system(size: 26, weight: .medium)).tracking(-0.26).foregroundStyle(Alive.ink3)
             }
             .padding(.top, 6)
-            (Text("CPUs busy · ").foregroundColor(Alive.ink2) + Text("\(Int((moment.total / cpus * 100).rounded()))%").fontWeight(.semibold))
-                .font(.system(size: 13))
+            demandLine.font(.system(size: 13))
+                .help("CPUs busy: how much of the \(Int(cpus)) CPUs is working. Demand: the threads running or ready to run (the load), over the CPUs; past 100% the CPUs are overbooked, some threads taking turns, which keeps every CPU busy.")
             Spacer(minLength: 8)
             VStack(alignment: .leading, spacing: 7) {
                 capacityVerdict
                 waitingVerdict
             }
         }
+    }
+
+    /// "CPUs busy · 100%", and while more threads want CPU than there are CPUs, "(demand 239%)".
+    private var demandLine: Text {
+        var t = Text("CPUs busy · ").foregroundColor(Alive.ink2) + Text("\(Int((moment.total / cpus * 100).rounded()))%").fontWeight(.semibold)
+        if let load = moment.load, load > cpus * 1.05 {
+            t = t + Text("  (demand \(Int((load / cpus * 100).rounded()))%)").fontWeight(.semibold).foregroundColor(Alive.rose)
+        }
+        return t
     }
 
     private func verdict(_ symbol: String, _ title: String, _ detail: String, tint: Color? = nil) -> some View {

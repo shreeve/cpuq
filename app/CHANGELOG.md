@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.7 — 2026-10-08
+
+- Beside the CPUs busy, the demand on them while it is more than they can do: "CPUs busy · 100%
+  (demand 239%)", the 1-minute load over the CPUs. Past 100% the CPUs are overbooked and threads
+  take turns, which is what keeps every CPU busy; the cells, a CPU's worth each, stop at 10.
+
 ## 0.13.6 — 2026-10-08
 
 - A timing window (a job run `--exclusive`, holding the Mac alone for a clean measurement) shows
