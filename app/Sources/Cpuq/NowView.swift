@@ -847,18 +847,21 @@ struct HourCard: View {
                 let idle = run.map { cpus - cols[$0].total }.reduce(0, +) / Double(run.count)
                 PointMark(x: .value("Time", mid), y: .value("CPUs", cpus * 0.78))
                     .opacity(0)
-                    .annotation(position: .overlay) {
+                    .annotation(position: .overlay, overflowResolution: .init(x: .fit(to: .chart), y: .disabled)) {
                         VStack(spacing: 0) {
                             Text("\(peak) waiting").font(.system(size: 12, weight: .semibold))
                             Text("\(Int(idle.rounded())) CPUs idle").font(.system(size: 10.5)).opacity(0.85)
                         }
                         .fixedSize()
+                        .halo()
                     }
             }
             ForEach(Array(quiet.enumerated()), id: \.offset) { _, run in
                 PointMark(x: .value("Time", cols[(run.lowerBound + run.upperBound) / 2].mid), y: .value("CPUs", 1.2))
                     .opacity(0)
-                    .annotation(position: .overlay) { Text("quiet · nothing queued").font(.system(size: 11)).foregroundStyle(Alive.ink3).fixedSize() }
+                    .annotation(position: .overlay, overflowResolution: .init(x: .fit(to: .chart), y: .disabled)) {
+                        Text("quiet · nothing queued").font(.system(size: 11)).foregroundStyle(Alive.ink3).fixedSize().halo()
+                    }
             }
             if let scrub { RuleMark(x: .value("Time", scrub)).foregroundStyle(Color.primary.opacity(0.5)) }
         }
@@ -1111,6 +1114,15 @@ extension View {
             .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Alive.cardEdge))
             .shadow(color: .black.opacity(0.05), radius: 1, y: 1)
             .shadow(color: .black.opacity(0.05), radius: 9, y: 6)
+    }
+}
+
+extension View {
+    /// A soft rim in the card's color around text drawn over the chart, so it reads over any
+    /// band or line beneath it, as a map's labels do.
+    func halo() -> some View {
+        shadow(color: Alive.card, radius: 0.6).shadow(color: Alive.card, radius: 0.6)
+            .shadow(color: Alive.card, radius: 1.2).shadow(color: Alive.card, radius: 1.8)
     }
 }
 
