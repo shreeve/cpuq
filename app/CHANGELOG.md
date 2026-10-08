@@ -3,6 +3,28 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.0 — 2026-10-07
+
+A new Now tab, from the "Beautiful and alive" design.
+
+- The CPUs busy right now, large ("8.4 / 10"), with two verdicts: working at full capacity,
+  partly busy or quiet; and nobody waiting, a fair wait (the CPUs are full) or a needless one
+  (CPUs idle while jobs wait), with the longest wait.
+- The Mac's ten CPUs as glass cells that fill with each project's color, then other work, with a
+  gentle wave on the surface. Jobs waiting sit in a tray beside them and flow toward the first
+  free cell; when they wait beside idle CPUs, the empty glass glows rose and says so. A right
+  click on a waiting job moves it to the front, starts it or cancels it.
+- The last hour on the same 0-to-10 scale: stacked by project, a white line along each band, or a
+  lane per CPU (performance cores above efficiency cores). Rose marks where jobs waited while
+  CPUs sat idle, with how many and for how long; a strip under it counts who waited, grey when
+  the wait was fair. Pointing at any moment replays it in the cells. The time axis is even.
+- Every job in one list: the CPU it uses, the cores it holds, how long it has run, and for each
+  waiting job what it asks for and why it waits. More than fit scroll inside the list.
+- The toolbar shows cpuq's gate, memory pressure and the load.
+- Gone: the reserved-core lanes, the four view toggles, the key, the project table and the
+  uneven time axis.
+- A project's color is reassigned when another on screen shares it.
+
 ## 0.12.0 — 2026-10-07
 
 Under cpuq 0.8's measured admission, every view now speaks of the Mac's real CPUs; what cpuq

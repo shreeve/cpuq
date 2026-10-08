@@ -3,21 +3,20 @@
 The cpuq menu-bar companion for macOS 14 and later on Apple silicon. The chip in the menu bar
 fills a cell per quarter of the core budget in use (none when idle, all four when the budget is
 full). Its menu shows what runs (cores in use and active), what waits and when it should start,
-the named leases, and any load outside cpuq. **Show Graphs** (⌘G) opens a window that leads with one line saying
-whether cpuq is admitting work (or why its gate is shut, and for how long), with cores in use of
-the budget, cores active, who waits, the load against the load valve, how busy the CPUs are and
-memory pressure, then shows the last hour as views stacked
-over one time axis, widest first, each turned on or off at the top right (remembered): All
-CPUs, the Mac's CPUs busy with cpuq's jobs and with other work, with the load, the valve's trip
-level and high memory pressure; Per CPU (off at first), each CPU a thin row, darker the
-busier, performance cores above efficiency cores; Stacked, each column's cores stacked busy first, from the floor,
-and idle (striped) above; Lanes, one lane per core of the budget, a held core striped in its
-project's color and filled in as far as it is busy; and the cores waiting jobs ask for (always
-shown). Stretches the gate was shut are shaded through all of them. Pointing at any of them says what was there then; recent
-time is widest. A table under it lists what each project has in use
-and active, and who waits; its History tab sums `cpuq history` per project. Each running job in the menu has Pause or Resume and Stop, and each waiting job Move to Front,
+the named leases, and any load outside cpuq. **Show Graphs** (⌘G) opens a window on the Mac's ten CPUs, never more. Its Now tab leads with
+the CPUs busy right now ("8.4 / 10") and two verdicts: whether the Mac is working at full capacity,
+and whether anyone waits, fairly (the CPUs are full) or needlessly (CPUs sit idle while jobs
+wait, the one case worth hunting). Beside them the CPUs are ten glass cells that fill with each
+project's color, then other work; the jobs waiting sit in a tray and flow toward the first free
+cell, and when they wait beside idle CPUs the empty glass glows rose. Under them, the last hour on
+the same 0-to-10 scale, either stacked by project or as a lane per CPU (performance cores above
+efficiency cores), with rose where jobs waited while CPUs sat idle and a strip of how many waited;
+pointing at any moment replays it in the cells. Last, every job: the CPU it uses, the cores it
+holds, how long it has run, and for each waiting job what it asks for and why it waits. The
+toolbar shows cpuq's gate, memory pressure and the load. Its History tab sums `cpuq history`
+per project. Each running job in the menu has Pause or Resume and Stop, and each waiting job Move to Front,
 Start Now and Cancel (with cpuq 0.7.1 or later); the graphs window offers the same on a right
-click. **Open Live View in Terminal** runs `cpuq status --watch`.
+click of a job or a waiting job. **Open Live View in Terminal** runs `cpuq status --watch`.
 
 The app only reads `cpuq status --json` (every 3 seconds) and `cpuq history --json`, so cpuq
 works the same with or without it. It finds cpuq where install.sh and Homebrew put it
