@@ -223,8 +223,10 @@ public struct Job: Decodable, Sendable, Equatable {
     public var waited: Double?
     public var ran: Double?
     public var used: Double?
+    /// It held the machine alone (`--exclusive`).
+    public var exclusive = false
 
-    private enum Keys: String, CodingKey { case state, pool, label, id, cores, slots, queued, started, ended, waited, ran, used }
+    private enum Keys: String, CodingKey { case state, pool, label, id, cores, slots, queued, started, ended, waited, ran, used, exclusive }
 
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
@@ -240,6 +242,7 @@ public struct Job: Decodable, Sendable, Equatable {
         waited = try c.decodeIfPresent(Double.self, forKey: .waited)
         ran = try c.decodeIfPresent(Double.self, forKey: .ran)
         used = try c.decodeIfPresent(Double.self, forKey: .used)
+        exclusive = try c.decodeIfPresent(Bool.self, forKey: .exclusive) ?? false
     }
 
     /// The cpuq pid in `id`.

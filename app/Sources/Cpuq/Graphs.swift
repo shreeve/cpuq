@@ -21,6 +21,8 @@ final class GraphModel {
         var active: [Reading] = []
         /// Its average active cores from history, for the stretch the app did not watch.
         var average: Double?
+        /// A timing window (`--exclusive`): it held the Mac alone.
+        var exclusive = false
     }
 
     struct Reading {
@@ -38,6 +40,8 @@ final class GraphModel {
         var need = 1
         var from: Date
         var to: Date?
+        /// Waiting for a timing window of its own.
+        var exclusive = false
     }
 
     /// The machine at one poll, for the top line when pointing at that moment.
@@ -127,7 +131,7 @@ final class GraphModel {
                 let from = Date(timeIntervalSince1970: Double(h.since))
                 blocks.append(Block(id: id, project: Self.project(h.label), label: Self.label(h.label, h.command),
                                     lanes: h.slots.isEmpty ? fit(h.cores, from: from) : h.slots, from: from,
-                                    active: h.using.map { [Reading(at: now, cores: $0)] } ?? []))
+                                    active: h.using.map { [Reading(at: now, cores: $0)] } ?? [], exclusive: h.exclusive))
                 remember(Self.project(h.label))
             }
         }
@@ -139,7 +143,7 @@ final class GraphModel {
             queued.insert(id)
             if !waits.contains(where: { $0.id == id }) {
                 waits.append(Wait(id: id, project: Self.project(w.label), label: Self.label(w.label, w.command), cores: Self.wants(w),
-                                  need: w.exclusive ? budget : max(w.cores, 1), from: Date(timeIntervalSince1970: Double(w.since))))
+                                  need: w.exclusive ? budget : max(w.cores, 1), from: Date(timeIntervalSince1970: Double(w.since)), exclusive: w.exclusive))
                 remember(Self.project(w.label))
             }
         }
@@ -204,10 +208,10 @@ final class GraphModel {
             let from = Date(timeIntervalSince1970: max(start, since))
             let to = Date(timeIntervalSince1970: j.ended ?? start)
             blocks.append(Block(id: "\(j.pid ?? 0)-\(Int(start))", project: Self.project(j.label), label: j.label.isEmpty ? "-" : j.label,
-                                lanes: j.slots ?? fit(cores, from: from, to: to), from: from, to: to, average: j.used))
+                                lanes: j.slots ?? fit(cores, from: from, to: to), from: from, to: to, average: j.used, exclusive: j.exclusive))
             if let w = j.waited, w >= 1, start > since {
                 waits.append(Wait(id: "h\(j.id)", project: Self.project(j.label), label: j.label, cores: "\(cores) cores",
-                                  need: cores, from: Date(timeIntervalSince1970: start - w), to: from))
+                                  need: cores, from: Date(timeIntervalSince1970: start - w), to: from, exclusive: j.exclusive))
             }
             remember(Self.project(j.label))
         }

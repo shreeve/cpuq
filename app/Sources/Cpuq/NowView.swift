@@ -78,11 +78,16 @@ struct Moment {
     var waiters: [Waiter] = []
     /// Why cpuq's gate was shut, if it was.
     var gateShut: String?
+    /// A timing window (`--exclusive`) holding the Mac, or first in line and waiting for it to
+    /// empty: its label. Jobs waiting meanwhile wait on purpose.
+    var window: String?
+    /// The window holds the Mac now (else it waits for running work to end).
+    var windowHolds = false
 
     var total: Double { shares.reduce(0) { $0 + $1.cpu } + outside }
     var free: Double { max(cpus - total, 0) }
     /// Jobs waited while CPUs sat idle with the gate open: the case to fix.
-    var needless: Bool { !waiters.isEmpty && free >= 2 && gateShut == nil }
+    var needless: Bool { !waiters.isEmpty && free >= 2 && gateShut == nil && window == nil }
 
     /// No more than the CPUs, whatever the readings say.
     mutating func fit() {
@@ -107,6 +112,12 @@ struct Moment {
                    asks: GraphModel.wants($0), need: $0.exclusive ? Int(cpus) : max($0.cores, 1), since: Date(timeIntervalSince1970: Double($0.since)))
         }
         out.gateShut = s.gate.state == "open" ? nil : s.gate.text
+        if let h = s.holders.first(where: \.exclusive) {
+            out.window = GraphModel.label(h.label, h.command)
+            out.windowHolds = true
+        } else if let w = s.waiters.min(by: { $0.order < $1.order }), w.exclusive {
+            out.window = GraphModel.label(w.label, w.command)
+        }
         out.fit()
         return out
     }
@@ -125,6 +136,12 @@ struct Moment {
         if let sample {
             out.outside = sample.busy.map { max($0 * cpus - jobs, 0) } ?? sample.outside
             if !sample.gateOpen { out.gateShut = sample.gateText }
+        }
+        if let b = m.blocks.first(where: { $0.exclusive && $0.from <= t && ($0.to ?? .distantFuture) >= t }) {
+            out.window = b.label
+            out.windowHolds = true
+        } else if let w = m.waits.first(where: { $0.exclusive && $0.from <= t && ($0.to ?? .distantFuture) >= t }) {
+            out.window = w.label
         }
         out.waiters = m.waits.filter { $0.from <= t && ($0.to ?? .distantFuture) >= t }.map {
             Waiter(id: $0.id, pid: 0, label: $0.label, project: $0.project, asks: $0.cores, need: $0.need, since: $0.from)
@@ -147,9 +164,11 @@ final class HourCache {
         /// The app was watching: there are machine readings.
         var watched = false
         var gateShut = false
+        /// A timing window held the Mac or waited for it to empty: waiting then was on purpose.
+        var window = false
         var perCPU: [Double]?
         var total: Double { shares.values.reduce(0, +) + outside }
-        var needless: Bool { waiting > 0 && cpus - total >= 2 && !gateShut }
+        var needless: Bool { waiting > 0 && cpus - total >= 2 && !gateShut && !window }
     }
 
     struct Hour {
@@ -227,6 +246,9 @@ final class HourCache {
             let t = cols[i].total
             if t > cpus { let f = cpus / t; cols[i].shares = cols[i].shares.mapValues { $0 * f }; cols[i].outside *= f }
             cols[i].waiting = m.waits.filter { $0.from < cols[i].to && ($0.to ?? end) > cols[i].from }.count
+            let c = cols[i]
+            cols[i].window = m.blocks.contains { $0.exclusive && $0.from < c.to && ($0.to ?? end) > c.from }
+                || m.waits.contains { $0.exclusive && $0.from < c.to && ($0.to ?? end) > c.from }
         }
         let projects = Set(cols.flatMap(\.shares.keys)).sorted { (m.slot($0), $0) < (m.slot($1), $1) }
         return Hour(span: span, step: step, end: end, columns: cols, projects: projects)
@@ -337,7 +359,10 @@ struct HeroCard: View {
 
     @ViewBuilder private var capacityVerdict: some View {
         let free = String(format: "%.1f", moment.free)
-        if moment.needless {
+        if let w = moment.window {
+            verdict("lock.fill", "Timing window", moment.windowHolds ? "\(w) has the Mac alone" : "\(w) waits for the Mac to empty",
+                    tint: Alive.windowTint)
+        } else if moment.needless {
             verdict("exclamationmark.triangle.fill", "\(moment.waiters.count) waiting while \(free) CPUs sit idle",
                     "Waiting with room to spare", tint: Alive.rose)
         } else if let shut = moment.gateShut {
@@ -354,7 +379,9 @@ struct HeroCard: View {
     @ViewBuilder private var waitingVerdict: some View {
         let ref = moment.at ?? Date()
         if let longest = moment.waiters.map({ ref.timeIntervalSince($0.since) }).max() {
-            if moment.needless {
+            if moment.window != nil {
+                verdict("clock", "\(moment.waiters.count) waiting \(duration(longest))", "They start when the window ends")
+            } else if moment.needless {
                 verdict("clock.fill", "Longest wait \(duration(longest))", "This is the case to fix", tint: Alive.rose)
             } else if moment.gateShut != nil {
                 verdict("clock", "\(moment.waiters.count) waiting \(duration(longest))", "They start when the gate opens")
@@ -439,7 +466,7 @@ struct WaitingTray: View {
                     .foregroundStyle(bad ? Alive.rose : Alive.ink2).fontWeight(bad ? .semibold : .regular)
             }
             .font(.caption)
-            Text(bad ? "asks \(w.asks) · CPUs idle" : "asks \(w.asks) · \(String(format: "%.1f", moment.free)) free")
+            Text(moment.window != nil ? "asks \(w.asks) · timing window" : bad ? "asks \(w.asks) · CPUs idle" : "asks \(w.asks) · \(String(format: "%.1f", moment.free)) free")
                 .font(.system(size: 10.5)).foregroundStyle(Alive.ink2).lineLimit(1).padding(.leading, 14)
         }
         .padding(.horizontal, 8).padding(.vertical, 5)
@@ -969,7 +996,8 @@ struct JobsCard: View {
                     Text(String(format: "%.1f", use)).fontWeight(.medium).foregroundStyle(Alive.ink).frame(width: 52, alignment: .leading)
                 }
             }
-            Text("\(h.cores) reserved").font(.system(size: 11.5)).foregroundStyle(Alive.ink3).frame(width: 100, alignment: .trailing)
+            Text(h.exclusive ? "timing window" : "\(h.cores) reserved").font(.system(size: 11.5))
+                .foregroundStyle(h.exclusive ? Alive.windowTint : Alive.ink3).frame(width: 100, alignment: .trailing)
             Text(duration(Date().timeIntervalSince1970 - Double(h.since))).foregroundStyle(Alive.ink2).frame(width: 64, alignment: .trailing)
             Spacer(minLength: 0)
         }
@@ -991,8 +1019,9 @@ struct JobsCard: View {
         let name = GraphModel.label(w.label, w.command)
         let need = w.exclusive ? cpus : Double(max(w.cores, 1))
         let gate = model.status?.gate.state ?? "open"
-        let needless = free >= 2 && gate == "open"
-        let why = gate != "open" ? "the gate is shut" : needless ? "CPUs idle" : free >= need ? "starting" : "\(String(format: "%.1f", free)) free, so it holds"
+        let window = Moment.now(model).window
+        let needless = free >= 2 && gate == "open" && window == nil
+        let why = w.exclusive ? "timing window: waits for the Mac to empty" : window != nil ? "waits for the timing window" : gate != "open" ? "the gate is shut" : needless ? "CPUs idle" : free >= need ? "starting" : "\(String(format: "%.1f", free)) free, so it holds"
         return HStack(spacing: 10) {
             Circle().strokeBorder(model.color(project), lineWidth: 2).frame(width: 8, height: 8)
             Text(name).lineLimit(1).truncationMode(.middle).fontWeight(.medium).foregroundStyle(Alive.ink).frame(width: 170, alignment: .leading)
@@ -1031,6 +1060,8 @@ enum Alive {
     static let rose = color(0xee2f57, 0xff4469)
     static let roseSoft = color(0xee2f57, 0xff4469, 0.10, 0.14)
     static let out = color(0xa2a2a8, 0x6c6c72)
+    /// A timing window: calm, deliberate, not an alarm.
+    static let windowTint = color(0x5856d6, 0x7d7aff)
 }
 
 extension View {

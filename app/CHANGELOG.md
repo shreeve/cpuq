@@ -3,6 +3,13 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.6 — 2026-10-08
+
+- A timing window (a job run `--exclusive`, holding the Mac alone for a clean measurement) shows
+  as one: "Timing window · emdb-pwrite:apfs has the Mac alone" in a calm indigo, and the jobs
+  behind it as waiting for the window, rather than the rose alarm for waiting beside idle CPUs.
+  Its stretch of the hour counts as no needless waiting. Needs cpuq 0.7.8 or later.
+
 ## 0.13.5 — 2026-10-08
 
 - The hour's time axis reads 60 min, 45 min, 30 min, 15 min and now, at round times back from now, not
