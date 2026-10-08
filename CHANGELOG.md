@@ -2,6 +2,12 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.8.8 — 2026-10-08
+
+- The first eight waiters, of every kind, look every 2 seconds for a hand-given order, so
+  `cpuq cancel`, `first` and `start` take effect at once. An exclusive waiter behind another
+  waiter slept up to a minute on the one ahead, and a cancel sat unseen meanwhile.
+
 ## 0.8.7 — 2026-10-08
 
 - A run or lease killed the moment it shows in the queue is recorded as having given up, not as

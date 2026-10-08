@@ -679,6 +679,12 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
         var wake_ms: i64 = @min(next_note - now, 60) * 1000;
         if (o.max_wait) |mw| wake_ms = @min(wake_ms, (start + mw - now) * 1000);
         wake_ms = @max(wake_ms, 100);
+        // The first few waiters, of every kind, look again every 2 seconds
+        // for a hand-given order (`cpuq cancel`, `first`, `start`) and for
+        // room; an exclusive waiter behind the head used to sleep up to a
+        // minute on the one ahead, and a cancel sat unseen meanwhile. The
+        // rest keep sleeping on the one ahead, so a long queue costs little.
+        if (pos < 8) wake_ms = @min(wake_ms, 2000);
 
         if (pos > 0) {
             // Behind the head, under measured admission: start now if this
@@ -702,7 +708,6 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
                         }
                     }
                 }
-                if (pos < 8) wake_ms = @min(wake_ms, 2000);
             } else if (!named and !o.exclusive and cfg.backfill) {
                 const budget: u32 = budgetNow(ctx, mach);
                 var v = st.readValve();
@@ -719,9 +724,6 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
                         return admitted(ctx, st, o, &rec, grant, ticket, ticket_name, job, now, true);
                     }
                 };
-                // The first few waiters look again every 2 seconds; the rest
-                // keep sleeping on the one ahead, so a long queue costs little.
-                if (pos < 8) wake_ms = @min(wake_ms, 2000);
             }
             const pred = st.queue.openFile(io, queue[pos - 1].name, .{}) catch null;
             st.unlock();

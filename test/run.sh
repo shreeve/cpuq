@@ -395,6 +395,23 @@ t_hold_gone() {
   check "a waiting hold whose stdin closes gives up (rc $rw, ${dw}s); a held one whose heartbeats stop ends (rc $rq, ${dq}s)" "[ $rw = 75 ] && [ $rq = 0 ] && grep -q 'has gone' '$T/err' && python3 -c 'import sys; sys.exit(0 if $dw < 3 and $dq < 4 else 1)'"
 }
 
+t_cancel_exclusive() {
+  setup cancel-exclusive
+  # An exclusive waiter behind another waiter takes a cancel within seconds.
+  "$CPUQ" run --cores 9 --label held -- sleep 30 & local h=$!
+  wait_held 9
+  "$CPUQ" run --cores 2 --label ahead -- true & local a=$!
+  wait_waiters 1
+  "$CPUQ" run --exclusive --label window -- true 2>/dev/null & local x=$!
+  wait_waiters 2
+  local t0; t0=$(now)
+  "$CPUQ" cancel window >/dev/null
+  wait $x; local rx=$?
+  local dt; dt=$(python3 -c "print('%.1f' % ($(now) - $t0))")
+  "$CPUQ" stop held >/dev/null; wait $h $a 2>/dev/null
+  check "an exclusive waiter behind another takes a cancel at once (rc $rx, ${dt}s)" "[ $rx = 75 ] && python3 -c 'import sys; sys.exit(0 if $dt < 4 else 1)'"
+}
+
 t_nested() {
   setup nested
   local t0; t0=$(now)
@@ -1220,7 +1237,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"
