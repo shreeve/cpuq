@@ -24,6 +24,9 @@ A new Now tab, from the "Beautiful and alive" design.
 - Gone: the reserved-core lanes, the four view toggles, the key, the project table and the
   uneven time axis.
 - A project's color is reassigned when another on screen shares it.
+- The project colors follow the design, in its order (blue, green, purple, orange, teal), which is
+  also the stacking order; em, nexis, emdb, rig and cpuq take them, and other projects keep the
+  color they had where the palette still has it. Busy cells bubble gently and glow underneath.
 
 ## 0.12.0 — 2026-10-07
 

@@ -108,7 +108,10 @@ final class GraphModel {
     let performance = CPUTicks.performanceCores()
     /// Each project's palette slot, assigned the first time it is seen and kept across launches,
     /// so a project's color never changes as others come and go.
-    private var slots: [String: Int] = (UserDefaults.standard.dictionary(forKey: "projectPalette") as? [String: Int]) ?? [:]
+    private var slots: [String: Int] = {
+        migratePalette()
+        return (UserDefaults.standard.dictionary(forKey: "projectPalette") as? [String: Int]) ?? [:]
+    }()
 
     var budget: Int { max(status?.budget ?? 8, 1) }
 
@@ -254,9 +257,24 @@ final class GraphModel {
     /// Project colors: the system's bright hues and a lime, the most distinct first. No red or
     /// pink (red means waiting), no grey (work outside cpuq), no brown (pale, it reads as the
     /// gate shut).
-    static let palette: [Color] = [Alive.color(0x2f7cf6, 0x3d86f5), Alive.color(0xf08a00, 0xcc7404), Alive.color(0x2fb457, 0x2db052),
-                                   Alive.color(0x9b5de5, 0xa070ee), .yellow, Alive.color(0x14a9b8, 0x16a0af), .mint,
+    /// In the design's order, which is also the stacking order: blue, green, purple, orange, teal.
+    static let palette: [Color] = [Alive.color(0x2f7cf6, 0x3d86f5), Alive.color(0x2fb457, 0x2db052), Alive.color(0x9b5de5, 0xa070ee),
+                                   Alive.color(0xf08a00, 0xcc7404), Alive.color(0x14a9b8, 0x16a0af), .yellow, .mint,
                                    Color(red: 0.62, green: 0.82, blue: 0.08), .indigo, .teal]
+
+    /// Slots saved by an app older than the design's palette moved to it: each keeps its color
+    /// where the palette still has it, and the projects the design shows take its colors.
+    private static func migratePalette() {
+        let d = UserDefaults.standard
+        guard d.integer(forKey: "paletteVersion") < 2 else { return }
+        var slots = (d.dictionary(forKey: "projectPalette") as? [String: Int]) ?? [:]
+        // Old order: blue, orange, green, purple, yellow, teal, mint, lime, indigo, system teal.
+        let moved = [0: 0, 1: 3, 2: 1, 3: 2, 4: 5, 5: 4, 6: 6, 7: 7, 8: 8, 9: 9]
+        slots = slots.mapValues { moved[$0 % 10] ?? $0 }
+        for (project, slot) in ["em": 0, "nexis": 1, "emdb": 2, "rig": 3, "cpuq": 4] { slots[project] = slot }
+        d.set(slots, forKey: "projectPalette")
+        d.set(2, forKey: "paletteVersion")
+    }
 
     func color(_ project: String) -> Color {
         Self.palette[(slots[project] ?? 0) % Self.palette.count]

@@ -401,10 +401,9 @@ struct WaitingTray: View {
             }
             if moment.waiters.isEmpty {
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("Queue empty").foregroundStyle(Alive.ink2)
-                    Text("New jobs start at once").foregroundStyle(Alive.ink3)
+                    Text("Queue empty").font(.system(size: 13)).foregroundStyle(Alive.ink2)
+                    Text("new jobs start at once").font(.system(size: 12)).foregroundStyle(Alive.ink3)
                 }
-                .font(.caption)
                 .padding(.top, 4)
             } else {
                 let ref = moment.at ?? Date()
@@ -461,6 +460,9 @@ final class CellMotion {
     var fill: [String: Double] = [:]
     var rose = 0.0
     var nozzle = 0.0
+    /// Bubbles rising through busy cells: which cell, where, how fast, how big.
+    var bubbles: [(cell: Int, x: Double, y: Double, speed: Double, r: Double)] = []
+    var lastFrame = 0.0
 
     /// The first frame shows the reading as it is; later ones ease toward it.
     private var primed = false
@@ -523,6 +525,35 @@ struct CellsCanvas: View {
         layers.append((Alive.out, acc, acc + ov)); acc += ov
         let total = acc
 
+        // A soft bloom of each project's color under the glass, wider the more it uses.
+        for (color, a, b) in layers {
+            let v = b - a
+            guard v >= 0.05 else { continue }
+            let mid = a + v / 2
+            let cx = x0 + mid * (w + gap) - gap / 2, r = 24 + v * 22
+            var g = gc
+            g.translateBy(x: cx, y: bottom + 4)
+            g.scaleBy(x: 1, y: 0.38)
+            g.fill(Path(ellipseIn: CGRect(x: -r, y: -r, width: 2 * r, height: 2 * r)),
+                   with: .radialGradient(Gradient(colors: [color.opacity(dark ? 0.34 : 0.22), color.opacity(0)]), center: .zero, startRadius: 0, endRadius: r))
+        }
+        // Bubbles: a few rise through each busy cell, more the busier it is.
+        let dt = motion.lastFrame == 0 ? 0 : min(t - motion.lastFrame, 0.1)
+        motion.lastFrame = t
+        if t > 0 {
+            for c in 0..<n {
+                let level = min(max(total - Double(c), 0), 1)
+                if level > 0.15 && Double.random(in: 0..<1) < 0.035 * level {
+                    motion.bubbles.append((c, Double.random(in: 4...max(w - 4, 5)), bottom - 2, Double.random(in: 10...26), Double.random(in: 0.7...1.8)))
+                }
+            }
+            motion.bubbles = motion.bubbles.compactMap { b in
+                let surface = bottom - min(max(total - Double(b.cell), 0), 1) * h + 3
+                let y = b.y - b.speed * dt
+                return y < surface ? nil : (b.cell, b.x, y, b.speed, b.r)
+            }
+        }
+
         for c in 0..<n {
             let x = x0 + Double(c) * (w + gap)
             let cell = CGRect(x: x, y: top, width: w, height: h)
@@ -562,6 +593,9 @@ struct CellsCanvas: View {
                 inner.fill(p, with: .color(color))
                 inner.fill(p, with: .linearGradient(Gradient(colors: [.white.opacity(dark ? 0.10 : 0.16), .black.opacity(dark ? 0.10 : 0.04)]),
                                                    startPoint: CGPoint(x: x, y: yTop), endPoint: CGPoint(x: x, y: yBot + 2)))
+            }
+            for b in motion.bubbles where b.cell == c {
+                inner.fill(Path(ellipseIn: CGRect(x: x + b.x - b.r, y: b.y - b.r, width: 2 * b.r, height: 2 * b.r)), with: .color(.white.opacity(0.45)))
             }
             // Glass sheen.
             inner.fill(Path(cell), with: .linearGradient(Gradient(stops: [.init(color: .white.opacity(dark ? 0.10 : 0.28), location: 0),
@@ -654,6 +688,7 @@ struct HourCard: View {
             t = t + Text(" · waited with CPUs idle ").foregroundColor(.secondary)
                 + Text(minutes < 1 ? "<1 min" : "\(Int(minutes.rounded())) min").foregroundColor(Alive.rose).bold()
                 + Text(b < 1 ? ", ending \(a) min ago" : ", \(a)–\(b) min ago").foregroundColor(.secondary)
+                + Text(" · otherwise waits were seconds").foregroundColor(.secondary)
         }
         return t
     }
@@ -877,9 +912,9 @@ struct JobsCard: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline) {
                 Text("JOBS").eyebrow()
-                Text("· \(holders.count) running · \(waiters.count) waiting").font(.caption).foregroundStyle(Alive.ink2)
+                Text("· \(holders.count) running · \(waiters.count) waiting").font(.system(size: 13, weight: .medium)).foregroundStyle(Alive.ink)
                 Spacer()
-                Text("bar = CPU in use (0–\(Int(scale))) · reserved = cores it holds").font(.caption2).foregroundStyle(Alive.ink3)
+                Text("bar = CPU actually used (0–\(Int(scale))) · reserved = the job’s ‑j ticket").font(.system(size: 11)).foregroundStyle(Alive.ink3)
             }
             ScrollView(.vertical) {
                 VStack(spacing: 0) {
