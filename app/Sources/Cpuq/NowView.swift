@@ -681,9 +681,10 @@ struct HourCard: View {
                 Text(title).eyebrow()
                 Picker("", selection: $mode) {
                     Text("Stacked").tag(NowView.HourMode.stacked)
-                    Text("Per core").tag(NowView.HourMode.cores)
+                    Text("Per Core").tag(NowView.HourMode.cores)
                 }
                 .pickerStyle(.segmented).labelsHidden().controlSize(.small).fixedSize()
+                .background { shortcuts }
                 Spacer()
                 summary.font(.caption).lineLimit(1).minimumScaleFactor(0.8)
             }
@@ -697,6 +698,15 @@ struct HourCard: View {
         }
         .padding(.horizontal, 18).padding(.vertical, 12)
         .card()
+    }
+
+    /// ⌘1 shows Stacked and ⌘2 Per Core, through buttons nobody sees.
+    private var shortcuts: some View {
+        ZStack {
+            Button("") { mode = .stacked }.keyboardShortcut("1", modifiers: .command)
+            Button("") { mode = .cores }.keyboardShortcut("2", modifiers: .command)
+        }
+        .opacity(0).allowsHitTesting(false).accessibilityHidden(true)
     }
 
     /// The charts' right-click menu: forget what is older than the moment under the pointer, or
@@ -963,6 +973,9 @@ struct HourCard: View {
 struct JobsCard: View {
     let model: GraphModel
     var control: ((String, Int, String) -> Void)?
+    /// The width between a row's name and its time, the same for running and waiting rows so
+    /// their times line up: a 300 bar, its value, and the reserved column.
+    private static let middle: CGFloat = 470
 
     var body: some View {
         let s = model.status
@@ -998,24 +1011,27 @@ struct JobsCard: View {
         return HStack(spacing: 10) {
             Circle().fill(model.color(project)).frame(width: 8, height: 8)
             Text(GraphModel.label(h.label, h.command)).lineLimit(1).truncationMode(.middle).fontWeight(.medium).foregroundStyle(Alive.ink).frame(width: 170, alignment: .leading)
-            HStack(spacing: 8) {
-                GeometryReader { g in
-                    ZStack(alignment: .leading) {
-                        Capsule().fill(Alive.track)
-                        Capsule().fill(model.color(project)).frame(width: g.size.width * min(use / scale, 1))
+            HStack(spacing: 10) {
+                HStack(spacing: 8) {
+                    GeometryReader { g in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(Alive.track)
+                            Capsule().fill(model.color(project)).frame(width: g.size.width * min(use / scale, 1))
+                        }
+                    }
+                    .frame(height: 8)
+                    if h.paused {
+                        Text("paused").foregroundStyle(.orange).frame(width: 52, alignment: .leading)
+                    } else if h.using == nil {
+                        Text("starting").foregroundStyle(Alive.ink2).frame(width: 52, alignment: .leading)
+                    } else {
+                        Text(String(format: "%.1f", use)).fontWeight(.medium).foregroundStyle(Alive.ink).frame(width: 52, alignment: .leading)
                     }
                 }
-                .frame(maxWidth: 300).frame(height: 8)
-                if h.paused {
-                    Text("paused").foregroundStyle(.orange).frame(width: 52, alignment: .leading)
-                } else if h.using == nil {
-                    Text("starting").foregroundStyle(Alive.ink2).frame(width: 52, alignment: .leading)
-                } else {
-                    Text(String(format: "%.1f", use)).fontWeight(.medium).foregroundStyle(Alive.ink).frame(width: 52, alignment: .leading)
-                }
+                Text(h.exclusive ? "timing window" : "\(h.cores) reserved").font(.system(size: 11.5))
+                    .foregroundStyle(h.exclusive ? Alive.windowTint : Alive.ink3).frame(width: 100, alignment: .trailing)
             }
-            Text(h.exclusive ? "timing window" : "\(h.cores) reserved").font(.system(size: 11.5))
-                .foregroundStyle(h.exclusive ? Alive.windowTint : Alive.ink3).frame(width: 100, alignment: .trailing)
+            .frame(maxWidth: Self.middle)
             Text(duration(Date().timeIntervalSince1970 - Double(h.since))).foregroundStyle(Alive.ink2).frame(width: 64, alignment: .trailing)
             Spacer(minLength: 0)
         }
@@ -1044,10 +1060,12 @@ struct JobsCard: View {
             Circle().strokeBorder(model.color(project), lineWidth: 2).frame(width: 8, height: 8)
             Text(name).lineLimit(1).truncationMode(.middle).fontWeight(.medium).foregroundStyle(Alive.ink).frame(width: 170, alignment: .leading)
             Text("waiting · asks \(GraphModel.wants(w)) · \(why)").foregroundStyle(needless ? Alive.rose : Alive.ink2)
-                .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                .lineLimit(1).frame(maxWidth: Self.middle, alignment: .leading)
             Text(duration(Date().timeIntervalSince1970 - Double(w.since))).foregroundStyle(needless ? Alive.rose : Alive.ink2)
                 .frame(width: 64, alignment: .trailing)
+            Spacer(minLength: 0)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .font(.system(size: 12)).monospacedDigit()
         .frame(height: 21)
         .contentShape(Rectangle())

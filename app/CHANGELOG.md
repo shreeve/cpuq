@@ -3,6 +3,11 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.10 — 2026-10-08
+
+- ⌘1 shows the hour Stacked and ⌘2 Per Core (now with a capital C).
+- A waiting job's time lines up under the running jobs' times.
+
 ## 0.13.9 — 2026-10-08
 
 - The jobs card no longer dims while you hover over the hour chart.
