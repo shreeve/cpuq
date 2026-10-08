@@ -3,6 +3,11 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.16 — 2026-10-08
+
+- The theme and the mode (Automatic, Light, Dark) have drop-downs beside Now and History, and
+  shortcuts: ⌘T for the next theme, ⌘M for the next mode.
+
 ## 0.13.15 — 2026-10-08
 
 - Themes: the menu's Theme submenu picks the window's colors, Alive (as before), Ocean,

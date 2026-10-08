@@ -345,10 +345,11 @@ struct GraphsView: View {
     @State private var tab = 0
     /// Read here so that a new theme draws the whole window again.
     @AppStorage("theme") private var theme = "alive"
+    @AppStorage("appearance") private var appearance = "auto"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
+            HStack(spacing: 10) {
                 Picker("", selection: $tab) {
                     Text("Now").tag(0)
                     Text("History").tag(1)
@@ -356,15 +357,61 @@ struct GraphsView: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .frame(maxWidth: 200)
-                Spacer()
-                if tab == 0 { StatusChips(model: model) }
+                themeMenu
+                modeMenu
+                Spacer(minLength: 8)
+                // The chips give way first when the window is narrow.
+                if tab == 0 { ViewThatFits(in: .horizontal) { StatusChips(model: model); Color.clear.frame(width: 0, height: 0) } }
             }
             if tab == 0 { NowView(model: model, control: control) } else { history }
         }
         .padding(16)
         .frame(minWidth: Self.minimumSize.width, maxWidth: .infinity, minHeight: Self.minimumSize.height, maxHeight: .infinity, alignment: .topLeading)
         .background(Alive.window)
+        .background(WindowAppearance(name: appearance))
         .id(theme)
+    }
+
+    static let modes = [("auto", "Automatic"), ("light", "Light"), ("dark", "Dark")]
+
+    /// The theme, from a drop-down or ⌘T for the next one.
+    private var themeMenu: some View {
+        Menu {
+            ForEach(Theme.all, id: \.id) { t in
+                Toggle(t.name, isOn: Binding(get: { t.id == theme }, set: { _ in Theme.use(t.id) }))
+            }
+        } label: {
+            Text((Theme.all.first { $0.id == theme } ?? Theme.all[0]).name + "  ") + Text("⌘T").foregroundStyle(Alive.ink3)
+        }
+        .menuStyle(.button).controlSize(.small).fixedSize()
+        .help("The window's colors. ⌘T: the next theme")
+        .background {
+            Button("") {
+                let i = Theme.all.firstIndex { $0.id == theme } ?? 0
+                Theme.use(Theme.all[(i + 1) % Theme.all.count].id)
+            }
+            .keyboardShortcut("t", modifiers: .command).opacity(0).allowsHitTesting(false).accessibilityHidden(true)
+        }
+    }
+
+    /// Automatic, Light or Dark, from a drop-down or ⌘M for the next one.
+    private var modeMenu: some View {
+        Menu {
+            ForEach(Self.modes, id: \.0) { m in
+                Toggle(m.1, isOn: Binding(get: { m.0 == appearance }, set: { _ in appearance = m.0 }))
+            }
+        } label: {
+            Text((Self.modes.first { $0.0 == appearance } ?? Self.modes[0]).1 + "  ") + Text("⌘M").foregroundStyle(Alive.ink3)
+        }
+        .menuStyle(.button).controlSize(.small).fixedSize()
+        .help("Automatic follows macOS; Light and Dark keep to one. ⌘M: the next")
+        .background {
+            Button("") {
+                let i = Self.modes.firstIndex { $0.0 == appearance } ?? 0
+                appearance = Self.modes[(i + 1) % Self.modes.count].0
+            }
+            .keyboardShortcut("m", modifiers: .command).opacity(0).allowsHitTesting(false).accessibilityHidden(true)
+        }
     }
 
     /// The smallest the window goes: at this size everything in it still fits.
@@ -392,6 +439,18 @@ struct GraphsView: View {
             if model.totals.isEmpty {
                 Text("cpuq history has no finished jobs yet.").font(.caption).foregroundStyle(.secondary)
             }
+        }
+    }
+}
+
+/// Sets the window's appearance: Automatic (follow macOS), Light or Dark.
+struct WindowAppearance: NSViewRepresentable {
+    let name: String
+    func makeNSView(context: Context) -> NSView { NSView() }
+    func updateNSView(_ view: NSView, context: Context) {
+        let name = name
+        DispatchQueue.main.async {
+            view.window?.appearance = name == "light" ? NSAppearance(named: .aqua) : name == "dark" ? NSAppearance(named: .darkAqua) : nil
         }
     }
 }
