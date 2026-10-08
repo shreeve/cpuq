@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.20 — 2026-10-08
+
+- The graphs window's minimum size holds for real: it is now a layout constraint, which a drag,
+  a tile or an accessibility resize cannot break. In 0.13.18 the window could still be made a
+  sliver.
+
 ## 0.13.19 — 2026-10-08
 
 - The menu shows the versions above Quit, in grey: "Cpuq.app 0.13.19 · cpuq 0.8.11", the app's

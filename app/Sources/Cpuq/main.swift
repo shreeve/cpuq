@@ -34,6 +34,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.menu = menu
         rebuild()
         poll()
+        // For testing a build: open the graphs window at launch.
+        if ProcessInfo.processInfo.environment["CPUQ_SHOW_GRAPHS"] != nil { showGraphs() }
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
         }
@@ -279,7 +281,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // shrinks it, and everything in it fits, the charts sharing what height there is.
             let host = NSHostingView(rootView: GraphsView(model: graphs, control: { [weak self] action, pid, who in self?.perform(action, pid: String(pid), who: who) }))
             host.sizingOptions = []
-            window.contentView = host
+            // The minimum as constraints the window cannot break: contentMinSize alone let a
+            // drag, a tile or an accessibility resize take the window down to a sliver.
+            let content = NSView()
+            host.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(host)
+            NSLayoutConstraint.activate([
+                host.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+                host.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+                host.topAnchor.constraint(equalTo: content.topAnchor),
+                host.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+                content.widthAnchor.constraint(greaterThanOrEqualToConstant: GraphsView.minimumSize.width),
+                content.heightAnchor.constraint(greaterThanOrEqualToConstant: GraphsView.minimumSize.height),
+            ])
+            window.contentView = content
             window.contentMinSize = GraphsView.minimumSize
             window.minSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: GraphsView.minimumSize)).size
             window.delegate = sizeGuard
