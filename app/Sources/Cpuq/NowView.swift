@@ -410,18 +410,31 @@ struct HeroCard: View {
         }
     }
 
+    /// The legend in full where it fits; in a narrow window, shorter names, then smaller type.
     private var legend: some View {
-        HStack(spacing: 11) {
+        ViewThatFits(in: .horizontal) {
+            legendRow(outside: "outside cpuq", size: 11.5)
+            legendRow(outside: "outside", size: 11.5)
+            legendRow(outside: "outside", size: 10.5, spacing: 8)
+            legendRow(outside: "out", size: 10, spacing: 6)
+            legendRow(outside: nil, size: 10, spacing: 6)
+        }
+    }
+
+    /// One way to lay the legend out; `outside` nil leaves out every name, the colors and
+    /// numbers alone as a last resort in the narrowest window.
+    private func legendRow(outside: String?, size: CGFloat, spacing: CGFloat = 11) -> some View {
+        HStack(spacing: spacing) {
             ForEach(moment.shares, id: \.project) { s in
                 HStack(spacing: 4) {
                     RoundedRectangle(cornerRadius: 3).fill(model.color(s.project)).frame(width: 9, height: 9)
-                    Text(s.project).foregroundStyle(Alive.ink2)
+                    if outside != nil { Text(s.project).foregroundStyle(Alive.ink2) }
                     Text(String(format: "%.1f", s.cpu)).fontWeight(.medium).foregroundStyle(Alive.ink)
                 }
             }
             HStack(spacing: 4) {
                 RoundedRectangle(cornerRadius: 3).fill(Alive.out).frame(width: 9, height: 9)
-                Text("outside cpuq").foregroundStyle(Alive.ink2)
+                if let outside { Text(outside).foregroundStyle(Alive.ink2) }
                 Text(String(format: "%.1f", moment.outside)).fontWeight(.medium).foregroundStyle(Alive.ink)
             }
             HStack(spacing: 4) {
@@ -429,14 +442,14 @@ struct HeroCard: View {
                     .strokeBorder(moment.needless ? Alive.rose : Alive.glassEdge)
                     .background(RoundedRectangle(cornerRadius: 3).fill(moment.needless ? Alive.roseSoft : Alive.glass))
                     .frame(width: 9, height: 9)
-                Text(moment.needless ? "idle" : "free").foregroundStyle(moment.needless ? Alive.rose : Alive.ink2)
+                if outside != nil { Text(moment.needless ? "idle" : "free").foregroundStyle(moment.needless ? Alive.rose : Alive.ink2) }
                 Text(String(format: "%.1f", moment.free)).fontWeight(.medium).foregroundStyle(moment.needless ? Alive.rose : Alive.ink)
             }
         }
-        .font(.system(size: 11.5))
+        .font(.system(size: size))
         .monospacedDigit()
         .lineLimit(1)
-        .minimumScaleFactor(0.7)
+        .fixedSize()
     }
 }
 
@@ -987,7 +1000,12 @@ struct JobsCard: View {
                 Text("JOBS").eyebrow()
                 Text("· \(holders.count) running · \(waiters.count) waiting").font(.system(size: 13, weight: .medium)).foregroundStyle(Alive.ink)
                 Spacer()
-                Text("bar = CPU actually used (0–\(Int(scale))) · reserved = the job’s ‑j ticket").font(.system(size: 11)).foregroundStyle(Alive.ink3)
+                ViewThatFits(in: .horizontal) {
+                    Text("bar = CPU actually used (0–\(Int(scale))) · reserved = the job’s ‑j ticket")
+                    Text("bar = CPU used (0–\(Int(scale)))")
+                    Color.clear.frame(width: 0, height: 0)
+                }
+                .font(.system(size: 11)).foregroundStyle(Alive.ink3).lineLimit(1)
             }
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 0) {

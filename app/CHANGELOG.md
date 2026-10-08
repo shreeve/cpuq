@@ -3,6 +3,14 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.18 — 2026-10-08
+
+- The graphs window keeps to its minimum size however it is resized, and a window saved
+  smaller than that opens at the minimum.
+- In a narrow window the legend shortens instead of cutting names to "e…": "outside" for
+  "outside cpuq", then smaller type, then the colors and numbers alone. The jobs card's
+  header shortens too.
+
 ## 0.13.17 — 2026-10-08
 
 - The chart's words ("1 waiting", "quiet") have a soft rim in the card's color, so they read

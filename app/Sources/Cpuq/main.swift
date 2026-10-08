@@ -17,6 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var polling = false
     private let graphs = GraphModel()
     private var graphsWindow: NSWindow?
+    private let sizeGuard = MinimumSize()
     private var historyTimer: Timer?
     /// Sparkle, running only in a Cpuq.app bundle: a binary run from the build folder never offers
     /// to replace itself.
@@ -268,9 +269,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             host.sizingOptions = []
             window.contentView = host
             window.contentMinSize = GraphsView.minimumSize
+            window.minSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: GraphsView.minimumSize)).size
+            window.delegate = sizeGuard
             window.center()
-            // Where it was and how big, kept from one opening to the next.
+            // Where it was and how big, kept from one opening to the next; a frame saved smaller
+            // than the minimum grows to it.
             window.setFrameAutosaveName("cpuq graphs")
+            var frame = window.frame
+            if frame.width < window.minSize.width || frame.height < window.minSize.height {
+                frame.size = NSSize(width: max(frame.width, window.minSize.width), height: max(frame.height, window.minSize.height))
+                window.setFrame(frame, display: false)
+            }
             graphsWindow = window
             // History changes slowly: read it now and each minute while the window is open.
             historyTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
@@ -410,3 +419,11 @@ app.delegate = delegate
 // A menu-bar app: no Dock icon, no main window.
 app.setActivationPolicy(.accessory)
 app.run()
+
+
+/// Keeps the graphs window from being made smaller than its minimum, however it is resized.
+final class MinimumSize: NSObject, NSWindowDelegate {
+    func windowWillResize(_ window: NSWindow, to size: NSSize) -> NSSize {
+        NSSize(width: max(size.width, window.minSize.width), height: max(size.height, window.minSize.height))
+    }
+}
