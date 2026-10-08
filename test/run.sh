@@ -196,8 +196,11 @@ t_exit_status() {
   "$CPUQ" run -- sh -c 'kill -TERM $$'; rc=$?
   check "a command killed by SIGTERM reports 143 (got $rc)" "[ $rc = 143 ]"
   local how
+  # SIGINT at its default first: a suite started as a `&` job hands it down
+  # ignored, cpuq keeps it ignored for the command, and sh survives its kill.
   how=$(python3 -c "
-import subprocess
+import signal, subprocess
+signal.signal(signal.SIGINT, signal.SIG_DFL)
 r = subprocess.run(['$CPUQ', 'run', '--', 'sh', '-c', 'kill -INT \$\$'])
 print(r.returncode)")
   check "cpuq re-raises the command's SIGINT: the parent sees death by signal 2 (got $how)" "[ '$how' = -2 ]"

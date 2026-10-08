@@ -18,3 +18,7 @@ Run each inside `nice cpuq run --cores 1 --qos none --label cpuq:test -- ...`.
 - trapwin3.py N: INT aimed at the moment /bin/sh sets its trap; 2 of 4000 hung (bash 3.2 SIG_IGN window).
 - stopwin.py N: SIGSTOP in the first 6 ms of `sh -c 'sleep 20'`; 115 of 400 lost.
 - termwin.py N: SIGTERM in the same window; 0 of 400 lost.
+- selfint.py DIR N [P] [ign] [dfl]: t_exit_status's `cpuq run -- sh -c 'kill -INT $$'` from
+  python, N times, P at once; counts cpuq's ends (-2 right). Under load: 4600 of 4600 -2, no
+  race. `ign` (started as a `&` job is): 600 of 600 end 0, as the suite once failed; `ign dfl`
+  (the test since its fix resets SIGINT): 600 of 600 -2.
