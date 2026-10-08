@@ -307,9 +307,11 @@ struct HeroCard: View {
             summary.frame(width: 232, alignment: .leading)
             GeometryReader { geo in
                 let tray = geo.size.width >= 470
-                VStack(alignment: .trailing, spacing: 6) {
+                // The cells' canvas runs down behind the legend, so their glow has room to spread
+                // out in full and fade before the card's edge.
+                ZStack(alignment: .bottomTrailing) {
                     ZStack(alignment: .topLeading) {
-                        CellsCanvas(model: model, moment: moment, motion: motion, trayWidth: tray ? 186 : 0)
+                        CellsCanvas(model: model, moment: moment, motion: motion, trayWidth: tray ? 186 : 0, below: 22)
                         if tray { WaitingTray(model: model, moment: moment, control: control).frame(width: 180) }
                     }
                     legend
@@ -527,6 +529,8 @@ struct CellsCanvas: View {
     let moment: Moment
     let motion: CellMotion
     let trayWidth: Double
+    /// Room kept under the cell numbers for the legend drawn over the canvas.
+    var below = 0.0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var scheme
 
@@ -544,7 +548,7 @@ struct CellsCanvas: View {
         let n = Int(cpus)
         let gap = 6.0
         let x0 = trayWidth + (trayWidth > 0 ? 30 : 0)
-        let top = 26.0, bottom = size.height - 16
+        let top = 26.0, bottom = size.height - 16 - below
         let w = max((size.width - x0 - gap * Double(n - 1)) / Double(n), 6)
         let h = max(bottom - top, 20)
         let dark = scheme == .dark

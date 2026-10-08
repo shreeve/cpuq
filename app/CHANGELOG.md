@@ -9,7 +9,8 @@ notes, shown by the update dialog too.
   as one: "Timing window · emdb-pwrite:apfs has the Mac alone" in a calm indigo, and the jobs
   behind it as waiting for the window, rather than the rose alarm for waiting beside idle CPUs.
   Its stretch of the hour counts as no needless waiting. Needs cpuq 0.7.8 or later.
-- The glow under the cells fades out before the edge of its space instead of being cut off flat.
+- The glow under the cells spreads out in full, behind the legend, and fades before the card's
+  edge, instead of being cut off flat under the cell numbers.
 
 ## 0.13.5 — 2026-10-08
 
