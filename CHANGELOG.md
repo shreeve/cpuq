@@ -2,6 +2,15 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.8.3 — 2026-10-07
+
+- `exclusive = off` (config; on by default): `--exclusive`, on `cpuq run` or a local `cpuq lease`,
+  runs as an ordinary job alongside the others instead of draining the machine, and says so on
+  stderr; `cpuq status` notes it. On this Mac 46 exclusive timing runs in two hours left the CPUs
+  mostly idle while everyone else queued: 89% of all waiting happened while one drained or held
+  the machine. Timing runs go to a machine that allows them; `--host HOST` leases follow HOST's
+  config.
+
 ## 0.8.2 — 2026-10-07
 
 - Every job's peak memory is recorded: the most its processes used together, looked at every 2

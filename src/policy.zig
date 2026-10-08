@@ -82,6 +82,12 @@ pub const Config = struct {
     /// Let a waiter behind the head start on cores the head cannot use yet
     /// (`backfill`).
     backfill: bool = true,
+    /// Grant `--exclusive` (`exclusive`): a run or lease that asks for it
+    /// waits for the machine to drain and holds it alone. Off, it runs as an
+    /// ordinary job alongside the others, and says so: for a machine shared
+    /// by many jobs, where draining it for one costs everyone, and timing runs
+    /// belong on another.
+    exclusive: bool = true,
     /// The least time, in seconds, the head lets others go ahead when there
     /// is no run time to judge by (`patience`).
     patience_s: u32 = 30,
@@ -149,6 +155,8 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             cfg.aging_s = a;
         } else if (std.mem.eql(u8, key, "note")) {
             cfg.note_s = parseCount(value) orelse return bad(diag, "note must be a whole number of seconds, at least 1");
+        } else if (std.mem.eql(u8, key, "exclusive")) {
+            cfg.exclusive = parseBool(value) orelse return bad(diag, "exclusive must be on or off");
         } else if (std.mem.eql(u8, key, "backfill")) {
             cfg.backfill = parseBool(value) orelse return bad(diag, "backfill must be on or off");
         } else if (std.mem.eql(u8, key, "right_size")) {

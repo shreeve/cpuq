@@ -367,7 +367,7 @@ fn nestedGrant(ctx: *Ctx) bool {
 }
 
 fn cmdRun(ctx: *Ctx, args: []const [:0]const u8) u8 {
-    const o = parseRun(args) orelse return exit_usage;
+    var o = parseRun(args) orelse return exit_usage;
     if (o.cmd.len == 0) return usageError("run needs a command", .{});
     if (o.host != null or o.hold or o.slots != 1) return usageError("--host, --hold and --slots are options of `cpuq lease`", .{});
 
@@ -392,6 +392,7 @@ fn cmdRun(ctx: *Ctx, args: []const [:0]const u8) u8 {
     _ = ctx.env.swapRemove("CPUQ_TOKEN");
 
     loadConfig(ctx);
+    if (o.exclusive and !ctx.cfg.exclusive) o.exclusive = exclusiveOff(o.label);
     const exe = findExecutable(ctx, o.cmd[0]) orelse {
         std.debug.print("cpuq: {s}: command not found\n", .{o.cmd[0]});
         return exit_notfound;
@@ -1358,7 +1359,9 @@ fn cmdLease(ctx: *Ctx, args: []const [:0]const u8) u8 {
         return if (err == error.FileNotFound) exit_notfound else exit_noexec;
     }
     loadConfig(ctx);
+    // On another host, that host's config decides.
     if (o.host) |host| return runRemote(ctx, o, host);
+    if (o.exclusive and !ctx.cfg.exclusive) o.exclusive = exclusiveOff(o.label);
     const exe: [:0]const u8 = if (o.hold) "" else findExecutable(ctx, o.cmd[0]) orelse {
         std.debug.print("cpuq: {s}: command not found\n", .{o.cmd[0]});
         return exit_notfound;
@@ -1385,6 +1388,15 @@ fn cmdLease(ctx: *Ctx, args: []const [:0]const u8) u8 {
     }
     if (o.hold) return holdAdmitted(ctx, &st, o, lease);
     return runAdmitted(ctx, &st, o, exe, lease);
+}
+
+/// `exclusive = off`: says that `--exclusive` is not granted here and that
+/// the job runs as an ordinary one; returns false, the flag's new value.
+fn exclusiveOff(label: []const u8) bool {
+    std.debug.print("cpuq: {s}{s}--exclusive is off on this machine (exclusive = off in the config): running as an ordinary job, alongside others; time it where exclusive runs are allowed\n", .{
+        label, if (label.len != 0) ": " else "",
+    });
+    return false;
 }
 
 /// The machine's cores held with a lease taken `--exclusive`, given back with it.
@@ -2715,6 +2727,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
         w.print("admit   by measured use, up to {d} CPUs; {d} cores handed out ({d} online of {d})\n", .{ targetCpus(ctx), held, m.active, sys.totalCpus(ctx.io) }) catch {};
     } else w.print("budget  {d} cores ({d} online of {d}); in use {d}, free {d}\n", .{ budget, m.active, sys.totalCpus(ctx.io), held, budget -| held }) catch {};
     w.print("load    {d:.2} {d:.2} {d:.2}; memory pressure {s}; gate {s}\n", .{ load[0], load[1], load[2], pressure, gate_text }) catch {};
+    if (!ctx.cfg.exclusive) w.writeAll("note    exclusive runs are off here: --exclusive runs as an ordinary job\n") catch {};
     if (showOutside(smp.outside, g)) {
         w.writeAll("outside") catch {};
         for (smp.outside, 0..) |o, k| w.print("{s} {s} (pid {d}, {d:.1})", .{ if (k == 0) "" else ",", o.name, o.pid, o.using }) catch {};

@@ -325,6 +325,20 @@ t_exclusive() {
   check "--exclusive waits for drain and blocks new work while it runs (got: $got)" "[ '$got' = 'held-end excl-start excl-end small ' ]"
 }
 
+t_exclusive_off() {
+  setup exclusive-off "exclusive = off"
+  # With exclusive runs off, --exclusive runs at once beside the work already
+  # running, says why, and so does a lease taken --exclusive.
+  local f=$T/log
+  "$CPUQ" run --cores 3 -- sh -c "sleep 1; echo held-end >>$f" & wait_held 3
+  "$CPUQ" run --exclusive --label race -- sh -c "echo excl-start >>$f" 2>"$T/err"
+  "$CPUQ" lease bench --exclusive -- sh -c "echo lease-start >>$f" 2>"$T/err2"
+  wait
+  local got; got=$(tr '\n' ' ' <"$f")
+  local note; note=$("$CPUQ" status --no-usage | grep -c 'exclusive runs are off')
+  check "exclusive = off: --exclusive runs alongside, and says so (got: $got)" "[ '$got' = 'excl-start lease-start held-end ' ] && grep -q 'race: --exclusive is off' '$T/err' && grep -q 'exclusive is off' '$T/err2' && [ $note = 1 ]"
+}
+
 t_nested() {
   setup nested
   local t0; t0=$(now)
@@ -1150,7 +1164,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold last_words measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off nested elastic reserve usage lease lease_host lease_host_hold last_words measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

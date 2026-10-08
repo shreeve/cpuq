@@ -287,6 +287,14 @@ HOST that carries the holder's CPUQ_LEASES (`ssh HOST "CPUQ_LEASES='$CPUQ_LEASES
 …"`) runs inside the window at once; without it, it waits for the window to
 end.
 
+A machine that many jobs share can refuse quiet windows: with `exclusive =
+off` in its config, `--exclusive` (on `cpuq run`, or a lease taken there) runs
+as an ordinary job, alongside the others, and says so on stderr; `cpuq status`
+notes it. Draining a busy machine for one benchmark stops everyone, and
+frequent windows cost more waiting than all the rest of the queue; timing
+runs then go to a machine that allows them (`cpuq lease NAME --host HOST
+--exclusive` asks HOST, whose own config decides).
+
 ### Named leases
 
 `cpuq lease NAME -- CMD` runs CMD holding NAME, a first-come, first-served
@@ -378,6 +386,7 @@ count oversubscribes it on purpose. The config file is `CPUQ_CONFIG`, default
 | `aging` | 600 | seconds of waiting per one-class promotion; 0 turns it off |
 | `poll` | 0.5 | seconds between the head's re-checks |
 | `note` | 60 | seconds between "waiting" lines |
+| `exclusive` | on | grant `--exclusive`; off, it runs as an ordinary job (see Quiet windows) |
 | `backfill` | on | let a waiter start ahead of the head on cores the head cannot use yet |
 | `patience` | 30 | the least seconds the head lets others go ahead without run times to judge by |
 | `lend` | on | lend the head the cores a running job leaves idle |
