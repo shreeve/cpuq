@@ -12,8 +12,8 @@ final class GraphModel {
         let id: String
         let project: String
         let label: String
-        /// Which of the budget's cores it holds, from 0.
-        let lanes: [Int]
+        /// Which of the budget's cores it holds, from 0 (in the jobs view, its row).
+        var lanes: [Int]
         var from: Date
         /// Nil while it runs.
         var to: Date?
@@ -211,6 +211,22 @@ final class GraphModel {
         blocks.sort { $0.from < $1.from }
     }
 
+    /// Each job on a row of its own, for the jobs view: the lowest row free when it started, so
+    /// there are as many rows as jobs ever ran at once, never more.
+    func jobBlocks() -> [Block] {
+        var ends: [Date] = []
+        var out: [Block] = []
+        for b in blocks.sorted(by: { ($0.from, $0.id) < ($1.from, $1.id) }) {
+            let row = ends.firstIndex { $0 <= b.from } ?? ends.count
+            if row == ends.count { ends.append(.distantFuture) }
+            ends[row] = b.to ?? .distantFuture
+            var j = b
+            j.lanes = [row]
+            out.append(j)
+        }
+        return out
+    }
+
     /// The lowest `n` adjacent cores free from `from` to `to` (or on), else the lowest free ones.
     private func fit(_ n: Int, from: Date, to: Date? = nil) -> [Int] {
         var busy = Set<Int>()
@@ -380,6 +396,9 @@ struct GraphsView: View {
         .frame(minWidth: Self.minimumSize.width, maxWidth: .infinity, minHeight: Self.minimumSize.height, maxHeight: .infinity, alignment: .topLeading)
     }
 
+    /// cpuq admits by measured CPU use (0.8 on): what it hands out is no count of CPUs.
+    private var measured: Bool { model.status?.admit == "measured" }
+
     /// The smallest the window goes: at this size every view still fits, compressed.
     static let minimumSize = CGSize(width: 560, height: 620)
 
@@ -492,12 +511,16 @@ struct GraphsView: View {
     private var now: some View {
         let end = Date()
         let axis = TimeAxis(span: min(max(end.timeIntervalSince(model.oldest(now: end)), 300), GraphModel.keep), end: end)
-        let held = max(model.budget, (model.blocks.flatMap(\.lanes).max() ?? 0) + 1)
-        let (all, waitCells) = Self.grid(model, columns: axis.columns, end: end, lanes: held)
-        // Lending draws work over the budget on the idle cores it borrowed; measured admission
-        // lends nothing, so every job stays on its own lanes.
-        let cells = model.status?.admit == "measured" ? all : Self.borrowed(all, budget: model.budget)
-        let lanes = max(model.budget, (cells.filter { $0.project != nil }.map(\.lane).max() ?? 0) + 1)
+        // Under measured admission cpuq hands out more cores than the Mac has, so its cores are no
+        // picture of the machine: the lanes are jobs, one row each, solid as far as each keeps a
+        // CPU busy. Under the reservation model they are the budget's cores.
+        let jobs = measured
+        let jobBlocks = jobs ? model.jobBlocks() : model.blocks
+        let held = jobs ? max((jobBlocks.flatMap(\.lanes).max() ?? 0) + 1, 4) : max(model.budget, (model.blocks.flatMap(\.lanes).max() ?? 0) + 1)
+        let (all, waitCells) = Self.grid(model, blocks: jobBlocks, columns: axis.columns, end: end, lanes: held)
+        // Lending draws work over the budget on the idle cores it borrowed.
+        let cells = jobs ? all : Self.borrowed(all, budget: model.budget)
+        let lanes = jobs ? held : max(model.budget, (cells.filter { $0.project != nil }.map(\.lane).max() ?? 0) + 1)
         let machine = Self.machine(model, columns: axis.columns)
         // The topmost view shown names each stretch the gate was shut.
         let top: Pane = showMac ? .mac : showPerCPU ? .percpu : showStacked ? .stack : showLanes ? .lanes : .waiting
@@ -512,7 +535,7 @@ struct GraphsView: View {
                     Toggle("All CPUs", isOn: $showMac)
                     Toggle("Per CPU", isOn: $showPerCPU)
                     Toggle("Stacked", isOn: $showStacked)
-                    Toggle("Lanes", isOn: $showLanes)
+                    Toggle(measured ? "Jobs" : "Lanes", isOn: $showLanes)
                 }
                 .toggleStyle(.button).controlSize(.small)
             }
@@ -542,7 +565,7 @@ struct GraphsView: View {
                             .padding(.bottom, 18 * h.gap)
                     }
                     if showLanes {
-                        lanesChart(axis: axis, lanes: lanes, cells: cells, machine: machine, labelGate: top == .lanes, height: h.lanes)
+                        lanesChart(axis: axis, lanes: lanes, cells: cells, machine: machine, labelGate: top == .lanes, height: h.lanes, jobs: jobs)
                             .frame(height: h.lanes)
                             .padding(.bottom, 14 * h.gap)
                     }
@@ -619,14 +642,14 @@ struct GraphsView: View {
         let cores = Group {
             if showStacked || showLanes {
                 Label { Text("busy") } icon: { swatch(grey, 10) }
-                Label { Text("held, idle") } icon: { swatch(grey.opacity(Self.shade(0)), 10) }
+                Label { Text(measured ? "job idle" : "held, idle") } icon: { swatch(grey.opacity(Self.shade(0)), 10) }
             }
             if showLanes {
                 Label { Text("held, not measured") } icon: { swatch(grey.opacity(0.6), 3) }
                 if !measured {
                     Label { Text("borrowed (edge: owner)") } icon: { VStack(spacing: 0) { swatch(.primary.opacity(0.8), 3); swatch(grey.opacity(0.7), 7) } }
                 }
-                Label { Text("free") } icon: { swatch(.secondary.opacity(0.12), 10) }
+                Label { Text(measured ? "no job" : "free") } icon: { swatch(.secondary.opacity(0.12), 10) }
             }
         }
         let machine = Group {
@@ -752,7 +775,7 @@ struct GraphsView: View {
 
     /// The lanes, one per core of the budget: a held core in its project's color, pale while
     /// idle and full as far as the job keeps it busy.
-    private func lanesChart(axis: TimeAxis, lanes: Int, cells: [Cell], machine: [MachineColumn?], labelGate: Bool, height: Double) -> some View {
+    private func lanesChart(axis: TimeAxis, lanes: Int, cells: [Cell], machine: [MachineColumn?], labelGate: Bool, height: Double, jobs: Bool = false) -> some View {
         // Every lane numbered while the numbers fit, else every second or fourth.
         let room = height / Double(max(lanes, 1))
         let every = room >= 13 ? 1 : room >= 6.5 ? 2 : 4
@@ -787,8 +810,14 @@ struct GraphsView: View {
         .chartXAxis { timeAxis(axis, labels: false) }
         .chartYScale(domain: 0...Double(lanes))
         .chartYAxis {
-            AxisMarks(position: .leading, values: (0..<lanes).filter { $0 % every == 0 }.map { Double($0) + 0.5 }) { v in
-                AxisValueLabel { if let d = v.as(Double.self) { axisLabel(Text("\(Int(d) + 1)")) } }
+            if jobs {
+                AxisMarks(position: .leading, values: [Double(lanes) / 2]) { _ in
+                    AxisValueLabel { axisLabel(Text("jobs")) }
+                }
+            } else {
+                AxisMarks(position: .leading, values: (0..<lanes).filter { $0 % every == 0 }.map { Double($0) + 0.5 }) { v in
+                    AxisValueLabel { if let d = v.as(Double.self) { axisLabel(Text("\(Int(d) + 1)")) } }
+                }
             }
         }
         .chartOverlay { hovering($0, .lanes) }
@@ -980,7 +1009,7 @@ struct GraphsView: View {
     /// Each column's cores held, stacked: every project's busy cores first, from the floor, in
     /// palette order, so the busy total reads off one edge; then every project's idle cores
     /// above them, pale, so the waste sits on top where it shows.
-    static func bands(_ m: GraphModel, columns: [(from: Date, to: Date)], end: Date) -> [Band] {
+    static func bands(_ m: GraphModel, columns: [(from: Date, to: Date)], end: Date, idle: Bool = true) -> [Band] {
         var out: [Band] = []
         for (c, column) in columns.enumerated() {
             let t1 = column.from, t2 = column.to
@@ -1002,11 +1031,12 @@ struct GraphsView: View {
             for p in projects {
                 let h = held[p] ?? 0
                 let k = known[p] ?? false
-                let part = k ? min(busy[p] ?? 0, h) : h
+                // Measured admission: only CPU measured busy is drawn, never what is reserved.
+                let part = k ? min(busy[p] ?? 0, h) : idle ? h : 0
                 if part > 0.001 { out.append(Band(column: c, project: p, kind: k ? .busy : .unmeasured, low: y, high: y + part)) }
                 y += part
             }
-            for p in projects where known[p] ?? false {
+            for p in projects where idle && known[p] ?? false {
                 let idle = (held[p] ?? 0) - min(busy[p] ?? 0, held[p] ?? 0)
                 if idle > 0.001 { out.append(Band(column: c, project: p, kind: .idle, low: y, high: y + idle)) }
                 y += idle
@@ -1020,9 +1050,11 @@ struct GraphsView: View {
     private func stackChart(axis: TimeAxis, machine: [MachineColumn?], labelGate: Bool, height: Double) -> some View {
         let cpus = Double(ProcessInfo.processInfo.activeProcessorCount)
         let budget = Double(model.budget)
-        let bands = Self.bands(model, columns: axis.columns, end: axis.end)
+        // Under measured admission what jobs hold is no count of CPUs: the chart is the CPU each
+        // project keeps busy, on the Mac's own scale.
+        let bands = Self.bands(model, columns: axis.columns, end: axis.end, idle: !measured)
         let peak = bands.map(\.high).max() ?? 0
-        let top = max(max(cpus, budget) + 1, peak.rounded(.up) + 0.5)
+        let top = measured ? max(cpus + 0.5, peak) : max(max(cpus, budget) + 1, peak.rounded(.up) + 0.5)
         return Chart {
             gateBands(machine, low: 0, high: top, label: labelGate)
             ForEach(bands) { b in
@@ -1067,7 +1099,8 @@ struct GraphsView: View {
     /// Every core in every column: the job holding it longest there, and how busy; and how many
     /// waited. A job keeps its lowest cores busy first: with 2.5 active of 4, its first two
     /// cores are solid, the third half, the fourth pale.
-    static func grid(_ m: GraphModel, columns: [(from: Date, to: Date)], end: Date, lanes: Int) -> ([Cell], [WaitCell]) {
+    static func grid(_ m: GraphModel, blocks: [GraphModel.Block]? = nil, columns: [(from: Date, to: Date)], end: Date, lanes: Int) -> ([Cell], [WaitCell]) {
+        let blocks = blocks ?? m.blocks
         var cells: [Cell] = []
         var waits: [WaitCell] = []
         for (c, column) in columns.enumerated() {
@@ -1076,7 +1109,7 @@ struct GraphsView: View {
             func overlap(_ from: Date, _ to: Date?) -> Double {
                 max(0, min(t2, to ?? end).timeIntervalSince(max(t1, from))) / length
             }
-            let here = m.blocks.compactMap { b -> (GraphModel.Block, Double)? in
+            let here = blocks.compactMap { b -> (GraphModel.Block, Double)? in
                 let o = overlap(b.from, b.to)
                 return o >= 0.3 ? (b, o) : nil
             }
@@ -1121,6 +1154,19 @@ struct GraphsView: View {
             if let since, since >= 10 { line = line + Text(" for \(age(since))").foregroundColor(.orange) }
         }
         let active = s.holders.reduce(0) { $0 + ($1.using ?? 0) }
+        let cpus = ProcessInfo.processInfo.activeProcessorCount
+        if measured {
+            // What the Mac is doing, first: its CPUs busy, then cpuq's jobs and what waits.
+            let busy = (model.samples.last?.busy).map { $0 * Double(cpus) } ?? active
+            line = line + Text("  ·  ") + Text(String(format: "%.1f of %d CPUs busy", busy, cpus)).bold()
+                + Text(" · \(s.holders.count) \(s.holders.count == 1 ? "job" : "jobs")")
+                + Text(" · \(s.waiters.count) waiting").foregroundColor(s.waiters.isEmpty ? nil : .red)
+            if let load = s.load.first { line = line + Text(String(format: " · load %.1f", load)).foregroundColor(.secondary) }
+            if s.memoryPressure == "high" { line = line + Text(" · memory pressure high").foregroundColor(.red) }
+            let outside = s.outside.reduce(0) { $0 + $1.using }
+            if outside >= 0.3 { line = line + Text(String(format: " · %.1f outside cpuq", outside)).foregroundColor(.secondary) }
+            return line
+        }
         line = line + Text("  ·  \(s.held) of \(s.budget) cores in use").bold() + Text(String(format: ", %.1f active", active))
         line = line + Text(" · \(s.waiters.count) waiting").foregroundColor(s.waiters.isEmpty ? nil : .red)
         if let load = s.load.first {
@@ -1149,7 +1195,7 @@ struct GraphsView: View {
         let then = model.samples.min { abs($0.at.timeIntervalSince(at)) < abs($1.at.timeIntervalSince(at)) }
             .flatMap { abs($0.at.timeIntervalSince(at)) < 30 ? $0 : nil }
         let machine = then.map {
-            Text("   cpuq \($0.inUse) in use, ").foregroundColor(.secondary)
+            Text(measured ? "   cpuq \($0.inUse) reserved, " : "   cpuq \($0.inUse) in use, ").foregroundColor(.secondary)
                 + Text(String(format: "%.1f active", $0.active)).foregroundColor(.secondary)
                 + Text(String(format: " · load %.1f", $0.load)).foregroundColor(.secondary)
         } ?? Text("")
@@ -1182,17 +1228,29 @@ struct GraphsView: View {
         if hoverIn == .stack {
             // The project whose band is under the pointer in that column.
             let columns = TimeAxis(span: min(max(end.timeIntervalSince(model.oldest(now: end)), 300), GraphModel.keep), end: end).columns
-            let here = Self.bands(model, columns: columns, end: end).filter { $0.column == column }
+            let here = Self.bands(model, columns: columns, end: end, idle: !measured).filter { $0.column == column }
             guard let band = here.first(where: { $0.low <= p.y && p.y < $0.high })
             else { return when + Text("no job here").foregroundColor(.secondary) }
             let mine = here.filter { $0.project == band.project }
             let held = mine.reduce(0) { $0 + $1.high - $1.low }
+            if measured { return when + Text(band.project).bold() + Text(String(format: " · %.1f CPUs busy", held)) }
             var t = when + Text(band.project).bold() + Text(String(format: " · %.1f cores in use", held))
             if !mine.contains(where: { $0.kind == .unmeasured }) {
                 let busy = mine.filter { $0.kind == .busy }.reduce(0) { $0 + $1.high - $1.low }
                 t = t + Text(String(format: ", %.1f active, %.1f idle", busy, held - busy))
             }
             return t
+        }
+        if hoverIn == .lanes, measured {
+            let row = Int(p.y)
+            guard let cell = cells.first(where: { $0.column == column && $0.lane == row }), let id = cell.block,
+                  let b = model.blocks.first(where: { $0.id == id }) else { return when + Text("no job").foregroundColor(.secondary) }
+            let near = b.active.min { abs($0.at.timeIntervalSince(at)) < abs($1.at.timeIntervalSince(at)) }
+            let active = near.flatMap { abs($0.at.timeIntervalSince(at)) < 30 ? $0.cores : nil } ?? b.average
+            var t = when + Text(b.label).bold()
+            if let active { t = t + Text(String(format: " · %.1f CPUs busy", active)) }
+            t = t + Text(" · \(b.lanes.count) reserved").foregroundColor(.secondary)
+            return t + Text(" · \(b.to == nil ? "running" : "ran") \(age((b.to ?? end).timeIntervalSince(b.from)))").foregroundColor(.secondary)
         }
         if hoverIn == .lanes {
             let lane = Int(p.y)
@@ -1233,9 +1291,10 @@ struct GraphsView: View {
             Grid(alignment: .leading, horizontalSpacing: 16) {
                 GridRow {
                     Text("Project").frame(width: 220, alignment: .leading)
-                    Text("In use").frame(width: 64, alignment: .trailing)
-                    Text("Active").frame(width: 64, alignment: .trailing)
-                    Text("Efficiency").frame(width: 72, alignment: .trailing)
+                    Text(measured ? "Reserved" : "In use").frame(width: 64, alignment: .trailing)
+                    Text(measured ? "CPUs busy" : "Active").frame(width: 64, alignment: .trailing)
+                    // Under measured admission what a job reserves costs nothing idle: no ratio.
+                    Text(measured ? "" : "Efficiency").frame(width: 72, alignment: .trailing)
                 }
             }
             .font(.caption.bold()).foregroundStyle(.secondary)
@@ -1255,7 +1314,7 @@ struct GraphsView: View {
                         .frame(width: 220, alignment: .leading)
                     Text("\(r.held)").frame(width: 64, alignment: .trailing)
                     Text(String(format: "%.1f", r.used)).frame(width: 64, alignment: .trailing)
-                    Text(r.held > 0 ? "\(Int((r.used / Double(r.held) * 100).rounded()))%" : "–")
+                    Text(measured ? "" : r.held > 0 ? "\(Int((r.used / Double(r.held) * 100).rounded()))%" : "–")
                         .foregroundStyle(r.used * 2 < Double(r.held) ? Color.orange : Color.secondary)
                         .frame(width: 72, alignment: .trailing)
                 }

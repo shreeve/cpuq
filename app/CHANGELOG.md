@@ -3,6 +3,20 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.12.0 — 2026-10-07
+
+Under cpuq 0.8's measured admission, every view now speaks of the Mac's real CPUs; what cpuq
+reserves for jobs (it hands out more than the Mac has, since idle reservations cost nothing) is
+a detail.
+
+- The top line leads with the CPUs busy: "8.4 of 10 CPUs busy · 6 jobs · 1 waiting".
+- Stacked is the CPU each project keeps busy, on the Mac's own scale: no reserved-but-idle cores
+  piled on top, and a job not yet measured counts for nothing rather than for what it reserved.
+- Lanes become Jobs: one row per job, solid while it keeps a CPU busy, pale while it idles, so
+  there are only as many rows as jobs ran at once, never one per reserved core.
+- The job table shows what each project reserves and the CPUs it keeps busy, without the
+  efficiency ratio, which no longer costs anyone anything.
+
 ## 0.11.0 — 2026-10-07
 
 - The window keeps the size you give it, and everything in it always fits: nothing scrolls and
