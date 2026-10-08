@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.2 — 2026-10-07
+
+- No line from the waiting tray to the cells: the tray and the rose cells say it already.
+- A stretch of needless waiting that began and ended in the same minute reads "7 min ago", not
+  "7–7 min ago".
+
 ## 0.13.1 — 2026-10-07
 
 - The Per core lanes call the fast cores Performance, as most people do, not by the name macOS

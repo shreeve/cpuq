@@ -459,7 +459,6 @@ struct WaiterActions: View {
 final class CellMotion {
     var fill: [String: Double] = [:]
     var rose = 0.0
-    var nozzle = 0.0
     /// Bubbles rising through busy cells: which cell, where, how fast, how big.
     var bubbles: [(cell: Int, x: Double, y: Double, speed: Double, r: Double)] = []
     var lastFrame = 0.0
@@ -479,13 +478,12 @@ final class CellMotion {
             if (fill[key] ?? 0) < 0.001 && target[key] == nil { fill[key] = nil }
         }
         rose += ((m.needless ? 1 : 0) - rose) * k
-        nozzle += (min(floor(m.total + 0.02), cpus - 1) - nozzle) * (instantly || first ? 1 : 0.08)
     }
 }
 
 /// Ten glass cells, one per CPU, filled left to right with each project's CPU in palette order,
-/// then other work; a gentle wave on the surface, and the pipe from the tray to the first free
-/// cell. Drawn with Canvas and paused when motion is reduced.
+/// then other work, with a gentle wave on the surface. Drawn with Canvas and paused when motion
+/// is reduced.
 struct CellsCanvas: View {
     let model: GraphModel
     let moment: Moment
@@ -610,29 +608,6 @@ struct CellsCanvas: View {
             }
             gc.draw(Text("\(c + 1)").font(.system(size: 10)).foregroundColor(Alive.ink3), at: CGPoint(x: x + w / 2, y: bottom + 9))
         }
-        // The pipe from the tray to the first free cell, with work flowing along it while jobs
-        // wait: slow when the wait is fair, stuck and rose when it is not.
-        guard trayWidth > 0, !moment.waiters.isEmpty else { return }
-        let ex = x0 + motion.nozzle * (w + gap) + w / 2
-        let start = CGPoint(x: trayWidth - 4, y: 36), end = CGPoint(x: ex, y: top - 6)
-        let c1 = CGPoint(x: start.x + 40, y: start.y), c2 = CGPoint(x: ex, y: 8)
-        var pipe = Path()
-        pipe.move(to: start)
-        pipe.addCurve(to: end, control1: c1, control2: c2)
-        let bad = moment.needless
-        gc.stroke(pipe, with: .color(bad ? Alive.rose.opacity(0.35 + 0.25 * pulse) : Alive.glassEdge), style: StrokeStyle(lineWidth: 6, lineCap: .round))
-        gc.stroke(pipe, with: .color(Alive.card), style: StrokeStyle(lineWidth: 3, lineCap: .round))
-        gc.fill(Path(roundedRect: CGRect(x: ex - 7, y: top - 7, width: 14, height: 3), cornerRadius: 1.5), with: .color(bad ? Alive.rose : Alive.ink3))
-        let first = moment.waiters.min { $0.since < $1.since }
-        let color = bad ? Alive.rose : model.color(first?.project ?? "")
-        for k in 0..<4 {
-            let u: Double
-            if bad { u = 0.05 + Double(k) * 0.04 + 0.004 * sin(t * 9 + Double(k)) } else { u = (t * 0.22 + Double(k) / 4).truncatingRemainder(dividingBy: 1) * 0.92 }
-            let a = 1 - u
-            let pt = CGPoint(x: a * a * a * start.x + 3 * a * a * u * c1.x + 3 * a * u * u * c2.x + u * u * u * end.x,
-                             y: a * a * a * start.y + 3 * a * a * u * c1.y + 3 * a * u * u * c2.y + u * u * u * end.y)
-            gc.fill(Path(ellipseIn: CGRect(x: pt.x - 2, y: pt.y - 2, width: 4, height: 4)), with: .color(color))
-        }
     }
 }
 
@@ -687,7 +662,7 @@ struct HourCard: View {
             let b = Int((end.timeIntervalSince(hour.columns[last.upperBound].to) / 60).rounded())
             t = t + Text(" · waited with CPUs idle ").foregroundColor(.secondary)
                 + Text(minutes < 1 ? "<1 min" : "\(Int(minutes.rounded())) min").foregroundColor(Alive.rose).bold()
-                + Text(b < 1 ? ", ending \(a) min ago" : ", \(a)–\(b) min ago").foregroundColor(.secondary)
+                + Text(b < 1 ? ", ending \(a) min ago" : a == b ? ", \(a) min ago" : ", \(a)–\(b) min ago").foregroundColor(.secondary)
                 + Text(" · otherwise waits were seconds").foregroundColor(.secondary)
         }
         return t
