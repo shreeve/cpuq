@@ -234,11 +234,43 @@ pub fn spawn(
 
 /// Signals forwarded to the command once it runs.
 pub const forwarded = [_]c.SIG{ .HUP, .INT, .QUIT, .TERM, .USR1, .USR2 };
+/// The signals last words catch: hangup, ^C, ^\ and kill.
+const fatal = [_]c.SIG{ .HUP, .INT, .QUIT, .TERM };
+
+/// Blocks `sigs` in the calling thread; returns the mask to restore.
+fn hold(sigs: []const c.SIG) c.sigset_t {
+    var set: c.sigset_t = undefined;
+    _ = c.sigemptyset(&set);
+    for (sigs) |sig| _ = c.sigaddset(&set, sig);
+    var before: c.sigset_t = undefined;
+    _ = c.sigprocmask(c.SIG.BLOCK, &set, &before);
+    return before;
+}
+
+/// Holds the fatal signals in the calling thread until `restoreSignals`:
+/// one that arrives meanwhile is delivered then.
+pub fn holdFatal() c.sigset_t {
+    return hold(&fatal);
+}
+
+/// Holds every signal cpuq handles in the calling thread until
+/// `restoreSignals`. A thread started meanwhile keeps them blocked for good,
+/// so they all go to the main thread, and a handler never runs beside the
+/// main thread's own work: last words half re-armed, or the command's pid
+/// half recorded. (The kernel gives a process's signal to any thread that
+/// has it unblocked: while the main thread holds it, a worker.)
+pub fn holdHandled() c.sigset_t {
+    return hold(&forwarded);
+}
+
+pub fn restoreSignals(before: c.sigset_t) void {
+    _ = c.sigprocmask(c.SIG.SETMASK, &before, null);
+}
 
 var child_pid = std.atomic.Value(c.pid_t).init(0);
-/// Whether cpuq runs in its terminal's foreground process group: then the
-/// terminal delivers ^C and ^\ to the command itself.
-var tty_foreground = false;
+/// cpuq's terminal, if it has one: while cpuq is in its foreground process
+/// group, the terminal delivers ^C, ^\ and hangup to the command itself.
+var tty_fd: c_int = -1;
 extern "c" fn tcgetpgrp(fd: c_int) c.pid_t;
 extern "c" fn getpgrp() c.pid_t;
 var pending_signal = std.atomic.Value(u32).init(0);
@@ -266,12 +298,8 @@ pub fn armLastWords(slot: u1, path: []const u8, head: []const u8, tail: []const 
     // A fatal signal arriving while the line is rewritten waits until it is
     // in place: the kit closes a hold's stdin and kills it at once, which
     // lands exactly as cpuq re-arms.
-    var fatal: c.sigset_t = undefined;
-    _ = c.sigemptyset(&fatal);
-    for ([_]c.SIG{ .HUP, .INT, .QUIT, .TERM }) |sig| _ = c.sigaddset(&fatal, sig);
-    var before: c.sigset_t = undefined;
-    _ = c.sigprocmask(c.SIG.BLOCK, &fatal, &before);
-    defer _ = c.sigprocmask(c.SIG.SETMASK, &before, null);
+    const before = holdFatal();
+    defer restoreSignals(before);
     const w = &last_words[slot];
     w.armed.store(false, .release);
     if (path.len >= last_path.len or head.len > w.head.len or tail.len > w.tail.len) return;
@@ -285,7 +313,7 @@ pub fn armLastWords(slot: u1, path: []const u8, head: []const u8, tail: []const 
     w.armed.store(true, .release);
     var sa: c.Sigaction = .{ .handler = .{ .handler = onFatal }, .mask = undefined, .flags = 0 };
     _ = c.sigemptyset(&sa.mask);
-    for ([_]c.SIG{ .HUP, .INT, .QUIT, .TERM }) |sig| {
+    for (fatal) |sig| {
         var old: c.Sigaction = undefined;
         if (c.sigaction(sig, null, &old) == 0 and old.handler.handler == c.SIG.IGN) continue;
         _ = c.sigaction(sig, &sa, null);
@@ -346,16 +374,21 @@ fn senderPid(info: *const c.siginfo_t) c.pid_t {
 }
 
 fn onSignal(sig: c.SIG, info: *const c.siginfo_t, _: ?*anyopaque) callconv(.c) void {
-    // A signal with no sending process came from the kernel's terminal
-    // driver (^C, ^\, hangup), which sent it to the whole foreground process
-    // group, the command included; like system(3), cpuq lets the command
-    // handle it alone. A signal some process sent to cpuq goes on to the
-    // command. ^C and ^\ in the foreground of a terminal are the terminal's
-    // whatever sender they show: macOS can name the process that wrote the
-    // keystroke to a pseudo-terminal, and passing them on would deliver them
-    // twice.
-    if (senderPid(info) == 0) return;
-    if (tty_foreground and (sig == .INT or sig == .QUIT)) return;
+    // In the foreground of a terminal, a signal with no sending process came
+    // from the kernel's terminal driver (^C, ^\, hangup), which sent it to
+    // the whole foreground process group, the command included; like
+    // system(3), cpuq lets the command handle it alone. ^C and ^\ there are
+    // the terminal's whatever sender they show: macOS can name the process
+    // that wrote the keystroke to a pseudo-terminal, and passing them on
+    // would deliver them twice. Any other signal some process sent to cpuq
+    // goes on to the command, with or without a sender: macOS keeps one
+    // sender per process, filled in only when the signal can be taken at
+    // once, so a kill that lands while that signal is blocked (its handler
+    // running for an earlier one, say) arrives with none. Whether cpuq is in
+    // the foreground is asked each time, since a shell can move it (fg, bg).
+    if (tty_fd >= 0 and tcgetpgrp(tty_fd) == getpgrp()) {
+        if (senderPid(info) == 0 or sig == .INT or sig == .QUIT) return;
+    }
     const pid = child_pid.load(.acquire);
     if (pid > 0) {
         _ = c.kill(pid, sig);
@@ -371,7 +404,7 @@ fn onSignal(sig: c.SIG, info: *const c.siginfo_t, _: ?*anyopaque) callconv(.c) v
 pub fn installForwarding() void {
     for ([_]c_int{ 0, 1, 2 }) |fd| {
         if (std.c.isatty(fd) == 0) continue;
-        tty_foreground = tcgetpgrp(fd) == getpgrp();
+        tty_fd = fd;
         break;
     }
     var sa: c.Sigaction = .{

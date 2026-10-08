@@ -208,11 +208,17 @@ print(r.returncode)")
 t_direct_sigint() {
   setup direct-sigint
   local f=$T/ints
-  dfl "$CPUQ" run -- sh -c "trap 'echo INT >>$f; exit 3' INT; while :; do sleep 0.05; done" & local p=$!
-  wait_held 2
-  sleep 0.3
+  dfl "$CPUQ" run -- sh -c "trap 'echo INT >>$f; exit 3' INT; : >$T/trapped; while :; do sleep 0.05; done" & local p=$!
+  # Signal only once the trap is set: the shell ignores SIGINT for a moment
+  # while it sets one, and on a slow runner the command can still be
+  # starting long after cpuq holds its cores.
+  local i=0
+  until [ -e "$T/trapped" ]; do i=$((i + 1)); [ $i -gt 100 ] && break; sleep 0.1; done
   kill -INT $p
+  # Never hang the suite: a lost signal fails here after 10 s.
+  (i=0; while kill -0 $p 2>/dev/null && [ $i -lt 100 ]; do i=$((i + 1)); sleep 0.1; done; kill -KILL $p 2>/dev/null) & local guard=$!
   wait $p; local rc=$?
+  wait $guard
   local n; n=$(wc -l <"$f" 2>/dev/null | tr -d ' ')
   check "kill -INT to cpuq reaches the command once (got ${n:-0}, exit $rc)" "[ '$n' = 1 ] && [ $rc = 3 ]"
 }
