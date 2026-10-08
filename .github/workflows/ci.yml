@@ -49,3 +49,44 @@ jobs:
         run: |
           zig build -Doptimize=safe
           test/run.sh
+
+  # Temporary: loops the two tests that flaked on macOS, three at once to
+  # load the runner, against this commit and (for comparison) 0.8.4.
+  stress:
+    name: Stress (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build this commit and 0.8.4
+        run: |
+          zig build -Doptimize=safe
+          mkdir -p /tmp/old && git archive v0.8.4 | tar -x -C /tmp/old
+          (cd /tmp/old && zig build -Doptimize=safe)
+
+      - name: Loop direct_sigint and last_words (this commit)
+        run: |
+          loop() { local i; for i in $(seq 40); do test/run.sh direct_sigint last_words >/tmp/s$1.$i.log 2>&1 || echo "loop $1 round $i FAILED: $(grep FAIL /tmp/s$1.$i.log | tr '\n' ' ')"; done; echo "loop $1 done"; }
+          loop 1 >/tmp/r1 & loop 2 >/tmp/r2 & loop 3 >/tmp/r3 & wait
+          cat /tmp/r1 /tmp/r2 /tmp/r3
+          ! grep -q FAILED /tmp/r1 /tmp/r2 /tmp/r3
+
+      - name: Loop last_words against 0.8.4 (for comparison; never fails the job)
+        run: |
+          loop() { local i; for i in $(seq 40); do CPUQ=/tmp/old/bin/cpuq test/run.sh last_words >/tmp/o$1.$i.log 2>&1 || echo "loop $1 round $i FAILED: $(grep FAIL /tmp/o$1.$i.log | tr '\n' ' ')"; done; echo "loop $1 done"; }
+          loop 1 >/tmp/q1 & loop 2 >/tmp/q2 & loop 3 >/tmp/q3 & wait
+          cat /tmp/q1 /tmp/q2 /tmp/q3
+          echo "0.8.4 failed $(cat /tmp/q1 /tmp/q2 /tmp/q3 | grep -c FAILED) of 120 rounds"
