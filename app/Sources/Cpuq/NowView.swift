@@ -568,8 +568,10 @@ struct CellsCanvas: View {
             let mid = a + v / 2
             let cx = x0 + mid * (w + gap) - gap / 2, r = 24 + v * 22
             var g = gc
-            g.translateBy(x: cx, y: bottom + 4)
-            g.scaleBy(x: 1, y: 0.38)
+            g.translateBy(x: cx, y: bottom + 2)
+            // Flattened into an ellipse no taller than the room under the cells, so it fades
+            // out before the canvas's edge rather than being cut off at it.
+            g.scaleBy(x: 1, y: min(0.38, (size.height - bottom - 3) / r))
             g.fill(Path(ellipseIn: CGRect(x: -r, y: -r, width: 2 * r, height: 2 * r)),
                    with: .radialGradient(Gradient(colors: [color.opacity(dark ? 0.34 : 0.22), color.opacity(0)]), center: .zero, startRadius: 0, endRadius: r))
         }
