@@ -200,6 +200,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         m.addItem(.separator())
         m.addItem(withTitle: "Show Graphs…", action: #selector(showGraphs), keyEquivalent: "g").target = self
+        m.addItem(themeItem())
         m.addItem(withTitle: "Open Live View in Terminal", action: #selector(openLiveView), keyEquivalent: "l").target = self
         if Bundle.main.bundleURL.pathExtension == "app" {
             let check = NSMenuItem(title: "Check for Updates…", action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)), keyEquivalent: "")
@@ -207,6 +208,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             m.addItem(check)
         }
         m.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    }
+
+    // MARK: - Themes
+
+    /// Theme ▸ the themes, each with its colors, then Automatic, Light and Dark.
+    private func themeItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "Theme", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        let dark = (graphsWindow?.effectiveAppearance ?? NSApp.effectiveAppearance).bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        for theme in Theme.all {
+            let t = NSMenuItem(title: theme.name, action: #selector(pickTheme(_:)), keyEquivalent: "")
+            t.target = self
+            t.representedObject = theme.id
+            t.image = theme.swatch(dark: dark)
+            t.state = theme.id == Theme.current.id ? .on : .off
+            sub.addItem(t)
+        }
+        sub.addItem(.separator())
+        for (id, title) in [("auto", "Automatic"), ("light", "Light"), ("dark", "Dark")] {
+            let a = NSMenuItem(title: title, action: #selector(pickAppearance(_:)), keyEquivalent: "")
+            a.target = self
+            a.representedObject = id
+            a.state = id == Theme.appearanceName ? .on : .off
+            sub.addItem(a)
+        }
+        item.submenu = sub
+        return item
+    }
+
+    @objc private func pickTheme(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        Theme.use(id)
+        // GraphsView redraws itself on the stored theme; the window's frame and border too.
+        graphsWindow?.contentView?.needsDisplay = true
+        graphsWindow?.invalidateShadow()
+    }
+
+    @objc private func pickAppearance(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        Theme.appearanceName = id
+        graphsWindow?.appearance = Theme.appearance
     }
 
     // MARK: - The graphs window
@@ -219,6 +261,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 backing: .buffered, defer: false)
             window.title = "cpuq"
             window.isReleasedWhenClosed = false
+            window.appearance = Theme.appearance
             // The window is the size it is given and no other: what is in it never grows or
             // shrinks it, and everything in it fits, the charts sharing what height there is.
             let host = NSHostingView(rootView: GraphsView(model: graphs, control: { [weak self] action, pid, who in self?.perform(action, pid: String(pid), who: who) }))

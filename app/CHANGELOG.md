@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.15 — 2026-10-08
+
+- Themes: the menu's Theme submenu picks the window's colors, Alive (as before), Ocean,
+  Forest, Sunset, Nordic, Pastel or Neon Slate, each with a light and a dark mode. Below
+  them, Automatic follows macOS between the two; Light and Dark keep to one.
+
 ## 0.13.14 — 2026-10-08
 
 - The rose behind needless waiting runs from the floor to the ceiling, under the stack, so the

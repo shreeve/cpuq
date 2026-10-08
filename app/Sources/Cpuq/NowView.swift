@@ -1075,18 +1075,31 @@ enum Alive {
             return NSColor(srgbRed: Double(v >> 16 & 0xff) / 255, green: Double(v >> 8 & 0xff) / 255, blue: Double(v & 0xff) / 255, alpha: d ? da : la)
         })
     }
-    static let window = color(0xf4f4f6, 0x1b1b1d)
-    static let card = color(0xffffff, 0x232326)
+    /// A color of the theme in use, light or dark as the appearance asks.
+    static func tone(_ value: @escaping (Theme.Tones) -> UInt32, alpha: Double = 1) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let theme = Theme.current
+            let d = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            return Theme.nsColor(value(d ? theme.dark : theme.light), alpha: alpha)
+        })
+    }
+    /// The theme's color for palette slot `i`.
+    static func slot(_ i: Int) -> Color { tone { $0.palette[i] } }
+    static let window = tone(\.window)
+    static let card = tone(\.card)
     static let cardEdge = color(0x000000, 0xffffff, 0.06, 0.06)
-    static let ink = color(0x1d1d1f, 0xf5f5f7)
-    static let ink2 = color(0x6e6e73, 0xa1a1a6)
-    static let ink3 = color(0xa3a3a8, 0x66666b)
+    static let ink = tone(\.ink)
+    static let ink2 = tone(\.ink2)
+    static let ink3 = tone(\.ink3)
     static let glass = color(0x141e3c, 0xffffff, 0.045, 0.045)
     static let glassEdge = color(0x141e3c, 0xffffff, 0.11, 0.11)
     static let track = color(0x000000, 0xffffff, 0.06, 0.08)
-    static let rose = color(0xee2f57, 0xff4469)
-    static let roseSoft = color(0xee2f57, 0xff4469, 0.10, 0.14)
-    static let out = color(0xa2a2a8, 0x6c6c72)
+    static let rose = tone(\.rose)
+    static let roseSoft = Color(nsColor: NSColor(name: nil) { appearance in
+        let d = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        return Theme.nsColor((d ? Theme.current.dark : Theme.current.light).rose, alpha: d ? 0.14 : 0.10)
+    })
+    static let out = tone(\.out)
     /// A timing window: calm, deliberate, not an alarm.
     static let windowTint = color(0x5856d6, 0x7d7aff)
 }

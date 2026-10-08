@@ -258,13 +258,9 @@ final class GraphModel {
     /// A project's place in the palette, which also orders the stacked chart.
     func slot(_ project: String) -> Int { slots[project] ?? Int.max }
 
-    /// Project colors: the system's bright hues and a lime, the most distinct first. No red or
-    /// pink (red means waiting), no grey (work outside cpuq), no brown (pale, it reads as the
-    /// gate shut).
-    /// In the design's order, which is also the stacking order: blue, green, purple, orange, teal.
-    static let palette: [Color] = [Alive.color(0x2f7cf6, 0x3d86f5), Alive.color(0x2fb457, 0x2db052), Alive.color(0x9b5de5, 0xa070ee),
-                                   Alive.color(0xf08a00, 0xcc7404), Alive.color(0x14a9b8, 0x16a0af), .yellow, .mint,
-                                   Color(red: 0.62, green: 0.82, blue: 0.08), .indigo, .teal]
+    /// Project colors, in the stacking order. The first six come from the theme (Theme.swift);
+    /// the rest are the same in every theme. No grey: that is work outside cpuq.
+    static let palette: [Color] = (0..<6).map { Alive.slot($0) } + [.mint, Color(red: 0.62, green: 0.82, blue: 0.08), .indigo, .teal]
 
     /// Slots saved by an app older than the design's palette moved to it: each keeps its color
     /// where the palette still has it, and the projects the design shows take its colors.
@@ -347,6 +343,8 @@ struct GraphsView: View {
     /// Runs a job action (`cpuq ACTION PID`), asking first where it costs something.
     var control: ((String, Int, String) -> Void)? = nil
     @State private var tab = 0
+    /// Read here so that a new theme draws the whole window again.
+    @AppStorage("theme") private var theme = "alive"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -366,6 +364,7 @@ struct GraphsView: View {
         .padding(16)
         .frame(minWidth: Self.minimumSize.width, maxWidth: .infinity, minHeight: Self.minimumSize.height, maxHeight: .infinity, alignment: .topLeading)
         .background(Alive.window)
+        .id(theme)
     }
 
     /// The smallest the window goes: at this size everything in it still fits.
