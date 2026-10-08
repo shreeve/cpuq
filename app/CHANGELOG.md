@@ -3,6 +3,11 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.19 — 2026-10-08
+
+- The menu shows the versions above Quit, in grey: "Cpuq.app 0.13.19 · cpuq 0.8.11", the app's
+  and the cpuq it reads.
+
 ## 0.13.18 — 2026-10-08
 
 - The graphs window keeps to its minimum size however it is resized, and a window saved

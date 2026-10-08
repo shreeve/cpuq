@@ -208,7 +208,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             check.target = updater
             m.addItem(check)
         }
+        m.addItem(versions())
         m.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    }
+
+    /// "Cpuq.app 0.13.18 · cpuq 0.8.11", in grey: the app's version and the cpuq it reads.
+    private func versions() -> NSMenuItem {
+        let app = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+        var s = "Cpuq.app \(app)"
+        if let cli = status?.version, !cli.isEmpty { s += " · cpuq \(cli)" }
+        let item = NSMenuItem(title: s, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        item.attributedTitle = NSAttributedString(string: s, attributes: [.font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize), .foregroundColor: NSColor.secondaryLabelColor])
+        return item
     }
 
     // MARK: - Themes
