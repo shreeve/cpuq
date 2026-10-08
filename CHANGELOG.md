@@ -2,8 +2,11 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
-## 0.8.3 — 2026-10-07
+## 0.8.4 — 2026-10-07
 
+- Waiters no longer scan the processes while a quiet window (`--exclusive`) is held: nothing is
+  admitted then, and each waiter's scan, twice a second, was kernel time taken from the
+  benchmark the window is for.
 - `exclusive = off` (config; on by default): `--exclusive`, on `cpuq run` or a local `cpuq lease`,
   runs as an ordinary job alongside the others instead of draining the machine, and says so on
   stderr; `cpuq status` notes it. On this Mac 46 exclusive timing runs in two hours left the CPUs

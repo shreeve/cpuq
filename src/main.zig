@@ -814,6 +814,9 @@ fn useOf(rt: RunTimes, label: []const u8) ?f64 {
 /// admission lock held.
 fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const RunTimes) struct { charged: f64, exclusive: bool } {
     const leases = state.scanLeases(st, a, false) catch return .{ .charged = 0, .exclusive = false };
+    // While a quiet window is held nothing is admitted, so nothing is
+    // measured: every waiter's scan of the processes would only disturb it.
+    for (leases) |l| if (l.record.exclusive) return .{ .charged = std.math.inf(f64), .exclusive = true };
     const procs = sys.processes(ctx.io, a);
     const old = st.readUsage(a);
     var fresh: std.StringHashMapUnmanaged(policy.Use) = .empty;
@@ -821,7 +824,6 @@ fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const Ru
     const now_s = @divFloor(now_ms, 1000);
     var charged: f64 = 0;
     for (leases) |l| {
-        if (l.record.exclusive) return .{ .charged = std.math.inf(f64), .exclusive = true };
         if (st.isPaused(l.name)) continue;
         const expected = useOf(rt.*, l.record.label);
         if (l.record.child <= 0) {
