@@ -53,6 +53,8 @@ pub const Event = struct {
     /// Stopped by cpuq for using more memory than `max_memory`: how much its
     /// processes used then, in bytes (ended).
     memory: ?u64 = null,
+    /// The most memory it used at once, in bytes (ended).
+    peak: ?u64 = null,
 };
 
 /// The longest command kept in a line, so a line stays well under 4 KB.
@@ -114,6 +116,8 @@ pub const Job = struct {
     slots: ?[]const u32 = null,
     /// Stopped by cpuq for its memory: how much it used, in bytes.
     memory: ?u64 = null,
+    /// The most memory it used at once, in bytes.
+    peak: ?u64 = null,
     state: State = .active,
 
     /// Seconds spent waiting: until admitted, or until it gave up.
@@ -187,6 +191,7 @@ pub fn load(io: Io, a: std.mem.Allocator, path: []const u8, boot: f64, alive: *c
                 j.signal = ev.signal;
                 j.cpu = ev.cpu;
                 j.memory = ev.memory;
+                j.peak = ev.peak;
                 if (ev.cores) |k| j.cores = k;
                 j.state = .done;
             } else if (std.mem.eql(u8, ev.event, "gave_up")) {

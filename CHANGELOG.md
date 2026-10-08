@@ -2,6 +2,15 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.8.2 — 2026-10-07
+
+- Every job's peak memory is recorded: the most its processes used together, looked at every 2
+  seconds, or for a job too quick to look at, the most any one of them held (the kernel's
+  maxrss). It is `peak` (bytes) in `cpuq history --json` and a MEMORY column in `cpuq history`,
+  so a label's real memory use can be read off its runs.
+- A command's end is noticed within a tenth of a second (it was up to 2 seconds with
+  `max_memory` set), so its cores go to the next job sooner.
+
 ## 0.8.1 — 2026-10-07
 
 - `min_available` (config, off by default, e.g. `min_available = 6G`): admit nothing while the

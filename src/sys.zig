@@ -404,6 +404,10 @@ pub const Waited = struct {
     cpu_s: f64 = 0,
     /// Set when cpuq stopped the command for its memory: what it used, in bytes.
     memory: ?u64 = null,
+    /// The most memory it used at once, in bytes: the larger of the most its
+    /// processes used together when looked at, and the most any one of them
+    /// held (wait4's maxrss), which catches a job too quick to be looked at.
+    peak: u64 = 0,
 };
 
 pub fn waitChild(pid: c.pid_t) Waited {
@@ -426,10 +430,13 @@ fn waitFor(pid: c.pid_t, block: bool) ?Waited {
         return .{ .exit = .{ .code = 125 } };
     }
     const cpu_s = seconds(ru.utime) + seconds(ru.stime);
+    // maxrss is in bytes on macOS, kilobytes on Linux.
+    const rss: u64 = @intCast(@max(ru.maxrss, 0));
+    const peak = if (is_darwin) rss else rss * 1024;
     const s: u32 = @bitCast(status);
-    if (c.W.IFEXITED(s)) return .{ .exit = .{ .code = c.W.EXITSTATUS(s) }, .cpu_s = cpu_s };
-    if (c.W.IFSIGNALED(s)) return .{ .exit = .{ .signal = c.W.TERMSIG(s) }, .cpu_s = cpu_s };
-    return .{ .exit = .{ .code = 125 }, .cpu_s = cpu_s };
+    if (c.W.IFEXITED(s)) return .{ .exit = .{ .code = c.W.EXITSTATUS(s) }, .cpu_s = cpu_s, .peak = peak };
+    if (c.W.IFSIGNALED(s)) return .{ .exit = .{ .signal = c.W.TERMSIG(s) }, .cpu_s = cpu_s, .peak = peak };
+    return .{ .exit = .{ .code = 125 }, .cpu_s = cpu_s, .peak = peak };
 }
 
 fn seconds(tv: c.timeval) f64 {

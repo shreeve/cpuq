@@ -1108,6 +1108,23 @@ print(h["signal"], "%.1f" % ((h.get("memory") or 0) / 2**30), j["small"]["exit"]
   check "a job over max_memory is stopped and recorded so; a small one is not (rc $rc, $got)" "[ $small = 0 ] && [ $rc = 143 ] && [[ '$got' == '15 0.'* ]] && [[ '$got' == *' 0' ]] && grep -q 'over max_memory' '$T/err'"
 }
 
+t_peak_memory() {
+  setup peak-memory
+  # Two processes holding 150 MB each for 1.5 s: the peak counts them together.
+  # A quick one is too quick to look at; wait4's maxrss still gives its peak.
+  # A command that ends at once frees its cores at once.
+  "$CPUQ" run --cores 1 --label pair -- bash -c '
+p() { python3 -c "import time; b = bytearray(150 << 20); b[::4096] = b\"x\" * len(b[::4096]); time.sleep(1.5)"; }
+p & p & wait'
+  "$CPUQ" run --cores 1 --label quick -- python3 -c 'b = bytearray(100 << 20); b[::4096] = b"x" * len(b[::4096])'
+  "$CPUQ" run --cores 1 --label instant -- true
+  local got; got=$("$CPUQ" history --json | python3 -c 'import json, sys
+j = {x["label"]: x for x in json.load(sys.stdin)}
+print(j["pair"].get("peak", 0) >> 20, j["quick"].get("peak", 0) >> 20, "%.2f" % j["instant"]["ran"])')
+  local pair quick ran; read -r pair quick ran <<<"$got"
+  check "history keeps each job's peak memory, its processes together (pair ${pair}M, quick ${quick}M, true ran ${ran}s)" "[ $pair -ge 280 ] && [ $quick -ge 95 ] && python3 -c 'import sys; sys.exit(0 if $ran < 0.5 else 1)'"
+}
+
 t_min_available() {
   setup min-available "min_available = 1000000G"
   "$CPUQ" run --cores 1 --max-wait 1 -- true 2>/dev/null; local rc=$?
@@ -1131,7 +1148,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold last_words measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory min_available status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive nested elastic reserve usage lease lease_host lease_host_hold last_words measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

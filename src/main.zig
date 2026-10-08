@@ -465,6 +465,8 @@ const EventExtra = struct {
     forced: ?bool = null,
     /// Stopped for its memory, using this many bytes (`max_memory`).
     memory: ?u64 = null,
+    /// The most memory it used at once, in bytes.
+    peak: ?u64 = null,
     slots: ?[]const u32 = null,
     exit: ?u8 = null,
     signal: ?u32 = null,
@@ -487,6 +489,7 @@ fn logEvent(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra) void {
     ev.lent = extra.lent;
     ev.forced = extra.forced;
     ev.memory = extra.memory;
+    ev.peak = extra.peak;
     history.append(ctx.io, path, ev);
 }
 
@@ -516,9 +519,21 @@ var words_slot: u1 = 0;
 /// Logs how a command ended.
 fn logEnded(ctx: *Ctx, job: JobLog, cores: u32, w: sys.Waited) void {
     switch (w.exit) {
-        .code => |code| logEvent(ctx, job, "ended", .{ .cores = cores, .exit = code, .cpu = w.cpu_s, .memory = w.memory }),
-        .signal => |sig| logEvent(ctx, job, "ended", .{ .cores = cores, .signal = @intCast(@backingInt(sig)), .cpu = w.cpu_s, .memory = w.memory }),
+        .code => |code| logEvent(ctx, job, "ended", .{ .cores = cores, .exit = code, .cpu = w.cpu_s, .memory = w.memory, .peak = peakOf(w) }),
+        .signal => |sig| logEvent(ctx, job, "ended", .{ .cores = cores, .signal = @intCast(@backingInt(sig)), .cpu = w.cpu_s, .memory = w.memory, .peak = peakOf(w) }),
     }
+}
+
+/// Bytes as a short size: 340M, 1.2G.
+fn bytesText(buf: []u8, n: u64) []const u8 {
+    const f: f64 = @floatFromInt(n);
+    if (f >= 1 << 30) return std.mem.print(buf, "{d:.1}G", .{f / (1 << 30)}) catch "?";
+    return std.mem.print(buf, "{d:.0}M", .{f / (1 << 20)}) catch "?";
+}
+
+/// A peak of 0 is unknown (no reading), left out of history.
+fn peakOf(w: sys.Waited) ?u64 {
+    return if (w.peak != 0) w.peak else null;
 }
 
 fn lockOrFail(st: *state.State) void {
@@ -1060,22 +1075,26 @@ fn note(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, waited: i64, queue: [
     std.debug.print("{s}\n", .{w.buffered()});
 }
 
-/// Waits for the command. With `max_memory` set it also looks at the memory
-/// the command and its descendants use, every 2 seconds: over the limit, the
-/// whole tree is asked to stop (SIGTERM), and made to (SIGKILL) if any of it
-/// is still there 10 seconds on. One job that balloons would otherwise fill
-/// the swap and shut the memory gate on everyone.
+/// Waits for the command, looking at the memory it and its descendants use
+/// every 2 seconds and keeping the most, for history. With `max_memory` set,
+/// over the limit the whole tree is asked to stop (SIGTERM), and made to
+/// (SIGKILL) if any of it is still there 10 seconds on: one job that balloons
+/// would otherwise fill the swap and shut the memory gate on everyone. It
+/// checks for the end every tenth of a second, so the cores go on promptly.
 fn watchChild(ctx: *Ctx, pid: std.c.pid_t, label: []const u8) sys.Waited {
     const limit = ctx.cfg.max_memory;
-    if (limit == 0) return sys.waitChild(pid);
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     var stopped: ?u64 = null;
     var stopped_at: f64 = 0;
-    while (true) {
-        if (sys.reapChild(pid)) |w| return withMemory(w, stopped);
-        ctx.io.sleep(.fromMilliseconds(2000), .awake) catch {};
-        if (sys.reapChild(pid)) |w| return withMemory(w, stopped);
+    var peak: u64 = 0;
+    var tick: u32 = 0;
+    while (true) : (tick += 1) {
+        if (sys.reapChild(pid)) |w| return withMemory(w, stopped, peak);
+        ctx.io.sleep(.fromMilliseconds(100), .awake) catch {};
+        // The first look at half a second, then every 2.
+        if (tick < 5 or (tick - 5) % 20 != 0) continue;
+        if (sys.reapChild(pid)) |w| return withMemory(w, stopped, peak);
         _ = arena_state.reset(.retain_capacity);
         const a = arena_state.allocator();
         const procs = sys.processes(ctx.io, a);
@@ -1084,7 +1103,8 @@ fn watchChild(ctx: *Ctx, pid: std.c.pid_t, label: []const u8) sys.Waited {
             continue;
         }
         const used = sys.treeMem(procs, pid);
-        if (used <= limit) continue;
+        peak = @max(peak, used);
+        if (limit == 0 or used <= limit) continue;
         const gb = 1 << 30;
         std.debug.print("cpuq: stopping {s}: its processes use {d:.2} GB of memory, over max_memory ({d:.2} GB)\n", .{
             if (label.len != 0) label else "the command", @as(f64, @floatFromInt(used)) / gb, @as(f64, @floatFromInt(limit)) / gb,
@@ -1095,9 +1115,10 @@ fn watchChild(ctx: *Ctx, pid: std.c.pid_t, label: []const u8) sys.Waited {
     }
 }
 
-fn withMemory(w: sys.Waited, stopped: ?u64) sys.Waited {
+fn withMemory(w: sys.Waited, stopped: ?u64, peak: u64) sys.Waited {
     var out = w;
     out.memory = stopped;
+    out.peak = @max(w.peak, peak);
     return out;
 }
 
@@ -1710,6 +1731,8 @@ const JsonJob = struct {
     signal: ?u32,
     /// Stopped by cpuq for using this many bytes of memory.
     memory: ?u64 = null,
+    /// The most memory it used at once, in bytes.
+    peak: ?u64 = null,
 };
 
 fn aliveForHistory(pid: i32) bool {
@@ -1786,6 +1809,7 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
             .exit = j.exit,
             .signal = j.signal,
             .memory = j.memory,
+            .peak = j.peak,
         }) catch {};
         std.json.Stringify.value(out.items, .{ .whitespace = .indent_2 }, w) catch {};
         w.writeAll("\n") catch {};
@@ -1808,7 +1832,7 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
     }
     var lbuf: [40]u8 = undefined;
     var pbuf: [24]u8 = undefined;
-    if (!boxed) w.print("  WHEN     {s} {s} IN USE WAITED   RAN      ACTIVE EXIT\n", .{ pad(&lbuf, "LABEL", lw), pad(&pbuf, "POOL", pw) }) catch {};
+    if (!boxed) w.print("  WHEN     {s} {s} IN USE WAITED   RAN      ACTIVE MEMORY EXIT\n", .{ pad(&lbuf, "LABEL", lw), pad(&pbuf, "POOL", pw) }) catch {};
     for (picked.items) |j| {
         var b1: [16]u8 = undefined;
         var b2: [16]u8 = undefined;
@@ -1816,6 +1840,8 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
         var b4: [16]u8 = undefined;
         var b5: [16]u8 = undefined;
         var b6: [24]u8 = undefined;
+        var b7: [16]u8 = undefined;
+        const mem_text = if (j.peak) |m| bytesText(&b7, m) else "-";
         const cores_text = if (j.cores) |c| std.mem.print(&b2, "{d}", .{c}) catch "?" else if (j.max > j.min) std.mem.print(&b2, "{d}-{d}", .{ j.min, j.max }) catch "?" else "-";
         const waited_text = if (j.waited()) |x| duration(&b3, x) else "-";
         const ran_text = if (j.ran()) |x| duration(&b4, x) else "-";
@@ -1842,14 +1868,15 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
                 .{ .text = a.dupe(u8, waited_text) catch "?" },
                 .{ .text = a.dupe(u8, ran_text) catch "?" },
                 .{ .text = a.dupe(u8, used_text) catch "?", .tint = used_tint },
+                .{ .text = a.dupe(u8, mem_text) catch "?", .tint = if (j.peak == null) .dim else null },
                 .{ .text = a.dupe(u8, exit_text) catch "?", .tint = exit_tint },
             }) catch continue) catch {};
             continue;
         }
-        w.print("  {s:<8} {s} {s} {s:<6} {s:<8} {s:<8} {s:<6} {s}\n", .{
+        w.print("  {s:<8} {s} {s} {s:<6} {s:<8} {s:<8} {s:<6} {s:<6} {s}\n", .{
             age(&b1, @intFromFloat(now - j.last())), pad(&lbuf, dash(j.label), lw), pad(&pbuf, j.pool, pw),
             cores_text,                              waited_text,                   ran_text,
-            used_text,                               exit_text,
+            used_text,                               mem_text,                      exit_text,
         }) catch {};
     }
 
@@ -1890,6 +1917,7 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
                 .{ .head = "WAITED", .alignment = .right },
                 .{ .head = "RAN", .alignment = .right },
                 .{ .head = "ACTIVE", .alignment = .right },
+                .{ .head = "MEMORY", .alignment = .right },
                 .{ .head = "EXIT", .flexible = true },
             },
             .rows = trows.items,

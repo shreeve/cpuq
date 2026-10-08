@@ -192,7 +192,7 @@ directory when `CPUQ_DIR` is set; `CPUQ_HISTORY` names the file), outside
 `/tmp` so it outlives a reboot. `cpuq history` lists jobs newest first: label,
 pool (cores or a lease), cores in use, how long each waited and ran, the
 cores it kept active on average (its CPU time, from the kernel, over its run
-time), and
+time), the most memory its processes used at once (`peak` in `--json`), and
 how it ended: an exit status, a signal, `gave up` (`--max-wait`, `cpuq
 cancel`, or a hangup, ^C or kill while it waited) or `lost`, a job that
 never finished because its cpuq died uncaught (SIGKILL, a crash) or the
@@ -386,10 +386,12 @@ count oversubscribes it on purpose. The config file is `CPUQ_CONFIG`, default
 | `max_memory` | off | stop a job whose processes together use more memory than this (e.g. `16G`) |
 | `min_available` | off | admit nothing while available memory is under this (e.g. `6G`) |
 
-With `max_memory` set, each running job's cpuq looks every 2 seconds at the
-memory its command and the command's descendants use (macOS's physical
-footprint, compressed pages included, as Activity Monitor shows it; Linux's
-resident set). Over the limit, it asks the whole tree to stop (SIGTERM),
+Each running job's cpuq looks every 2 seconds at the memory its command and
+the command's descendants use together (macOS's physical footprint,
+compressed pages included, as Activity Monitor shows it; Linux's resident
+set) and records the most in history; a job too quick to look at gets the
+most any one of its processes held, from the kernel. With `max_memory` set,
+over the limit, it asks the whole tree to stop (SIGTERM),
 makes it (SIGKILL) 10 seconds later if any of it remains, says so, and
 records the job as stopped for its memory (`memory` in `history --json`,
 "memory 42.0G" in `cpuq history`). One job that balloons, a compiler or a
