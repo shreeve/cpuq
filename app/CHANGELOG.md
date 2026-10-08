@@ -6,7 +6,7 @@ notes, shown by the update dialog too.
 ## 0.13.5 — 2026-10-08
 
 - A right click on the last hour offers Clear Prior Data, which forgets what the window shows
-  from before the moment under the pointer, and Keep Last 5 Minutes. cpuq's history
+  from before the moment under the pointer, and Keep Five Minutes Only. cpuq's history
   is untouched.
 
 ## 0.13.4 — 2026-10-07

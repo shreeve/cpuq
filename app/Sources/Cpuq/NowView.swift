@@ -661,7 +661,7 @@ struct HourCard: View {
                 scrub = nil
             }
         }
-        Button("Keep Last 5 Minutes") {
+        Button("Keep Five Minutes Only") {
             model.clear(before: Date().addingTimeInterval(-300))
             scrub = nil
         }
