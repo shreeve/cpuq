@@ -680,8 +680,8 @@ struct HourCard: View {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 Text(title).eyebrow()
                 Picker("", selection: $mode) {
-                    Text("Stacked").tag(NowView.HourMode.stacked)
-                    Text("Per Core").tag(NowView.HourMode.cores)
+                    (Text("Stacked ") + Text("⌘1").foregroundStyle(Alive.ink3)).tag(NowView.HourMode.stacked)
+                    (Text("Per Core ") + Text("⌘2").foregroundStyle(Alive.ink3)).tag(NowView.HourMode.cores)
                 }
                 .pickerStyle(.segmented).labelsHidden().controlSize(.small).fixedSize()
                 .background { shortcuts }

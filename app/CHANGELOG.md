@@ -3,6 +3,10 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.12 — 2026-10-08
+
+- The hour's picker shows its shortcuts: Stacked ⌘1, Per Core ⌘2.
+
 ## 0.13.11 — 2026-10-08
 
 - The jobs' reserved cores and times sit at the card's right edge, in line with the header
