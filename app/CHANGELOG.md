@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.5 — 2026-10-08
+
+- A right click on the last hour clears what the window shows from before the moment under the
+  pointer, or keeps only the last five minutes, as the window before 0.13 did. cpuq's history
+  is untouched.
+
 ## 0.13.4 — 2026-10-07
 
 - Running jobs line up at the left of the job list with the waiting ones; with a job waiting,

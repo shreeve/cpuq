@@ -644,10 +644,27 @@ struct HourCard: View {
                 if mode == .stacked { stacked } else { cores }
             }
             .frame(maxHeight: .infinity)
+            .contextMenu { clearMenu }
             waitStrip.frame(height: 20)
+                .contextMenu { clearMenu }
         }
         .padding(.horizontal, 18).padding(.vertical, 12)
         .card()
+    }
+
+    /// The charts' right-click menu: forget what is older than the moment under the pointer, or
+    /// than five minutes ago. Only the window forgets; cpuq's history is untouched.
+    @ViewBuilder private var clearMenu: some View {
+        if let at = scrub, Date().timeIntervalSince(at) > 5 {
+            Button("Clear Data Older Than \(duration(Date().timeIntervalSince(at))) Ago") {
+                model.clear(before: at)
+                scrub = nil
+            }
+        }
+        Button("Keep Only the Last 5 Minutes") {
+            model.clear(before: Date().addingTimeInterval(-300))
+            scrub = nil
+        }
     }
 
     private var title: String {
