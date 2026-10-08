@@ -845,7 +845,7 @@ struct HourCard: View {
         .chartYAxis {
             if p > 0 {
                 AxisMarks(position: .leading, values: [top - Double(p) / 2]) { _ in
-                    AxisValueLabel { Text("\(p) \(model.performance?.name ?? "P")").font(.caption2) }
+                    AxisValueLabel { Text("\(p) Performance").font(.caption2) }
                 }
             }
             AxisMarks(position: .leading, values: [Double(e) / 2]) { _ in

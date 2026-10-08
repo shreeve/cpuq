@@ -3,6 +3,11 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.1 — 2026-10-07
+
+- The Per core lanes call the fast cores Performance, as most people do, not by the name macOS
+  gives them on this chip (Super).
+
 ## 0.13.0 — 2026-10-07
 
 A new Now tab, from the "Beautiful and alive" design.
