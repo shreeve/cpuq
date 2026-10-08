@@ -291,6 +291,12 @@ HOST that carries the holder's CPUQ_LEASES (`ssh HOST "CPUQ_LEASES='$CPUQ_LEASES
 …"`) runs inside the window at once; without it, it waits for the window to
 end.
 
+Windows back to back can hold a shared machine most of the day. With
+`window_gap = SECONDS`, for that long after a window ends the windows still
+waiting go behind the other waiters (`cpuq status` lists them so), so the
+work that queued during the window gets its turn before the next one empties
+the machine again; after the gap they go first as usual.
+
 A machine that many jobs share can refuse quiet windows: with `exclusive =
 off` in its config, `--exclusive` (on `cpuq run`, or a lease taken there) runs
 as an ordinary job, alongside the others, and says so on stderr; `cpuq status`
@@ -395,6 +401,7 @@ count oversubscribes it on purpose. The config file is `CPUQ_CONFIG`, default
 | `poll` | 0.5 | seconds between the head's re-checks |
 | `note` | 60 | seconds between "waiting" lines |
 | `exclusive` | on | grant `--exclusive`; off, it runs as an ordinary job (see Quiet windows) |
+| `window_gap` | 0 | seconds after a quiet window ends during which the next waits behind other work |
 | `backfill` | on | let a waiter start ahead of the head on cores the head cannot use yet |
 | `patience` | 30 | the least seconds the head lets others go ahead without run times to judge by |
 | `lend` | on | lend the head the cores a running job leaves idle |

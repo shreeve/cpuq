@@ -105,6 +105,11 @@ pub const Config = struct {
     lend_after_s: u32 = 60,
     /// Cap a range request near what its label has used (`right_size`).
     right_size: bool = true,
+    /// Seconds after a timing window (an exclusive run) ends during which
+    /// the next waits behind other work (`window_gap`); 0 lets windows run
+    /// back to back. Without it, windows one after another can hold a shared
+    /// machine most of the day.
+    window_gap_s: u32 = 0,
 };
 
 pub const Diagnostic = struct {
@@ -163,6 +168,8 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             cfg.right_size = parseBool(value) orelse return bad(diag, "right_size must be on or off");
         } else if (std.mem.eql(u8, key, "lend_after")) {
             cfg.lend_after_s = parseCount(value) orelse return bad(diag, "lend_after must be a whole number of seconds, at least 1");
+        } else if (std.mem.eql(u8, key, "window_gap")) {
+            cfg.window_gap_s = std.fmt.parseInt(u32, value, 10) catch return bad(diag, "window_gap must be a whole number of seconds");
         } else if (std.mem.eql(u8, key, "lend")) {
             cfg.lend = parseBool(value) orelse return bad(diag, "lend must be on or off");
         } else if (std.mem.eql(u8, key, "admit")) {

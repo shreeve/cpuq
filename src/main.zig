@@ -621,7 +621,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
 
         lockOrFail(st);
         const now = nowSeconds(io);
-        const queue = state.scanQueue(st, a, ticket_name, rec, now, cfg.aging_s) catch |err| fail("queue: {t}", .{err});
+        const queue = servedOrder(ctx, st, a, state.scanQueue(st, a, ticket_name, rec, now, cfg.aging_s) catch |err| fail("queue: {t}", .{err}), now);
         const pos = for (queue, 0..) |e, i| {
             if (std.mem.eql(u8, e.name, ticket_name)) break i;
         } else fail("ticket {s} vanished from the queue", .{ticket_name});
@@ -1280,7 +1280,22 @@ fn release(io: Io, st: *state.State, lease: Lease) void {
     lease.file.close(io);
     st.leases.deleteFile(io, lease.name) catch {};
     st.setPaused(lease.name, false);
+    if (lease.record.exclusive) st.markWindowEnded(nowSeconds(io));
     st.unlock();
+}
+
+/// The queue as it is served: in the `window_gap` after a timing window
+/// ends, waiting windows go behind the other waiters, so other work gets a
+/// turn before the next window empties the machine again.
+fn servedOrder(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, queue: []state.Entry, now: i64) []state.Entry {
+    const gap = ctx.cfg.window_gap_s;
+    if (gap == 0) return queue;
+    const ended = st.windowEnded();
+    if (ended == 0 or now - ended >= gap) return queue;
+    var out: std.ArrayList(state.Entry) = .empty;
+    for (queue) |e| if (!e.record.exclusive) out.append(a, e) catch return queue;
+    for (queue) |e| if (e.record.exclusive) out.append(a, e) catch return queue;
+    return out.items;
 }
 
 /// A lease name: letters, digits, `.`, `_` and `-`.
@@ -1795,7 +1810,7 @@ fn cmdWait(ctx: *Ctx, args: []const [:0]const u8) u8 {
         for (pools.items) |*st| {
             lockOrFail(st);
             const leases = state.scanLeases(st, a, false) catch @as([]state.Entry, &.{});
-            const queue = state.scanQueue(st, a, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{});
+            const queue = servedOrder(ctx, st, a, state.scanQueue(st, a, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{}), now);
             st.unlock();
             for (leases) |e| found = found or labelMatches(pat, e.record.label);
             for (queue) |e| found = found or labelMatches(pat, e.record.label);
@@ -2731,7 +2746,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
     lockOrFail(&st);
     const held = state.heldTokens(&st) catch 0;
     const leases = state.scanLeases(&st, a, false) catch @as([]state.Entry, &.{});
-    const queue = state.scanQueue(&st, a, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{});
+    const queue = servedOrder(ctx, &st, a, state.scanQueue(&st, a, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{}), now);
     var valve = st.readValve();
     st.unlock();
     const g = policy.gate(ctx.cfg, m, budget, &valve, now);

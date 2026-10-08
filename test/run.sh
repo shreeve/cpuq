@@ -418,6 +418,21 @@ t_cancel_exclusive() {
   check "an exclusive waiter behind another takes a cancel at once (rc $rx, ${dt}s)" "[ $rx = 75 ] && python3 -c 'import sys; sys.exit(0 if $dt < 4 else 1)'"
 }
 
+t_window_gap() {
+  setup window-gap "window_gap = 5"
+  # Just after a timing window ends, the next one waits behind other work;
+  # without the gap it would go first (see t_exclusive).
+  local f=$T/log
+  "$CPUQ" run --exclusive --label w1 -- sh -c "echo w1 >>$f"
+  "$CPUQ" run --cores 9 --label hold -- sleep 1.5 & wait_held 9
+  "$CPUQ" run --exclusive --label w2 -- sh -c "echo w2 >>$f" & wait_waiters 1
+  "$CPUQ" run --cores 2 --label small -- sh -c "echo small >>$f" & wait_waiters 2
+  local shown; shown=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print(" ".join(w["label"] for w in sorted(json.load(sys.stdin)["waiters"], key=lambda w: w["order"])))')
+  wait
+  local got; got=$(tr '\n' ' ' <"$f")
+  check "in the window_gap a waiting window goes behind other work, and status shows it so (got: $got; queue: $shown)" "[ '$got' = 'w1 small w2 ' ] && [ '$shown' = 'small w2' ]"
+}
+
 t_nested() {
   setup nested
   local t0; t0=$(now)
@@ -1243,7 +1258,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

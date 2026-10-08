@@ -171,6 +171,20 @@ pub const State = struct {
         s.dir.writeFile(s.io, .{ .sub_path = name, .data = action }) catch {};
     }
 
+    /// When the last timing window (an exclusive run) ended, in Unix
+    /// seconds; 0 when none has.
+    pub fn windowEnded(s: *State) i64 {
+        var buf: [32]u8 = undefined;
+        const t = s.dir.readFile(s.io, "window-ended", &buf) catch return 0;
+        return std.fmt.parseInt(i64, std.mem.trim(u8, t, " \n"), 10) catch 0;
+    }
+
+    pub fn markWindowEnded(s: *State, now: i64) void {
+        var buf: [32]u8 = undefined;
+        const t = std.mem.print(&buf, "{d}\n", .{now}) catch return;
+        s.dir.writeFile(s.io, .{ .sub_path = "window-ended", .data = t }) catch {};
+    }
+
     /// Whether a holder is paused by hand (`cpuq pause`): "paused-LEASE".
     pub fn isPaused(s: *State, lease: []const u8) bool {
         var name_buf: [96]u8 = undefined;

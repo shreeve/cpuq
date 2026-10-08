@@ -2,6 +2,14 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.8.10 — 2026-10-08
+
+- `window_gap` (config, seconds, off by default): for that long after a quiet window
+  (`--exclusive`) ends, windows still waiting go behind the other waiters, so the work queued
+  during a window gets its turn before the next one empties the machine. On pup, 299 windows a
+  day held or drained the machine about 45% of the time, and other work waited behind them;
+  with a 5-minute gap after windows of a few minutes, they take at most about a third.
+
 ## 0.8.9 — 2026-10-08
 
 - An exclusive run that opens beside a job paused by hand borrows nothing. It counted the paused
