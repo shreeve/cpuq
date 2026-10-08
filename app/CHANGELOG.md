@@ -5,7 +5,7 @@ notes, shown by the update dialog too.
 
 ## 0.13.5 — 2026-10-08
 
-- The hour's time axis reads "1 hour ago", 45, 30, 15 and now, at round times back from now,
+- The hour's time axis reads "60 min ago", 45, 30, 15 and now, at round times back from now,
   not "61 min ago" where the clock-pinned columns happen to start.
 - A right click on the last hour offers Clear Prior Data, which forgets what the window shows
   from before the moment under the pointer, and Keep Last Five Minutes. cpuq's history
