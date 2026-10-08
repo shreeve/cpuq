@@ -576,11 +576,15 @@ everything; the leftover files are dead and are cleaned as they are found.
 
 **Signals.** While the command runs, cpuq forwards HUP, INT, QUIT, TERM, USR1
 and USR2 that a process sends it (`kill -INT <cpuq>` reaches the command).
-A signal from the terminal driver (`^C`, `^\`, hangup) has no sending pid
-(`si_pid` 0); the terminal already sent it to the whole foreground process
-group, the command included, so cpuq does not send it again (as with
-`system(3)`). A process that signals the whole process group (`kill -INT
--PGID`) has a pid, so the command receives such a signal twice.
+While cpuq is in its terminal's foreground, `^C` and `^\`, and any signal
+with no sending pid (`si_pid` 0, the terminal driver's hangup), came from the
+terminal, which already sent them to the whole foreground process group, the
+command included, so cpuq does not send them again (as with `system(3)`).
+Elsewhere a signal with no sending pid is still forwarded: macOS records a
+sender only for a signal that can be taken at once, so a kill that lands
+while cpuq is handling the same signal arrives without one. A process that
+signals the whole process group (`kill -INT -PGID`) has a pid, so the command
+receives such a signal twice.
 
 ## Limits
 
