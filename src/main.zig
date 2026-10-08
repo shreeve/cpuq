@@ -497,9 +497,9 @@ fn logEvent(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra) void {
 /// Arms the line a fatal signal leaves in history in place of cpuq's own
 /// next one: `gave_up` while it waits, `ended` once it holds. With `done`,
 /// the job's work is over (a hold's stdin closed): it ended with status 0,
-/// whatever signal then stops cpuq. Each event is logged before the next
-/// line is armed, so no moment is left without one; a second line for the
-/// same event is harmless.
+/// whatever signal then stops cpuq. `logAndArm` logs each event and arms
+/// the line after it as one step; a second line for the same event is
+/// harmless.
 fn armLastWords(ctx: *Ctx, job: JobLog, event: []const u8, cores: ?u32, done: bool) void {
     const path = historyPath(ctx);
     if (path.len == 0) return;
@@ -511,6 +511,18 @@ fn armLastWords(ctx: *Ctx, job: JobLog, event: []const u8, cores: ?u32, done: bo
     if (cores) |k| tw.print(",\"cores\":{d}", .{k}) catch return;
     if (done) tw.writeAll(",\"exit\":0") catch return;
     sys.armLastWords(words_slot, path, head, tw.buffered(), !done);
+}
+
+/// Logs `event` and arms the line a fatal signal leaves next (`armed`, as
+/// `armLastWords` takes it) as one step: a signal that lands between the two
+/// waits until the new line is armed, so the job never dies with nothing
+/// armed, or with the line for the step before (`gave_up` once `started`
+/// is logged).
+fn logAndArm(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra, armed: []const u8, cores: ?u32) void {
+    const before = sys.holdFatal();
+    defer sys.restoreSignals(before);
+    logEvent(ctx, job, event, extra);
+    armLastWords(ctx, job, armed, cores, false);
 }
 
 /// Which last-words slot the job being waited for or run uses: 1 for the
@@ -567,6 +579,10 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
     var ticks = sys.cpuTicks(io);
     const cores: u32 = if (named) o.slots else sys.totalCpus(io);
     const start = nowSeconds(io);
+    // In history, and its last words armed, before its ticket shows it
+    // waiting: killed as soon as it is seen in the queue, it gave up.
+    const job = newJobLog(ctx, o);
+    logAndArm(ctx, job, "queued", .{}, "gave_up", null);
 
     lockOrFail(st);
     var rec: state.Record = .{
@@ -585,9 +601,6 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
     const ticket_name = state.ticketName(&name_buf, o.priority, rec.ticket);
     const ticket = st.createTicket(rec, ticket_name) catch |err| fail("ticket: {t}", .{err});
     st.unlock();
-    const job = newJobLog(ctx, o);
-    logEvent(ctx, job, "queued", .{});
-    armLastWords(ctx, job, "gave_up", null, false);
 
     var next_note = start + cfg.note_s;
     var last_gate: policy.Gate = .open;
@@ -944,8 +957,7 @@ fn admitted(ctx: *Ctx, st: *state.State, o: RunOptions, rec: *state.Record, gran
     st.dropControl(ticket_name);
     ticket.close(io);
     st.unlock();
-    logEvent(ctx, job, "started", .{ .cores = rec.cores, .slots = grant.slots, .ahead = if (ahead) true else null, .lent = if (lent_now > 0) lent_now else null, .forced = if (forced_now) true else null });
-    armLastWords(ctx, job, "ended", rec.cores, false);
+    logAndArm(ctx, job, "started", .{ .cores = rec.cores, .slots = grant.slots, .ahead = if (ahead) true else null, .lent = if (lent_now > 0) lent_now else null, .forced = if (forced_now) true else null }, "ended", rec.cores);
     return .{ .record = rec.*, .name = lease_name, .file = lease, .tokens = grant.files, .job = job };
 }
 
@@ -1025,7 +1037,11 @@ fn watch(io: Io, f: Io.File, sem: *Io.Semaphore) Io.Cancelable!void {
 /// Blocks until `f`'s exclusive holder lets go, or `ms` pass.
 fn waitOn(io: Io, f: Io.File, ms: i64) void {
     var sem: Io.Semaphore = .{};
-    var fut = io.concurrent(watch, .{ io, f, &sem }) catch {
+    // The worker thread this may start never takes cpuq's signals.
+    const before = sys.holdHandled();
+    const started = io.concurrent(watch, .{ io, f, &sem });
+    sys.restoreSignals(before);
+    var fut = started catch {
         io.sleep(.fromMilliseconds(@min(ms, 1000)), .awake) catch {};
         return;
     };
@@ -1522,8 +1538,7 @@ fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
     if (o.max_wait) |mw| remote.print(a, " --max-wait {d}", .{mw}) catch fail("out of memory", .{});
     const argv = [_][]const u8{ "ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4", host, remote.items };
     const job = newJobLog(ctx, o);
-    logEvent(ctx, job, "queued", .{});
-    armLastWords(ctx, job, "gave_up", null, false);
+    logAndArm(ctx, job, "queued", .{}, "gave_up", null);
     var child = std.process.spawn(io, .{ .argv = &argv, .stdin = .pipe, .stdout = .pipe, .stderr = .inherit }) catch |err|
         fail("ssh {s}: {t}", .{ host, err });
     // Heartbeats down the connection, so the hold on HOST knows this end is
@@ -1557,8 +1572,7 @@ fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
         return code;
     }
 
-    logEvent(ctx, job, "started", .{ .cores = 1 });
-    armLastWords(ctx, job, "ended", 1, false);
+    logAndArm(ctx, job, "started", .{ .cores = 1 }, "ended", 1);
     var pid_buf: [16]u8 = undefined;
     const val = std.mem.concat(a, u8, &.{ id, ":", std.mem.print(&pid_buf, "{d}", .{sys.getpid()}) catch "0" }) catch fail("out of memory", .{});
     if (o.hold) {

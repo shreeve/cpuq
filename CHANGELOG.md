@@ -2,6 +2,20 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.8.7 — 2026-10-08
+
+- A run or lease killed the moment it shows in the queue is recorded as having given up, not as
+  lost: its `queued` line and its last words are in place before its ticket appears. One killed
+  just as it starts is recorded as ended, not as having given up.
+- A wait behind another waiter starts a helper thread, and a kill could reach that thread while
+  the main one held signals to re-arm its last words, so the job died with none written and
+  read as lost (the kit's release, which closes a hold's stdin and kills it at once, lands
+  exactly then). cpuq's signals now always go to its main thread.
+- macOS: a signal some process sends to cpuq while the same signal is being handled is
+  forwarded to the command. macOS gives it no sender, and cpuq took it for the terminal's
+  and kept it from the command. Only in a terminal's foreground is a signal with no sender
+  the terminal's, and cpuq asks whether it is in the foreground each time (`fg`, `bg`).
+
 ## 0.8.6 — 2026-10-07
 
 - A job's threads ready to run count toward its demand only while the CPUs are at least 90%
