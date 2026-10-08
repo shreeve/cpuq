@@ -707,7 +707,7 @@ struct HourCard: View {
 
     /// Ticks at quarters of the span, the oldest labelled with how long ago.
     /// Ticks at round times back from now: now, round minutes between, the oldest a whole span
-    /// ago ("60 min ago", giving the unit once), whatever second the clock-pinned columns start on.
+    /// ago ("60 min", giving the unit once; "now" at the other end says the rest), whatever second the clock-pinned columns start on.
     private var ticks: [Date] {
         guard let a = hour.columns.first?.from else { return [] }
         // Between them, round minutes: every 15 over an hour, every 5 over 25 minutes, about
@@ -719,7 +719,7 @@ struct HourCard: View {
 
     private func tickLabel(_ d: Date) -> String {
         if d == ticks.last { return "now" }
-        if d == ticks.first { return "\(Int((hour.span / 60).rounded())) min ago" }
+        if d == ticks.first { return "\(Int((hour.span / 60).rounded())) min" }
         return "\(Int((hour.end.timeIntervalSince(d) / 60).rounded()))"
     }
 
