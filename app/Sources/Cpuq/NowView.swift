@@ -815,15 +815,6 @@ struct HourCard: View {
                                                             .init(color: .black.opacity(0.10), location: 1)], startPoint: .top, endPoint: .bottom))
                     .interpolationMethod(.monotone)
             }
-            // Over the bands, a hairline in the card's color along each band's top edge: a clean
-            // line between colors, drawn on top rather than cut between them.
-            ForEach(layers.dropLast(), id: \.self) { p in
-                ForEach(Array(cols.enumerated()), id: \.offset) { _, c in
-                    let top = layers.prefix { $0 != p }.reduce(0.0) { $0 + value(c, $1) } + value(c, p)
-                    LineMark(x: .value("Time", c.mid), y: .value("CPUs", top), series: .value("Edge", "edge-" + p))
-                        .foregroundStyle(Alive.card).lineStyle(StrokeStyle(lineWidth: 1)).interpolationMethod(.monotone)
-                }
-            }
             // The total: a soft line over it all.
             ForEach(Array(cols.enumerated()), id: \.offset) { _, c in
                 LineMark(x: .value("Time", c.mid), y: .value("CPUs", c.total), series: .value("Edge", "~total"))
@@ -851,6 +842,15 @@ struct HourCard: View {
                 PointMark(x: .value("Time", cols[(run.lowerBound + run.upperBound) / 2].mid), y: .value("CPUs", 1.2))
                     .opacity(0)
                     .annotation(position: .overlay) { Text("quiet · nothing queued").font(.system(size: 11)).foregroundStyle(Alive.ink3).fixedSize() }
+            }
+            // Last of all, over everything else, a hairline in the card's color along each band's
+            // top edge: a clean line between colors, drawn once, on top, not cut between them.
+            ForEach(layers.dropLast(), id: \.self) { p in
+                ForEach(Array(cols.enumerated()), id: \.offset) { _, c in
+                    let top = layers.prefix { $0 != p }.reduce(0.0) { $0 + value(c, $1) } + value(c, p)
+                    LineMark(x: .value("Time", c.mid), y: .value("CPUs", top), series: .value("Edge", "edge-" + p))
+                        .foregroundStyle(Alive.card).lineStyle(StrokeStyle(lineWidth: 1)).interpolationMethod(.monotone)
+                }
             }
             if let scrub { RuleMark(x: .value("Time", scrub)).foregroundStyle(Color.primary.opacity(0.5)) }
         }

@@ -3,6 +3,11 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.8 — 2026-10-08
+
+- The white lines between the hour's bands are drawn last, over everything else, so nothing
+  drawn after them breaks them up.
+
 ## 0.13.7 — 2026-10-08
 
 - Beside the CPUs busy, the demand on them while it is more than they can do: "CPUs busy · 100%
