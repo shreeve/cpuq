@@ -785,6 +785,9 @@ pub const StdinWatch = struct {
         if (started) return;
         started = true;
         _ = c.pipe(&wake);
+        // Started with cpuq's signals held, so they never reach this thread.
+        const before = holdHandled();
+        defer restoreSignals(before);
         const t = std.Thread.spawn(.{}, run, .{}) catch return;
         t.detach();
     }
@@ -834,6 +837,9 @@ pub const Heartbeat = struct {
     thread: ?std.Thread = null,
 
     pub fn start(self: *Heartbeat) void {
+        // Started with cpuq's signals held, so they never reach this thread.
+        const before = holdHandled();
+        defer restoreSignals(before);
         self.thread = std.Thread.spawn(.{}, run, .{self}) catch null;
     }
 

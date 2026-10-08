@@ -15,6 +15,11 @@ User-visible changes to cpuq. Each version's section is its release notes.
   forwarded to the command. macOS gives it no sender, and cpuq took it for the terminal's
   and kept it from the command. Only in a terminal's foreground is a signal with no sender
   the terminal's, and cpuq asks whether it is in the foreground each time (`fg`, `bg`).
+- macOS: `cpuq pause` stops the whole tree even when a stop lands as a process starts. macOS
+  drops a stop that arrives during exec (in a test, 115 of 400 sent in a command's first 6 ms),
+  so pause now looks again every 50 ms for up to half a second and stops whatever still runs.
+- The threads that watch a `--hold`'s stdin and send its heartbeat (0.8.6) start with cpuq's
+  signals held too, so the kit's close-and-kill always finds the hold's last words in place.
 
 ## 0.8.6 — 2026-10-07
 
