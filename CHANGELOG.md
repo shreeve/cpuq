@@ -2,6 +2,13 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.8.9 — 2026-10-08
+
+- An exclusive run that opens beside a job paused by hand borrows nothing. It counted the paused
+  job's cores as lent: it said it ran "on cores lent by jobs that leave them idle, at background
+  priority", which made a clean timing window look like a shared one, and on Linux it really
+  ran at background priority.
+
 ## 0.8.8 — 2026-10-08
 
 - The first eight waiters, of every kind, look every 2 seconds for a hand-given order, so

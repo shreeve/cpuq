@@ -787,7 +787,11 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             if (got) |grant| {
                 valve.last_admit = now;
                 if (check_load) st.writeValve(valve);
-                const borrowed: u32 = @intCast(@min(grant.files.len, (held_before + grant.files.len) -| budget));
+                // An exclusive run borrows nothing: the cores it sits beside are
+                // a paused job's, set aside, not lent. Counting them made a
+                // timing window say it ran on lent cores, and on Linux run it
+                // at background priority.
+                const borrowed: u32 = if (o.exclusive) 0 else @intCast(@min(grant.files.len, (held_before + grant.files.len) -| budget));
                 if (borrowed > 0) std.debug.print("cpuq: starting on {d} {s} lent by jobs that leave them idle, at background priority so the lenders come first\n", .{ borrowed, if (borrowed == 1) "core" else "cores" });
                 return admittedLent(ctx, st, o, &rec, grant, ticket, ticket_name, job, now, borrowed);
             }

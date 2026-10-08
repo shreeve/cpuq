@@ -347,13 +347,16 @@ t_exclusive_off() {
 
 t_exclusive_paused() {
   setup exclusive-paused
-  # A job paused by hand runs nothing, so a quiet window opens beside it; and
-  # an exclusive run started by hand opens beside a job still running.
-  "$CPUQ" run --cores 3 --label held -- sleep 30 & local h=$!
-  wait_held 3
+  # A job paused by hand runs nothing, so a quiet window opens beside it,
+  # borrowing nothing (a budget under the CPUs, so the window takes more
+  # cores than the budget); and an exclusive run started by hand opens
+  # beside a job still running.
+  export CPUQ_BUDGET=2
+  "$CPUQ" run --cores 2 --label held -- sleep 30 & local h=$!
+  wait_held 2
   "$CPUQ" pause held >/dev/null
   local t0; t0=$(now)
-  "$CPUQ" run --exclusive --max-wait 4 --label window -- true; local rc=$?
+  "$CPUQ" run --exclusive --max-wait 4 --label window -- true 2>"$T/err"; local rc=$?
   local dt; dt=$(python3 -c "print('%.1f' % ($(now) - $t0))")
   "$CPUQ" resume held >/dev/null
   "$CPUQ" run --exclusive --label forced -- true & local f=$!
@@ -363,7 +366,7 @@ t_exclusive_paused() {
   wait $f; local rf=$?
   local df; df=$(python3 -c "print('%.1f' % ($(now) - $t1))")
   "$CPUQ" stop held >/dev/null; wait $h 2>/dev/null
-  check "an exclusive run opens beside a paused job (rc $rc, ${dt}s) and, started by hand, beside a running one (rc $rf, ${df}s)" "[ $rc = 0 ] && [ $rf = 0 ] && python3 -c 'import sys; sys.exit(0 if $dt < 3 and $df < 3 else 1)'"
+  check "an exclusive run opens beside a paused job (rc $rc, ${dt}s), borrowing nothing, and, started by hand, beside a running one (rc $rf, ${df}s)" "[ $rc = 0 ] && [ $rf = 0 ] && ! grep -q 'lent by' '$T/err' && python3 -c 'import sys; sys.exit(0 if $dt < 3 and $df < 3 else 1)'"
 }
 
 t_hold_gone() {
