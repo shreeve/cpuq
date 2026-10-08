@@ -3,6 +3,11 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.11 — 2026-10-08
+
+- The jobs' reserved cores and times sit at the card's right edge, in line with the header
+  above them, for running and waiting jobs alike.
+
 ## 0.13.10 — 2026-10-08
 
 - ⌘1 shows the hour Stacked and ⌘2 Per Core (now with a capital C).
