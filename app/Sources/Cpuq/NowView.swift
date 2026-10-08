@@ -154,6 +154,8 @@ final class HourCache {
 
     struct Hour {
         var span: TimeInterval = 300
+        /// How long each column lasts.
+        var step: TimeInterval = 2.5
         var columns: [Column] = []
         /// Projects in the hour, in palette order: the stacking order.
         var projects: [String] = []
@@ -173,10 +175,15 @@ final class HourCache {
     static let count = 120
 
     static func build(_ m: GraphModel, end: Date) -> Hour {
-        let span = min(max(end.timeIntervalSince(m.oldest(now: end)), 300), GraphModel.keep)
+        // Columns pinned to the clock: each covers the same seconds from one refresh to the
+        // next, so a short wait never flickers between columns. The span grows in 5-minute
+        // steps up to the hour, so the columns keep their length while it does.
+        let raw = max(end.timeIntervalSince(m.oldest(now: end)), 300)
+        let span = min((raw / 300).rounded(.up) * 300, GraphModel.keep)
         let step = span / Double(count)
-        let start = end.addingTimeInterval(-span)
-        var cols = (0..<count).map { c in
+        let start = Date(timeIntervalSince1970: (end.addingTimeInterval(-span).timeIntervalSince1970 / step).rounded(.down) * step)
+        let total = Int((end.timeIntervalSince(start) / step).rounded(.up))
+        var cols = (0..<total).map { c in
             Column(from: start.addingTimeInterval(Double(c) * step), to: start.addingTimeInterval(Double(c + 1) * step))
         }
         let index = { (t: Date) -> Int in Int((t.timeIntervalSince(start) / step).rounded(.down)) }
@@ -184,9 +191,11 @@ final class HourCache {
         // average from history, weighted by how much of the column it ran.
         for b in m.blocks {
             var sum = [Int: Double](), n = [Int: Int]()
-            for r in b.active { let i = index(r.at); if i >= 0 && i < count { sum[i, default: 0] += r.cores; n[i, default: 0] += 1 } }
+            for r in b.active { let i = index(r.at); if i >= 0 && i < total { sum[i, default: 0] += r.cores; n[i, default: 0] += 1 } }
             let firstReading = b.active.first?.at
-            for i in max(index(b.from), 0)...min(index(b.to ?? end), count - 1) {
+            let lo = max(index(b.from), 0), hi = min(index(b.to ?? end), total - 1)
+            guard lo <= hi else { continue }
+            for i in lo...hi {
                 let c = cols[i]
                 let o = max(0, min(c.to, b.to ?? end).timeIntervalSince(max(c.from, b.from))) / step
                 guard o > 0 else { continue }
@@ -199,7 +208,7 @@ final class HourCache {
         var busy = [Int: (Double, Int)](), shut = [Int: (Int, Int)](), per = [Int: ([Double], Int)]()
         for s in m.samples {
             let i = index(s.at)
-            guard i >= 0 && i < count else { continue }
+            guard i >= 0 && i < total else { continue }
             if let b = s.busy { let e = busy[i] ?? (0, 0); busy[i] = (e.0 + b, e.1 + 1) }
             let g = shut[i] ?? (0, 0); shut[i] = (g.0 + (s.gateOpen ? 0 : 1), g.1 + 1)
             if let p = s.perCPU {
@@ -208,7 +217,7 @@ final class HourCache {
                 per[i] = e
             }
         }
-        for i in 0..<count {
+        for i in 0..<total {
             if let (b, k) = busy[i] { cols[i].watched = true; cols[i].outside = max(b / Double(k) * cpus - cols[i].shares.values.reduce(0, +), 0) }
             if let (s, k) = shut[i] { cols[i].gateShut = s * 2 >= k }
             if let (p, k) = per[i], k > 0 { cols[i].perCPU = p.map { $0 / Double(k) } }
@@ -218,7 +227,7 @@ final class HourCache {
             cols[i].waiting = m.waits.filter { $0.from < cols[i].to && ($0.to ?? end) > cols[i].from }.count
         }
         let projects = Set(cols.flatMap(\.shares.keys)).sorted { (m.slot($0), $0) < (m.slot($1), $1) }
-        return Hour(span: span, columns: cols, projects: projects)
+        return Hour(span: span, step: step, columns: cols, projects: projects)
     }
 
     /// Runs of columns where `test` holds, allowing a one-column gap.
@@ -645,7 +654,12 @@ struct HourCard: View {
         hour.span >= GraphModel.keep - 60 ? "LAST HOUR" : "LAST \(Int((hour.span / 60).rounded())) MIN"
     }
 
-    private var step: TimeInterval { hour.span / Double(HourCache.count) }
+    private var step: TimeInterval { hour.step }
+
+    /// The width of the labels left of every chart in the card, the same for each, so their
+    /// plots start at the same x and share one time axis: wide enough for "4 Performance" in
+    /// Per core, for "wait" and "10" in Stacked.
+    private var labelWidth: CGFloat { mode == .cores ? 78 : 26 }
 
     private var summary: Text {
         let watched = hour.columns.filter(\.watched)
@@ -778,7 +792,7 @@ struct HourCard: View {
         .chartYAxis {
             AxisMarks(position: .leading, values: [0, cpus / 2, cpus]) { v in
                 AxisGridLine().foregroundStyle(Color.primary.opacity(0.06))
-                AxisValueLabel { if let d = v.as(Double.self) { Text("\(Int(d))").frame(width: 20, alignment: .trailing) } }
+                AxisValueLabel { if let d = v.as(Double.self) { Text("\(Int(d))").frame(width: labelWidth, alignment: .trailing) } }
             }
         }
         .chartOverlay { scrubber($0) }
@@ -824,11 +838,11 @@ struct HourCard: View {
         .chartYAxis {
             if p > 0 {
                 AxisMarks(position: .leading, values: [top - Double(p) / 2]) { _ in
-                    AxisValueLabel { Text("\(p) Performance").font(.caption2) }
+                    AxisValueLabel { Text("\(p) Performance").font(.caption2).frame(width: labelWidth, alignment: .trailing) }
                 }
             }
             AxisMarks(position: .leading, values: [Double(e) / 2]) { _ in
-                AxisValueLabel { Text(p > 0 ? "\(e) Efficiency" : "per CPU").font(.caption2) }
+                AxisValueLabel { Text(p > 0 ? "\(e) Efficiency" : "per CPU").font(.caption2).frame(width: labelWidth, alignment: .trailing) }
             }
         }
         .chartOverlay { scrubber($0) }
@@ -853,7 +867,7 @@ struct HourCard: View {
         .chartXAxis(.hidden)
         .chartYAxis {
             AxisMarks(position: .leading, values: [4.5]) { _ in
-                AxisValueLabel { Text("wait").font(.caption2) }
+                AxisValueLabel { Text("wait").font(.caption2).frame(width: labelWidth, alignment: .trailing) }
             }
         }
         .help("Jobs waiting: grey while the CPUs were full, a fair wait; rose while CPUs sat idle.")
@@ -896,7 +910,7 @@ struct JobsCard: View {
                 Text("bar = CPU actually used (0–\(Int(scale))) · reserved = the job’s ‑j ticket").font(.system(size: 11)).foregroundStyle(Alive.ink3)
             }
             ScrollView(.vertical) {
-                VStack(spacing: 0) {
+                VStack(alignment: .leading, spacing: 0) {
                     ForEach(holders, id: \.pid) { h in running(h, scale: scale) }
                     ForEach(waiters, id: \.pid) { w in waiting(w, free: free) }
                     if holders.isEmpty && waiters.isEmpty {
@@ -934,7 +948,9 @@ struct JobsCard: View {
             }
             Text("\(h.cores) reserved").font(.system(size: 11.5)).foregroundStyle(Alive.ink3).frame(width: 100, alignment: .trailing)
             Text(duration(Date().timeIntervalSince1970 - Double(h.since))).foregroundStyle(Alive.ink2).frame(width: 64, alignment: .trailing)
+            Spacer(minLength: 0)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .font(.system(size: 12)).monospacedDigit()
         .frame(height: 21)
         .contentShape(Rectangle())

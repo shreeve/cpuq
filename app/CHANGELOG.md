@@ -3,6 +3,15 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.4 — 2026-10-07
+
+- Running jobs line up at the left of the job list with the waiting ones; with a job waiting,
+  they had been pushed toward the middle.
+- The hour's columns are pinned to the clock, each covering the same seconds from one refresh to
+  the next, so a short wait no longer flickers between rose and blank as the columns shift.
+- The wait strip lines up with the chart above it: every chart in the card has labels of one
+  width, so their plots start at the same point (Per core's had been far out of line).
+
 ## 0.13.3 — 2026-10-07
 
 - A stretch of needless waiting one column long fills rose like any other, rather than showing
