@@ -1,22 +1,27 @@
 # Cpuq.app
 
-The cpuq menu-bar companion for macOS 14 and later on Apple silicon. The chip in the menu bar
-fills a cell per quarter of the core budget in use (none when idle, all four when the budget is
-full). Its menu shows what runs (cores in use and active), what waits and when it should start,
-the named leases, and any load outside cpuq. **Show Graphs** (⌘G) opens a window on the Mac's ten CPUs, never more. Its Now tab leads with
-the CPUs busy right now ("8.4 / 10") and two verdicts: whether the Mac is working at full capacity,
-and whether anyone waits, fairly (the CPUs are full) or needlessly (CPUs sit idle while jobs
-wait, the one case worth hunting). Beside them the CPUs are ten glass cells that fill with each
-project's color, then other work; the jobs waiting sit in a tray and flow toward the first free
-cell, and when they wait beside idle CPUs the empty glass glows rose. Under them, the last hour on
-the same 0-to-10 scale, either stacked by project or as a lane per CPU (performance cores above
-efficiency cores), with rose where jobs waited while CPUs sat idle and a strip of how many waited;
-pointing at any moment replays it in the cells. Last, every job: the CPU it uses, the cores it
-holds, how long it has run, and for each waiting job what it asks for and why it waits. The
-toolbar shows cpuq's gate, memory pressure and the load. Its History tab sums `cpuq history`
-per project. Each running job in the menu has Pause or Resume and Stop, and each waiting job Move to Front,
-Start Now and Cancel (with cpuq 0.7.1 or later); the graphs window offers the same on a right
-click of a job or a waiting job. **Open Live View in Terminal** runs `cpuq status --watch`.
+The cpuq menu-bar companion for macOS 14 and later on Apple silicon.
+
+- **The chip** in the menu bar fills a cell per quarter of the core budget handed out (none when
+  idle, all four when the budget is full).
+- **The menu** shows what runs (cores in use and active), what waits and when it should start,
+  the named leases, and any load outside cpuq. Each running job has Pause or Resume and Stop, and
+  each waiting job Move to Front, Start Now and Cancel. **Open Live View in Terminal** (⌘L) runs
+  `cpuq status --watch`.
+- **Show Graphs** (⌘G) opens a window on the Mac's active CPUs. Its **Now** tab leads with the
+  CPUs busy right now ("8.4 / 10") and two verdicts: whether the Mac is working at full capacity,
+  and whether anyone waits, fairly (the CPUs are full) or needlessly (CPUs sit idle while jobs
+  wait, the one case worth hunting). Beside them, a glass cell per CPU fills with each project's
+  color, then other work; the jobs waiting sit in a tray, and when they wait beside idle CPUs the
+  empty glass glows rose.
+- **The last hour**, under them on the same scale, is **Stacked** by project (⌘1) or **Per Core**
+  (⌘2), a lane per CPU with the performance cores above the efficiency cores, with rose where
+  jobs waited while CPUs sat idle and a strip of how many waited. Pointing at any moment replays
+  it in the cells.
+- **Every job** comes last: the CPU it uses, the cores it holds, how long it has run, and for each
+  waiting job what it asks for and why it waits. A right click offers the menu's job actions.
+  The toolbar shows cpuq's gate, memory pressure and the load.
+- **The History tab** sums `cpuq history` per project.
 
 The app only reads `cpuq status --json` (every 3 seconds) and `cpuq history --json`, so cpuq
 works the same with or without it. It finds cpuq where install.sh and Homebrew put it
@@ -58,39 +63,5 @@ Two signatures, for two jobs: Gatekeeper accepts the app because it is signed wi
 ID and notarized, with the ticket stapled into the bundle; Sparkle accepts an update when its code
 signature is valid and its EdDSA signature matches `SUPublicEDKey` in the installed copy.
 
-### One-time setup
-
-- The Developer ID and the notarytool keychain profile `notary-tool` are the ones Shotts,
-  Transfer and DuckTable use:
-
-      security find-identity -v -p codesigning   # lists "Developer ID Application: Steve Shreeve (SD6N7Z8P9P)"
-      xcrun notarytool history --keychain-profile notary-tool
-
-- The update key is an ed25519 key of Cpuq's own, under the keychain account `cpuq` (Shotts uses
-  `shotts`, DuckTable `ducktable`, Transfer the default account; never delete or export a key by
-  service alone, which would take them all). Its public half is `Support/sparkle-public-key.txt`
-  and `SUPublicEDKey` in `Support/Info.plist`. The tools are in `.build/artifacts` after a build:
-
-      bin=$(find .build/artifacts -type d -path '*Sparkle/bin' | head -1)
-      $bin/generate_keys --account cpuq -p                      # must print Support/sparkle-public-key.txt
-      $bin/generate_keys --account cpuq -x /tmp/cpuq-key        # export, to back it up; then rm /tmp/cpuq-key
-      $bin/generate_keys --account cpuq -f /tmp/cpuq-key        # import it on another Mac
-
-  Keep a backup of the private key in a password manager. Losing it strands every installed copy
-  on its version, since an app trusts only the key it shipped with; anyone who has it can sign an
-  update every installed copy will accept.
-
-## Releasing
-
-Add the version's `## X.Y.Z — date` section to `CHANGELOG.md` (it is the release notes, and what
-the update dialog shows), land it on `main`, then:
-
-    scripts/release.sh X.Y.Z --dry-run   # builds, notarizes, staples, zips and signs the feed; publishes nothing
-    scripts/release.sh X.Y.Z             # publishes app-vX.Y.Z and refreshes the cpuq-app-updates feed
-    scripts/update-cask.sh X.Y.Z         # opens the tap's pull request for the cask; merge it
-
-The release refuses to run without the Developer ID, the notary profile, a keychain key that
-matches `Support/sparkle-public-key.txt`, or the changelog section; a real release also needs a
-clean `main` in step with `origin/main`, a signed-in `gh`, and a version higher than the last
-`app-v*` tag. Versions only go up: Sparkle orders updates by `CFBundleVersion`, which the release
-sets to the version. A bad release is fixed by a higher one; deleting a release rolls no one back.
+Setting up the signing keys and cutting a release are described in
+[docs/RELEASING.md](../docs/RELEASING.md#cpuqapp).

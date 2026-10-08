@@ -3,7 +3,8 @@ times, so a regression shows as a count rather than a rare CI failure. Not part 
 `test/run.sh`: run them by hand, old binary against new.
 
 Run each inside `nice cpuq run --cores 1 --qos none --label cpuq:test -- ...`.
-`CPUQ=path` picks the binary; the first argument is a scratch directory.
+`CPUQ=path` picks the binary. The stress_*.sh scripts and selfint.py take a scratch directory
+first; loop.sh takes a test name, and the *win*.py harnesses a count.
 
 - stress_waiter.sh DIR N: SIGTERM a waiter the moment its ticket shows; counts gave_up/lost.
   0.8.4: 4 lost of 300; 0.8.6: 2 of 150. 0.8.7: 0.

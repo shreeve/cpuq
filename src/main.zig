@@ -20,40 +20,61 @@ test {
 const version = @import("build_options").version;
 
 const usage =
-    \\usage: cpuq run [options] [--] CMD [ARGS...]
-    \\       cpuq lease NAME [--slots N] [--host HOST] [lease options] [--] CMD [ARGS...]
+    \\usage: cpuq run [run options] [--] CMD [ARGS...]
+    \\       cpuq lease NAME [lease options] [--] CMD [ARGS...]
+    \\       cpuq lease NAME --host HOST --hold [lease options]
     \\       cpuq wait --label PATTERN [--max-wait SECONDS]
     \\       cpuq status [--host HOST]... [--json] [--no-usage] [--watch[=SECONDS]]
     \\       cpuq history [--label PATTERN] [--limit N] [--json]
-    \\       cpuq first|start|cancel LABEL|PID [--all]    (a waiting job)
-    \\       cpuq pause|resume|stop LABEL|PID [--all]     (a running job)
-    \\       cpuq budget
-    \\       cpuq qos
+    \\       cpuq first|start|cancel|pause|resume|stop LABEL|PID [--all]
+    \\       cpuq budget | qos | --version | --help
     \\
     \\run options:
-    \\  --cores K|MIN-MAX     cores to hold: exactly K, or MIN to MAX of what is
-    \\                        free (default 2; clamped to the budget)
+    \\  --cores K             exactly K cores
+    \\  --cores MIN-MAX       MIN to MAX, as many as there is room for
+    \\                        (none: sized from the label's history, else 2)
+    \\  --label PROJECT:TASK  the job's name; history sizes and times jobs by it
     \\  --priority P          high, normal (default) or low
-    \\  --exclusive           take the whole budget once running work drains
-    \\  --label TEXT          a name shown by `cpuq status`
-    \\  --max-wait SECONDS    give up (exit 75) after waiting this long
-    \\  --no-load-check       ignore the load safety valve
-    \\  --qos none            leave the command's scheduling class unchanged
+    \\  --max-wait SECONDS    give up after this long (exit 75); 0: start now or
+    \\                        give up
+    \\  --exclusive           hold the machine alone once it drains (timing only)
+    \\  --no-load-check       ignore the load valve
+    \\  --qos none|auto       none: leave the command's scheduling class alone
     \\
-    \\lease: a first-come, first-served lock on NAME (letters, digits, . _ -),
-    \\with --priority, --label and --max-wait as for run; --slots N lets N
-    \\hold it at once (default 1). --host HOST holds it on HOST's cpuq over ssh
-    \\while CMD runs here. CMD gets CPUQ_LEASES. --host HOST --hold, with no
-    \\command, prints `held NAME@HOST ENTRY` once granted (ENTRY: a CPUQ_LEASES
-    \\entry) and holds the lease until stdin closes, for a script. --exclusive
-    \\also takes the machine's whole budget once running work drains, and
-    \\keeps it while the lease is held: a timing window (with --host, on HOST).
-    \\wait: until no job whose label matches (PATTERN* for a prefix) holds or
-    \\waits.
+    \\lease options (NAME: letters, digits, . _ -):
+    \\  --slots N             let N hold NAME at once (default 1)
+    \\  --host HOST           hold NAME on HOST's cpuq over ssh while CMD runs here
+    \\  --hold                with --host and no CMD: once granted, print
+    \\                        `held NAME@HOST ENTRY` and hold until stdin closes
+    \\  --exclusive           also hold the machine alone (HOST's, with --host)
+    \\  --priority, --label, --max-wait   as for run
     \\
-    \\environment: CPUQ_DIR (state directory), CPUQ_BUDGET, CPUQ_CONFIG
-    \\(default ~/.config/cpuq/config). A run gets CPUQ_CORES, CPUQ_TOKEN and
-    \\a GNU make jobserver in MAKEFLAGS.
+    \\commands:
+    \\  wait                  until no job whose label matches runs or waits
+    \\  status                --json for programs, --watch on a terminal, --host HOST
+    \\  history               newest first: --label PATTERN, --limit N (20), --json
+    \\  first                 move a waiting job to the front
+    \\  start                 start a waiting job now, past the queue and the gates
+    \\  cancel                take a waiting job out of the queue (it exits 75)
+    \\  pause | resume        SIGSTOP | SIGCONT a running job's process tree
+    \\  stop                  SIGTERM a running job's process tree
+    \\  budget | qos          print the budget | this process's scheduling class
+    \\  (a LABEL ending in * is a prefix; several matches need --all)
+    \\
+    \\environment: CPUQ_DIR (state directory), CPUQ_CONFIG (~/.config/cpuq/config),
+    \\CPUQ_BUDGET, CPUQ_HISTORY. A run's command gets CPUQ_CORES (its grant),
+    \\CPUQ_TOKEN and a GNU make jobserver in MAKEFLAGS; a lease's gets CPUQ_LEASES.
+    \\
+    \\exit: the command's own status; 128+N killed by signal N; 75 gave up waiting
+    \\(the command never ran); 125 cpuq failed; 126/127 not executable/not found;
+    \\2 usage or config error.
+    \\
+    \\for agents and scripts:
+    \\  pass the grant in single quotes, so it is expanded after cpuq sets it:
+    \\    cpuq run --label app:build --cores 2-6 -- sh -c 'zig build -j"$CPUQ_CORES"'
+    \\  plain `make` needs no -j: it takes its slots from the jobserver.
+    \\  exit 75: the command never ran; run it again later, not in a loop.
+    \\  see AGENTS.md: https://github.com/shreeve/cpuq/blob/main/AGENTS.md
     \\
 ;
 
