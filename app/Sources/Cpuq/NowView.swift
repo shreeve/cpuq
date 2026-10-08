@@ -703,8 +703,12 @@ struct HourCard: View {
         return Chart {
             // Waiting while CPUs sat idle: rose fills the space above the stack.
             ForEach(Array(bad.enumerated()), id: \.offset) { k, run in
-                ForEach(Array(run), id: \.self) { i in
-                    AreaMark(x: .value("Time", cols[i].mid), yStart: .value("CPUs", cols[i].total), yEnd: .value("CPUs", cpus),
+                // From the start of its first column to the end of its last, so a run of one
+                // column fills too.
+                let points = [(cols[run.lowerBound].from, cols[run.lowerBound].total)] + run.map { (cols[$0].mid, cols[$0].total) }
+                    + [(cols[run.upperBound].to, cols[run.upperBound].total)]
+                ForEach(Array(points.enumerated()), id: \.offset) { _, pt in
+                    AreaMark(x: .value("Time", pt.0), yStart: .value("CPUs", pt.1), yEnd: .value("CPUs", cpus),
                              series: .value("Layer", "idle\(k)"))
                         .foregroundStyle(LinearGradient(colors: [Alive.rose.opacity(0.55), Alive.rose.opacity(0.18)], startPoint: .top, endPoint: .bottom))
                         .interpolationMethod(.monotone)

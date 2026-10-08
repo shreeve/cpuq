@@ -3,6 +3,11 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.3 — 2026-10-07
+
+- A stretch of needless waiting one column long fills rose like any other, rather than showing
+  only its top edge.
+
 ## 0.13.2 — 2026-10-07
 
 - No line from the waiting tray to the cells: the tray and the rose cells say it already.
