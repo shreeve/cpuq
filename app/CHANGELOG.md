@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.14 — 2026-10-08
+
+- The rose behind needless waiting runs from the floor to the ceiling, under the stack, so the
+  stack's curves never cut it off.
+- The chart's words ("5 waiting", "quiet") are drawn last, over everything else.
+
 ## 0.13.13 — 2026-10-08
 
 - In a wide window the CPU cells stop growing at a comfortable width, and the waiting jobs

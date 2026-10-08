@@ -796,18 +796,13 @@ struct HourCard: View {
         let quiet = HourCache.runs(cols) { $0.watched && $0.total < 0.3 && $0.waiting == 0 }.filter { $0.count >= 10 }
         let layers = hour.projects + ["~outside"]
         return Chart {
-            // Waiting while CPUs sat idle: rose fills the space above the stack.
-            ForEach(Array(bad.enumerated()), id: \.offset) { k, run in
-                // From the start of its first column to the end of its last, so a run of one
-                // column fills too.
-                let points = [(cols[run.lowerBound].from, cols[run.lowerBound].total)] + run.map { (cols[$0].mid, cols[$0].total) }
-                    + [(cols[run.upperBound].to, cols[run.upperBound].total)]
-                ForEach(Array(points.enumerated()), id: \.offset) { _, pt in
-                    AreaMark(x: .value("Time", pt.0), yStart: .value("CPUs", pt.1), yEnd: .value("CPUs", cpus),
-                             series: .value("Layer", "idle\(k)"))
-                        .foregroundStyle(LinearGradient(colors: [Alive.rose.opacity(0.55), Alive.rose.opacity(0.18)], startPoint: .top, endPoint: .bottom))
-                        .interpolationMethod(.monotone)
-                }
+            // Waiting while CPUs sat idle: rose from the floor to the ceiling, under the stack, so
+            // it shows wherever the stack is low and is never cut off by the stack's curves. From
+            // the start of its first column to the end of its last, so a run of one column fills too.
+            ForEach(Array(bad.enumerated()), id: \.offset) { _, run in
+                RectangleMark(xStart: .value("Time", cols[run.lowerBound].from), xEnd: .value("Time", cols[run.upperBound].to),
+                              yStart: .value("CPUs", 0), yEnd: .value("CPUs", cpus))
+                    .foregroundStyle(LinearGradient(colors: [Alive.rose.opacity(0.55), Alive.rose.opacity(0.18)], startPoint: .top, endPoint: .bottom))
                 RuleMark(xStart: .value("Time", cols[run.lowerBound].from), xEnd: .value("Time", cols[run.upperBound].to), y: .value("CPUs", cpus))
                     .foregroundStyle(Alive.rose).lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round))
             }
@@ -836,6 +831,16 @@ struct HourCard: View {
             if let last = cols.last {
                 PointMark(x: .value("Time", last.mid), y: .value("CPUs", last.total)).foregroundStyle(Alive.ink).symbolSize(26)
             }
+            // Last of all, over everything else, a hairline in the card's color along each band's
+            // top edge: a clean line between colors, drawn once, on top, not cut between them.
+            ForEach(layers.dropLast(), id: \.self) { p in
+                ForEach(Array(cols.enumerated()), id: \.offset) { _, c in
+                    let top = layers.prefix { $0 != p }.reduce(0.0) { $0 + value(c, $1) } + value(c, p)
+                    LineMark(x: .value("Time", c.mid), y: .value("CPUs", top), series: .value("Edge", "edge-" + p))
+                        .foregroundStyle(Alive.card).lineStyle(StrokeStyle(lineWidth: 1)).interpolationMethod(.monotone)
+                }
+            }
+            // The words go on last, over the stack and its lines.
             if let run = bad.max(by: { $0.count < $1.count }) {
                 let mid = cols[(run.lowerBound + run.upperBound) / 2].mid
                 let peak = run.map { cols[$0].waiting }.max() ?? 0
@@ -854,15 +859,6 @@ struct HourCard: View {
                 PointMark(x: .value("Time", cols[(run.lowerBound + run.upperBound) / 2].mid), y: .value("CPUs", 1.2))
                     .opacity(0)
                     .annotation(position: .overlay) { Text("quiet · nothing queued").font(.system(size: 11)).foregroundStyle(Alive.ink3).fixedSize() }
-            }
-            // Last of all, over everything else, a hairline in the card's color along each band's
-            // top edge: a clean line between colors, drawn once, on top, not cut between them.
-            ForEach(layers.dropLast(), id: \.self) { p in
-                ForEach(Array(cols.enumerated()), id: \.offset) { _, c in
-                    let top = layers.prefix { $0 != p }.reduce(0.0) { $0 + value(c, $1) } + value(c, p)
-                    LineMark(x: .value("Time", c.mid), y: .value("CPUs", top), series: .value("Edge", "edge-" + p))
-                        .foregroundStyle(Alive.card).lineStyle(StrokeStyle(lineWidth: 1)).interpolationMethod(.monotone)
-                }
             }
             if let scrub { RuleMark(x: .value("Time", scrub)).foregroundStyle(Color.primary.opacity(0.5)) }
         }
