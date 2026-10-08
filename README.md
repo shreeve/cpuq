@@ -15,6 +15,11 @@ turn for room on the CPUs, then run in the foreground. One binary, no daemon: ev
 The queue is per user. "Machine-wide" means across every process that user runs on the machine;
 another user on the same machine has a queue of their own.
 
+<p align="center">
+  <img src="assets/screenshots/cpuq-app.gif" width="760" alt="Cpuq.app's window, live: ten CPU cells filling with each project's color, the last hour stacked by project with rose where a job waited beside idle CPUs, and the running jobs with what each uses and reserves">
+  <br><sub>Cpuq.app, the menu-bar companion (see <a href="#cpuqapp-macos">Cpuq.app</a>)</sub>
+</p>
+
 ## Quick start
 
     curl -fsSL https://raw.githubusercontent.com/shreeve/cpuq/main/install.sh | bash
@@ -224,12 +229,9 @@ budget handed out; its menu shows what runs, what waits and the named leases, wi
 Resume, Stop, Move to Front, Start Now and Cancel. Show Graphs opens a window with a Now tab (the
 CPUs busy right now, each project's share, who waits and why, and the last hour, Stacked by
 project (⌘1) or Per Core (⌘2), one lane per CPU, rose where jobs waited beside idle CPUs) and a
-History tab (`cpuq history` summed by project). It only reads `cpuq status --json` and
-`cpuq history --json`. Install it with `brew install --cask shreeve/tap/cpuq-app`.
-
-<p align="center">
-  <img src="assets/screenshots/cpuq-app-lanes.png" width="760" alt="Cpuq.app's graphs window in an earlier version: the last hour as ten lanes, one per reserved core; two projects' jobs keep nearly all of their five cores busy, and nobody waits">
-</p>
+History tab (`cpuq history` summed by project). Seven themes, each light and dark, switch with
+⌘T and ⌘M. It only reads `cpuq status --json` and `cpuq history --json`. Install it with
+`brew install --cask shreeve/tap/cpuq-app`.
 
 ## Waiting and order
 
