@@ -3,6 +3,11 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.13 — 2026-10-08
+
+- In a wide window the CPU cells stop growing at a comfortable width, and the waiting jobs
+  beside them get the extra room.
+
 ## 0.13.12 — 2026-10-08
 
 - The hour's picker shows its shortcuts: Stacked ⌘1, Per Core ⌘2.

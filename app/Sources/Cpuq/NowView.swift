@@ -310,12 +310,15 @@ struct HeroCard: View {
             summary.frame(width: 232, alignment: .leading)
             GeometryReader { geo in
                 let tray = geo.size.width >= 470
+                // Cells grow to 44 points wide; past that the waiting tray takes the extra width.
+                let cells = cpus * 44 + (cpus - 1) * 6
+                let trayWidth = tray ? max(180, geo.size.width - cells - 36) : 0
                 // The cells' canvas runs down behind the legend, so their glow has room to spread
                 // out in full and fade before the card's edge.
                 ZStack(alignment: .bottomTrailing) {
                     ZStack(alignment: .topLeading) {
-                        CellsCanvas(model: model, moment: moment, motion: motion, trayWidth: tray ? 186 : 0, below: 22)
-                        if tray { WaitingTray(model: model, moment: moment, control: control).frame(width: 180) }
+                        CellsCanvas(model: model, moment: moment, motion: motion, trayWidth: tray ? trayWidth + 6 : 0, below: 22)
+                        if tray { WaitingTray(model: model, moment: moment, control: control).frame(width: trayWidth) }
                     }
                     legend
                 }
