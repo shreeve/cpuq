@@ -360,6 +360,35 @@ t_exclusive_paused() {
   check "an exclusive run opens beside a paused job (rc $rc, ${dt}s) and, started by hand, beside a running one (rc $rf, ${df}s)" "[ $rc = 0 ] && [ $rf = 0 ] && python3 -c 'import sys; sys.exit(0 if $dt < 3 and $df < 3 else 1)'"
 }
 
+t_hold_gone() {
+  setup hold-gone
+  # A hold for someone who goes away ends, waiting or holding: when its stdin
+  # closes, or when the heartbeats it had stop (a dropped connection).
+  "$CPUQ" lease bench --hold --label first < <(sleep 30) >/dev/null & local h=$!
+  wait_lease_holder bench
+  mkfifo "$T/w"
+  "$CPUQ" lease bench --hold --label waiter <"$T/w" >/dev/null 2>"$T/err" & local w=$!
+  exec 7>"$T/w"
+  wait_waiters 1
+  local t0; t0=$(now)
+  exec 7>&-
+  wait $w; local rw=$?
+  local dw; dw=$(python3 -c "print('%.1f' % ($(now) - $t0))")
+  kill $h 2>/dev/null; wait $h 2>/dev/null
+  # Heartbeats, then silence with the pipe still open: the hold ends after
+  # CPUQ_HOLD_QUIET seconds.
+  mkfifo "$T/b"
+  CPUQ_HOLD_QUIET=1 "$CPUQ" lease bench --hold --label quiet <"$T/b" >"$T/out" & local q=$!
+  exec 6>"$T/b"
+  echo >&6
+  wait_lease_holder bench
+  local t1; t1=$(now)
+  wait $q; local rq=$?
+  local dq; dq=$(python3 -c "print('%.1f' % ($(now) - $t1))")
+  exec 6>&-
+  check "a waiting hold whose stdin closes gives up (rc $rw, ${dw}s); a held one whose heartbeats stop ends (rc $rq, ${dq}s)" "[ $rw = 75 ] && [ $rq = 0 ] && grep -q 'has gone' '$T/err' && python3 -c 'import sys; sys.exit(0 if $dw < 3 and $dq < 4 else 1)'"
+}
+
 t_nested() {
   setup nested
   local t0; t0=$(now)
@@ -1185,7 +1214,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused nested elastic reserve usage lease lease_host lease_host_hold last_words measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

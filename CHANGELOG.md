@@ -2,6 +2,19 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.8.6 — 2026-10-07
+
+- A job's threads ready to run count toward its demand only while the CPUs are at least 90%
+  busy. With CPUs idle they are waiting on something else, and counting them held the queue: a
+  6-core job using 5.6 CPUs was charged 12, more than the Mac, and ten jobs waited 23 minutes
+  behind it with 4 CPUs idle.
+- A lease held over ssh (`cpuq lease NAME --host HOST`) no longer outlives a dropped connection.
+  The client sends a heartbeat down the connection every 10 seconds; the hold on HOST ends when
+  its stdin closes or, once heartbeats have come, when they stop for a minute
+  (`CPUQ_HOLD_QUIET`). This holds while it waits too: a waiting hold whose holder has gone gives
+  up rather than taking the lease for nobody. Twice in a day a dropped connection left pup held
+  or queued for nobody.
+
 ## 0.8.5 — 2026-10-07
 
 - An `--exclusive` run (a quiet window, on `cpuq run` or a lease) opens beside jobs paused by

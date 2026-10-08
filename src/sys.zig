@@ -710,3 +710,110 @@ pub fn getpid() c.pid_t {
 pub fn getuid() u32 {
     return c.getuid();
 }
+
+/// Milliseconds on a clock that only moves forward.
+pub fn monoMs() i64 {
+    var ts: c.timespec = undefined;
+    _ = c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
+fn sleepMs(ms: u32) void {
+    var ts: c.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast(@as(u64, ms % 1000) * 1_000_000) };
+    _ = c.nanosleep(&ts, &ts);
+}
+
+/// A lease held for someone else (`--hold`, as `cpuq lease --host` runs it
+/// over ssh) watches its stdin from a thread of its own: the hold ends when
+/// stdin closes, or, once the far end has sent heartbeats, when they stop.
+/// A connection that drops without closing (the network gone, the client's
+/// machine asleep) leaves the far end's stdin open but silent; without this
+/// the lease, waiting or held, would outlive its holder.
+pub const StdinWatch = struct {
+    var started = false;
+    var eof = std.atomic.Value(bool).init(false);
+    /// Written when stdin closes, so a waiter wakes at once.
+    var wake: [2]c.fd_t = .{ -1, -1 };
+    /// When the last heartbeat came, in monoMs; 0 before the first.
+    var beat = std.atomic.Value(i64).init(0);
+
+    pub fn start() void {
+        if (started) return;
+        started = true;
+        _ = c.pipe(&wake);
+        const t = std.Thread.spawn(.{}, run, .{}) catch return;
+        t.detach();
+    }
+
+    fn run() void {
+        var buf: [64]u8 = undefined;
+        while (true) {
+            const n = c.read(0, &buf, buf.len);
+            if (n > 0) {
+                beat.store(monoMs(), .release);
+                continue;
+            }
+            if (n < 0 and c.errno(n) == .INTR) continue;
+            eof.store(true, .release);
+            if (wake[1] >= 0) _ = c.write(wake[1], "x", 1);
+            return;
+        }
+    }
+
+    /// Returns once the holder is gone: at once when stdin closes (the kit
+    /// closes a hold's stdin and kills it in the same breath), else within a
+    /// second of the heartbeats stopping.
+    pub fn untilGone(quiet_ms: i64) void {
+        while (!gone(quiet_ms)) {
+            var fds = [_]c.pollfd{.{ .fd = wake[0], .events = c.POLL.IN, .revents = 0 }};
+            _ = c.poll(&fds, 1, 1000);
+        }
+    }
+
+    /// The holder is gone: stdin closed, or heartbeats came and none for
+    /// `quiet_ms`. Always false unless watching.
+    pub fn gone(quiet_ms: i64) bool {
+        if (!started) return false;
+        if (eof.load(.acquire)) return true;
+        const last = beat.load(.acquire);
+        return last != 0 and monoMs() - last > quiet_ms;
+    }
+};
+
+/// Sends a newline down `fd` (ssh's stdin, to a remote hold's StdinWatch)
+/// now and every `every_ms` from a thread of its own, until stopped or the
+/// pipe breaks.
+pub const Heartbeat = struct {
+    fd: c.fd_t,
+    every_ms: u32 = 10_000,
+    stopping: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    pub fn start(self: *Heartbeat) void {
+        self.thread = std.Thread.spawn(.{}, run, .{self}) catch null;
+    }
+
+    fn run(self: *Heartbeat) void {
+        // A broken pipe is an error here, never a signal that ends cpuq.
+        var pipe: c.sigset_t = undefined;
+        _ = c.sigemptyset(&pipe);
+        _ = c.sigaddset(&pipe, .PIPE);
+        _ = c.sigprocmask(c.SIG.BLOCK, &pipe, null);
+        var since: u32 = self.every_ms;
+        while (!self.stopping.load(.acquire)) {
+            if (since >= self.every_ms) {
+                since = 0;
+                if (c.write(self.fd, "\n", 1) < 0) return;
+            }
+            sleepMs(100);
+            since += 100;
+        }
+    }
+
+    /// Stops sending; returns once the thread is done with `fd`.
+    pub fn stop(self: *Heartbeat) void {
+        self.stopping.store(true, .release);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+    }
+};

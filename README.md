@@ -211,9 +211,10 @@ command still gets `CPUQ_CORES` and a jobserver of that size, but what counts
 against the machine is its measured demand: for its first `settle` seconds
 (20) its expected use from history (the 75th percentile of its label's
 recent runs, else all it holds), then what it is measured asking of the CPUs,
-smoothed over about ten seconds. Demand is the larger of the CPU time it gets
-and the threads it has ready to run, so a job that a contended machine slows
-still counts in full. The head of the queue starts when its expected use fits
+smoothed over about ten seconds. Demand is the CPU time it gets; while the
+CPUs are at least 90% busy, it is the larger of that and the threads it has
+ready to run, so a job that a contended machine slows still counts in full.
+With CPUs idle, ready threads are waiting on something else and do not count. The head of the queue starts when its expected use fits
 under `target` (the active CPUs) beside what the running jobs count for, and
 the CPUs are not measured at 97% busy or more; a job behind the head starts
 too when it fits and leaves the head room, or the head has waited less than
@@ -334,7 +335,10 @@ A script that takes the lease partway through its run, and gives it back
 later, uses `--hold` with `--host` and no command. Once HOST grants the
 lease, cpuq prints `held NAME@HOST ENTRY`, where ENTRY is the `CPUQ_LEASES`
 entry (`NAME@HOST=ID:PID`) that makes runs inside see the lease as theirs,
-and holds it until its stdin closes or it dies. In any bash, 3.2 included:
+and holds it until its stdin closes or it dies. The connection carries a
+heartbeat (a newline every 10 seconds), so when it drops without closing (the
+network gone, the Mac asleep), the hold on HOST ends within a minute, waiting
+or held, rather than holding HOST for nobody. In any bash, 3.2 included:
 
     d=$(mktemp -d); mkfifo "$d/in" "$d/out"
     cpuq lease pup-bench --host pup --hold <"$d/in" >"$d/out" & hold=$!
@@ -364,6 +368,7 @@ wait for another session's work without polling `cpuq status`;
 | `CPUQ_TOKEN` | set for CMD: its lease, which makes runs inside it nested |
 | `CPUQ_LEASES` | set for CMD: the named leases it runs inside, `NAME=ID` here and `NAME@HOST=ID:PID` on HOST |
 | `CPUQ_HISTORY` | the history file |
+| `CPUQ_HOLD_QUIET` | seconds a `--hold` that has had heartbeats waits for the next before it ends (60) |
 
 ### Budget and configuration
 

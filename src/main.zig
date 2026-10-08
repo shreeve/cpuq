@@ -613,6 +613,13 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             if (std.mem.eql(u8, e.name, ticket_name)) break i;
         } else fail("ticket {s} vanished from the queue", .{ticket_name});
 
+        // Waiting to hold a lease for someone who has gone (their
+        // connection dropped): give up rather than hold it for nobody.
+        if (sys.StdinWatch.gone(hold_quiet_ms)) {
+            std.debug.print("cpuq: whoever this hold was for has gone; giving up\n", .{});
+            giveUp(ctx, st, ticket_name, now - start, job);
+        }
+
         // A hand-given order (`cpuq first`, `start`, `cancel`).
         if (!named) if (st.takeControl(ticket_name)) |action| {
             if (std.mem.eql(u8, action, "cancel")) {
@@ -667,7 +674,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             // patience); behind an exclusive head, only as backfill allows.
             if (!named and !o.exclusive and cfg.admit == .measured and !queue[0].record.exclusive and mach.pressure != .high) {
                 if (run_times == null) run_times = RunTimes.load(ctx, ctx.arena);
-                const m = measuredLoad(ctx, st, a, &run_times.?);
+                const m = measuredLoad(ctx, st, a, &run_times.?, mach.busy);
                 if (!m.exclusive) {
                     const room = targetCpus(ctx) - m.charged;
                     const req = policy.measuredGrant(o.request, o.cores_given, labelUses(run_times.?, o.label), room, cores);
@@ -724,7 +731,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             // its expected use while it settles) and start while that leaves
             // room for this one, unless the CPUs are measured all but full.
             if (run_times == null) run_times = RunTimes.load(ctx, ctx.arena);
-            const m = measuredLoad(ctx, st, a, &run_times.?);
+            const m = measuredLoad(ctx, st, a, &run_times.?, mach.busy);
             const target = targetCpus(ctx);
             const room = target - m.charged;
             const req = policy.measuredGrant(o.request, o.cores_given, labelUses(run_times.?, o.label), room, cores);
@@ -817,7 +824,13 @@ fn useOf(rt: RunTimes, label: []const u8) ?f64 {
 /// CPU, averaged over about half of `settle`), the measurements kept in the
 /// state directory so the next head carries on from them. Call with the
 /// admission lock held.
-fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const RunTimes) struct { charged: f64, exclusive: bool } {
+fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const RunTimes, busy: ?f64) struct { charged: f64, exclusive: bool } {
+    // Threads ready to run mean a job is short of CPU only when the CPUs are
+    // full; with CPUs idle they are waiting on something else (a pool of
+    // workers, a burst of short processes), and counting them held the
+    // queue: a 6-core job using 5.6 CPUs was charged 12 with 4 CPUs idle,
+    // and ten jobs waited 23 minutes behind it.
+    const contended = (busy orelse 1) >= 0.9;
     const leases = state.scanLeases(st, a, false) catch return .{ .charged = 0, .exclusive = false };
     // While a quiet window is held nothing is admitted, so nothing is
     // measured: every waiter's scan of the processes would only disturb it.
@@ -843,7 +856,7 @@ fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const Ru
         // What it asks of the CPUs: what it gets, or on a contended machine
         // the threads it has ready to run, whichever is more (at most twice
         // what it holds, so a burst of short processes cannot swamp it).
-        const asks = @max(u.avg, @min(u.runnable, 2 * @as(f64, @floatFromInt(l.record.cores))));
+        const asks = if (contended) @max(u.avg, @min(u.runnable, 2 * @as(f64, @floatFromInt(l.record.cores)))) else u.avg;
         const measured: ?f64 = if (u.at_ms != 0) asks else null;
         charged += policy.charge(expected, measured, now_s - l.record.since, ctx.cfg.settle_s, l.record.cores);
     }
@@ -1382,6 +1395,13 @@ fn cmdLease(ctx: *Ctx, args: []const [:0]const u8) u8 {
         std.debug.print("cpuq: {s}: command not found\n", .{o.cmd[0]});
         return exit_notfound;
     };
+    // Held for someone else: watch for them going, while waiting too.
+    if (o.hold) {
+        if (ctx.env.get("CPUQ_HOLD_QUIET")) |q| if (std.fmt.parseInt(u32, q, 10)) |secs| {
+            hold_quiet_ms = @as(i64, secs) * 1000;
+        } else |_| {};
+        sys.StdinWatch.start();
+    }
     var st = openNamed(ctx, name);
     var named = o;
     named.exclusive = false;
@@ -1458,10 +1478,14 @@ fn heldEntry(ctx: *Ctx, name: []const u8, host: []const u8) ?[]const u8 {
 /// The far end of `cpuq lease --host`: once admitted, prints `held NAME ID`
 /// and holds the lease until stdin closes. If the connection dies instead,
 /// this process dies with it and the kernel frees the lease.
+/// How long a hold whose holder sends heartbeats waits without one before
+/// it takes them for gone: six missed beats (CPUQ_HOLD_QUIET, in seconds).
+var hold_quiet_ms: i64 = 60_000;
+
 fn holdAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, lease: Lease) u8 {
     ctx.out.print("held {s} {s}\n", .{ o.lease.?, lease.name }) catch {};
     ctx.out.flush() catch {};
-    untilStdinCloses();
+    sys.StdinWatch.untilGone(hold_quiet_ms);
     armLastWords(ctx, lease.job, "ended", lease.record.cores, true);
     if (exclusive_cores) |x| {
         words_slot = 1;
@@ -1502,6 +1526,10 @@ fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
     armLastWords(ctx, job, "gave_up", null, false);
     var child = std.process.spawn(io, .{ .argv = &argv, .stdin = .pipe, .stdout = .pipe, .stderr = .inherit }) catch |err|
         fail("ssh {s}: {t}", .{ host, err });
+    // Heartbeats down the connection, so the hold on HOST knows this end is
+    // here, waiting or holding, and gives up when they stop.
+    var heart: sys.Heartbeat = .{ .fd = child.stdin.?.handle };
+    heart.start();
 
     // The held line: `held NAME ID`.
     var rbuf: [256]u8 = undefined;
@@ -1512,6 +1540,7 @@ fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
     _ = words.next();
     const id = words.next() orelse "";
     if (!std.mem.eql(u8, word, "held") or id.len == 0) {
+        heart.stop();
         if (child.stdin) |f| f.close(io);
         child.stdin = null;
         const term = child.wait(io) catch std.process.Child.Term{ .unknown = 0 };
@@ -1541,6 +1570,7 @@ fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
         // release does) still records it as ended normally.
         untilStdinCloses();
         armLastWords(ctx, job, "ended", 1, true);
+        heart.stop();
         if (child.stdin) |f| f.close(io);
         child.stdin = null;
         _ = child.wait(io) catch {};
@@ -1561,6 +1591,7 @@ fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
         break :blk .{ .exit = .{ .code = if (err == error.FileNotFound) exit_notfound else exit_noexec } };
     };
     // Closing ssh's stdin ends the remote hold.
+    heart.stop();
     if (child.stdin) |f| f.close(io);
     child.stdin = null;
     _ = child.wait(io) catch {};
