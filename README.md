@@ -259,6 +259,9 @@ LABEL may end in `*` for a prefix; a target that matches several jobs needs
 `--all`. A waiting job takes its order at its next look: the head within
 `poll`, the next waiters within 2 seconds. `start` never goes into an
 `--exclusive` run, and nothing here touches one: those are timing windows.
+An `--exclusive` run opens beside jobs paused by hand (their processes are
+stopped, so the window stays quiet), and one started by hand opens at once on
+the cores that are free, beside those still held.
 A job started by hand is marked `"forced": true` in its history; a paused job
 shows as paused in `cpuq status --json`, and its cores are lent at once. A
 paused job keeps its memory and its cores' reservation, and a network peer

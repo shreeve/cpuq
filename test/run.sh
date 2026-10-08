@@ -339,6 +339,27 @@ t_exclusive_off() {
   check "exclusive = off: --exclusive runs alongside, and says so (got: $got)" "[ '$got' = 'excl-start lease-start held-end ' ] && grep -q 'race: --exclusive is off' '$T/err' && grep -q 'exclusive is off' '$T/err2' && [ $note = 1 ]"
 }
 
+t_exclusive_paused() {
+  setup exclusive-paused
+  # A job paused by hand runs nothing, so a quiet window opens beside it; and
+  # an exclusive run started by hand opens beside a job still running.
+  "$CPUQ" run --cores 3 --label held -- sleep 30 & local h=$!
+  wait_held 3
+  "$CPUQ" pause held >/dev/null
+  local t0; t0=$(now)
+  "$CPUQ" run --exclusive --max-wait 4 --label window -- true; local rc=$?
+  local dt; dt=$(python3 -c "print('%.1f' % ($(now) - $t0))")
+  "$CPUQ" resume held >/dev/null
+  "$CPUQ" run --exclusive --label forced -- true & local f=$!
+  wait_waiters 1
+  "$CPUQ" start forced >/dev/null
+  local t1; t1=$(now)
+  wait $f; local rf=$?
+  local df; df=$(python3 -c "print('%.1f' % ($(now) - $t1))")
+  "$CPUQ" stop held >/dev/null; wait $h 2>/dev/null
+  check "an exclusive run opens beside a paused job (rc $rc, ${dt}s) and, started by hand, beside a running one (rc $rf, ${df}s)" "[ $rc = 0 ] && [ $rf = 0 ] && python3 -c 'import sys; sys.exit(0 if $dt < 3 and $df < 3 else 1)'"
+}
+
 t_nested() {
   setup nested
   local t0; t0=$(now)
@@ -1164,7 +1185,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off nested elastic reserve usage lease lease_host lease_host_hold last_words measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused nested elastic reserve usage lease lease_host lease_host_hold last_words measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

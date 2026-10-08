@@ -462,7 +462,10 @@ pub const Grant = struct {
 /// when the answer is to wait. Every token file in the directory counts,
 /// beyond the first `cores` too, so every run sees every hold whatever core
 /// count it was started with. Call with the admission lock held.
-pub fn takeTokens(s: *State, arena: std.mem.Allocator, req: policy.Request, exclusive: bool, budget: u32, cores: u32, exclusive_running: bool, reserve: u32) !?Grant {
+/// `aside`: cores an exclusive run may sit beside, held by jobs paused by hand
+/// (their processes are stopped, so the window stays quiet), or by every job
+/// for an exclusive run started by hand. It takes all that is free.
+pub fn takeTokens(s: *State, arena: std.mem.Allocator, req: policy.Request, exclusive: bool, budget: u32, cores: u32, exclusive_running: bool, reserve: u32, aside: u32) !?Grant {
     var n = cores;
     var it = s.tokens.iterate();
     while (try it.next(s.io)) |entry| {
@@ -489,7 +492,10 @@ pub fn takeTokens(s: *State, arena: std.mem.Allocator, req: policy.Request, excl
             f.close(s.io);
         }
     }
-    const k = policy.admit(req, exclusive, budget, held, exclusive_running, reserve) orelse 0;
+    const counted = if (exclusive) held -| aside else held;
+    const admitted = policy.admit(req, exclusive, budget, counted, exclusive_running, reserve) orelse 0;
+    // Beside cores set aside, an exclusive run takes all that is free.
+    const k = if (exclusive and counted < held) @min(admitted, @as(u32, @intCast(free.items.len))) else admitted;
     const keep = @min(k, free.items.len);
     for (free.items[keep..]) |f| {
         f.unlock(s.io);

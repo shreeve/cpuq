@@ -2,6 +2,15 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.8.5 — 2026-10-07
+
+- An `--exclusive` run (a quiet window, on `cpuq run` or a lease) opens beside jobs paused by
+  hand: their processes are stopped, so the window stays quiet. It used to wait for their cores,
+  so pausing a long job to let a timing run through deadlocked: on pup a timing window waited 30
+  minutes behind a paused 12-core job while the machine sat idle.
+- `cpuq start` on an exclusive waiter opens its window at once on the cores that are free,
+  beside those still held. It used to do nothing.
+
 ## 0.8.4 — 2026-10-07
 
 - Waiters no longer scan the processes while a quiet window (`--exclusive`) is held: nothing is

@@ -628,8 +628,11 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
                 if ((state.scanLeases(st, a, true) catch @as([]state.Entry, &.{})).len != 0) {
                     std.debug.print("cpuq: not started by hand: an exclusive run holds the machine; still waiting\n", .{});
                 } else {
+                    // An exclusive run started by hand opens its window on the
+                    // cores that are free, beside those still held.
                     const over: u32 = @intCast(heldCores(st, a) + o.request.max);
-                    const got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, over, @max(cores, over), false, 0) catch |err| fail("tokens: {t}", .{err});
+                    const all = @max(cores, over);
+                    const got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, if (o.exclusive) all else over, all, false, 0, if (o.exclusive) std.math.maxInt(u32) else 0) catch |err| fail("tokens: {t}", .{err});
                     if (got) |grant| {
                         std.debug.print("cpuq: started by hand on {d} {s}, past the queue\n", .{ grant.files.len, if (grant.files.len == 1) "core" else "cores" });
                         forced_now = true;
@@ -673,7 +676,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
                     const head_need = policy.charge(useOf(run_times.?, head.label), null, 0, 1, @max(head.cores, 1));
                     const head_waited: f64 = @floatFromInt(now - head.since);
                     if (mine <= room and (mine + head_need <= room or head_waited < @as(f64, @floatFromInt(cfg.patience_s)))) {
-                        if (state.takeTokens(st, ctx.arena, req, false, poolCap(ctx), poolCap(ctx), false, 0) catch |err| fail("tokens: {t}", .{err})) |grant| {
+                        if (state.takeTokens(st, ctx.arena, req, false, poolCap(ctx), poolCap(ctx), false, 0, 0) catch |err| fail("tokens: {t}", .{err})) |grant| {
                             std.debug.print("cpuq: starting ahead of {s} on {d} {s}: the CPUs have room\n", .{ if (head.label.len != 0) head.label else head.cmd, grant.files.len, if (grant.files.len == 1) "core" else "cores" });
                             return admitted(ctx, st, o, &rec, grant, ticket, ticket_name, job, now, true);
                         }
@@ -685,7 +688,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
                 var v = st.readValve();
                 const g = policy.gate(cfg, mach, budget, if (o.load_check) &v else null, now);
                 if (g == .open) if (goAhead(ctx, st, a, o, queue, pos, budget, now, &run_times)) |req| {
-                    const got = state.takeTokens(st, ctx.arena, req, false, budget, @max(cores, budget), false, 0) catch |err| fail("tokens: {t}", .{err});
+                    const got = state.takeTokens(st, ctx.arena, req, false, budget, @max(cores, budget), false, 0, 0) catch |err| fail("tokens: {t}", .{err});
                     if (got) |grant| {
                         const head = queue[0].record;
                         std.debug.print("cpuq: starting ahead of {s}, which waits for {d} cores, on {d} of the free ones\n", .{ if (head.label.len != 0) head.label else head.cmd, head.cores, grant.files.len });
@@ -728,7 +731,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             const mine = policy.charge(useOf(run_times.?, o.label), null, 0, 1, req.max);
             const saturated = if (mach.busy) |b| b >= 0.97 else false;
             if (!m.exclusive and (m.charged == 0 or (mine <= room and !saturated))) {
-                if (state.takeTokens(st, ctx.arena, req, false, poolCap(ctx), poolCap(ctx), false, 0) catch |err| fail("tokens: {t}", .{err})) |grant| {
+                if (state.takeTokens(st, ctx.arena, req, false, poolCap(ctx), poolCap(ctx), false, 0, 0) catch |err| fail("tokens: {t}", .{err})) |grant| {
                     if (o.cores_given == false and grant.files.len != 2) std.debug.print("cpuq: {d} {s} for {s}, from its history\n", .{ grant.files.len, if (grant.files.len == 1) "core" else "cores", if (o.label.len != 0) o.label else "this job" });
                     return admitted(ctx, st, o, &rec, grant, ticket, ticket_name, job, now, false);
                 }
@@ -738,7 +741,9 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             // Leave the next waiter's minimum free when this grant can spare it.
             const reserve: u32 = if (queue.len > 1 and !queue[1].record.exclusive) @min(queue[1].record.cores, budget) else 0;
             const held_before = heldCores(st, a);
-            var got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, budget, @max(cores, budget), exclusive_running, reserve) catch |err| fail("tokens: {t}", .{err});
+            // A job paused by hand runs nothing: a quiet window may open beside it.
+            const paused_cores: u32 = if (o.exclusive) pausedCores(st, a) else 0;
+            var got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, budget, @max(cores, budget), exclusive_running, reserve, paused_cores) catch |err| fail("tokens: {t}", .{err});
             // Not enough free: borrow the cores the holders have left idle for
             // a minute, on top of the budget. Only idle cores are lent, so the
             // work running stays within the budget; should a lender get busy
@@ -755,7 +760,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
                     if (mach.busy) |b| room = @min(room, @as(u32, @intFromFloat(@floor(@as(f64, @floatFromInt(cpus)) * (1 - b)))));
                 }
                 const lent = @min(measureIdle(ctx, st, a), room);
-                if (lent > 0) got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, budget + lent, @max(cores, budget) + lent, exclusive_running, reserve) catch |err| fail("tokens: {t}", .{err});
+                if (lent > 0) got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, budget + lent, @max(cores, budget) + lent, exclusive_running, reserve, paused_cores) catch |err| fail("tokens: {t}", .{err});
             }
             if (got) |grant| {
                 valve.last_admit = now;
@@ -844,6 +849,15 @@ fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const Ru
     }
     st.writeUsage(a, fresh);
     return .{ .charged = charged, .exclusive = false };
+}
+
+/// Cores held by jobs paused by hand.
+fn pausedCores(st: *state.State, a: std.mem.Allocator) u32 {
+    var n: u32 = 0;
+    for (state.scanLeases(st, a, false) catch &.{}) |l| if (st.isPaused(l.name)) {
+        n += l.record.cores;
+    };
+    return n;
 }
 
 /// Cores held by every lease now.
