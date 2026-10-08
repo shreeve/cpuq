@@ -39,7 +39,6 @@ struct NowView: View {
                 HourCard(model: model, hour: hour, mode: $hourMode, scrub: $scrub)
                     .frame(height: hist)
                 JobsCard(model: model, control: control)
-                    .opacity(scrub == nil ? 1 : 0.45)
                     .frame(height: jobs)
             }
         })
