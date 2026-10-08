@@ -712,7 +712,12 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             // job fits the room the running ones leave and the head, which
             // goes first, still fits after it (or has waited less than its
             // patience); behind an exclusive head, only as backfill allows.
-            if (!named and !o.exclusive and cfg.admit == .measured and !queue[0].record.exclusive and mach.pressure != .high) {
+            // The machine's checks hold it as they hold the head: memory
+            // pressure, low memory, CPUs measured all but full; and with
+            // backfill off, nothing starts ahead of the head.
+            const saturated = if (mach.busy) |b| b >= 0.97 else false;
+            const machine_open = policy.gate(cfg, mach, 0, null, now) == .open and !saturated;
+            if (!named and !o.exclusive and cfg.admit == .measured and cfg.backfill and !queue[0].record.exclusive and machine_open) {
                 if (run_times == null) run_times = RunTimes.load(ctx, ctx.arena);
                 const m = measuredLoad(ctx, st, a, &run_times.?, mach.busy);
                 if (!m.exclusive) {
@@ -2111,6 +2116,8 @@ const JsonWaiter = struct {
 const JsonGate = struct {
     state: []const u8 = "",
     load: ?f64 = null,
+    /// With `state` low_memory: the bytes of memory available.
+    available: ?u64 = null,
     text: []const u8 = "",
     /// The load valve's thresholds, when the load check is on: it trips above
     /// `trip` while the CPUs are at least `busy_trip` busy, and reopens at
@@ -2168,22 +2175,39 @@ const RunTimes = struct {
 /// its minimum fits and then holds it for its own typical run. An unknown
 /// run time ahead of a waiter leaves its ETA unknown.
 fn estimate(rt: RunTimes, budget: u32, holders: []const JsonHolder, waiters: []JsonWaiter, now: i64) void {
-    const Release = struct { at: ?f64, cores: u32 };
+    estimateIn(rt, @floatFromInt(budget), null, holders, waiters, now);
+}
+
+/// Plays the queue forward: each running job ends at its label's typical run
+/// time, and each waiter starts, in order, once what it needs is free. Under
+/// `admit = cores` (`target` null) the room is the budget and a job takes its
+/// cores; under measured admission the room is the target, a running job
+/// takes what it is measured using (its label's typical use until measured)
+/// and a waiter what its label typically uses, as admission charges them.
+fn estimateIn(rt: RunTimes, capacity: f64, target: ?f64, holders: []const JsonHolder, waiters: []JsonWaiter, now: i64) void {
+    const Release = struct { at: ?f64, units: f64 };
     var pending: [256]Release = undefined;
     var n: usize = 0;
-    var free: i64 = @intCast(budget);
+    var free: f64 = capacity;
     for (holders) |h| {
-        free -= h.cores;
+        const cores = h.cores;
+        const units: f64 = if (target != null) policy.charge(useOf(rt, h.label), h.using, 1, 0, @max(cores, 1)) else @floatFromInt(cores);
+        free -= units;
         if (n == pending.len) return;
         const at: ?f64 = if (rt.typical(h.label)) |t| @max(@as(f64, @floatFromInt(h.since)) + t - @as(f64, @floatFromInt(now)), 0) else null;
-        pending[n] = .{ .at = at, .cores = h.cores };
+        pending[n] = .{ .at = at, .units = units };
         n += 1;
     }
     var clock: f64 = 0;
     var known = true;
     for (waiters) |*q| {
-        const need: i64 = if (q.exclusive) @intCast(budget) else @min(q.cores, budget);
-        while (free < need and n != 0) {
+        const cores = @max(q.cores, 1);
+        // An exclusive run waits for the whole machine to drain.
+        const need: f64 = if (q.exclusive) capacity else if (target != null)
+            policy.charge(useOf(rt, q.label), null, 0, 1, cores)
+        else
+            @min(@as(f64, @floatFromInt(cores)), capacity);
+        while (n != 0 and (free < need - 1e-9 or q.exclusive)) {
             // The next release: the earliest known one; an unknown one only
             // when no known one is left.
             var pick: usize = 0;
@@ -2197,9 +2221,9 @@ fn estimate(rt: RunTimes, budget: u32, holders: []const JsonHolder, waiters: []J
             pending[pick] = pending[n - 1];
             n -= 1;
             if (r.at) |at| clock = @max(clock, at) else known = false;
-            free += r.cores;
+            free += r.units;
         }
-        if (free < need or !known) {
+        if (free < need - 1e-9 or !known) {
             q.eta = null;
             known = false;
             continue;
@@ -2207,7 +2231,7 @@ fn estimate(rt: RunTimes, budget: u32, holders: []const JsonHolder, waiters: []J
         q.eta = clock;
         free -= need;
         if (n < pending.len) {
-            pending[n] = .{ .at = if (rt.typical(q.label)) |t| clock + t else null, .cores = @intCast(need) };
+            pending[n] = .{ .at = if (rt.typical(q.label)) |t| clock + t else null, .units = need };
             n += 1;
         }
     }
@@ -2711,6 +2735,8 @@ fn statusRemote(ctx: *Ctx, host: []const u8, json: bool, measure: bool) u8 {
         .{ .load = st.gate.load orelse 0 }
     else if (std.mem.eql(u8, st.gate.state, "spacing"))
         .{ .spacing = st.gate.load orelse 0 }
+    else if (std.mem.eql(u8, st.gate.state, "low_memory"))
+        .{ .low_memory = st.gate.available orelse 0 }
     else
         .open;
     const waiters = a.dupe(JsonWaiter, st.waiters) catch st.waiters;
@@ -2770,7 +2796,9 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
     const queue = servedOrder(ctx, &st, a, state.scanQueue(&st, a, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{}), now);
     var valve = st.readValve();
     st.unlock();
-    const g = policy.gate(ctx.cfg, m, budget, &valve, now);
+    // Under measured admission the load valve gates only an exclusive run.
+    const valved = ctx.cfg.admit == .cores or (queue.len != 0 and queue[0].record.exclusive);
+    const g = policy.gate(ctx.cfg, m, budget, if (valved) &valve else null, now);
     var gbuf: [256]u8 = undefined;
     const gate_text = gateText(&gbuf, g, budget);
 
@@ -2782,7 +2810,13 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
     const holders = toHolders(a, leases, busy);
     for (holders, leases) |*h, l| h.paused = st.isPaused(l.name);
     const waiters = toWaiters(a, queue);
-    if (waiters.len != 0) estimate(RunTimes.load(ctx, a), budget, holders, waiters, now);
+    if (waiters.len != 0) {
+        const rt = RunTimes.load(ctx, a);
+        if (ctx.cfg.admit == .measured) {
+            const target = targetCpus(ctx);
+            estimateIn(rt, target, target, holders, waiters, now);
+        } else estimate(rt, budget, holders, waiters, now);
+    }
 
     // The named leases: each a pool of one with its own holder and waiters.
     var named: std.ArrayList(JsonLease) = .empty;
@@ -2815,6 +2849,10 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
                 .load = switch (g) {
                     .load, .spacing => |l| l,
                     .open, .pressure, .low_memory => null,
+                },
+                .available = switch (g) {
+                    .low_memory => |av| av,
+                    else => null,
                 },
                 .text = gate_text,
                 .trip = if (ctx.cfg.load_check) @as(f64, @floatFromInt(budget)) + ctx.cfg.load_margin else null,

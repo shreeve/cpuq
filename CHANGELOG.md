@@ -2,6 +2,24 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.8.11 — 2026-10-08
+
+- Under measured admission, a job behind the first waiter starts ahead of it only when the
+  machine's checks allow, as they do for the first: not under memory pressure or low memory
+  (`min_available`), not while the CPUs are measured 97% busy, and not with `backfill = off`.
+  Before, such a job could start beside full CPUs or low memory.
+- Wait estimates (`eta` in `cpuq status --json`, and the boxed view) under measured admission
+  count what jobs use against `target`, as admission does, instead of cores held against the
+  budget, which made them far too short or too long.
+- `cpuq status` shows the load valve only where it holds anything: under `admit = cores`, or
+  with an exclusive run first in line. The gate in `--json` carries `available` (bytes) when
+  memory is low, and `cpuq status --host` shows a remote host closed for low memory as
+  closed, not open.
+- `cpuq --help` is reorganized: run and lease options in two columns, the real `--cores`
+  default, every exit status, and a short block for agents and scripts. The README is
+  rewritten around measured admission, with AGENTS.md for coding agents and docs/DESIGN.md
+  for the internals.
+
 ## 0.8.10 — 2026-10-08
 
 - `window_gap` (config, seconds, off by default): for that long after a quiet window

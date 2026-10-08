@@ -844,6 +844,44 @@ open("'"$f"'", "a").write("spin-done\n")' & local s=$!
   check "without --cores a label's history picks the cores (got $got, want $want)" "[ '$got' = '$want' ]"
 }
 
+t_measured_backfill() {
+  # Measured admission: a job behind the head starts ahead of it only while
+  # backfill is on. An idle holder settles near 0; the head (4 cores) needs
+  # more than the target of 2 leaves; a 1-core job fits beside it.
+  local mode rc out=""
+  for mode in on off; do
+    setup "measured-backfill-$mode" "admit = measured" "target = 2" "settle = 1" "backfill = $mode"
+    "$CPUQ" run --cores 1 --label idle -- sleep 4 & local i=$!
+    sleep 1.5
+    "$CPUQ" run --cores 4 --label big -- true & local b=$!
+    wait_waiters 1
+    "$CPUQ" run --cores 1 --max-wait 1 --label tiny -- true 2>/dev/null; rc=$?
+    out="$out$mode:$rc "
+    wait $i $b
+  done
+  check "behind the head a job starts ahead with backfill on, not off (got $out)" "[ '$out' = 'on:0 off:75 ' ]"
+}
+
+t_eta_measured() {
+  # Under measured admission ETAs count CPUs of use against the target, not
+  # cores against the budget: two 2-CPU jobs on a target of 2 go one at a time.
+  setup eta-measured "admit = measured" "target = 2" "settle = 1"
+  local h=$CPUQ_DIR/history.jsonl
+  mkdir -p "$CPUQ_DIR"
+  ev() { printf '{"v":1,"event":"%s","id":"%s","t":%s,"pid":1,"label":"%s","cores":%s,"cpu":%s,"exit":0}\n' "$@" >>"$h"; }
+  for n in 1 2 3; do ev started $n 1 build 2 0; ev ended $n 2 build 2 2; done
+  "$CPUQ" run --cores 2 --label build -- sleep 2 & wait_held 2
+  "$CPUQ" run --cores 2 --label build -- true & wait_waiters 1
+  "$CPUQ" run --cores 2 --label build -- true & wait_waiters 2
+  local got; got=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys
+print(" ".join("%.1f" % w["eta"] if w["eta"] is not None else "none" for w in json.load(sys.stdin)["waiters"]))')
+  wait
+  check "measured ETAs: one 2-CPU job after another on a target of 2 (got $got)" "python3 -c '
+import sys
+a, b = (float(x) for x in \"$got\".split())
+sys.exit(0 if 0 <= a <= 1.5 and 0.8 <= b - a <= 1.5 else 1)'"
+}
+
 t_backfill_exclusive() {
   setup backfill_exclusive
   local f=$T/order h=$CPUQ_DIR/history.jsonl
@@ -1238,10 +1276,10 @@ print(j["pair"].get("peak", 0) >> 20, j["quick"].get("peak", 0) >> 20, "%.2f" % 
 t_min_available() {
   setup min-available "min_available = 1000000G"
   "$CPUQ" run --cores 1 --max-wait 1 -- true 2>/dev/null; local rc=$?
-  local state; state=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print(json.load(sys.stdin)["gate"]["state"])')
+  local state; state=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; g = json.load(sys.stdin)["gate"]; print(g["state"], "with-available" if (g.get("available") or 0) > 0 else "no-available")')
   setup min-available-low "min_available = 1M"
   "$CPUQ" run --cores 1 --max-wait 1 -- true; local rc2=$?
-  check "under min_available nothing starts (rc $rc, gate $state); above it, it does (rc $rc2)" "[ $rc = 75 ] && [ '$state' = low_memory ] && [ $rc2 = 0 ]"
+  check "under min_available nothing starts (rc $rc, gate $state); above it, it does (rc $rc2)" "[ $rc = 75 ] && [ '$state' = 'low_memory with-available' ] && [ $rc2 = 0 ]"
 }
 
 t_status() {
@@ -1258,7 +1296,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"
