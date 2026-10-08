@@ -922,6 +922,8 @@ t_eta() {
   setup eta
   "$CPUQ" run --cores 9 --label build -- sleep 1
   "$CPUQ" run --cores 9 --label build -- sleep 1
+  # Runs of 1 s are recorded a little long (the end is seen within 0.1 s) and
+  # longer on a slow runner: the bounds allow for it.
   "$CPUQ" run --cores 9 --label build -- sleep 2 & wait_held 9
   "$CPUQ" run --cores 9 --label build -- true & wait_waiters 1
   "$CPUQ" run --cores 9 --label other -- true & wait_waiters 2
@@ -932,7 +934,7 @@ print(" ".join("%.1f" % w["eta"] if w["eta"] is not None else "none" for w in js
   check "waiters get ETAs from the history's typical run times (got $got)" "python3 -c '
 import sys
 a, b = (float(x) for x in \"$got\".split())
-sys.exit(0 if 0 <= a <= 1.2 and 0.8 <= b - a <= 1.2 else 1)'"
+sys.exit(0 if 0 <= a <= 1.5 and 0.8 <= b - a <= 1.5 else 1)'"
 }
 
 t_status_host() {
