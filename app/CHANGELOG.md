@@ -3,6 +3,18 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.11.0 — 2026-10-07
+
+- The window keeps the size you give it, and everything in it always fits: nothing scrolls and
+  nothing is cut off at the bottom. The charts share the height there is, compressed alike
+  when the window is short (it goes no shorter than they can take); the lanes and the stacked
+  chart number fewer lines when they are squeezed.
+- The table of jobs is always five rows tall, so the charts never jump as jobs come and go;
+  more than five scroll inside it.
+- The window remembers its size and place.
+- Brown is gone from the project colors (pale, it read as the gate shut); a lime takes its
+  place.
+
 ## 0.10.0 — 2026-10-07
 
 From a design review of the window, and for cpuq 0.8's measured admission.

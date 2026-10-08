@@ -234,9 +234,10 @@ final class GraphModel {
     /// A project's place in the palette, which also orders the stacked chart.
     func slot(_ project: String) -> Int { slots[project] ?? Int.max }
 
-    /// Project colors: the system's bright hues, less red and pink (red means waiting), the most
-    /// distinct first; grey means work outside cpuq.
-    static let palette: [Color] = [.blue, .orange, .green, .purple, .yellow, .cyan, .mint, .brown, .indigo, .teal]
+    /// Project colors: the system's bright hues and a lime, the most distinct first. No red or
+    /// pink (red means waiting), no grey (work outside cpuq), no brown (pale, it reads as the
+    /// gate shut).
+    static let palette: [Color] = [.blue, .orange, .green, .purple, .yellow, .cyan, .mint, Color(red: 0.62, green: 0.82, blue: 0.08), .indigo, .teal]
 
     func color(_ project: String) -> Color {
         Self.palette[(slots[project] ?? 0) % Self.palette.count]
@@ -376,7 +377,34 @@ struct GraphsView: View {
             if tab == 0 { now } else { history }
         }
         .padding(16)
-        .frame(minWidth: 560, minHeight: 600)
+        .frame(minWidth: Self.minimumSize.width, maxWidth: .infinity, minHeight: Self.minimumSize.height, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    /// The smallest the window goes: at this size every view still fits, compressed.
+    static let minimumSize = CGSize(width: 560, height: 620)
+
+    /// How tall each view over time is, and the space under it, in a given height: each its
+    /// natural height where there is room, with what is left over going to the stacked chart
+    /// and the lanes; in less, all of them compressed alike, so nothing is ever cut off.
+    struct Heights {
+        var mac = 0.0, perCPU = 0.0, stacked = 0.0, lanes = 0.0, waiting = 0.0
+        /// The space under each view, compressed with them.
+        var gap = 1.0
+
+        init(height: Double, mac showMac: Bool, perCPU showPerCPU: Bool, stacked showStacked: Bool, lanes showLanes: Bool) {
+            let views = [showMac, showPerCPU, showStacked, showLanes].filter { $0 }.count + 1
+            let fixed = (showMac ? 92.0 + 14 : 0) + (showPerCPU ? 96.0 + 14 : 0) + (showStacked ? 18.0 : 0) + (showLanes ? 14.0 : 0) + 70 + Double(views - 1) * 4
+            let flexible = (showStacked ? 180.0 : 0) + (showLanes ? 200.0 : 0)
+            let scale = min(max(height / (fixed + flexible), 0.3), 1)
+            let spare = max(height - fixed - flexible, 0)
+            let stackShare = showStacked && showLanes ? 0.45 : showStacked ? 1.0 : 0
+            mac = showMac ? 92 * scale : 0
+            perCPU = showPerCPU ? 96 * scale : 0
+            stacked = showStacked ? 180 * scale + spare * stackShare : 0
+            lanes = showLanes ? 200 * scale + spare * (1 - stackShare) : 0
+            waiting = 70 * scale
+            gap = scale
+        }
     }
 
     // MARK: Now
@@ -493,42 +521,36 @@ struct GraphsView: View {
             ((hover.flatMap { describe($0, axis: axis, cells: cells) }) ?? Text(" "))
                 .font(.callout).monospacedDigit().lineLimit(1)
                 .frame(height: 18, alignment: .leading)
-            // The views scroll when the window is too short for them all, so the top line and the
-            // toggles always show; given room, the stacked chart and the lanes share it.
+            // The views share the height left: never scrolled, never cut off, compressed alike
+            // when the window is short.
             GeometryReader { geo in
-                let fixed = (showMac ? 106.0 : 0) + (showPerCPU ? 110.0 : 0) + 70 + (showStacked ? 18.0 : 0) + (showLanes ? 14.0 : 0)
-                let spare = max(geo.size.height - fixed, 0)
-                let share = showStacked && showLanes ? 0.45 : 1.0
-                let stackH = max(150, spare * share)
-                let lanesH = max(170, spare * (showStacked ? 0.55 : 1.0))
-                ScrollView(.vertical) {
-            VStack(spacing: 4) {
-                if showMac {
-                    macChart(axis: axis, machine: machine, labelGate: top == .mac)
-                        .frame(height: 92)
-                        .padding(.bottom, 14)
-                }
-                if showPerCPU {
-                    perCPUChart(axis: axis, machine: machine, labelGate: top == .percpu)
-                        .frame(height: 96)
-                        .padding(.bottom, 14)
-                }
-                if showStacked {
-                    stackChart(axis: axis, machine: machine, labelGate: top == .stack)
-                        .frame(height: stackH)
-                        .padding(.bottom, 18)
-                }
-                if showLanes {
-                    lanesChart(axis: axis, lanes: lanes, cells: cells, machine: machine, labelGate: top == .lanes)
-                        .frame(height: lanesH)
-                        .padding(.bottom, 14)
-                }
-                waitingChart(axis: axis, waits: waitCells, machine: machine, labelGate: top == .waiting)
-                    .frame(height: 70)
-            }
+                let h = Heights(height: geo.size.height, mac: showMac, perCPU: showPerCPU, stacked: showStacked, lanes: showLanes)
+                VStack(spacing: 4 * h.gap) {
+                    if showMac {
+                        macChart(axis: axis, machine: machine, labelGate: top == .mac)
+                            .frame(height: h.mac)
+                            .padding(.bottom, 14 * h.gap)
+                    }
+                    if showPerCPU {
+                        perCPUChart(axis: axis, machine: machine, labelGate: top == .percpu)
+                            .frame(height: h.perCPU)
+                            .padding(.bottom, 14 * h.gap)
+                    }
+                    if showStacked {
+                        stackChart(axis: axis, machine: machine, labelGate: top == .stack, height: h.stacked)
+                            .frame(height: h.stacked)
+                            .padding(.bottom, 18 * h.gap)
+                    }
+                    if showLanes {
+                        lanesChart(axis: axis, lanes: lanes, cells: cells, machine: machine, labelGate: top == .lanes, height: h.lanes)
+                            .frame(height: h.lanes)
+                            .padding(.bottom, 14 * h.gap)
+                    }
+                    waitingChart(axis: axis, waits: waitCells, machine: machine, labelGate: top == .waiting)
+                        .frame(height: h.waiting)
+                    Spacer(minLength: 0)
                 }
             }
-            .frame(minHeight: 240)
             key
             table
         }
@@ -730,8 +752,11 @@ struct GraphsView: View {
 
     /// The lanes, one per core of the budget: a held core in its project's color, pale while
     /// idle and full as far as the job keeps it busy.
-    private func lanesChart(axis: TimeAxis, lanes: Int, cells: [Cell], machine: [MachineColumn?], labelGate: Bool) -> some View {
-        Chart {
+    private func lanesChart(axis: TimeAxis, lanes: Int, cells: [Cell], machine: [MachineColumn?], labelGate: Bool, height: Double) -> some View {
+        // Every lane numbered while the numbers fit, else every second or fourth.
+        let room = height / Double(max(lanes, 1))
+        let every = room >= 13 ? 1 : room >= 6.5 ? 2 : 4
+        return Chart {
             gateBands(machine, low: 0, high: Double(lanes), label: labelGate)
             ForEach(cells) { c in
                 let x0 = Double(c.column) + 0.08, x1 = Double(c.column) + 0.92
@@ -762,8 +787,7 @@ struct GraphsView: View {
         .chartXAxis { timeAxis(axis, labels: false) }
         .chartYScale(domain: 0...Double(lanes))
         .chartYAxis {
-            // Every lane numbered while they fit; past 16, every fourth.
-            AxisMarks(position: .leading, values: (0..<lanes).filter { lanes <= 16 || $0 % 4 == 0 }.map { Double($0) + 0.5 }) { v in
+            AxisMarks(position: .leading, values: (0..<lanes).filter { $0 % every == 0 }.map { Double($0) + 0.5 }) { v in
                 AxisValueLabel { if let d = v.as(Double.self) { axisLabel(Text("\(Int(d) + 1)")) } }
             }
         }
@@ -993,7 +1017,7 @@ struct GraphsView: View {
 
     /// The cores held, stacked (busy solid from the floor, idle pale above), with the
     /// budget. It shares the time axis of the views around it.
-    private func stackChart(axis: TimeAxis, machine: [MachineColumn?], labelGate: Bool) -> some View {
+    private func stackChart(axis: TimeAxis, machine: [MachineColumn?], labelGate: Bool, height: Double) -> some View {
         let cpus = Double(ProcessInfo.processInfo.activeProcessorCount)
         let budget = Double(model.budget)
         let bands = Self.bands(model, columns: axis.columns, end: axis.end)
@@ -1021,7 +1045,9 @@ struct GraphsView: View {
         .chartYAxis {
             // Under measured admission the budget limits nothing, so the axis marks the CPUs alone.
             let measured = model.status?.admit == "measured"
-            AxisMarks(position: .leading, values: Array(stride(from: 0.0, through: max(cpus, measured ? cpus : budget), by: 2)).filter { (measured || abs($0 - budget) > 1.1) && abs($0 - cpus) > 1.1 }) { v in
+            // A number every 2 cores while they fit, else every 4.
+            let step = height / top * 2 >= 14 ? 2.0 : 4.0
+            AxisMarks(position: .leading, values: Array(stride(from: 0.0, through: max(cpus, measured ? cpus : budget), by: step)).filter { (measured || abs($0 - budget) > step * 0.55) && abs($0 - cpus) > step * 0.55 }) { v in
                 AxisGridLine().foregroundStyle(.secondary.opacity(0.15))
                 AxisValueLabel { if let d = v.as(Double.self) { axisLabel(Text("\(Int(d))")) } }
             }
@@ -1198,17 +1224,31 @@ struct GraphsView: View {
         return out
     }
 
-    /// Who holds what now, and who waits: the legend and the numbers in one.
+    /// Who holds what now, and who waits: the legend and the numbers in one. It is always the
+    /// same height, room for five rows, so the charts above never jump as jobs come and go;
+    /// more than five scroll inside it.
     private var table: some View {
-        Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 4) {
+        VStack(alignment: .leading, spacing: 4) {
             // Fixed widths, so nothing shifts as the numbers change.
-            GridRow {
-                Text("Project").frame(width: 220, alignment: .leading)
-                Text("In use").frame(width: 64, alignment: .trailing)
-                Text("Active").frame(width: 64, alignment: .trailing)
-                Text("Efficiency").frame(width: 72, alignment: .trailing)
+            Grid(alignment: .leading, horizontalSpacing: 16) {
+                GridRow {
+                    Text("Project").frame(width: 220, alignment: .leading)
+                    Text("In use").frame(width: 64, alignment: .trailing)
+                    Text("Active").frame(width: 64, alignment: .trailing)
+                    Text("Efficiency").frame(width: 72, alignment: .trailing)
+                }
             }
             .font(.caption.bold()).foregroundStyle(.secondary)
+            ScrollView(.vertical) { tableRows.frame(maxWidth: .infinity, alignment: .leading) }
+                .frame(height: Self.tableHeight)
+        }
+    }
+
+    /// Five rows of the table.
+    static let tableHeight = 5 * 21.0
+
+    private var tableRows: some View {
+        Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 4) {
             ForEach(model.rows) { r in
                 GridRow {
                     HStack(spacing: 6) { Circle().fill(model.color(r.project)).frame(width: 8, height: 8); Text(r.project).lineLimit(1) }

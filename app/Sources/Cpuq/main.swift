@@ -214,13 +214,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func showGraphs() {
         if graphsWindow == nil {
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 640, height: 600),
+                contentRect: NSRect(x: 0, y: 0, width: 960, height: 780),
                 styleMask: [.titled, .closable, .resizable, .miniaturizable],
                 backing: .buffered, defer: false)
             window.title = "cpuq"
             window.isReleasedWhenClosed = false
-            window.contentView = NSHostingView(rootView: GraphsView(model: graphs, control: { [weak self] action, pid, who in self?.perform(action, pid: String(pid), who: who) }))
+            // The window is the size it is given and no other: what is in it never grows or
+            // shrinks it, and everything in it fits, the charts sharing what height there is.
+            let host = NSHostingView(rootView: GraphsView(model: graphs, control: { [weak self] action, pid, who in self?.perform(action, pid: String(pid), who: who) }))
+            host.sizingOptions = []
+            window.contentView = host
+            window.contentMinSize = GraphsView.minimumSize
             window.center()
+            // Where it was and how big, kept from one opening to the next.
+            window.setFrameAutosaveName("cpuq graphs")
             graphsWindow = window
             // History changes slowly: read it now and each minute while the window is open.
             historyTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
