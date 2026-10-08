@@ -156,6 +156,8 @@ final class HourCache {
         var span: TimeInterval = 300
         /// How long each column lasts.
         var step: TimeInterval = 2.5
+        /// The moment it was worked out: now, for its time axis.
+        var end = Date()
         var columns: [Column] = []
         /// Projects in the hour, in palette order: the stacking order.
         var projects: [String] = []
@@ -227,7 +229,7 @@ final class HourCache {
             cols[i].waiting = m.waits.filter { $0.from < cols[i].to && ($0.to ?? end) > cols[i].from }.count
         }
         let projects = Set(cols.flatMap(\.shares.keys)).sorted { (m.slot($0), $0) < (m.slot($1), $1) }
-        return Hour(span: span, step: step, columns: cols, projects: projects)
+        return Hour(span: span, step: step, end: end, columns: cols, projects: projects)
     }
 
     /// Runs of columns where `test` holds, allowing a one-column gap.
@@ -704,17 +706,21 @@ struct HourCard: View {
     }
 
     /// Ticks at quarters of the span, the oldest labelled with how long ago.
+    /// Ticks at round times back from now: now, round minutes between, the oldest a whole span
+    /// ago ("1 hour ago"), whatever second the clock-pinned columns start on.
     private var ticks: [Date] {
-        guard let a = hour.columns.first?.from, let b = hour.columns.last?.to else { return [] }
-        return (0...4).map { a.addingTimeInterval(b.timeIntervalSince(a) * Double($0) / 4) }
+        guard let a = hour.columns.first?.from else { return [] }
+        // Between them, round minutes: every 15 over an hour, every 5 over 25 minutes, about
+        // five spaces in all, none crowding the oldest.
+        let every = max(5, ((hour.span / 60 / 5) / 5).rounded(.up) * 5) * 60
+        let between = stride(from: every, to: hour.span - every / 2, by: every).reversed().map { hour.end.addingTimeInterval(-$0) }
+        return [max(hour.end.addingTimeInterval(-hour.span), a)] + between + [hour.end]
     }
 
     private func tickLabel(_ d: Date) -> String {
-        let end = hour.columns.last?.to ?? Date()
-        let ago = end.timeIntervalSince(d)
-        if ago < 1 { return "now" }
-        let m = Int((ago / 60).rounded())
-        return d == hour.columns.first?.from ? "\(m) min ago" : "\(m)"
+        if d == ticks.last { return "now" }
+        if d == ticks.first { return hour.span >= 3600 ? "1 hour ago" : "\(Int((hour.span / 60).rounded())) min ago" }
+        return "\(Int((hour.end.timeIntervalSince(d) / 60).rounded()))"
     }
 
     private var xAxis: some AxisContent {
