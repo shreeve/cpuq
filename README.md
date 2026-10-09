@@ -280,6 +280,25 @@ With `window_gap = SECONDS`, for that long after an exclusive run ends the exclu
 waiting go behind the other waiters (`cpuq status` lists them so), so work that queued during
 the window gets its turn before the next one empties the machine again.
 
+**Other work beside a window.** cpuq holds back only cpuq's jobs. While a window runs, its cpuq
+watches every other process too (system services such as Spotlight or photo analysis, work
+started outside cpuq). It warns on stderr when they pass a CPU (`work outside this timing window
+is using 2.3 CPUs (mediaanalysisd 1.8, ...): its timings may be noisy`). At the end it says how
+much they used if that reached half a CPU. History keeps it as `noise` and `noise_peak` (CPUs,
+average and peak). Rerun a window whose noise was high.
+
+**Lending an idle window.** With `window_lend = SECONDS`, a window held with no command of its
+own (`cpuq lease NAME --hold --exclusive`, the far end of `--host … --exclusive`) lends the
+machine to waiting jobs once its owner has done nothing for that long. The owner's work is this
+user's processes that started after the window opened, other than the jobs it lent to (or, with
+`CPUQ_WINDOW_OWNER=PID`, that process's tree). Idle means under 0.1 CPU and no process waiting
+on a disk. The moment the owner works again (0.2 CPU, or a process waiting on a disk, checked
+every second), the lent jobs are frozen (SIGSTOP) until the owner idles that long again or the
+window ends; then they continue. The first second or so of the owner's next step can overlap
+them, and frozen jobs keep their memory. `cpuq status` notes a lending window and shows frozen
+jobs as paused. This suits a dedicated build or benchmark machine where those processes are the
+window's work. It needs measured admission.
+
 ## Named leases
 
     cpuq lease NAME [--slots N] [--exclusive] [--priority P] [--label L] [--max-wait S] -- CMD...
@@ -380,11 +399,12 @@ re-reads the file when it changes; an invalid edit keeps the settings in force a
 | `max_memory` | off | stop a job whose processes together use more memory than this (e.g. `16G`) |
 | `exclusive` | on | grant `--exclusive`; off, it runs as an ordinary job |
 | `window_gap` | 0 | seconds after an exclusive run ends during which waiting ones go behind other work |
+| `window_lend` | 0 | seconds a `--hold --exclusive` window's owner idles before it lends the machine (measured only; 0: never) |
 | `budget` | active CPUs - 2 | cores an exclusive run takes; under `admit = cores`, the cores to hand out |
 | `active_cap` | on | cap the budget by the CPUs active now |
 | `load_check` | on | the load valve; under measured admission, for exclusive runs only |
 | `load_margin` | 4 | the valve trips above budget + margin; as `load_check` |
-| `backfill` | on | `admit = cores` only, and behind an exclusive first waiter: let a job start ahead on cores the first cannot use yet |
+| `backfill` | on | let a job start ahead of the first waiter when both fit (measured), or on cores the first cannot use yet (`admit = cores`, and behind an exclusive first waiter) |
 | `lend` | on | `admit = cores` only: lend the first waiter the cores a running job leaves idle |
 | `lend_after` | 60 | `admit = cores` only: seconds a core must stay idle before it is lent |
 | `right_size` | on | `admit = cores` only: cap a range near what its label has used (measured admission always does) |
@@ -427,6 +447,7 @@ In this mode a few things keep reserved cores from sitting idle:
 | `CPUQ_BUDGET` | the budget in cores, over the config file |
 | `CPUQ_HISTORY` | the history file |
 | `CPUQ_HOLD_QUIET` | seconds a `--hold` that has had heartbeats waits for the next before it ends (60) |
+| `CPUQ_WINDOW_OWNER` | for a `--hold --exclusive` window with `window_lend`: the PID whose process tree is its owner's work |
 | `NO_COLOR` | draw `cpuq status` and `cpuq history` without color |
 | `CPUQ_CORES` | set for CMD: its grant |
 | `CPUQ_TOKEN` | set for CMD: its hold, which makes runs inside it nested |

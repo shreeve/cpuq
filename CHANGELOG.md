@@ -2,6 +2,23 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.9.0 — 2026-10-09
+
+- A timing window watches the work beside it. While an exclusive run or hold runs, its cpuq
+  measures every other process: system services, work outside cpuq, parked jobs. It warns on
+  stderr when they pass a CPU, says at the end how much they used if that reached half a CPU,
+  and history keeps it as `noise` and `noise_peak`. On the Mac, Spotlight and photo analysis
+  had used 2–4.6 CPUs in windows nobody could see; one window lost 14 of its 18 passes to it.
+- `window_lend = SECONDS` (off by default): a window held with no command (`lease --hold
+  --exclusive`, the far end of `--host … --exclusive`) whose owner has done nothing for that
+  long lends the machine to waiting jobs, and freezes them (SIGSTOP) the moment the owner works
+  again, until it idles that long again or the window ends. The owner's work is this user's
+  processes started after the window opened, less the lent jobs (`CPUQ_WINDOW_OWNER=PID` names
+  a tree instead); a process waiting on a disk counts as work. On pup, the 13 holds of 10
+  minutes or more in two days, some sitting idle while their owner built on the Mac, accounted
+  for over half the waiting behind holds. `cpuq status` notes a lending window, and JSON marks
+  it (`lending`) and the jobs it froze (`frozen`).
+
 ## 0.8.11 — 2026-10-08
 
 - Under measured admission, a job behind the first waiter starts ahead of it only when the

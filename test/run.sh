@@ -401,6 +401,55 @@ t_hold_gone() {
   check "a waiting hold whose stdin closes gives up (rc $rw, ${dw}s); a held one whose heartbeats stop ends (rc $rq, ${dq}s)" "[ $rw = 75 ] && [ $rq = 0 ] && grep -q 'has gone' '$T/err' && python3 -c 'import sys; sys.exit(0 if $dw < 3 and $dq < 4 else 1)'"
 }
 
+t_window_lend() {
+  # window_lend: an exclusive hold whose owner idles lends the machine to a
+  # waiting job, freezes it while the owner works, and thaws it once the
+  # owner idles again. The owner's work here is one process tree
+  # (CPUQ_WINDOW_OWNER): idle 6 s, busy 3 s, then idle.
+  setup window-lend "admit = measured" "target = 4" "settle = 1" "window_lend = 2"
+  local f=$T/ticks
+  sh -c 'sleep 6; python3 -c "import time
+e = time.time() + 3
+while time.time() < e: pass"; sleep 60' & local owner=$!
+  mkfifo "$T/in"
+  CPUQ_WINDOW_OWNER=$owner "$CPUQ" lease bench --hold --exclusive --label win <"$T/in" >/dev/null 2>"$T/hold" & local h=$!
+  exec 7>"$T/in"
+  wait_lease_holder bench
+  # Ticks every 0.1 s, 100 of them: about 10 s of work once lent the machine.
+  "$CPUQ" run --cores 1 --label lent --max-wait 8 -- python3 -c 'import time
+for _ in range(100):
+    open("'"$f"'", "a").write("%.3f\n" % time.time()); time.sleep(0.1)' & local j=$!
+  wait $j; local rc=$?
+  local gap; gap=$(python3 -c 'import sys
+t = [float(x) for x in open(sys.argv[1])]
+print("%.1f" % max(b - a for a, b in zip(t, t[1:])))' "$f" 2>/dev/null || echo 0)
+  # Its holder closes the hold's stdin, as the kit does: the hold ends.
+  exec 7>&-
+  wait $h
+  kill $owner 2>/dev/null; wait $owner 2>/dev/null
+  # Off, the same job waits the window out.
+  setup window-lend-off "admit = measured" "target = 4" "settle = 1"
+  "$CPUQ" lease bench --hold --exclusive --label win < <(sleep 30) >/dev/null & h=$!
+  wait_lease_holder bench
+  "$CPUQ" run --cores 1 --label lent --max-wait 4 -- true 2>/dev/null; local rc_off=$?
+  kill $h 2>/dev/null; wait $h 2>/dev/null
+  check "an idle window lends the machine (rc $rc), freezes the job while its owner works (longest pause ${gap}s) and thaws it; with window_lend off the job waits (rc $rc_off)" "[ $rc = 0 ] && [ $rc_off = 75 ] && python3 -c 'import sys; sys.exit(0 if 2 <= $gap <= 8 else 1)' && grep -q 'lending the machine' '$T/../window-lend/hold' && grep -q 'froze 1 job' '$T/../window-lend/hold'"
+}
+
+t_window_noise() {
+  # A timing window measures the other work beside it: it warns while that
+  # passes a CPU, says how much there was at the end, and keeps it in history.
+  setup window-noise
+  local i
+  for i in 1 2; do python3 -c 'import time
+e = time.time() + 5
+while time.time() < e: pass' & done
+  "$CPUQ" run --exclusive --label timed -- sleep 4 2>"$T/err"; local rc=$?
+  wait
+  local noise; noise=$("$CPUQ" history --json --label timed | python3 -c 'import json, sys; j = json.load(sys.stdin)[0]; print("%s %s" % (j.get("noise"), j.get("noise_peak")))')
+  check "an exclusive run reports the work beside it (rc $rc, noise and peak $noise)" "[ $rc = 0 ] && grep -q 'work outside this timing window is using' '$T/err' && grep -q 'used .* CPUs on average' '$T/err' && python3 -c 'import sys; a, b = (float(x) for x in \"$noise\".split()); sys.exit(0 if a >= 1 and b >= 1.5 else 1)'"
+}
+
 t_cancel_exclusive() {
   setup cancel-exclusive
   # An exclusive waiter behind another waiter takes a cancel within seconds.
@@ -1296,7 +1345,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

@@ -540,6 +540,11 @@ pub const Proc = struct {
     running: u32 = 0,
     /// Stopped (SIGSTOP), or a zombie, which runs no more either.
     stopped: bool = false,
+    /// Its owner's user id.
+    uid: u32 = 0,
+    /// Waiting on a disk or other device (Linux state D): busy, though using
+    /// no CPU. Always false on macOS.
+    blocked: bool = false,
 };
 
 /// Every process the caller can see, with its parent and its CPU time so
@@ -577,10 +582,13 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
             var ppid: i32 = undefined;
             var name: []const u8 = "";
             var stopped = true;
+            var uid: u32 = 0;
             if (proc_pidinfo(pid, 3, 0, &bsd, bsd.len) == bsd.len) {
                 // pbi_status at 4: SSTOP is 4.
                 stopped = std.mem.readInt(u32, bsd[4..8], .little) == 4;
                 ppid = @bitCast(std.mem.readInt(u32, bsd[16..20], .little));
+                // pbi_uid at 20.
+                uid = std.mem.readInt(u32, bsd[20..24], .little);
                 // pbi_name (32 bytes at 64) when set, else pbi_comm (16 at 48).
                 const long = std.mem.sliceTo(bsd[64..96], 0);
                 name = if (long.len != 0) long else std.mem.sliceTo(bsd[48..64], 0);
@@ -600,6 +608,7 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
                 .mem = mem,
                 .running = running,
                 .stopped = stopped,
+                .uid = uid,
             }) catch break;
         }
         return list.items;
@@ -627,11 +636,13 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
         var rss: u64 = 0;
         var running: u32 = 0;
         var stopped = false;
+        var blocked = false;
         var i: usize = 0;
         while (fields.next()) |f| : (i += 1) {
             switch (i) {
                 0 => {
                     running = if (std.mem.eql(u8, f, "R")) 1 else 0;
+                    blocked = std.mem.eql(u8, f, "D");
                     // T stopped, t stopped by a tracer, Z a zombie.
                     stopped = f.len == 1 and (f[0] == 'T' or f[0] == 't' or f[0] == 'Z');
                 },
@@ -648,7 +659,16 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
             }
             if (i == 21) break;
         }
-        list.append(arena, .{ .pid = pid, .ppid = ppid, .name = arena.dupe(u8, text[open + 1 .. close]) catch "", .cpu_ns = ticks * std.time.ns_per_s / tick_hz, .own_ns = own * std.time.ns_per_s / tick_hz, .mem = rss * page, .running = running, .stopped = stopped }) catch break;
+        // The owner: /proc/PID belongs to the process's user.
+        var uid: u32 = 0;
+        var name_z: [16:0]u8 = @splat(0);
+        if (entry.name.len < name_z.len) {
+            @memcpy(name_z[0..entry.name.len], entry.name);
+            const linux = std.os.linux;
+            var stx: linux.Statx = undefined;
+            if (linux.statx(dir.handle, &name_z, 0, .{ .UID = true }, &stx) == 0) uid = stx.uid;
+        }
+        list.append(arena, .{ .pid = pid, .ppid = ppid, .name = arena.dupe(u8, text[open + 1 .. close]) catch "", .cpu_ns = ticks * std.time.ns_per_s / tick_hz, .own_ns = own * std.time.ns_per_s / tick_hz, .mem = rss * page, .running = running, .stopped = stopped, .uid = uid, .blocked = blocked }) catch break;
     }
     return list.items;
 }
@@ -815,6 +835,14 @@ pub const StdinWatch = struct {
             var fds = [_]c.pollfd{.{ .fd = wake[0], .events = c.POLL.IN, .revents = 0 }};
             _ = c.poll(&fds, 1, 1000);
         }
+    }
+
+    /// Waits up to `ms` for the holder to go; true once it has.
+    pub fn waitGone(quiet_ms: i64, ms: i32) bool {
+        if (gone(quiet_ms)) return true;
+        var fds = [_]c.pollfd{.{ .fd = wake[0], .events = c.POLL.IN, .revents = 0 }};
+        _ = c.poll(&fds, 1, ms);
+        return gone(quiet_ms);
     }
 
     /// The holder is gone: stdin closed, or heartbeats came and none for

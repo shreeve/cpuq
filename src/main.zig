@@ -493,6 +493,10 @@ const EventExtra = struct {
     exit: ?u8 = null,
     signal: ?u32 = null,
     cpu: ?f64 = null,
+    /// A timing window's: CPU used beside it by other work, on average and
+    /// at most (`Noise`).
+    noise: ?f64 = null,
+    noise_peak: ?f64 = null,
 };
 
 fn logEvent(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra) void {
@@ -512,6 +516,8 @@ fn logEvent(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra) void {
     ev.forced = extra.forced;
     ev.memory = extra.memory;
     ev.peak = extra.peak;
+    ev.noise = extra.noise;
+    ev.noise_peak = extra.noise_peak;
     history.append(ctx.io, path, ev);
 }
 
@@ -552,10 +558,13 @@ var words_slot: u1 = 0;
 
 /// Logs how a command ended.
 fn logEnded(ctx: *Ctx, job: JobLog, cores: u32, w: sys.Waited) void {
+    var extra: EventExtra = .{ .cores = cores, .cpu = w.cpu_s, .memory = w.memory, .peak = peakOf(w) };
     switch (w.exit) {
-        .code => |code| logEvent(ctx, job, "ended", .{ .cores = cores, .exit = code, .cpu = w.cpu_s, .memory = w.memory, .peak = peakOf(w) }),
-        .signal => |sig| logEvent(ctx, job, "ended", .{ .cores = cores, .signal = @intCast(@backingInt(sig)), .cpu = w.cpu_s, .memory = w.memory, .peak = peakOf(w) }),
+        .code => |code| extra.exit = code,
+        .signal => |sig| extra.signal = @intCast(@backingInt(sig)),
     }
+    if (job.base.exclusive) noiseInto(&extra);
+    logEvent(ctx, job, "ended", extra);
 }
 
 /// Bytes as a short size: 340M, 1.2G.
@@ -879,7 +888,13 @@ fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const Ru
     const leases = state.scanLeases(st, a, false) catch return .{ .charged = 0, .exclusive = false };
     // While a quiet window is held nothing is admitted, so nothing is
     // measured: every waiter's scan of the processes would only disturb it.
-    for (leases) |l| if (l.record.exclusive) return .{ .charged = std.math.inf(f64), .exclusive = true };
+    // A window lending the machine (`window_lend`) holds nothing back.
+    var lend_buf: [128]u8 = undefined;
+    const lending = st.lendingWindow(&lend_buf);
+    for (leases) |l| if (l.record.exclusive) {
+        if (lending) |w| if (std.mem.eql(u8, w, l.name)) continue;
+        return .{ .charged = std.math.inf(f64), .exclusive = true };
+    };
     const procs = sys.processes(ctx.io, a);
     const old = st.readUsage(a);
     var fresh: std.StringHashMapUnmanaged(policy.Use) = .empty;
@@ -887,7 +902,7 @@ fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const Ru
     const now_s = @divFloor(now_ms, 1000);
     var charged: f64 = 0;
     for (leases) |l| {
-        if (st.isPaused(l.name)) continue;
+        if (l.record.exclusive or st.isPaused(l.name)) continue;
         const expected = useOf(rt.*, l.record.label);
         if (l.record.child <= 0) {
             charged += policy.charge(expected, null, 0, ctx.cfg.settle_s, l.record.cores);
@@ -1176,6 +1191,19 @@ fn watchChild(ctx: *Ctx, pid: std.c.pid_t, label: []const u8) sys.Waited {
         _ = arena_state.reset(.retain_capacity);
         const a = arena_state.allocator();
         const procs = sys.processes(ctx.io, a);
+        if (window_noise) |*n| {
+            // A timing window: everything but its own command (and cpuq) is
+            // other work beside it.
+            const own = a.alloc(bool, procs.len) catch continue;
+            @memset(own, false);
+            sys.markTree(procs, pid, own);
+            const self = sys.getpid();
+            for (procs, own) |p, *o| if (p.pid == self) {
+                o.* = true;
+            };
+            n.observe(procs, own, true, label);
+        }
+        keepFrozen(ctx, a, procs, pid);
         if (stopped != null) {
             if (nowFloat(ctx.io) - stopped_at >= 10) signalTree(a, procs, pid, .KILL);
             continue;
@@ -1262,6 +1290,10 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
     for (o.cmd, 0..) |a, i| argv[i] = a.ptr;
 
     sys.installForwarding();
+    // A timing window watches what other work runs beside it; an ordinary
+    // job keeps itself frozen while a window says so.
+    if (lease.record.exclusive or exclusive_cores != null) window_noise = .{};
+    if (o.lease == null and !lease.record.exclusive) own_lease = .{ .st = st, .name = lease.name };
     const qos_enabled = ctx.cfg.qos and o.qos and o.lease == null;
     const qos: policy.Qos = if (lease.borrowed > 0 and qos_enabled and policy.borrowersYield()) .background else policy.qosFor(o.priority, o.exclusive, qos_enabled);
     const spawned = sys.spawn(exe, argv.ptr, @ptrCast(envp.slice.ptr), qos);
@@ -1281,6 +1313,8 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
         break :blk .{ .exit = .{ .code = if (err == error.FileNotFound) exit_notfound else exit_noexec } };
     };
 
+    if (window_noise) |*n| n.report(lease.job.base.label);
+    own_lease = null;
     releaseExclusiveCores(ctx, waited);
     release(io, st, lease);
     logEnded(ctx, lease.job, k, waited);
@@ -1507,7 +1541,11 @@ fn releaseExclusiveCores(ctx: *Ctx, ended: ?sys.Waited) void {
     const x = exclusive_cores orelse return;
     exclusive_cores = null;
     release(ctx.io, x.st, x.lease);
-    if (ended) |w| logEnded(ctx, x.lease.job, x.lease.record.cores, w) else logEvent(ctx, x.lease.job, "ended", .{ .cores = x.lease.record.cores, .exit = 0 });
+    if (ended) |w| logEnded(ctx, x.lease.job, x.lease.record.cores, w) else {
+        var extra: EventExtra = .{ .cores = x.lease.record.cores, .exit = 0 };
+        noiseInto(&extra);
+        logEvent(ctx, x.lease.job, "ended", extra);
+    }
 }
 
 /// Blocks until stdin reaches its end: the holder of a `--hold` closed it,
@@ -1548,7 +1586,7 @@ var hold_quiet_ms: i64 = 60_000;
 fn holdAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, lease: Lease) u8 {
     ctx.out.print("held {s} {s}\n", .{ o.lease.?, lease.name }) catch {};
     ctx.out.flush() catch {};
-    sys.StdinWatch.untilGone(hold_quiet_ms);
+    if (exclusive_cores) |x| watchWindow(ctx, x.st, x.lease.name, o.label) else sys.StdinWatch.untilGone(hold_quiet_ms);
     armLastWords(ctx, lease.job, "ended", lease.record.cores, true);
     if (exclusive_cores) |x| {
         words_slot = 1;
@@ -1559,6 +1597,303 @@ fn holdAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, lease: Lease) u8 {
     release(ctx.io, st, lease);
     logEvent(ctx, lease.job, "ended", .{ .cores = lease.record.cores, .exit = 0 });
     return 0;
+}
+
+/// CPU used beside a timing window by everything but the window's own
+/// work: what disturbs its timings. Fed the process snapshots the window
+/// takes anyway, so it costs no more looks; `report` says what it saw.
+const Noise = struct {
+    /// Each process's own CPU time at the last look, by pid.
+    prev: std.AutoHashMapUnmanaged(i32, u64) = .empty,
+    cur: std.AutoHashMapUnmanaged(i32, u64) = .empty,
+    /// CPU seconds by program name, for naming the worst.
+    names: std.StringHashMapUnmanaged(f64) = .empty,
+    last_ms: i64 = 0,
+    cpu_s: f64 = 0,
+    wall_s: f64 = 0,
+    peak: f64 = 0,
+    warned: bool = false,
+
+    const gpa = std.heap.page_allocator;
+
+    /// One look. `own` marks the window's own processes (and cpuq); with
+    /// `count` off, it only keeps its place (while a window lends, other
+    /// work is meant to run).
+    fn observe(n: *Noise, procs: []const sys.Proc, own: []const bool, count: bool, label: []const u8) void {
+        const now = sys.monoMs();
+        const first = n.last_ms == 0;
+        n.cur.clearRetainingCapacity();
+        var sum_ns: u64 = 0;
+        var top: [3]struct { name: []const u8 = "", ns: u64 = 0 } = @splat(.{});
+        for (procs, own) |p, mine| {
+            if (mine) continue;
+            n.cur.put(gpa, p.pid, p.own_ns) catch {};
+            if (first or !count) continue;
+            // A process new since the last look did all its work since.
+            const d = p.own_ns -| (n.prev.get(p.pid) orelse 0);
+            if (d == 0) continue;
+            sum_ns += d;
+            const e = n.names.getOrPut(gpa, p.name) catch continue;
+            if (!e.found_existing) {
+                e.key_ptr.* = gpa.dupe(u8, p.name) catch "?";
+                e.value_ptr.* = 0;
+            }
+            e.value_ptr.* += @as(f64, @floatFromInt(d)) / 1e9;
+            var i: usize = top.len;
+            while (i > 0 and top[i - 1].ns < d) : (i -= 1) {
+                if (i < top.len) top[i] = top[i - 1];
+            }
+            if (i < top.len) top[i] = .{ .name = p.name, .ns = d };
+        }
+        std.mem.swap(std.AutoHashMapUnmanaged(i32, u64), &n.prev, &n.cur);
+        defer n.last_ms = now;
+        if (first or !count) return;
+        const wall = @as(f64, @floatFromInt(now - n.last_ms)) / 1000;
+        if (wall <= 0) return;
+        const rate = @as(f64, @floatFromInt(sum_ns)) / 1e9 / wall;
+        n.cpu_s += @as(f64, @floatFromInt(sum_ns)) / 1e9;
+        n.wall_s += wall;
+        n.peak = @max(n.peak, rate);
+        if (n.warned or rate < 1.0) return;
+        n.warned = true;
+        var buf: [256]u8 = undefined;
+        var w: Io.Writer = .fixed(&buf);
+        for (top, 0..) |t, k| if (t.ns != 0) {
+            w.print("{s}{s} {d:.1}", .{ if (k != 0) ", " else "", t.name, @as(f64, @floatFromInt(t.ns)) / 1e9 / wall }) catch break;
+        };
+        std.debug.print("cpuq: {s}{s}work outside this timing window is using {d:.1} CPUs ({s}): its timings may be noisy\n", .{ label, if (label.len != 0) ": " else "", rate, w.buffered() });
+    }
+
+    fn mean(n: Noise) ?f64 {
+        return if (n.wall_s > 0) n.cpu_s / n.wall_s else null;
+    }
+
+    /// Says how much other work ran beside the window, when it was enough
+    /// to matter (half a CPU at some look), naming the busiest programs.
+    fn report(n: *Noise, label: []const u8) void {
+        const avg = n.mean() orelse return;
+        if (n.peak < 0.5) return;
+        var best: [3]struct { name: []const u8 = "", s: f64 = 0 } = @splat(.{});
+        var it = n.names.iterator();
+        while (it.next()) |e| {
+            var i: usize = best.len;
+            while (i > 0 and best[i - 1].s < e.value_ptr.*) : (i -= 1) {
+                if (i < best.len) best[i] = best[i - 1];
+            }
+            if (i < best.len) best[i] = .{ .name = e.key_ptr.*, .s = e.value_ptr.* };
+        }
+        var buf: [256]u8 = undefined;
+        var w: Io.Writer = .fixed(&buf);
+        for (best, 0..) |b, k| if (b.s > 0) {
+            w.print("{s}{s} {d:.1}", .{ if (k != 0) ", " else "", b.name, b.s / n.wall_s }) catch break;
+        };
+        std.debug.print("cpuq: {s}{s}work outside this timing window used {d:.1} CPUs on average, {d:.1} at most ({s})\n", .{ label, if (label.len != 0) ": " else "", avg, n.peak, w.buffered() });
+    }
+};
+
+/// The running timing window's `Noise`, if this cpuq holds one.
+var window_noise: ?Noise = null;
+
+/// Adds the window's noise to its `ended` line.
+fn noiseInto(extra: *EventExtra) void {
+    const n = window_noise orelse return;
+    const avg = n.mean() orelse return;
+    extra.noise = @round(avg * 100) / 100;
+    extra.noise_peak = @round(n.peak * 100) / 100;
+}
+
+/// The lease of the ordinary job this cpuq runs, so that it keeps its own
+/// command frozen while a timing window says so (`keepFrozen`).
+var own_lease: ?struct { st: *state.State, name: []const u8 } = null;
+
+/// Whether the timing window `window` (a lease in the cores' state) is
+/// still held.
+fn windowHeld(ctx: *Ctx, window: []const u8) bool {
+    const path = std.mem.concat(ctx.arena, u8, &.{ stateDir(ctx), "/leases/", window }) catch return true;
+    return heldRecord(ctx, path) != null;
+}
+
+/// A job frozen by a timing window stays frozen while the window works,
+/// even a child that started as it froze; once the window lends again or
+/// is gone (its holder killed), the job thaws itself.
+fn keepFrozen(ctx: *Ctx, a: std.mem.Allocator, procs: []const sys.Proc, root: std.c.pid_t) void {
+    const o = own_lease orelse return;
+    var buf: [128]u8 = undefined;
+    const window = o.st.frozenBy(o.name, &buf) orelse return;
+    var lend_buf: [128]u8 = undefined;
+    const lending = o.st.lendingWindow(&lend_buf);
+    const in_tree = a.alloc(bool, procs.len) catch return;
+    @memset(in_tree, false);
+    sys.markTree(procs, root, in_tree);
+    if (!windowHeld(ctx, window) or (lending != null and std.mem.eql(u8, lending.?, window))) {
+        for (procs, in_tree) |p, mine| if (mine) {
+            _ = std.c.kill(p.pid, .CONT);
+        };
+        o.st.setPaused(o.name, false);
+        return;
+    }
+    for (procs, in_tree) |p, mine| if (mine and !p.stopped) {
+        _ = std.c.kill(p.pid, .STOP);
+    };
+}
+
+/// Sends `sig` (STOP or CONT) to a process tree, and nothing else.
+fn sendTree(a: std.mem.Allocator, procs: []const sys.Proc, root: std.c.pid_t, sig: std.c.SIG) void {
+    const in_tree = a.alloc(bool, procs.len) catch return;
+    @memset(in_tree, false);
+    sys.markTree(procs, root, in_tree);
+    for (procs, in_tree) |p, mine| if (mine) {
+        _ = std.c.kill(p.pid, sig);
+    };
+}
+
+/// Thaws every job the timing window `window` froze. Call with the
+/// admission lock held.
+fn thawFrozen(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, window: []const u8) u32 {
+    var procs: ?[]sys.Proc = null;
+    var n: u32 = 0;
+    for (state.scanLeases(st, a, false) catch &.{}) |l| {
+        var buf: [128]u8 = undefined;
+        const by = st.frozenBy(l.name, &buf) orelse continue;
+        if (!std.mem.eql(u8, by, window)) continue;
+        if (l.record.child > 0) {
+            if (procs == null) procs = sys.processes(ctx.io, a);
+            sendTree(a, procs.?, l.record.child, .CONT);
+        }
+        st.setPaused(l.name, false);
+        n += 1;
+    }
+    return n;
+}
+
+/// Freezes every ordinary job running beside the timing window `window`:
+/// they were admitted while it lent the machine, and its owner works again.
+/// Ends the lending first, so nothing more starts.
+fn freezeBeside(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, window: []const u8) u32 {
+    lockOrFail(st);
+    st.setLending(null);
+    var roots: std.ArrayList(std.c.pid_t) = .empty;
+    const procs = sys.processes(ctx.io, a);
+    for (state.scanLeases(st, a, false) catch &.{}) |l| {
+        if (l.record.exclusive or st.isPaused(l.name)) continue;
+        // Marked even before its command starts: the job freezes itself then.
+        st.setFrozen(l.name, window);
+        if (l.record.child <= 0) continue;
+        sendTree(a, procs, l.record.child, .STOP);
+        roots.append(a, l.record.child) catch {};
+    }
+    st.unlock();
+    // macOS drops a SIGSTOP that lands mid-exec: look again (stopTree).
+    for (roots.items) |r| stopTree(ctx, a, r);
+    return @intCast(roots.items.len);
+}
+
+/// Holds a timing window that runs no command of its own (`--hold
+/// --exclusive`, as a remote window is held) until its holder goes, looking
+/// at the machine every few seconds. It measures the other work beside the
+/// window (`Noise`), and with `window_lend` it lends the machine to waiting
+/// jobs once the window's owner has done nothing for that long, freezing
+/// them the moment the owner works again.
+///
+/// The owner's work is this user's processes that started after the window
+/// opened, other than the jobs it lent to: a remote window's work arrives
+/// through ssh, outside any cpuq. CPUQ_WINDOW_OWNER=PID makes it that
+/// process's tree instead (a local script holding a window). Idle means under 0.1 CPU and nothing
+/// waiting on a disk at every look; working again, 0.2 CPU or a process
+/// waiting on a disk at a look a second apart.
+fn watchWindow(ctx: *Ctx, st: *state.State, window: []const u8, label: []const u8) void {
+    const lend_ms: i64 = if (ctx.cfg.admit == .measured) @as(i64, ctx.cfg.window_lend_s) * 1000 else 0;
+    const gpa = std.heap.page_allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const me = sys.getuid();
+    const self = sys.getpid();
+    const owner: ?i32 = if (ctx.env.get("CPUQ_WINDOW_OWNER")) |t| std.fmt.parseInt(i32, t, 10) catch null else null;
+    // Whatever ran when the window opened is not its owner's work.
+    var before: std.AutoHashMapUnmanaged(i32, void) = .empty;
+    defer before.deinit(gpa);
+    for (sys.processes(ctx.io, arena_state.allocator())) |p| before.put(gpa, p.pid, {}) catch {};
+    var prev: std.AutoHashMapUnmanaged(i32, u64) = .empty;
+    var cur: std.AutoHashMapUnmanaged(i32, u64) = .empty;
+    defer prev.deinit(gpa);
+    defer cur.deinit(gpa);
+    window_noise = .{};
+    var lending = false;
+    var lent_from: i64 = 0;
+    var lent_ms: i64 = 0;
+    var lends: u32 = 0;
+    var frozen: u32 = 0;
+    var last = sys.monoMs();
+    var idle_since = last;
+    const slow: i32 = if (lend_ms > 0) @intCast(std.math.clamp(@divFloor(lend_ms, 4), 500, 5000)) else 5000;
+    while (!sys.StdinWatch.waitGone(hold_quiet_ms, if (lending) 1000 else slow)) {
+        _ = arena_state.reset(.retain_capacity);
+        const a = arena_state.allocator();
+        const procs = sys.processes(ctx.io, a);
+        const now = sys.monoMs();
+        // The jobs lent the machine, and cpuq's own processes, are not the
+        // owner's work.
+        const lent = a.alloc(bool, procs.len) catch continue;
+        @memset(lent, false);
+        lockOrFail(st);
+        const leases = state.scanLeases(st, a, false) catch &.{};
+        st.unlock();
+        for (leases) |l| if (!l.record.exclusive) {
+            sys.markTree(procs, l.record.pid, lent);
+            if (l.record.child > 0) sys.markTree(procs, l.record.child, lent);
+        };
+        const own = a.alloc(bool, procs.len) catch continue;
+        @memset(own, false);
+        if (owner) |root| sys.markTree(procs, root, own);
+        var own_ns: u64 = 0;
+        var blocked = false;
+        cur.clearRetainingCapacity();
+        for (procs, own, lent) |p, *o, l| {
+            cur.put(gpa, p.pid, p.own_ns) catch {};
+            if (owner == null) o.* = p.uid == me and !l and !before.contains(p.pid);
+            o.* = o.* or p.pid == self;
+            if (!o.* or p.pid == self) continue;
+            own_ns += p.own_ns -| (prev.get(p.pid) orelse 0);
+            blocked = blocked or p.blocked;
+        }
+        std.mem.swap(std.AutoHashMapUnmanaged(i32, u64), &prev, &cur);
+        const wall_s = @as(f64, @floatFromInt(@max(now - last, 1))) / 1000;
+        last = now;
+        const owner_cpu = @as(f64, @floatFromInt(own_ns)) / 1e9 / wall_s;
+        window_noise.?.observe(procs, own, !lending, label);
+        if (lend_ms == 0) continue;
+        if (lending) {
+            if (owner_cpu < 0.2 and !blocked) continue;
+            lending = false;
+            lent_ms += now - lent_from;
+            idle_since = now;
+            frozen += freezeBeside(ctx, st, a, window);
+        } else if (owner_cpu >= 0.1 or blocked) {
+            idle_since = now;
+        } else if (now - idle_since >= lend_ms) {
+            lockOrFail(st);
+            _ = thawFrozen(ctx, st, a, window);
+            st.setLending(window);
+            st.unlock();
+            lending = true;
+            lent_from = now;
+            lends += 1;
+            if (lends == 1) std.debug.print("cpuq: {s}{s}the timing window is idle: lending the machine to waiting jobs, which freeze the moment it is used again\n", .{ label, if (label.len != 0) ": " else "" });
+        }
+    }
+    if (lending) lent_ms += sys.monoMs() - lent_from;
+    lockOrFail(st);
+    var lend_buf: [128]u8 = undefined;
+    if (st.lendingWindow(&lend_buf)) |w| if (std.mem.eql(u8, w, window)) st.setLending(null);
+    _ = thawFrozen(ctx, st, arena_state.allocator(), window);
+    st.unlock();
+    if (lends > 0) std.debug.print("cpuq: {s}{s}lent the machine {d} {s}, {d:.0} s in all; froze {d} {s} when the window was used again\n", .{
+        label,                                   if (label.len != 0) ": " else "",
+        lends,                                   if (lends == 1) "time" else "times",
+        @as(f64, @floatFromInt(lent_ms)) / 1000, frozen,
+        if (frozen == 1) "job" else "jobs",
+    });
+    window_noise.?.report(label);
 }
 
 /// `cpuq lease NAME --host HOST -- CMD`: holds NAME on HOST's cpuq through
@@ -1875,6 +2210,10 @@ const JsonJob = struct {
     memory: ?u64 = null,
     /// The most memory it used at once, in bytes.
     peak: ?u64 = null,
+    /// A timing window's: CPUs of other work beside it, on average and at
+    /// most.
+    noise: ?f64 = null,
+    noise_peak: ?f64 = null,
 };
 
 fn aliveForHistory(pid: i32) bool {
@@ -1952,6 +2291,8 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
             .signal = j.signal,
             .memory = j.memory,
             .peak = j.peak,
+            .noise = j.noise,
+            .noise_peak = j.noise_peak,
         }) catch {};
         std.json.Stringify.value(out.items, .{ .whitespace = .indent_2 }, w) catch {};
         w.writeAll("\n") catch {};
@@ -2080,8 +2421,12 @@ const JsonHolder = struct {
     cores: u32 = 0,
     /// The core tokens it holds, by number: which of the budget's cores.
     slots: []const u32 = &.{},
-    /// Paused by hand (`cpuq pause`).
+    /// Paused by hand (`cpuq pause`), or frozen by a timing window.
     paused: bool = false,
+    /// Frozen by a timing window whose owner works again (`window_lend`).
+    frozen: bool = false,
+    /// A timing window lending the machine while its owner idles.
+    lending: bool = false,
     /// Cores the command's process tree kept busy over the sample: CPU time
     /// over wall time; null when there is no command to measure.
     using: ?f64 = null,
@@ -2808,7 +3153,16 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
     const busy = smp.busy;
 
     const holders = toHolders(a, leases, busy);
-    for (holders, leases) |*h, l| h.paused = st.isPaused(l.name);
+    var lend_buf: [128]u8 = undefined;
+    const lending = st.lendingWindow(&lend_buf);
+    var lending_label: ?[]const u8 = null;
+    for (holders, leases) |*h, l| {
+        h.paused = st.isPaused(l.name);
+        var fbuf: [128]u8 = undefined;
+        h.frozen = st.frozenBy(l.name, &fbuf) != null;
+        h.lending = l.record.exclusive and lending != null and std.mem.eql(u8, lending.?, l.name);
+        if (h.lending) lending_label = if (l.record.label.len != 0) l.record.label else "a timing window";
+    }
     const waiters = toWaiters(a, queue);
     if (waiters.len != 0) {
         const rt = RunTimes.load(ctx, a);
@@ -2891,6 +3245,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
     } else w.print("budget  {d} cores ({d} online of {d}); in use {d}, free {d}\n", .{ budget, m.active, sys.totalCpus(ctx.io), held, budget -| held }) catch {};
     w.print("load    {d:.2} {d:.2} {d:.2}; memory pressure {s}; gate {s}\n", .{ load[0], load[1], load[2], pressure, gate_text }) catch {};
     if (!ctx.cfg.exclusive) w.writeAll("note    exclusive runs are off here: --exclusive runs as an ordinary job\n") catch {};
+    if (lending_label) |l| w.print("note    {s} is idle: its timing window lends the machine until it is used again\n", .{l}) catch {};
     if (showOutside(smp.outside, g)) {
         w.writeAll("outside") catch {};
         for (smp.outside, 0..) |o, k| w.print("{s} {s} (pid {d}, {d:.1})", .{ if (k == 0) "" else ",", o.name, o.pid, o.using }) catch {};

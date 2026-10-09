@@ -110,6 +110,11 @@ pub const Config = struct {
     /// back to back. Without it, windows one after another can hold a shared
     /// machine most of the day.
     window_gap_s: u32 = 0,
+    /// A timing window held with no command (`lease --hold --exclusive`, as
+    /// a remote window is held) whose owner has done nothing for this long
+    /// lends the machine to waiting jobs, freezing them the moment the owner
+    /// works again (`window_lend`); 0 never lends.
+    window_lend_s: u32 = 0,
 };
 
 pub const Diagnostic = struct {
@@ -170,6 +175,8 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             cfg.lend_after_s = parseCount(value) orelse return bad(diag, "lend_after must be a whole number of seconds, at least 1");
         } else if (std.mem.eql(u8, key, "window_gap")) {
             cfg.window_gap_s = std.fmt.parseInt(u32, value, 10) catch return bad(diag, "window_gap must be a whole number of seconds");
+        } else if (std.mem.eql(u8, key, "window_lend")) {
+            cfg.window_lend_s = std.fmt.parseInt(u32, value, 10) catch return bad(diag, "window_lend must be a whole number of seconds");
         } else if (std.mem.eql(u8, key, "lend")) {
             cfg.lend = parseBool(value) orelse return bad(diag, "lend must be on or off");
         } else if (std.mem.eql(u8, key, "admit")) {

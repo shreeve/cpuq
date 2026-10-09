@@ -24,7 +24,8 @@ written, cpuq fails; it never falls back to another directory.
     usage               each running job's measured use, carried from one head to the next
     window-ended        when the last exclusive run ended (for window_gap)
     control-TICKET      an order for a waiter from `cpuq first`, `start` or `cancel`
-    paused-LEASE        a job paused by hand
+    paused-LEASE        a job paused by hand (empty), or frozen by the timing window it names
+    lending             the timing window lending the machine now (window_lend)
     queue/P-NNNNNNNNNN  one ticket per waiter (P: 0 high, 1 normal, 2 low)
     tokens/NNNN         one file per core handed out; an exclusive lock is a held core
     leases/NNNNNNNNNN   one record per running job (suffix .x: an exclusive run)
@@ -179,6 +180,27 @@ window at once, with `CPUQ_CORES` set to its maximum request.
 
 With `window_gap` set, for that many seconds after an exclusive run ends (`window-ended`) the
 exclusive waiters are served after every other waiter.
+
+## Noise and lending in a timing window
+
+A timing window's cpuq looks at every process while the window runs: the one running a command
+in its 2-second checks (the same look that tracks peak memory), a `--hold` window every 5 seconds
+(every second while it lends). Everything but the window's own work counts as noise: its CPU over
+each interval, summed, gives the peak and the mean that go into history, and the programs that
+used the most. A process that appeared since the last look counts in full; one that came and went
+between looks is missed.
+
+`window_lend` applies to a window held with no command (`--hold --exclusive`): the remote end of
+a kit's lease. Its owner's work arrives over ssh outside any cpuq, so the owner is taken to be
+this user's processes that started after the window opened, less the jobs it lent to
+(`CPUQ_WINDOW_OWNER` names a process tree instead). Lending writes `lending` (the window's lease
+name); `measuredLoad` then counts the window for nothing and admits as usual. When the owner works
+again the window removes `lending` and freezes every ordinary job: it writes `paused-LEASE` with
+its own name, then SIGSTOPs each job's tree. A frozen job's own cpuq keeps its tree stopped in its
+2-second checks (a child started as it froze), and thaws itself when the window lends again or
+is no longer held, so a window killed outright leaves nothing stopped. A clean end thaws them all
+at once. A hand `cpuq pause` overwrites the marker as a hand pause, which only `cpuq resume`
+ends.
 
 cpuq has no separate hold command: a window is always tied to a running process. A hold not
 tied to one would need a file that outlives its owner, which is the thing cpuq exists to avoid.

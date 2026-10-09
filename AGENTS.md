@@ -52,7 +52,9 @@ branch names: history sizes jobs and estimates waits by label.
 
 ## Timing (benchmarks only)
 
-`--exclusive` drains the machine and holds it alone; use it only for real timing. Where
+`--exclusive` drains the machine and holds it alone; use it only for real timing. If cpuq warns
+that work outside the window is using CPUs (stderr, and `noise` in `cpuq history --json`), the
+timings may be noisy: rerun them. Where
 `exclusive = off`, it runs as an ordinary job (it says so on stderr) and your numbers are not
 quiet; `cpuq status --no-usage | grep 'exclusive runs are off'` finds out first. Time on a
 machine that allows it:

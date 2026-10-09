@@ -199,6 +199,37 @@ pub const State = struct {
         if (on) s.dir.writeFile(s.io, .{ .sub_path = name, .data = "" }) catch {} else s.dir.deleteFile(s.io, name) catch {};
     }
 
+    /// The timing window that froze a holder ("paused-LEASE" naming it), or
+    /// null when the holder is not frozen (running, or paused by hand).
+    pub fn frozenBy(s: *State, lease: []const u8, buf: []u8) ?[]const u8 {
+        var name_buf: [96]u8 = undefined;
+        const name = std.mem.print(&name_buf, "paused-{s}", .{lease}) catch return null;
+        const text = s.dir.readFile(s.io, name, buf) catch return null;
+        const window = std.mem.trim(u8, text, " \n");
+        return if (window.len != 0) window else null;
+    }
+
+    /// Freezes a holder for a timing window: paused, by that window.
+    pub fn setFrozen(s: *State, lease: []const u8, window: []const u8) void {
+        var name_buf: [96]u8 = undefined;
+        const name = std.mem.print(&name_buf, "paused-{s}", .{lease}) catch return;
+        s.dir.writeFile(s.io, .{ .sub_path = name, .data = window }) catch {};
+    }
+
+    /// The timing window lending the machine now ("lending": its lease's
+    /// name), or null. Read with the admission lock held.
+    pub fn lendingWindow(s: *State, buf: []u8) ?[]const u8 {
+        const text = s.dir.readFile(s.io, "lending", buf) catch return null;
+        const window = std.mem.trim(u8, text, " \n");
+        return if (window.len != 0) window else null;
+    }
+
+    /// Starts (`window` set) or ends (null) a window's lending. Call with
+    /// the admission lock held.
+    pub fn setLending(s: *State, window: ?[]const u8) void {
+        if (window) |w| s.dir.writeFile(s.io, .{ .sub_path = "lending", .data = w }) catch {} else s.dir.deleteFile(s.io, "lending") catch {};
+    }
+
     pub fn writeValve(s: *State, v: policy.Valve) void {
         var out: [128]u8 = undefined;
         const text = std.mem.print(&out, "{d} {d} {d} {d}\n", .{ @intFromBool(v.tripped), v.calm_since, v.last_admit, v.last_check }) catch return;
