@@ -1183,11 +1183,11 @@ fn watchChild(ctx: *Ctx, pid: std.c.pid_t, label: []const u8) sys.Waited {
     var peak: u64 = 0;
     var tick: u32 = 0;
     while (true) : (tick += 1) {
-        if (sys.reapChild(pid)) |w| return withMemory(w, stopped, peak);
+        if (sys.reapChild(pid)) |w| return lastLook(ctx, &arena_state, withMemory(w, stopped, peak), label);
         ctx.io.sleep(.fromMilliseconds(100), .awake) catch {};
         // The first look at half a second, then every 2.
         if (tick < 5 or (tick - 5) % 20 != 0) continue;
-        if (sys.reapChild(pid)) |w| return withMemory(w, stopped, peak);
+        if (sys.reapChild(pid)) |w| return lastLook(ctx, &arena_state, withMemory(w, stopped, peak), label);
         _ = arena_state.reset(.retain_capacity);
         const a = arena_state.allocator();
         const procs = sys.processes(ctx.io, a);
@@ -1219,6 +1219,20 @@ fn watchChild(ctx: *Ctx, pid: std.c.pid_t, label: []const u8) sys.Waited {
         stopped_at = nowFloat(ctx.io);
         signalTree(a, procs, pid, .TERM);
     }
+}
+
+/// A timing window's last look at the work beside it, as its command ends,
+/// so even a short window, or one on a slow machine, gets one interval.
+fn lastLook(ctx: *Ctx, arena_state: *std.heap.ArenaAllocator, w: sys.Waited, label: []const u8) sys.Waited {
+    const n = if (window_noise) |*n| n else return w;
+    _ = arena_state.reset(.retain_capacity);
+    const a = arena_state.allocator();
+    const procs = sys.processes(ctx.io, a);
+    const own = a.alloc(bool, procs.len) catch return w;
+    const self = sys.getpid();
+    for (procs, own) |p, *o| o.* = p.pid == self;
+    n.observe(procs, own, true, label);
+    return w;
 }
 
 fn withMemory(w: sys.Waited, stopped: ?u64, peak: u64) sys.Waited {

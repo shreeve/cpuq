@@ -442,9 +442,9 @@ t_window_noise() {
   setup window-noise
   local i
   for i in 1 2; do python3 -c 'import time
-e = time.time() + 5
+e = time.time() + 6
 while time.time() < e: pass' & done
-  "$CPUQ" run --exclusive --label timed -- sleep 4 2>"$T/err"; local rc=$?
+  "$CPUQ" run --exclusive --label timed -- sleep 5 2>"$T/err"; local rc=$?
   wait
   local noise; noise=$("$CPUQ" history --json --label timed | python3 -c 'import json, sys; j = json.load(sys.stdin)[0]; print("%s %s" % (j.get("noise"), j.get("noise_peak")))')
   check "an exclusive run reports the work beside it (rc $rc, noise and peak $noise)" "[ $rc = 0 ] && grep -q 'work outside this timing window is using' '$T/err' && grep -q 'used .* CPUs on average' '$T/err' && python3 -c 'import sys; a, b = (float(x) for x in \"$noise\".split()); sys.exit(0 if a >= 1 and b >= 1.5 else 1)'"
