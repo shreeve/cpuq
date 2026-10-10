@@ -276,6 +276,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 backing: .buffered, defer: false)
             window.title = "cpuq"
             window.isReleasedWhenClosed = false
+            // The cells animate smoothly only while the mouse moves in the window or it is
+            // resized (Liveliness); otherwise once a second.
+            window.acceptsMouseMovedEvents = true
+            NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .scrollWheel]) { [weak window] event in
+                if let window, event.window === window { Liveliness.shared.poke() }
+                return event
+            }
+            NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: window, queue: .main) { _ in
+                MainActor.assumeIsolated { Liveliness.shared.poke() }
+            }
             window.appearance = Theme.appearance
             // The window is the size it is given and no other: what is in it never grows or
             // shrinks it, and everything in it fits, the charts sharing what height there is.

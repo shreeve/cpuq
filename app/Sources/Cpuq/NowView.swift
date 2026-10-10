@@ -522,6 +522,32 @@ struct WaiterActions: View {
     }
 }
 
+/// Whether the window is being looked at closely: the mouse moving in it, or it being resized.
+/// The cells animate smoothly only then, and a second after it stops they drop to one frame a
+/// second, so an open window costs next to nothing.
+@MainActor
+final class Liveliness: ObservableObject {
+    static let shared = Liveliness()
+    @Published private(set) var lively = false
+    private var until = Date.distantPast
+    private var timer: Timer?
+
+    /// Something moved: lively for the next second.
+    func poke() {
+        until = Date().addingTimeInterval(1)
+        if !lively { lively = true }
+        guard timer == nil else { return }
+        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, Date() >= self.until else { return }
+                self.lively = false
+                self.timer?.invalidate()
+                self.timer = nil
+            }
+        }
+    }
+}
+
 /// The cells' animated state: each layer's fill eases toward its reading, and the rose glow
 /// fades in and out, so a new poll pours rather than jumps.
 final class CellMotion {
@@ -533,11 +559,16 @@ final class CellMotion {
 
     /// The first frame shows the reading as it is; later ones ease toward it.
     private var primed = false
+    private var lastStep = 0.0
 
-    func step(toward m: Moment, instantly: Bool) {
+    /// Eases toward the reading by the time since the last frame (a third of a second to most
+    /// of the way), so it looks the same at one frame a second as at thirty.
+    func step(toward m: Moment, at t: Double, instantly: Bool) {
         let first = !primed
         primed = true
-        let k = instantly || first ? 1 : 0.10
+        let dt = lastStep == 0 ? 1 : min(max(t - lastStep, 0), 1)
+        lastStep = t
+        let k = instantly || first ? 1 : 1 - exp(-dt / 0.3)
         var target: [String: Double] = ["~outside": m.outside]
         for s in m.shares { target[s.project] = s.cpu }
         for key in Set(target.keys).union(fill.keys) {
@@ -562,11 +593,15 @@ struct CellsCanvas: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var scheme
 
+    @ObservedObject private var live = Liveliness.shared
+
+    /// Once a second, to keep the app light; thirty times a second while the mouse moves in the
+    /// window or it is resized, so it feels alive when someone is looking at it closely.
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion)) { tl in
+        TimelineView(.animation(minimumInterval: live.lively ? 1.0 / 30 : 1, paused: reduceMotion)) { tl in
             Canvas { gc, size in
                 let t = tl.date.timeIntervalSinceReferenceDate
-                motion.step(toward: moment, instantly: reduceMotion)
+                motion.step(toward: moment, at: t, instantly: reduceMotion)
                 draw(&gc, size: size, t: reduceMotion ? 0 : t)
             }
         }
@@ -607,10 +642,12 @@ struct CellsCanvas: View {
             g.fill(Path(ellipseIn: CGRect(x: -r, y: -r, width: 2 * r, height: 2 * r)),
                    with: .radialGradient(Gradient(colors: [color.opacity(dark ? 0.34 : 0.22), color.opacity(0)]), center: .zero, startRadius: 0, endRadius: r))
         }
-        // Bubbles: a few rise through each busy cell, more the busier it is.
+        // Bubbles: a few rise through each busy cell, more the busier it is; only while the
+        // cells move smoothly, as a bubble jumping once a second looks wrong.
         let dt = motion.lastFrame == 0 ? 0 : min(t - motion.lastFrame, 0.1)
         motion.lastFrame = t
-        if t > 0 {
+        if !live.lively { motion.bubbles = [] }
+        if t > 0 && live.lively {
             for c in 0..<n {
                 let level = min(max(total - Double(c), 0), 1)
                 if level > 0.15 && Double.random(in: 0..<1) < 0.035 * level {

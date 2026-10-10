@@ -3,6 +3,13 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.21 — 2026-10-09
+
+- Much lighter: the cells redraw once a second, and smoothly (30 times a second) only while
+  the mouse moves in the window or it is being resized, dropping back a second later. An open
+  window went from about a third of a CPU (spikes to 83%) to about 1%. The cells' easing
+  follows the clock, so it looks the same at either rate; bubbles rise only while smooth.
+
 ## 0.13.20 — 2026-10-08
 
 - The graphs window's minimum size holds for real: it is now a layout constraint, which a drag,
