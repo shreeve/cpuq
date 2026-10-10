@@ -65,6 +65,11 @@ and estimates, a view of what runs, and a history of what each kind of job reall
 with most jobs starting at once. It earns its keep when independent jobs share a machine; one
 person running one job at a time gains little from it.
 
+**Hasn't someone solved this already?** Pieces of it, many times over: global make jobservers,
+job spoolers, Google's Borg, Meta's Buck2, benchmark locks, and in 2026 a wave of build locks for
+AI agents. [docs/PRIOR-ART.md](docs/PRIOR-ART.md) surveys them all: what each does, what cpuq
+borrows, and what is new here.
+
 ## Words
 
 | word | meaning |
