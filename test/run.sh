@@ -860,14 +860,15 @@ t_measured() {
   local f=$T/order h=$CPUQ_DIR/history.jsonl
   mkdir -p "$CPUQ_DIR"
   # Two holders of 4 cores each that sleep: they settle near 0.
-  "$CPUQ" run --cores 4 --label idle1 -- sleep 5 & local i1=$!
-  "$CPUQ" run --cores 4 --label idle2 -- sleep 5 & local i2=$!
+  "$CPUQ" run --cores 4 --label idle1 -- sleep 8 & local i1=$!
+  "$CPUQ" run --cores 4 --label idle2 -- sleep 8 & local i2=$!
   local t0; t0=$(now)
   sleep 2.5
   "$CPUQ" run --cores 1 --label small -- true; local rc=$?
   local dt; dt=$(python3 -c "print('%.1f' % ($(now) - $t0))")
   wait $i1 $i2
-  check "beside 8 held but idle cores a job starts at once (after ${dt}s, rc $rc)" "[ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if $dt < 4.5 else 1)'"
+  # Started before the idle holders end (at 8 s), with room for a slow, busy runner.
+  check "beside 8 held but idle cores a job starts at once (after ${dt}s, rc $rc)" "[ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if $dt < 7 else 1)'"
   # A holder keeping 2 CPUs busy fills the target: the next waits for it.
   "$CPUQ" run --cores 2 --label spin -- python3 -c 'import os, time
 e = time.time() + 3
