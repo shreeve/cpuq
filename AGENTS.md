@@ -44,6 +44,16 @@ branch names: history sizes jobs and estimates waits by label.
 - `cpuq wait --label 'proj:*' --max-wait 600` waits until no job with a matching label runs or
   waits.
 
+## Another machine
+
+When this machine's queue is long (about 5 or more waiting in `cpuq status`) and another machine
+you can use has room (`cpuq status --host HOST`), run work that doesn't need this OS there,
+through that machine's own cpuq:
+
+    ssh HOST 'cd repo && cpuq run --label app:build --cores 2-8 -- sh -c "make -j\"\$CPUQ_CORES\""'
+
+Never run it there outside cpuq: its queue can't share what it doesn't see.
+
 ## Exit status
 
 - CMD's own status passes through; 128+N: CMD was killed by signal N.
