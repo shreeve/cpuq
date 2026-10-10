@@ -733,7 +733,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             // The machine's checks hold it as they hold the head: memory
             // pressure, low memory, CPUs measured all but full; and with
             // backfill off, nothing starts ahead of the head.
-            const saturated = if (mach.busy) |b| b >= 0.97 else false;
+            const saturated = cfg.load_check and o.load_check and if (mach.busy) |b| b >= 0.97 else false;
             const machine_open = policy.gate(cfg, mach, 0, null, now) == .open and !saturated;
             if (!named and !o.exclusive and cfg.admit == .measured and cfg.backfill and !queue[0].record.exclusive and machine_open) {
                 if (run_times == null) run_times = RunTimes.load(ctx, ctx.arena);
@@ -796,7 +796,8 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             const room = target - m.charged;
             const req = policy.measuredGrant(o.request, o.cores_given, if (o.hidden) &.{} else labelUses(run_times.?, o.label), room, cores);
             const mine = policy.charge(useOf(run_times.?, o.label), null, 0, 1, req.max);
-            const saturated = if (mach.busy) |b| b >= 0.97 else false;
+            // `load_check = off` (or --no-load-check) ignores the machine's load here too.
+            const saturated = ctx.cfg.load_check and o.load_check and if (mach.busy) |b| b >= 0.97 else false;
             if (!m.exclusive and !(o.hidden and m.lent) and (m.charged == 0 or (mine <= room and !saturated))) {
                 if (state.takeTokens(st, ctx.arena, req, false, poolCap(ctx), poolCap(ctx), false, 0, 0) catch |err| fail("tokens: {t}", .{err})) |grant| {
                     if (o.cores_given == false and grant.files.len != 2) std.debug.print("cpuq: {d} {s} for {s}, from its history\n", .{ grant.files.len, if (grant.files.len == 1) "core" else "cores", if (o.label.len != 0) o.label else "this job" });

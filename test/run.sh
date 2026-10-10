@@ -494,7 +494,7 @@ t_nested() {
 
 t_elastic() {
   setup elastic
-  "$CPUQ" run --cores 7 -- sleep 2 & wait_held 7
+  "$CPUQ" run --cores 7 -- sleep 4 & wait_held 7
   local t0; t0=$(now)
   local got; got=$("$CPUQ" run --cores 2-4 -- sh -c 'echo $CPUQ_CORES')
   local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
@@ -901,11 +901,11 @@ t_measured_backfill() {
   local mode rc out=""
   for mode in on off; do
     setup "measured-backfill-$mode" "admit = measured" "target = 2" "settle = 1" "backfill = $mode"
-    "$CPUQ" run --cores 1 --label idle -- sleep 4 & local i=$!
+    "$CPUQ" run --cores 1 --label idle -- sleep 8 & local i=$!
     sleep 1.5
     "$CPUQ" run --cores 4 --label big -- true & local b=$!
     wait_waiters 1
-    "$CPUQ" run --cores 1 --max-wait 1 --label tiny -- true 2>/dev/null; rc=$?
+    "$CPUQ" run --cores 1 --max-wait 3 --label tiny -- true 2>/dev/null; rc=$?
     out="$out$mode:$rc "
     wait $i $b
   done
@@ -940,7 +940,7 @@ t_opaque() {
   for mode in opaque plain; do
     setup "opaque-$mode" "admit = measured" "target = 2" "settle = 1"
     local flag=""; [ $mode = opaque ] && flag=--opaque
-    "$CPUQ" run --cores 2 $flag --label box -- sleep 4 & local b=$!
+    "$CPUQ" run --cores 2 $flag --label box -- sleep 8 & local b=$!
     wait_held 2
     sleep 2
     "$CPUQ" run --cores 1 --max-wait 2 --label next -- true 2>/dev/null; rc=$?

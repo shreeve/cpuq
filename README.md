@@ -418,7 +418,7 @@ re-reads the file when it changes; an invalid edit keeps the settings in force a
 | `window_lend` | 0 | seconds a `--hold --exclusive` window's owner idles before it lends the machine (measured only; 0: never) |
 | `budget` | active CPUs - 2 | cores an exclusive run takes; under `admit = cores`, the cores to hand out |
 | `active_cap` | on | cap the budget by the CPUs active now |
-| `load_check` | on | the load valve; under measured admission, for exclusive runs only |
+| `load_check` | on | the load valve (under measured admission, for exclusive runs only) and the 97%-busy check; off ignores the machine's load |
 | `load_margin` | 4 | the valve trips above budget + margin; as `load_check` |
 | `backfill` | on | let a job start ahead of the first waiter when both fit (measured), or on cores the first cannot use yet (`admit = cores`, and behind an exclusive first waiter) |
 | `lend` | on | `admit = cores` only: lend the first waiter the cores a running job leaves idle |

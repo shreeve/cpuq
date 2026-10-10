@@ -13,6 +13,8 @@ User-visible changes to cpuq. Each version's section is its release notes.
   its grant, so a crowded machine's CPU time divides by grant however many threads a job starts,
   and a quiet machine limits nothing. On pup one `zig build` without `-j` took 11.5 CPUs on a
   12-core grant beside seven others and drove the load to 37 on 22 CPUs.
+- `load_check = off` (and `--no-load-check`) also skips the 97%-busy check under measured
+  admission: it ignores the machine's load altogether.
 
 ## 0.9.0 — 2026-10-09
 
