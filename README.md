@@ -497,5 +497,6 @@ In this mode a few things keep reserved cores from sitting idle:
 
 - [AGENTS.md](AGENTS.md): how a coding agent should use cpuq.
 - [docs/DESIGN.md](docs/DESIGN.md): how it works inside.
+- [docs/PRIOR-ART.md](docs/PRIOR-ART.md): who else has tackled this, and what cpuq borrows or does differently.
 - [CHANGELOG.md](CHANGELOG.md): what changed in each version, and why.
 - [docs/RELEASING.md](docs/RELEASING.md): cutting a release.
