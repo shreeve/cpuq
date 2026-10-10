@@ -25,7 +25,8 @@ written, cpuq fails; it never falls back to another directory.
     window-ended        when the last exclusive run ended (for window_gap)
     control-TICKET      an order for a waiter from `cpuq first`, `start` or `cancel`
     paused-LEASE        a job paused by hand (empty), or frozen by the timing window it names
-    lending             the timing window lending the machine now (window_lend)
+    lending             the timing window lending the machine (window_lend)
+    weights-ok          systemd user scopes work here (cpu_weights), probed at most every 10 min
     queue/P-NNNNNNNNNN  one ticket per waiter (P: 0 high, 1 normal, 2 low)
     tokens/NNNN         one file per core handed out; an exclusive lock is a held core
     leases/NNNNNNNNNN   one record per running job (suffix .x: an exclusive run)
@@ -302,3 +303,16 @@ efficiency cores, with throttled I/O. Utility QoS for normal would keep work mos
 efficiency cores too, and leave the performance cores idle. On Linux, where cores are alike,
 high, normal and low run at nice 0, 5 and 15. Children inherit the class. Exclusive runs (they
 time benchmarks), named leases and `--qos none` leave it unchanged.
+
+## Opaque jobs and CPU weights
+
+A job's record carries `opaque=1` when it was started with `--opaque`. `measuredLoad` charges such
+a job its whole grant instead of its measured use, and an opaque waiter does not start while a
+window lends the machine; `freezeBeside` skips it.
+
+With `cpu_weights`, `runAdmitted` starts a core job as `systemd-run --user --scope --quiet
+--collect --property=CPUWeight=GRANT×100 --unit=cpuq-LEASE-PID -- CMD...`. systemd-run moves itself
+into the new scope and execs CMD, so the pid cpuq tracks stays the command's. Whether scopes work
+is probed with `systemd-run --user --scope true` and remembered in `weights-ok` for ten minutes;
+without them, or off Linux, the command starts as it is. Timing windows and named leases are not
+weighted.

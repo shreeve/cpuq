@@ -931,6 +931,37 @@ a, b = (float(x) for x in \"$got\".split())
 sys.exit(0 if 0 <= a <= 1.5 and 0.8 <= b - a <= 1.5 else 1)'"
 }
 
+t_opaque() {
+  # --opaque: a job whose work cpuq cannot see (a container) counts at its
+  # whole grant, measured idle or not; without it, an idle job settles to
+  # nearly nothing and leaves room.
+  local mode rc out=""
+  for mode in opaque plain; do
+    setup "opaque-$mode" "admit = measured" "target = 2" "settle = 1"
+    local flag=""; [ $mode = opaque ] && flag=--opaque
+    "$CPUQ" run --cores 2 $flag --label box -- sleep 4 & local b=$!
+    wait_held 2
+    sleep 2
+    "$CPUQ" run --cores 1 --max-wait 2 --label next -- true 2>/dev/null; rc=$?
+    out="$out$mode:$rc "
+    [ $mode = opaque ] && local shown; [ $mode = opaque ] && shown=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print([h["opaque"] for h in json.load(sys.stdin)["holders"]])')
+    wait $b
+  done
+  check "an --opaque job counts whole (status $shown), so the next waits; a plain idle one leaves room (got $out)" "[ '$out' = 'opaque:75 plain:0 ' ] && [ '$shown' = '[True]' ]"
+}
+
+t_cpu_weights() {
+  # cpu_weights (Linux with a user systemd): each job runs in a scope of its
+  # own weighted by its grant; elsewhere, or off, jobs run as they are.
+  setup cpu-weights "cpu_weights = on"
+  local got; got=$({ "$CPUQ" run --cores 3 --label weighed -- sh -c 'g=$(cut -d: -f3 /proc/self/cgroup 2>/dev/null); echo "$g $(cat /sys/fs/cgroup$g/cpu.weight 2>/dev/null)"'; echo "rc=$?"; } | tr '\n' ' ')
+  if [ "$(uname)" = Linux ] && systemd-run --user --scope --quiet true 2>/dev/null; then
+    check "with cpu_weights a job runs in a scope weighted by its grant (got $got)" "[[ '$got' == *'/cpuq-'*'.scope 300 rc=0 ' ]]"
+  else
+    check "without a user systemd, cpu_weights leaves the job as it is (got $got)" "[[ '$got' == *'rc=0 ' ]]"
+  fi
+}
+
 t_backfill_exclusive() {
   setup backfill_exclusive
   local f=$T/order h=$CPUQ_DIR/history.jsonl
@@ -1345,7 +1376,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

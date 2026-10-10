@@ -38,6 +38,8 @@ const usage =
     \\  --max-wait SECONDS    give up after this long (exit 75); 0: start now or
     \\                        give up
     \\  --exclusive           hold the machine alone once it drains (timing only)
+    \\  --opaque              its work runs where cpuq can't see it (a container,
+    \\                        a VM): counted at its whole grant; give --cores
     \\  --no-load-check       ignore the load valve
     \\  --qos none|auto       none: leave the command's scheduling class alone
     \\
@@ -261,6 +263,10 @@ const RunOptions = struct {
     /// lease taken `--exclusive`, a timing window that goes next once
     /// running work drains, not behind a stream of later arrivals.
     first: bool = false,
+    /// `--opaque`: the command's real work runs where cpuq cannot see or
+    /// stop it (inside a container or a VM): counted at its whole grant,
+    /// never lent a timing window it could not be frozen out of.
+    hidden: bool = false,
 };
 
 fn parseRun(args: []const [:0]const u8) ?RunOptions {
@@ -299,7 +305,7 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             _ = usageError("{s} takes no value", .{name});
             return null;
         }
-        for ([_][]const u8{ "--cores", "--no-load-check", "--qos" }) |r| {
+        for ([_][]const u8{ "--cores", "--no-load-check", "--qos", "--opaque" }) |r| {
             if (std.mem.eql(u8, name, r)) o.run_only = r;
         }
         if (std.mem.eql(u8, name, "--cores")) {
@@ -329,6 +335,8 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             o.exclusive = true;
         } else if (std.mem.eql(u8, name, "--no-load-check")) {
             o.load_check = false;
+        } else if (std.mem.eql(u8, name, "--opaque")) {
+            o.hidden = true;
         } else if (std.mem.eql(u8, name, "--host")) {
             o.host = value;
         } else if (std.mem.eql(u8, name, "--slots")) {
@@ -626,6 +634,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
         .label = o.label,
         .cmd = joinCommand(ctx, o.cmd),
         .first = o.first,
+        .hidden = o.hidden,
     };
     var name_buf: [32]u8 = undefined;
     const ticket_name = state.ticketName(&name_buf, o.priority, rec.ticket);
@@ -729,9 +738,10 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             if (!named and !o.exclusive and cfg.admit == .measured and cfg.backfill and !queue[0].record.exclusive and machine_open) {
                 if (run_times == null) run_times = RunTimes.load(ctx, ctx.arena);
                 const m = measuredLoad(ctx, st, a, &run_times.?, mach.busy);
-                if (!m.exclusive) {
+                // Work cpuq cannot freeze never starts in a lending window.
+                if (!m.exclusive and !(o.hidden and m.lent)) {
                     const room = targetCpus(ctx) - m.charged;
-                    const req = policy.measuredGrant(o.request, o.cores_given, labelUses(run_times.?, o.label), room, cores);
+                    const req = policy.measuredGrant(o.request, o.cores_given, if (o.hidden) &.{} else labelUses(run_times.?, o.label), room, cores);
                     const mine = policy.charge(useOf(run_times.?, o.label), null, 0, 1, req.max);
                     const head = queue[0].record;
                     const head_need = policy.charge(useOf(run_times.?, head.label), null, 0, 1, @max(head.cores, 1));
@@ -784,10 +794,10 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             const m = measuredLoad(ctx, st, a, &run_times.?, mach.busy);
             const target = targetCpus(ctx);
             const room = target - m.charged;
-            const req = policy.measuredGrant(o.request, o.cores_given, labelUses(run_times.?, o.label), room, cores);
+            const req = policy.measuredGrant(o.request, o.cores_given, if (o.hidden) &.{} else labelUses(run_times.?, o.label), room, cores);
             const mine = policy.charge(useOf(run_times.?, o.label), null, 0, 1, req.max);
             const saturated = if (mach.busy) |b| b >= 0.97 else false;
-            if (!m.exclusive and (m.charged == 0 or (mine <= room and !saturated))) {
+            if (!m.exclusive and !(o.hidden and m.lent) and (m.charged == 0 or (mine <= room and !saturated))) {
                 if (state.takeTokens(st, ctx.arena, req, false, poolCap(ctx), poolCap(ctx), false, 0, 0) catch |err| fail("tokens: {t}", .{err})) |grant| {
                     if (o.cores_given == false and grant.files.len != 2) std.debug.print("cpuq: {d} {s} for {s}, from its history\n", .{ grant.files.len, if (grant.files.len == 1) "core" else "cores", if (o.label.len != 0) o.label else "this job" });
                     return admitted(ctx, st, o, &rec, grant, ticket, ticket_name, job, now, false);
@@ -878,7 +888,7 @@ fn useOf(rt: RunTimes, label: []const u8) ?f64 {
 /// CPU, averaged over about half of `settle`), the measurements kept in the
 /// state directory so the next head carries on from them. Call with the
 /// admission lock held.
-fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const RunTimes, busy: ?f64) struct { charged: f64, exclusive: bool } {
+fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const RunTimes, busy: ?f64) struct { charged: f64, exclusive: bool, lent: bool = false } {
     // Threads ready to run mean a job is short of CPU only when the CPUs are
     // full; with CPUs idle they are waiting on something else (a pool of
     // workers, a burst of short processes), and counting them held the
@@ -891,8 +901,12 @@ fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const Ru
     // A window lending the machine (`window_lend`) holds nothing back.
     var lend_buf: [128]u8 = undefined;
     const lending = st.lendingWindow(&lend_buf);
+    var lent = false;
     for (leases) |l| if (l.record.exclusive) {
-        if (lending) |w| if (std.mem.eql(u8, w, l.name)) continue;
+        if (lending) |w| if (std.mem.eql(u8, w, l.name)) {
+            lent = true;
+            continue;
+        };
         return .{ .charged = std.math.inf(f64), .exclusive = true };
     };
     const procs = sys.processes(ctx.io, a);
@@ -903,6 +917,11 @@ fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const Ru
     var charged: f64 = 0;
     for (leases) |l| {
         if (l.record.exclusive or st.isPaused(l.name)) continue;
+        // Work cpuq cannot see counts at its whole grant.
+        if (l.record.hidden) {
+            charged += @floatFromInt(l.record.cores);
+            continue;
+        }
         const expected = useOf(rt.*, l.record.label);
         if (l.record.child <= 0) {
             charged += policy.charge(expected, null, 0, ctx.cfg.settle_s, l.record.cores);
@@ -921,7 +940,7 @@ fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const Ru
         charged += policy.charge(expected, measured, now_s - l.record.since, ctx.cfg.settle_s, l.record.cores);
     }
     st.writeUsage(a, fresh);
-    return .{ .charged = charged, .exclusive = false };
+    return .{ .charged = charged, .exclusive = false, .lent = lent };
 }
 
 /// Cores held by jobs paused by hand.
@@ -1310,7 +1329,11 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
     if (o.lease == null and !lease.record.exclusive) own_lease = .{ .st = st, .name = lease.name };
     const qos_enabled = ctx.cfg.qos and o.qos and o.lease == null;
     const qos: policy.Qos = if (lease.borrowed > 0 and qos_enabled and policy.borrowersYield()) .background else policy.qosFor(o.priority, o.exclusive, qos_enabled);
-    const spawned = sys.spawn(exe, argv.ptr, @ptrCast(envp.slice.ptr), qos);
+    // Linux, `cpu_weights`: the job runs in a cgroup of its own weighted by
+    // its grant (a systemd user scope), so a crowded machine's CPU time
+    // divides by grant however many threads a job starts.
+    const weighted: ?[*:null]const ?[*:0]const u8 = if (o.lease == null and !lease.record.exclusive and ctx.cfg.cpu_weights) weightedArgv(ctx, exe, argv, k, lease.name) else null;
+    const spawned = if (weighted) |wv| sys.spawn(wv[0].?, wv, @ptrCast(envp.slice.ptr), qos) else sys.spawn(exe, argv.ptr, @ptrCast(envp.slice.ptr), qos);
     if (pipe[0] >= 0) sys.closeFd(pipe[0]);
     if (pipe[1] >= 0) sys.closeFd(pipe[1]);
     const waited: sys.Waited = if (spawned) |pid| blk: {
@@ -1337,6 +1360,49 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
         .code => |c| return c,
         .signal => |sig| sys.dieBySignal(sig),
     }
+}
+
+/// `systemd-run --user --scope -p CPUWeight=W -- EXE ARGS...` for a job of
+/// `cores`, when this is Linux with a user systemd that can make scopes;
+/// else null, and the job runs as it is. systemd-run execs the command in
+/// place, so its pid stays the job's. Whether scopes work is probed once and
+/// remembered for ten minutes ("weights-ok" in the state directory), so a
+/// job never fails for want of one.
+fn weightedArgv(ctx: *Ctx, exe: [:0]const u8, argv: [:null]?[*:0]const u8, cores: u32, lease_name: []const u8) ?[*:null]const ?[*:0]const u8 {
+    if (@import("builtin").os.tag != .linux) return null;
+    const run = findExecutable(ctx, "systemd-run") orelse return null;
+    if (!scopesWork(ctx, run)) return null;
+    const a = ctx.arena;
+    const weight = std.math.clamp(@as(u64, cores) * 100, 1, 10000);
+    const head = [_][]const u8{
+        run,                                                              "--user",                                                                        "--scope", "--quiet", "--collect",
+        a.print("--property=CPUWeight={d}", .{weight}) catch return null, a.print("--unit=cpuq-{s}-{d}", .{ lease_name, sys.getpid() }) catch return null, "--",
+    };
+    const out = a.allocSentinel(?[*:0]const u8, head.len + 1 + argv.len - 1, null) catch return null;
+    for (head, 0..) |h, i| out[i] = (a.dupeSentinel(u8, h, 0) catch return null).ptr;
+    out[head.len] = exe.ptr;
+    for (argv[1..], 0..) |v, i| out[head.len + 1 + i] = v;
+    return out.ptr;
+}
+
+/// Whether `systemd-run --user --scope` works here: tried once, the answer
+/// kept ten minutes.
+fn scopesWork(ctx: *Ctx, run: [:0]const u8) bool {
+    const io = ctx.io;
+    const path = std.mem.concat(ctx.arena, u8, &.{ stateDir(ctx), "/weights-ok" }) catch return false;
+    const cwd = Io.Dir.cwd();
+    if (cwd.statFile(io, path, .{})) |st| {
+        const age_ns = Io.Clock.real.now(io).toNanoseconds() - st.mtime.toNanoseconds();
+        if (age_ns >= 0 and age_ns < 600 * std.time.ns_per_s) return true;
+    } else |_| {}
+    var child = std.process.spawn(io, .{ .argv = &.{ run, "--user", "--scope", "--quiet", "--collect", "true" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
+    const term = child.wait(io) catch return false;
+    const ok = switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (ok) cwd.writeFile(io, .{ .sub_path = path, .data = "" }) catch {};
+    return ok;
 }
 
 /// Gives a lease back. LOCK_UN releases each lock for every holder of the
@@ -1789,7 +1855,7 @@ fn freezeBeside(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, window: []con
     var roots: std.ArrayList(std.c.pid_t) = .empty;
     const procs = sys.processes(ctx.io, a);
     for (state.scanLeases(st, a, false) catch &.{}) |l| {
-        if (l.record.exclusive or st.isPaused(l.name)) continue;
+        if (l.record.exclusive or l.record.hidden or st.isPaused(l.name)) continue;
         // Marked even before its command starts: the job freezes itself then.
         st.setFrozen(l.name, window);
         if (l.record.child <= 0) continue;
@@ -2106,6 +2172,8 @@ fn cmdControl(ctx: *Ctx, comptime action: []const u8, args: []const [:0]const u8
             std.debug.print("cpuq: {s} is an exclusive run, a timing window; left alone\n", .{who});
             continue;
         }
+        if (r.hidden and !comptime std.mem.eql(u8, action, "resume"))
+            std.debug.print("cpuq: {s} runs its work where cpuq cannot reach it (--opaque): {s} reaches only the command cpuq started\n", .{ who, action });
         if (r.child > 0) {
             // The command's whole process tree, not just its first process: a
             // shell's children would otherwise run on, or be left orphaned.
@@ -2441,6 +2509,8 @@ const JsonHolder = struct {
     frozen: bool = false,
     /// A timing window lending the machine while its owner idles.
     lending: bool = false,
+    /// `--opaque`: its work runs where cpuq cannot see it; counted whole.
+    @"opaque": bool = false,
     /// Cores the command's process tree kept busy over the sample: CPU time
     /// over wall time; null when there is no command to measure.
     using: ?f64 = null,
@@ -3175,6 +3245,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
         var fbuf: [128]u8 = undefined;
         h.frozen = st.frozenBy(l.name, &fbuf) != null;
         h.lending = l.record.exclusive and lending != null and std.mem.eql(u8, lending.?, l.name);
+        h.@"opaque" = l.record.hidden;
         if (h.lending) lending_label = if (l.record.label.len != 0) l.record.label else "a timing window";
     }
     const waiters = toWaiters(a, queue);

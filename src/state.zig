@@ -216,7 +216,7 @@ pub const State = struct {
         s.dir.writeFile(s.io, .{ .sub_path = name, .data = window }) catch {};
     }
 
-    /// The timing window lending the machine now ("lending": its lease's
+    /// The timing window lending the machine ("lending": its lease's
     /// name), or null. Read with the admission lock held.
     pub fn lendingWindow(s: *State, buf: []u8) ?[]const u8 {
         const text = s.dir.readFile(s.io, "lending", buf) catch return null;
@@ -280,6 +280,9 @@ pub const Record = struct {
     /// A waiter moved to the front by hand (`cpuq first`): it goes ahead of
     /// every waiter not so moved.
     first: bool = false,
+    /// `--opaque`: its work runs where cpuq cannot see or stop it (a
+    /// container, a VM), so it counts at its whole grant.
+    hidden: bool = false,
 
     pub fn write(r: Record, w: *Io.Writer) Io.Writer.Error!void {
         try w.print("ticket={d}\npid={d}\nchild={d}\ncores={d}\nmax={d}\npriority={t}\nexclusive={d}\nsince={d}\n", .{
@@ -291,6 +294,7 @@ pub const Record = struct {
         try writeLine(w, r.cmd);
         if (r.slots.len != 0) try w.print("slots={s}\n", .{r.slots});
         if (r.first) try w.writeAll("first=1\n");
+        if (r.hidden) try w.writeAll("opaque=1\n");
     }
 
     fn writeLine(w: *Io.Writer, text: []const u8) Io.Writer.Error!void {
@@ -315,6 +319,7 @@ pub const Record = struct {
             if (std.mem.eql(u8, k, "cmd")) r.cmd = v;
             if (std.mem.eql(u8, k, "slots")) r.slots = v;
             if (std.mem.eql(u8, k, "first")) r.first = std.mem.eql(u8, v, "1");
+            if (std.mem.eql(u8, k, "opaque")) r.hidden = std.mem.eql(u8, v, "1");
         }
         return r;
     }

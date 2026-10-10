@@ -22,6 +22,9 @@ nothing after it has no limit):
 
 A bare `zig build` uses every CPU: always give it `-j"$CPUQ_CORES"`.
 
+Work that runs inside a container or VM (`incus exec`, `docker exec`) is invisible to cpuq's
+measurements: add `--opaque` and a fixed `--cores`, so it counts at its whole grant.
+
 ## Cores
 
 - Same label, run before: omit `--cores`; its history sizes the job.

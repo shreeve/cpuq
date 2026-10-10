@@ -2,6 +2,18 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.9.1 — 2026-10-09
+
+- `cpuq run --opaque`: for a job whose work runs where cpuq can't see it (in a container or a
+  VM through `incus exec` or `docker exec`, whose processes belong to the container). It counts
+  at its whole grant the whole time, never starts inside a lending timing window, and `pause` and
+  `stop` say they reach only the command cpuq started. On pup, em's container test runs measured
+  0.0 CPU while using four, so their cores were handed out again.
+- `cpu_weights = on` (Linux, off by default): each job runs in a systemd user scope weighted by
+  its grant, so a crowded machine's CPU time divides by grant however many threads a job starts,
+  and a quiet machine limits nothing. On pup one `zig build` without `-j` took 11.5 CPUs on a
+  12-core grant beside seven others and drove the load to 37 on 22 CPUs.
+
 ## 0.9.0 — 2026-10-09
 
 - A timing window watches the work beside it. While an exclusive run or hold runs, its cpuq

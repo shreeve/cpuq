@@ -99,7 +99,8 @@ see [Reservation mode](#reservation-mode-admit--cores).
 ## Using it
 
     cpuq run [--cores K|MIN-MAX] [--label PROJECT:TASK] [--priority high|normal|low]
-             [--max-wait SECONDS] [--exclusive] [--no-load-check] [--qos none|auto] -- CMD ARGS...
+             [--max-wait SECONDS] [--exclusive] [--opaque] [--no-load-check] [--qos none|auto]
+             -- CMD ARGS...
 
 `cpuq run` waits its turn, then runs CMD in the foreground: stdin, stdout and stderr are
 inherited (a terminal stays a terminal), signals are forwarded, and CMD's exit status is cpuq's.
@@ -107,6 +108,20 @@ While it waits it prints a line to stderr about once a minute, saying who it wai
 
 CMD's environment gets `CPUQ_CORES` (its grant), a GNU make jobserver of that size in
 `MAKEFLAGS`, and `CPUQ_TOKEN` (its hold, which makes runs inside it nested).
+
+**Work cpuq can't see.** cpuq measures a job by its command's process tree. Work that runs in a
+container or a VM (`incus exec`, `docker exec`) belongs to the container's own processes, so the
+job measures idle and its cores would be handed out again. Give such a job `--opaque` and a
+`--cores` count: it counts at its whole grant the whole time, is never started inside a lending
+timing window (it couldn't be frozen), and `cpuq pause`/`stop` say they reach only the command
+cpuq started.
+
+**CPU weights (Linux).** With `cpu_weights = on`, each job runs in a systemd user scope of its
+own whose CPU weight is its grant (`systemd-run --user --scope`). On a crowded machine CPU time
+then divides in proportion to grants, so a job that starts more threads than it was granted
+(`zig build` without `-j`) slows only itself; on a quiet one a job can still use every CPU.
+Where `systemd-run --user` doesn't work, jobs run as they are. Work in a container stays in the
+container's own cgroup.
 
 ### How many cores
 
@@ -399,6 +414,7 @@ re-reads the file when it changes; an invalid edit keeps the settings in force a
 | `max_memory` | off | stop a job whose processes together use more memory than this (e.g. `16G`) |
 | `exclusive` | on | grant `--exclusive`; off, it runs as an ordinary job |
 | `window_gap` | 0 | seconds after an exclusive run ends during which waiting ones go behind other work |
+| `cpu_weights` | off | Linux: run each job in a scope weighted by its grant |
 | `window_lend` | 0 | seconds a `--hold --exclusive` window's owner idles before it lends the machine (measured only; 0: never) |
 | `budget` | active CPUs - 2 | cores an exclusive run takes; under `admit = cores`, the cores to hand out |
 | `active_cap` | on | cap the budget by the CPUs active now |
