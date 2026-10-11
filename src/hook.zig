@@ -88,7 +88,8 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32
             if (std.mem.eql(u8, o, takes)) i += 1;
         }
     }
-    if (min_cores) |m| if (m > @max(cpus / 2, 1)) return .{
+    // Over half the CPUs, and more than 2: a minimum of 2 fits even a small machine.
+    if (min_cores) |m| if (m > @max(cpus / 2, 2)) return .{
         .reason = a.print("asking for at least {d} cores on a {d}-CPU machine: a request over half the CPUs waits until the machine is nearly empty", .{ m, cpus }) catch "too many cores asked for",
         .instead = "ask for a range the job can shrink to, such as --cores 2-6, and pass \"$CPUQ_CORES\" on; run big jobs on the larger machine",
     };
@@ -398,6 +399,14 @@ fn refused(command: []const u8) bool {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     return check(arena.allocator(), command, 10, "app") != null;
+}
+
+test "a minimum of 2 cores fits even a small machine" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expect(check(a, "cpuq run --cores 2-6 -- make", 3, "app") == null);
+    try std.testing.expect(check(a, "cpuq run --cores 3 -- make", 4, "app") != null);
 }
 
 test "heavy commands outside cpuq are refused" {

@@ -1217,13 +1217,14 @@ fn watchChild(ctx: *Ctx, pid: std.c.pid_t, label: []const u8) sys.Waited {
     var peak: u64 = 0;
     var last_cpu: u64 = 0;
     var last_ms: i64 = 0;
+    const start_ms = sys.monoMs();
     var tick: u32 = 0;
     while (true) : (tick += 1) {
-        if (sys.reapChild(pid)) |w| return lastLook(ctx, &arena_state, withMemory(w, stopped, peak), label);
+        if (sys.reapChild(pid)) |w| return lastLook(ctx, &arena_state, peakAtLeastAverage(withMemory(w, stopped, peak), start_ms), label);
         ctx.io.sleep(.fromMilliseconds(100), .awake) catch {};
         // The first look at half a second, then every 2.
         if (tick < 5 or (tick - 5) % 20 != 0) continue;
-        if (sys.reapChild(pid)) |w| return lastLook(ctx, &arena_state, withMemory(w, stopped, peak), label);
+        if (sys.reapChild(pid)) |w| return lastLook(ctx, &arena_state, peakAtLeastAverage(withMemory(w, stopped, peak), start_ms), label);
         _ = arena_state.reset(.retain_capacity);
         const a = arena_state.allocator();
         const procs = sys.processes(ctx.io, a);
@@ -1263,6 +1264,14 @@ fn watchChild(ctx: *Ctx, pid: std.c.pid_t, label: []const u8) sys.Waited {
         stopped_at = nowFloat(ctx.io);
         signalTree(a, procs, pid, .TERM);
     }
+}
+
+/// The peak is never below the run's average: a run too short, or a machine
+/// too slow, for two looks a second apart still records its use.
+fn peakAtLeastAverage(w: sys.Waited, start_ms: i64) sys.Waited {
+    const ms = sys.monoMs() - start_ms;
+    if (ms > 0) cpu_peak = @max(cpu_peak, w.cpu_s / (@as(f64, @floatFromInt(ms)) / 1000));
+    return w;
 }
 
 /// A timing window's last look at the work beside it, as its command ends,
