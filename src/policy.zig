@@ -16,7 +16,9 @@ pub const Priority = enum(u2) {
 
 /// The scheduling class a command runs in. On macOS `utility` and
 /// `background` are QoS classes; on Linux they are nice 5 and 15.
-pub const Qos = enum { unchanged, utility, background };
+/// How a job is started: as it is; at utility or background QoS (macOS) or
+/// nice 5 or 15 (Linux); or at nice 10 with its QoS left alone (`niced`).
+pub const Qos = enum { unchanged, utility, background, niced };
 
 pub fn qosFor(priority: Priority, exclusive: bool, qos_enabled: bool) Qos {
     if (exclusive or !qos_enabled) return .unchanged;
@@ -28,7 +30,11 @@ pub fn qosFor(priority: Priority, exclusive: bool, qos_enabled: bool) Qos {
         // the default class. So normal leaves the class alone on macOS; on
         // Linux, where every core is alike, nice 5 only lets high win.
         .normal => if (builtin.os.tag.isDarwin()) .unchanged else .utility,
-        .low => .background,
+        // Background QoS confines a job to the efficiency cores even when the
+        // performance cores sit idle: a CPU-bound loop took 3.8-4.1 s at
+        // background and 1.6-2.0 s at nice 10 on a loaded M5. So low is nice
+        // 10 on macOS, which yields to other work without being confined.
+        .low => if (builtin.os.tag.isDarwin()) .niced else .background,
     };
 }
 
@@ -900,7 +906,7 @@ test "aging promotes one class per period" {
 test "qos classes" {
     try testing.expectEqual(Qos.unchanged, qosFor(.high, false, true));
     try testing.expectEqual(if (builtin.os.tag.isDarwin()) Qos.unchanged else Qos.utility, qosFor(.normal, false, true));
-    try testing.expectEqual(Qos.background, qosFor(.low, false, true));
+    try testing.expectEqual(if (builtin.os.tag.isDarwin()) Qos.niced else Qos.background, qosFor(.low, false, true));
     try testing.expectEqual(Qos.unchanged, qosFor(.low, true, true));
     try testing.expectEqual(Qos.unchanged, qosFor(.low, false, false));
 }

@@ -141,7 +141,7 @@ pub fn memoryPressure(io: Io, psi_threshold: f64) policy.Pressure {
 /// The scheduling class of the calling process, for `cpuq qos`.
 pub fn currentQos(buf: []u8) []const u8 {
     if (is_darwin) {
-        return switch (qos_class_self()) {
+        const class = switch (qos_class_self()) {
             0x21 => "user-interactive",
             0x19 => "user-initiated",
             0x15 => "default",
@@ -150,6 +150,12 @@ pub fn currentQos(buf: []u8) []const u8 {
             0x00 => "unspecified",
             else => |q| std.mem.print(buf, "qos 0x{x}", .{q}) catch "qos ?",
         };
+        // A nice value, when one is set: "default, nice 10".
+        const nice = getpriority(PRIO_PROCESS, 0);
+        if (nice == 0) return class;
+        var tmp: [32]u8 = undefined;
+        @memcpy(tmp[0..class.len], class);
+        return std.mem.print(buf, "{s}, nice {d}", .{ tmp[0..class.len], nice }) catch class;
     }
     return std.mem.print(buf, "nice {d}", .{getpriority(PRIO_PROCESS, 0)}) catch "nice ?";
 }
@@ -203,10 +209,16 @@ pub fn spawn(
             .unchanged => {},
             .utility => _ = posix_spawnattr_set_qos_class_np(&attr, QOS_CLASS_UTILITY),
             .background => _ = posix_spawnattr_set_qos_class_np(&attr, QOS_CLASS_BACKGROUND),
+            .niced => {},
         }
         var pid: c.pid_t = 0;
         return switch (c.posix_spawn(&pid, path, null, &attr, argv, envp)) {
-            0 => pid,
+            0 => blk: {
+                // posix_spawn sets no nice value: set it on the child at once,
+                // before it has time to start others, which inherit it.
+                if (qos == .niced and getpriority(PRIO_PROCESS, 0) < 10) _ = setpriority(PRIO_PROCESS, @intCast(pid), 10);
+                break :blk pid;
+            },
             @backingInt(c.E.NOENT) => error.FileNotFound,
             @backingInt(c.E.ACCES), @backingInt(c.E.PERM) => error.AccessDenied,
             else => error.SpawnFailed,
@@ -215,6 +227,7 @@ pub fn spawn(
     const nice: c_int = switch (qos) {
         .unchanged => 0,
         .utility => 5,
+        .niced => 10,
         .background => 15,
     };
     const pid = c.fork();

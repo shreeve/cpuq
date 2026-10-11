@@ -74,6 +74,12 @@ machine that allows it:
 
     ssh buildbox 'cd repo && cpuq run --exclusive --label app:bench -- ./bench'
 
+## The hook
+
+Where `cpuq hook` is installed (Claude Code's PreToolUse hook), a heavy command run outside cpuq,
+or a misused `cpuq run`, is refused with the corrected command: run that instead. Mark a command
+`# cpuq: skip` only when it truly must run as it is.
+
 ## Don't
 
 - `--priority high` (except a release gate a human is waiting on), `--no-load-check`,

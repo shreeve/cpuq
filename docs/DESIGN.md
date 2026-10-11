@@ -316,3 +316,24 @@ into the new scope and execs CMD, so the pid cpuq tracks stays the command's. Wh
 is probed with `systemd-run --user --scope true` and remembered in `weights-ok` for ten minutes;
 without them, or off Linux, the command starts as it is. Timing windows and named leases are not
 weighted.
+
+## Fair turns, peaks, doctor and the hook
+
+`fairOrder` reorders the cores' queue within each priority class: a waiter's turn is its
+project's running jobs plus its project's waiters ahead of it (in ticket order), and the queue
+sorts by (moved to the front, class, turn, ticket). Every waiter computes the same order under the
+admission lock, so they agree on the head. Named leases keep arrival order.
+
+`watchChild` reads the command tree's CPU at each 2-second look and keeps the most cores used over
+any look of a second or more; `logEnded` writes it as `cpu_peak`. History sizing (`RunTimes.uses`)
+prefers `cpu_peak` over the run's average, so a build that fans out briefly counts at what it fans
+out to while it settles.
+
+`cpuq doctor` takes the state under the lock, samples like `cpuq status` (each job's CPU, the
+processes outside every job) and one more process snapshot for threads ready to run, then prints
+a line per finding.
+
+`cpuq hook` (src/hook.zig) never touches state or config. It splits the command at `;`, `&`, `|`,
+newlines, parentheses and `$(…)`, unquotes words, skips assignments and wrappers (`nice`, `env`,
+`time`, `timeout`…), follows `sh -c` scripts and `ssh HOST CMD`, and checks each simple command;
+quoting is tracked for `$CPUQ_CORES` expanded outside single quotes.

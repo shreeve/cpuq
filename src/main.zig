@@ -8,9 +8,11 @@ const state = @import("state.zig");
 const sys = @import("sys.zig");
 
 const history = @import("history.zig");
+const hook = @import("hook.zig");
 const table = @import("table.zig");
 
 test {
+    _ = hook;
     _ = policy;
     _ = state;
     _ = history;
@@ -27,6 +29,8 @@ const usage =
     \\       cpuq status [--host HOST]... [--json] [--no-usage] [--watch[=SECONDS]]
     \\       cpuq history [--label PATTERN] [--limit N] [--json]
     \\       cpuq first|start|cancel|pause|resume|stop LABEL|PID [--all]
+    \\       cpuq doctor [--host HOST]
+    \\       cpuq hook                (an agent harness's pre-command hook)
     \\       cpuq budget | qos | --version | --help
     \\
     \\run options:
@@ -60,6 +64,11 @@ const usage =
     \\  cancel                take a waiting job out of the queue (it exits 75)
     \\  pause | resume        SIGSTOP | SIGCONT a running job's process tree
     \\  stop                  SIGTERM a running job's process tree
+    \\  doctor                what's wrong that cpuq sees but can't stop: work
+    \\                        outside it, jobs over their grant, parked jobs,
+    \\                        requests too big to start; exit 1 if any
+    \\  hook                  Claude Code PreToolUse hook: refuses heavy commands
+    \\                        outside cpuq or misusing it (exit 2, fix on stderr)
     \\  budget | qos          print the budget | this process's scheduling class
     \\  (a LABEL ending in * is a prefix; several matches need --all)
     \\
@@ -122,12 +131,14 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
         ctx.out.writeAll("cpuq " ++ version ++ "\n") catch {};
         return 0;
     }
+    if (std.mem.eql(u8, cmd, "hook")) return cmdHook(ctx);
     if (std.mem.eql(u8, cmd, "run")) return cmdRun(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "lease")) return cmdLease(ctx, args[1..]);
     loadConfig(ctx);
     if (std.mem.eql(u8, cmd, "status")) return cmdStatus(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "wait")) return cmdWait(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "history")) return cmdHistory(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "doctor")) return cmdDoctor(ctx, args[1..]);
     inline for (.{ "first", "start", "cancel", "pause", "resume", "stop" }) |action| {
         if (std.mem.eql(u8, cmd, action)) return cmdControl(ctx, action, args[1..]);
     }
@@ -505,6 +516,8 @@ const EventExtra = struct {
     /// at most (`Noise`).
     noise: ?f64 = null,
     noise_peak: ?f64 = null,
+    /// The most cores its tree kept busy over a 2-second look.
+    cpu_peak: ?f64 = null,
 };
 
 fn logEvent(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra) void {
@@ -526,6 +539,7 @@ fn logEvent(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra) void {
     ev.peak = extra.peak;
     ev.noise = extra.noise;
     ev.noise_peak = extra.noise_peak;
+    ev.cpu_peak = extra.cpu_peak;
     history.append(ctx.io, path, ev);
 }
 
@@ -566,7 +580,7 @@ var words_slot: u1 = 0;
 
 /// Logs how a command ended.
 fn logEnded(ctx: *Ctx, job: JobLog, cores: u32, w: sys.Waited) void {
-    var extra: EventExtra = .{ .cores = cores, .cpu = w.cpu_s, .memory = w.memory, .peak = peakOf(w) };
+    var extra: EventExtra = .{ .cores = cores, .cpu = w.cpu_s, .memory = w.memory, .peak = peakOf(w), .cpu_peak = if (cpu_peak > 0) @round(cpu_peak * 100) / 100 else null };
     switch (w.exit) {
         .code => |code| extra.exit = code,
         .signal => |sig| extra.signal = @intCast(@backingInt(sig)),
@@ -660,7 +674,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
 
         lockOrFail(st);
         const now = nowSeconds(io);
-        const queue = servedOrder(ctx, st, a, state.scanQueue(st, a, ticket_name, rec, now, cfg.aging_s) catch |err| fail("queue: {t}", .{err}), now);
+        const queue = servedOrder(ctx, st, a, state.scanQueue(st, a, ticket_name, rec, now, cfg.aging_s) catch |err| fail("queue: {t}", .{err}), now, !named);
         const pos = for (queue, 0..) |e, i| {
             if (std.mem.eql(u8, e.name, ticket_name)) break i;
         } else fail("ticket {s} vanished from the queue", .{ticket_name});
@@ -1201,6 +1215,8 @@ fn watchChild(ctx: *Ctx, pid: std.c.pid_t, label: []const u8) sys.Waited {
     var stopped: ?u64 = null;
     var stopped_at: f64 = 0;
     var peak: u64 = 0;
+    var last_cpu: u64 = 0;
+    var last_ms: i64 = 0;
     var tick: u32 = 0;
     while (true) : (tick += 1) {
         if (sys.reapChild(pid)) |w| return lastLook(ctx, &arena_state, withMemory(w, stopped, peak), label);
@@ -1228,6 +1244,14 @@ fn watchChild(ctx: *Ctx, pid: std.c.pid_t, label: []const u8) sys.Waited {
             if (nowFloat(ctx.io) - stopped_at >= 10) signalTree(a, procs, pid, .KILL);
             continue;
         }
+        // The busiest stretch: the tree's CPU over each look of a second or
+        // more (`cpu_peak` in history, which sizes the label's next runs).
+        const cpu_now = sys.treeCpu(procs, pid);
+        const now_ms = sys.monoMs();
+        if (last_ms != 0 and now_ms - last_ms >= 1000 and cpu_now >= last_cpu)
+            cpu_peak = @max(cpu_peak, @as(f64, @floatFromInt(cpu_now - last_cpu)) / @as(f64, @floatFromInt((now_ms - last_ms) * 1_000_000)));
+        last_cpu = cpu_now;
+        last_ms = now_ms;
         const used = sys.treeMem(procs, pid);
         peak = @max(peak, used);
         if (limit == 0 or used <= limit) continue;
@@ -1425,10 +1449,13 @@ fn release(io: Io, st: *state.State, lease: Lease) void {
     st.unlock();
 }
 
-/// The queue as it is served: in the `window_gap` after a timing window
-/// ends, waiting windows go behind the other waiters, so other work gets a
-/// turn before the next window empties the machine again.
-fn servedOrder(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, queue: []state.Entry, now: i64) []state.Entry {
+/// The queue as it is served. The cores' queue takes turns by project (the
+/// label before its colon) within each priority class (`fairOrder`). In the
+/// `window_gap` after a timing window ends, waiting windows go behind the
+/// other waiters, so other work gets a turn before the next window empties
+/// the machine again.
+fn servedOrder(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, queue_in: []state.Entry, now: i64, fair: bool) []state.Entry {
+    const queue = if (fair) fairOrder(st, a, queue_in) else queue_in;
     const gap = ctx.cfg.window_gap_s;
     if (gap == 0) return queue;
     const ended = st.windowEnded();
@@ -1437,6 +1464,38 @@ fn servedOrder(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, queue: []state
     for (queue) |e| if (!e.record.exclusive) out.append(a, e) catch return queue;
     for (queue) |e| if (e.record.exclusive) out.append(a, e) catch return queue;
     return out.items;
+}
+
+/// Takes turns by project within each priority class, so one project's ten
+/// waiting jobs don't all go ahead of another project's one: a waiter's turn
+/// is its project's jobs running plus those ahead of it in line, lowest
+/// first, then by ticket. Jobs moved to the front by hand keep their place.
+fn fairOrder(st: *state.State, a: std.mem.Allocator, queue: []state.Entry) []state.Entry {
+    if (queue.len < 2) return queue;
+    var count: std.StringHashMapUnmanaged(u32) = .empty;
+    for (state.scanLeases(st, a, false) catch &.{}) |l| if (!l.record.exclusive) {
+        const gop = count.getOrPut(a, std.mem.sliceTo(l.record.label, ':')) catch return queue;
+        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+    };
+    const Turn = struct { e: state.Entry, turn: u32 };
+    const turns = a.alloc(Turn, queue.len) catch return queue;
+    for (queue, turns) |e, *t| {
+        const gop = count.getOrPut(a, std.mem.sliceTo(e.record.label, ':')) catch return queue;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        t.* = .{ .e = e, .turn = gop.value_ptr.* };
+        gop.value_ptr.* += 1;
+    }
+    std.mem.sort(Turn, turns, {}, struct {
+        fn less(_: void, x: Turn, y: Turn) bool {
+            if (x.e.record.first != y.e.record.first) return x.e.record.first;
+            if (x.e.class != y.e.class) return x.e.class < y.e.class;
+            if (x.turn != y.turn) return x.turn < y.turn;
+            return x.e.record.ticket < y.e.record.ticket;
+        }
+    }.less);
+    const out = a.alloc(state.Entry, queue.len) catch return queue;
+    for (turns, out) |t, *o| o.* = t.e;
+    return out;
 }
 
 /// A lease name: letters, digits, `.`, `_` and `-`.
@@ -1771,6 +1830,9 @@ const Noise = struct {
         std.debug.print("cpuq: {s}{s}work outside this timing window used {d:.1} CPUs on average, {d:.1} at most ({s})\n", .{ label, if (label.len != 0) ": " else "", avg, n.peak, w.buffered() });
     }
 };
+
+/// The most cores the command's tree kept busy over one look (`watchChild`).
+var cpu_peak: f64 = 0;
 
 /// The running timing window's `Noise`, if this cpuq holds one.
 var window_noise: ?Noise = null;
@@ -2221,6 +2283,120 @@ fn stopTree(ctx: *Ctx, a: std.mem.Allocator, root: std.c.pid_t) void {
     }
 }
 
+/// `cpuq hook`: Claude Code's PreToolUse hook. Reads the tool call (JSON) on
+/// stdin; a shell command that would load the machine outside cpuq, or misuse
+/// it, is refused: the reason and the command to run instead on stderr, exit
+/// 2, which the agent sees. Everything else, and anything it cannot read,
+/// passes (exit 0). CPUQ_HOOK=off turns it off.
+fn cmdHook(ctx: *Ctx) u8 {
+    if (ctx.env.get("CPUQ_HOOK")) |v| if (std.mem.eql(u8, v, "off")) return 0;
+    // Inside a cpuq job already: runs nest within its grant.
+    if (nestedGrant(ctx)) return 0;
+    const a = ctx.arena;
+    var input: std.ArrayList(u8) = .empty;
+    var buf: [65536]u8 = undefined;
+    while (input.items.len < 1 << 22) {
+        const n = std.c.read(0, &buf, buf.len);
+        if (n > 0) {
+            input.appendSlice(a, buf[0..@intCast(n)]) catch return 0;
+            continue;
+        }
+        if (n < 0 and std.c.errno(n) == .INTR) continue;
+        break;
+    }
+    const Call = struct {
+        tool_name: []const u8 = "",
+        tool_input: struct { command: []const u8 = "" } = .{},
+        cwd: []const u8 = "",
+    };
+    const call = std.json.parseFromSliceLeaky(Call, a, input.items, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return 0;
+    if (!std.mem.eql(u8, call.tool_name, "Bash") or call.tool_input.command.len == 0) return 0;
+    const project = std.fs.path.basename(call.cwd);
+    const r = hook.check(a, call.tool_input.command, sys.totalCpus(ctx.io), project) orelse return 0;
+    std.debug.print("cpuq: {s}.\nRun instead: {s}\n(See AGENTS.md in the cpuq repo. A command that must run as it is can end with `# cpuq: skip`.)\n", .{ r.reason, r.instead });
+    return 2;
+}
+
+/// `cpuq doctor [--host HOST]`: what goes wrong that cpuq can see but not
+/// stop. Heavy work outside cpuq, jobs using far more CPU than they were
+/// granted, jobs idle for long while holding cores, requests too big to start
+/// on a busy machine, and waiters held beside idle CPUs. One line each; exit
+/// 1 when there is anything to fix, 0 when not.
+fn cmdDoctor(ctx: *Ctx, args: []const [:0]const u8) u8 {
+    var host: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
+            host = args[i + 1];
+            i += 1;
+        } else return usageError("doctor takes only --host HOST", .{});
+    }
+    const io = ctx.io;
+    if (host) |h| {
+        var child = std.process.spawn(io, .{ .argv = &.{ "ssh", "-o", "BatchMode=yes", h, "cpuq", "doctor" }, .stdin = .ignore, .stdout = .inherit, .stderr = .inherit }) catch return exit_failure;
+        const term = child.wait(io) catch return exit_failure;
+        return switch (term) {
+            .exited => |code| code,
+            else => exit_failure,
+        };
+    }
+    const a = ctx.arena;
+    var st = openState(ctx);
+    const m = machine(ctx);
+    const now = nowSeconds(io);
+    lockOrFail(&st);
+    const leases = state.scanLeases(&st, a, false) catch @as([]state.Entry, &.{});
+    const queue = state.scanQueue(&st, a, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{});
+    const uses = st.readUsage(a);
+    st.unlock();
+    const smp = sample(io, a, leases, true);
+    // Threads ready to run show a job that starts more than its grant even
+    // when a crowded machine gives them little CPU.
+    const procs = sys.processes(io, a);
+    const cpus = sys.totalCpus(io);
+    const w = ctx.out;
+    var found: u32 = 0;
+    for (smp.outside) |o| if (o.using >= 1.0) {
+        found += 1;
+        w.print("warn    {s} (pid {d}) uses {d:.1} CPUs outside cpuq: run heavy work through `cpuq run`; if it is an --opaque job's hidden work, nothing to do\n", .{ o.name, o.pid, o.using }) catch {};
+    };
+    for (leases, smp.busy) |l, busy| {
+        const r = l.record;
+        if (r.exclusive or r.hidden) continue;
+        const who = if (r.label.len != 0) r.label else r.cmd;
+        const cores: f64 = @floatFromInt(r.cores);
+        const ready: u32 = if (r.child > 0) sys.treeRunning(procs, r.child) else 0;
+        const u = busy orelse 0;
+        if (u >= cores * 1.5 and u - cores >= 1) {
+            found += 1;
+            w.print("warn    {s} (pid {d}) uses {d:.1} CPUs on a grant of {d}: pass the grant on (-j\"$CPUQ_CORES\")\n", .{ who, r.pid, u, r.cores }) catch {};
+        } else if (ready >= 2 * r.cores + 2) {
+            found += 1;
+            w.print("warn    {s} (pid {d}) has {d} threads ready to run on a grant of {d}: pass the grant on (-j\"$CPUQ_CORES\")\n", .{ who, r.pid, ready, r.cores }) catch {};
+        }
+        if (uses.get(l.name)) |use| if (use.at_ms != 0 and use.avg < 0.05 and now - r.since > 600) {
+            found += 1;
+            w.print("warn    {s} (pid {d}) has held {d} {s} for {d} min using almost no CPU: parked? It blocks timing windows\n", .{ who, r.pid, r.cores, if (r.cores == 1) "core" else "cores", @divFloor(now - r.since, 60) }) catch {};
+        };
+    }
+    const busy_share = m.busy orelse 1;
+    for (queue) |e| {
+        const r = e.record;
+        const who = if (r.label.len != 0) r.label else r.cmd;
+        if (!r.exclusive and r.cores > @max(cpus / 2, 1)) {
+            found += 1;
+            w.print("warn    {s} (pid {d}) asks for at least {d} cores on {d} CPUs: it waits for a nearly empty machine; ask for a range such as --cores 2-6\n", .{ who, r.pid, r.cores, cpus }) catch {};
+        }
+        if (now - r.since > 300 and busy_share < 0.6 and m.pressure != .high) {
+            found += 1;
+            w.print("warn    {s} (pid {d}) has waited {d} min while the CPUs are {d:.0}% busy\n", .{ who, r.pid, @divFloor(now - r.since, 60), busy_share * 100 }) catch {};
+        }
+    }
+    if (found == 0) w.writeAll("ok      nothing to fix\n") catch {};
+    w.flush() catch {};
+    return if (found == 0) 0 else 1;
+}
+
 fn cmdWait(ctx: *Ctx, args: []const [:0]const u8) u8 {
     var pattern: ?[]const u8 = null;
     var max_wait: ?i64 = null;
@@ -2254,7 +2430,7 @@ fn cmdWait(ctx: *Ctx, args: []const [:0]const u8) u8 {
         for (pools.items) |*st| {
             lockOrFail(st);
             const leases = state.scanLeases(st, a, false) catch @as([]state.Entry, &.{});
-            const queue = servedOrder(ctx, st, a, state.scanQueue(st, a, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{}), now);
+            const queue = servedOrder(ctx, st, a, state.scanQueue(st, a, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{}), now, false);
             st.unlock();
             for (leases) |e| found = found or labelMatches(pat, e.record.label);
             for (queue) |e| found = found or labelMatches(pat, e.record.label);
@@ -2297,6 +2473,8 @@ const JsonJob = struct {
     /// most.
     noise: ?f64 = null,
     noise_peak: ?f64 = null,
+    /// The most cores it kept busy over a 2-second look.
+    cpu_peak: ?f64 = null,
 };
 
 fn aliveForHistory(pid: i32) bool {
@@ -2376,6 +2554,7 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
             .peak = j.peak,
             .noise = j.noise,
             .noise_peak = j.noise_peak,
+            .cpu_peak = j.cpu_peak,
         }) catch {};
         std.json.Stringify.value(out.items, .{ .whitespace = .indent_2 }, w) catch {};
         w.writeAll("\n") catch {};
@@ -2562,7 +2741,10 @@ const JsonGate = struct {
 const RunTimes = struct {
     by_label: std.StringHashMapUnmanaged(f64) = .empty,
     by_project: std.StringHashMapUnmanaged(f64) = .empty,
-    /// Each label's finished runs' average active cores, oldest first.
+    /// Each label's finished runs' use, oldest first: the most cores a run
+    /// kept busy over a 2-second look, else (older history) its average.
+    /// Sizing from peaks counts a build that fans out briefly at what it
+    /// fans out to, not at its average.
     uses: std.StringHashMapUnmanaged(std.ArrayList(f64)) = .empty,
 
     fn load(ctx: *Ctx, a: std.mem.Allocator) RunTimes {
@@ -2573,7 +2755,7 @@ const RunTimes = struct {
         for (jobs) |j| {
             const r = j.ran() orelse continue;
             if (j.label.len == 0 or !std.mem.eql(u8, j.pool, "cores")) continue;
-            if (j.used()) |u| {
+            if (j.cpu_peak orelse j.used()) |u| {
                 const gop = rt.uses.getOrPut(a, j.label) catch continue;
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
                 gop.value_ptr.append(a, u) catch {};
@@ -3223,7 +3405,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
     lockOrFail(&st);
     const held = state.heldTokens(&st) catch 0;
     const leases = state.scanLeases(&st, a, false) catch @as([]state.Entry, &.{});
-    const queue = servedOrder(ctx, &st, a, state.scanQueue(&st, a, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{}), now);
+    const queue = servedOrder(ctx, &st, a, state.scanQueue(&st, a, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{}), now, true);
     var valve = st.readValve();
     st.unlock();
     // Under measured admission the load valve gates only an exclusive run.

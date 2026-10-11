@@ -59,6 +59,9 @@ pub const Event = struct {
     /// most (ended).
     noise: ?f64 = null,
     noise_peak: ?f64 = null,
+    /// The most cores its process tree kept busy over any 2-second look
+    /// (ended).
+    cpu_peak: ?f64 = null,
 };
 
 /// The longest command kept in a line, so a line stays well under 4 KB.
@@ -124,6 +127,7 @@ pub const Job = struct {
     peak: ?u64 = null,
     noise: ?f64 = null,
     noise_peak: ?f64 = null,
+    cpu_peak: ?f64 = null,
     state: State = .active,
 
     /// Seconds spent waiting: until admitted, or until it gave up.
@@ -200,6 +204,7 @@ pub fn load(io: Io, a: std.mem.Allocator, path: []const u8, boot: f64, alive: *c
                 j.peak = ev.peak;
                 j.noise = ev.noise;
                 j.noise_peak = ev.noise_peak;
+                j.cpu_peak = ev.cpu_peak;
                 if (ev.cores) |k| j.cores = k;
                 j.state = .done;
             } else if (std.mem.eql(u8, ev.event, "gave_up")) {

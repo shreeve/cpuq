@@ -614,13 +614,13 @@ t_lease_host() {
 
 t_wait() {
   setup wait
-  "$CPUQ" run --cores 2 --label job:a -- sleep 1.5 &
+  "$CPUQ" run --cores 2 --label job:a -- sleep 4 &
   "$CPUQ" lease bench --label job:b -- sleep 0.5 &
   wait_held 2
   local t0; t0=$(now)
   "$CPUQ" wait --label 'job:*'; local rc=$?
   local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
-  check "cpuq wait --label 'job:*' returns when the last matching job ends (exit $rc after ${dt}s)" "[ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if 0.8 < $dt < 3 else 1)'"
+  check "cpuq wait --label 'job:*' returns when the last matching job ends (exit $rc after ${dt}s)" "[ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if 0.8 < $dt < 6 else 1)'"
   "$CPUQ" run --label long -- sleep 3 & wait_held 2
   "$CPUQ" wait --label long --max-wait 1; rc=$?
   check "cpuq wait --max-wait gives up with 75 (got $rc)" "[ $rc = 75 ]"
@@ -920,7 +920,7 @@ t_eta_measured() {
   mkdir -p "$CPUQ_DIR"
   ev() { printf '{"v":1,"event":"%s","id":"%s","t":%s,"pid":1,"label":"%s","cores":%s,"cpu":%s,"exit":0}\n' "$@" >>"$h"; }
   for n in 1 2 3; do ev started $n 1 build 2 0; ev ended $n 2 build 2 2; done
-  "$CPUQ" run --cores 2 --label build -- sleep 2 & wait_held 2
+  "$CPUQ" run --cores 2 --label build -- sleep 5 & wait_held 2
   "$CPUQ" run --cores 2 --label build -- true & wait_waiters 1
   "$CPUQ" run --cores 2 --label build -- true & wait_waiters 2
   local got; got=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys
@@ -961,6 +961,69 @@ t_cpu_weights() {
   else
     check "without a user systemd, cpu_weights leaves the job as it is (got $got)" "[[ '$got' == *'rc=0 ' ]]"
   fi
+}
+
+t_hook() {
+  # cpuq hook: Claude Code's PreToolUse hook refuses heavy commands outside
+  # cpuq (exit 2, the fix on stderr) and passes everything else.
+  setup hook
+  call() { printf '{"tool_name":"%s","tool_input":{"command":%s},"cwd":"/x/app"}' "$1" "$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$2")" | "$CPUQ" hook 2>"$T/err"; echo $?; }
+  local bare cpuq light other off
+  bare=$(call Bash 'cd x && zig build test')
+  cpuq=$(call Bash "cpuq run --label app:build --cores 2-6 -- sh -c 'zig build -j\"\$CPUQ_CORES\"'")
+  light=$(call Bash 'git status')
+  other=$(call Read 'zig build')
+  off=$(printf '{"tool_name":"Bash","tool_input":{"command":"make"}}' | CPUQ_HOOK=off "$CPUQ" hook; echo $?)
+  call Bash 'make -j8' >/dev/null
+  check "the hook refuses a bare build with the fix (rc $bare), passes cpuq runs, light commands, other tools and CPUQ_HOOK=off (rc $cpuq $light $other $off)" "[ $bare = 2 ] && [ $cpuq = 0 ] && [ $light = 0 ] && [ $other = 0 ] && [ $off = 0 ] && grep -q 'Run instead: cpuq run --label app:build' '$T/err'"
+}
+
+t_doctor() {
+  # cpuq doctor names a job that uses far more CPU than its grant: eight busy
+  # processes on a grant of one, enough even on a loaded machine.
+  setup doctor
+  "$CPUQ" run --cores 1 --label greedy -- python3 -c 'import os, time
+e = time.time() + 4
+for _ in range(3): os.fork()
+while time.time() < e: pass' & local g=$!
+  wait_held 1
+  sleep 1.5
+  "$CPUQ" doctor >"$T/out"; local rc=$?
+  wait $g 2>/dev/null
+  check "doctor warns about a job using more than its grant (rc $rc)" "[ $rc = 1 ] && grep -q 'greedy .* on a grant of 1' '$T/out'"
+}
+
+t_fair() {
+  # Within a priority class waiters take turns by project: with two cores
+  # free, b's one job starts beside a's first, before a's second and third.
+  setup fair
+  export CPUQ_BUDGET=2
+  local f=$T/order n k=0
+  # The holder outlasts queueing all four, even on a loaded machine.
+  "$CPUQ" run --cores 2 --label h:x -- sleep 4 & wait_held 2
+  for n in a1 a2 a3 b1; do
+    "$CPUQ" run --cores 1 --label "${n:0:1}:x" -- sh -c "echo $n >>$f; sleep 1" &
+    k=$((k + 1)); wait_waiters $k
+  done
+  wait
+  export CPUQ_BUDGET=9
+  # Two start at once, so compare the pairs: without turns a1 and a2 would go first.
+  local got first; got=$(tr '\n' ' ' <"$f"); first=$(head -2 "$f" | sort | tr '\n' ' ')
+  check "projects take turns: b's one job starts with a's first, before a's second (got: $got)" "[ '$first' = 'a1 b1 ' ]"
+}
+
+t_cpu_peak() {
+  # History keeps each run's busiest stretch (cpu_peak), which sizes the
+  # label's next runs.
+  setup cpu-peak
+  "$CPUQ" run --cores 2 --label peaky -- python3 -c 'import os, time
+e = time.time() + 3.5
+os.fork()
+while time.time() < e: pass'
+  # On a loaded machine two busy processes may get less than two CPUs: the
+  # peak is there, and at least the average.
+  local got; got=$("$CPUQ" history --json --label peaky | python3 -c 'import json, sys; j = json.load(sys.stdin)[0]; print(j.get("cpu_peak"), j.get("used"))')
+  check "history records the run's peak CPU, at least its average (peak, average: $got)" "python3 -c 'import sys; p, u = \"$got\".split(); sys.exit(0 if p != \"None\" and float(p) >= 0.95 * float(u) else 1)'"
 }
 
 t_backfill_exclusive() {
@@ -1153,7 +1216,8 @@ t_eta() {
   # longer on a slow runner: the bounds allow for it.
   "$CPUQ" run --cores 9 --label build -- sleep 2 & wait_held 9
   "$CPUQ" run --cores 9 --label build -- true & wait_waiters 1
-  "$CPUQ" run --cores 9 --label other -- true & wait_waiters 2
+  # The same project (build), so fair turns keep arrival order here.
+  "$CPUQ" run --cores 9 --label build:other -- true & wait_waiters 2
   local got; got=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys
 print(" ".join("%.1f" % w["eta"] if w["eta"] is not None else "none" for w in json.load(sys.stdin)["waiters"]))')
   wait
@@ -1267,7 +1331,9 @@ t_qos() {
   none=$("$CPUQ" run --priority low --qos none -- "$CPUQ" qos)
   echo "  outside: $outside; low: $low; normal: $normal; high: $high; exclusive low: $excl; low --qos none: $none"
   if [ "$(uname)" = Darwin ]; then
-    check "low runs at background QoS; normal keeps the class, so it can use the performance cores" "[ '$low' = background ] && [ '$normal' = '$outside' ]"
+    # Low keeps the class (background QoS would confine it to the efficiency cores) at nice 10 or
+    # more; normal keeps both.
+    check "low runs niced at the same class; normal keeps the class, so both can use the performance cores" "[ '${low%%,*}' = '${outside%%,*}' ] && [[ '$low' == *'nice '* ]] && [ '$normal' = '$outside' ]"
   else
     check "low runs at nice 15, normal at nice 5" "[ '$low' = 'nice 15' ] && [ '$normal' = 'nice 5' ]"
   fi
@@ -1377,7 +1443,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

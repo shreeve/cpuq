@@ -255,8 +255,13 @@ History tab (`cpuq history` summed by project). Seven themes, each light and dar
 
 ## Waiting and order
 
-Waiters are served high before normal before low (`--priority`), in arrival order within a
-class. A waiter moves up one class per `aging` seconds (600) of waiting, so low is never starved.
+Waiters are served high before normal before low (`--priority`). Within a class, projects take
+turns: a waiter's turn is the number of its project's jobs running or ahead of it in line (the
+project is the label before its colon), lowest first, then arrival order. So one project's ten
+queued jobs don't all go ahead of another project's one. A waiter moves up one class per `aging`
+seconds (600) of waiting, so low is never starved. Named leases are served in arrival order.
+On macOS `--priority low` runs at nice 10 with its QoS class left alone: background QoS would
+confine it to the efficiency cores even with the performance cores idle.
 Behind the first waiter, others start as soon as they fit (see
 [How jobs are admitted](#how-jobs-are-admitted)).
 
@@ -396,6 +401,45 @@ an exclusive run alone. A job started by hand is marked `"forced": true` in hist
 counts for nothing (its cores are lent at once under `admit = cores`) and shows `paused` in
 `cpuq status --json`; it keeps its memory and its cores, and a network peer may time out on it,
 so pausing suits builds and tests best.
+
+## Checking up: doctor and the agent hook
+
+    cpuq doctor [--host HOST]
+
+`cpuq doctor` reports what cpuq can see but not stop, one line each, and exits 1 when there is
+anything (0 and `ok` when not):
+
+- heavy work outside cpuq (a process using a CPU or more that no job accounts for);
+- a job using far more CPU than its grant, or with far more threads ready to run than it was
+  granted (a build without `-j"$CPUQ_CORES"`);
+- a job holding cores for over ten minutes while using almost none (parked on something; it
+  also blocks timing windows);
+- a waiter asking for more than half the CPUs, which waits for a nearly empty machine;
+- a waiter held for over five minutes while the CPUs are under 60% busy.
+
+`--host HOST` runs it on HOST over ssh.
+
+    cpuq hook
+
+`cpuq hook` is a Claude Code PreToolUse hook: it reads the tool call on stdin and, for a shell
+command that would load the machine outside cpuq or misuse it, prints why and the command to run
+instead, and exits 2, which refuses the command and shows the agent the fix. It refuses:
+
+- a heavy command (`zig build`, `cargo build/test/…`, `make`, `ninja`, `cmake --build`,
+  `xcodebuild`, `swift build/test`, `go build/test`, `pytest`, `gradle`, `mvn`, `bazel`,
+  `buck2`) outside `cpuq run`, here or through `ssh HOST`;
+- a `cpuq run` whose `$CPUQ_CORES` the typing shell expands (outside single quotes);
+- `zig build` without `-j` inside a job;
+- a request for more than half the CPUs;
+- work in a container or simulator (`incus`/`docker exec`, `xcodebuild` on a Simulator) without
+  `--opaque`.
+
+Help, version, dry-run and listing invocations pass, as does any command marked `# cpuq: skip`
+and everything when `CPUQ_HOOK=off`. It reads only the command's text; anything it can't parse
+passes. Install it for every session in `~/.claude/settings.json`:
+
+    {"hooks": {"PreToolUse": [{"matcher": "Bash",
+       "hooks": [{"type": "command", "command": "cpuq hook"}]}]}}
 
 ## Configuration
 

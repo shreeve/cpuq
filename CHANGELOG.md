@@ -2,6 +2,27 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.10.0 — 2026-10-10
+
+- `cpuq hook`: a Claude Code PreToolUse hook that enforces the queue where agents act. It refuses
+  heavy commands run outside cpuq (here or through ssh), a `$CPUQ_CORES` expanded by the typing
+  shell, `zig build` without `-j` in a job, requests over half the CPUs, and container or
+  simulator work without `--opaque`, printing the command to run instead. In two days on one Mac
+  every load spike traced to one of these: an iOS app's Simulator tests outside cpuq (load 84),
+  `zig build` without `-j` (load 37 on 22 CPUs), a 10-core request on a 10-CPU Mac, a cargo
+  variable expanded too early.
+- `cpuq doctor [--host HOST]`: what cpuq sees but can't stop: heavy work outside it, jobs using
+  far more CPU or threads than their grant, jobs parked on cores for ten minutes, requests too big
+  to start, waiters held beside idle CPUs. Exit 1 when there is anything.
+- Projects take turns within a priority class: one project's ten queued jobs no longer all go
+  ahead of another project's one.
+- `--priority low` on macOS runs at nice 10 instead of background QoS, which confined it to the
+  efficiency cores: the same loop took 3.8–4.1 s at background and 1.6–2.0 s at nice 10.
+  `cpuq qos` shows the nice value beside the class.
+- History keeps each run's busiest stretch (`cpu_peak`, the most cores over any 2-second look),
+  and sizing from history uses it, so a build that fans out briefly counts at what it fans out
+  to while it settles, not at its average.
+
 ## 0.9.1 — 2026-10-09
 
 - `cpuq run --opaque`: for a job whose work runs where cpuq can't see it (in a container or a
