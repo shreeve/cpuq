@@ -3,6 +3,14 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.23 — 2026-10-11
+
+- Visual effects are one decision: on and the Mac not strained, the water moves and bubbles
+  rise, always; otherwise never, hovering or not. (0.13.22 still showed them while hovering.)
+- The hour card's labels sit in one fixed column, so neither "wait" nor the plot moves when
+  switching between Stacked and Per Core. Per Core labels its rows "4 ⚡" and "6 🍃" (bolt and
+  leaf): the performance and efficiency cores, named in full in the chart's tooltip.
+
 ## 0.13.22 — 2026-10-11
 
 - Visual effects: the water moves and bubbles rise on their own again, at 30 frames a second,

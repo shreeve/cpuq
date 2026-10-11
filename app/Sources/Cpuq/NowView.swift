@@ -522,12 +522,12 @@ struct WaiterActions: View {
     }
 }
 
-/// How lively the cells are. With visual effects on (the default), the water moves and bubbles
-/// rise at thirty frames a second while the window is on screen and the Mac has CPUs to spare
-/// (measured: about 7% of one CPU; fewer frames look jerky, sixty costs two to five times as much). When effects
-/// are off, the window is hidden, or the Mac is strained, the cells draw once a second and keep
-/// still, except while the mouse moves in the window or it is resized: then they move smoothly
-/// for a second, effects and all where effects are on.
+/// How lively the cells are. One decision says whether the water moves and bubbles rise: effects
+/// are on and the Mac is not strained. Then they always do, at thirty frames a second while the
+/// window is on screen (measured: about 6% of one CPU; fewer frames look jerky, sixty costs two to
+/// five times as much). Otherwise they never do, hovering or not: the cells keep still, drawn once
+/// a second, and ease smoothly to new readings only while the mouse moves in the window or it is
+/// resized.
 @MainActor
 final class Liveliness: ObservableObject {
     static let shared = Liveliness()
@@ -542,10 +542,10 @@ final class Liveliness: ObservableObject {
     /// Some of the window shows on screen.
     @Published var visible = true
 
-    /// Effects run on their own: on, in view and with CPUs to spare.
-    var ambient: Bool { effects && visible && !strained }
-    /// The water and bubbles move in this frame.
-    var moving: Bool { effects && (lively || ambient) }
+    /// The one decision: the water moves and bubbles rise, or not at all.
+    var showsEffects: Bool { effects && !strained }
+    /// Effects run on their own while someone can see them.
+    var ambient: Bool { showsEffects && visible }
     /// Seconds between frames.
     var interval: Double { lively || ambient ? 1.0 / 30 : 1 }
 
@@ -629,7 +629,7 @@ struct CellsCanvas: View {
             Canvas { gc, size in
                 let t = tl.date.timeIntervalSinceReferenceDate
                 motion.step(toward: moment, at: t, instantly: reduceMotion)
-                draw(&gc, size: size, t: reduceMotion || !live.moving ? 0 : t)
+                draw(&gc, size: size, t: reduceMotion || !live.showsEffects ? 0 : t)
             }
         }
     }
@@ -810,10 +810,32 @@ struct HourCard: View {
 
     private var step: TimeInterval { hour.step }
 
-    /// The width of the labels left of every chart in the card, the same for each, so their
-    /// plots start at the same x and share one time axis: wide enough for "4 Performance" in
-    /// Per core, for "wait" and "10" in Stacked.
-    private var labelWidth: CGFloat { mode == .cores ? 78 : 26 }
+    /// The labels left of every chart in the card, drawn here rather than by Charts (whose axis
+    /// room varies with its labels and marks) in one column, the same for each chart and in both
+    /// modes, so the plots start at the same x, share one time axis and stay put when the mode
+    /// changes: wide enough for "wait" and "10", and Per Core's bolt and leaf with their counts.
+    private let labelWidth: CGFloat = 26
+    private var labelColumn: CGFloat { labelWidth + 6 }
+
+    /// Draws `labels` (a value on the y scale, its text) right-aligned in the label column.
+    private func yLabels(_ proxy: ChartProxy, _ labels: [(Double, String)], font: Font = .caption2) -> some View {
+        yLabels(proxy, labels.map { ($0.0, Text($0.1)) }, font: font)
+    }
+
+    private func yLabels(_ proxy: ChartProxy, _ labels: [(Double, Text)], font: Font = .caption2) -> some View {
+        GeometryReader { geo in
+            if let frame = proxy.plotFrame {
+                let plot = geo[frame]
+                ForEach(Array(labels.enumerated()), id: \.offset) { _, l in
+                    if let y = proxy.position(forY: l.0) {
+                        l.1.font(font).foregroundStyle(.secondary).lineLimit(1)
+                            .frame(width: labelWidth, alignment: .trailing)
+                            .position(x: plot.minX - labelColumn + labelWidth / 2, y: plot.minY + y)
+                    }
+                }
+            }
+        }
+    }
 
     private var summary: Text {
         let watched = hour.columns.filter(\.watched)
@@ -873,6 +895,11 @@ struct HourCard: View {
         let quiet = HourCache.runs(cols) { $0.watched && $0.total < 0.3 && $0.waiting == 0 }.filter { $0.count >= 10 }
         let layers = hour.projects + ["~outside"]
         return Chart {
+            // The grid drawn as marks, with the axis hidden: an axis Charts draws, even without
+            // labels, takes room at the left that Per Core's lacks, and the plot would shift.
+            ForEach([0, cpus / 2, cpus], id: \.self) { v in
+                RuleMark(y: .value("CPU", v)).foregroundStyle(Color.primary.opacity(0.06)).lineStyle(StrokeStyle(lineWidth: 1))
+            }
             // Waiting while CPUs sat idle: rose from the floor to the ceiling, under the stack, so
             // it shows wherever the stack is low and is never cut off by the stack's curves. From
             // the start of its first column to the end of its last, so a run of one column fills too.
@@ -943,16 +970,13 @@ struct HourCard: View {
             if let scrub { RuleMark(x: .value("Time", scrub)).foregroundStyle(Color.primary.opacity(0.5)) }
         }
         .chartLegend(.hidden)
-        .chartXScale(domain: xDomain)
+        .chartXScale(domain: xDomain, range: .plotDimension(padding: 0))
         .chartYScale(domain: 0...cpus)
         .chartXAxis { xAxis }
-        .chartYAxis {
-            AxisMarks(position: .leading, values: [0, cpus / 2, cpus]) { v in
-                AxisGridLine().foregroundStyle(Color.primary.opacity(0.06))
-                AxisValueLabel { if let d = v.as(Double.self) { Text("\(Int(d))").frame(width: labelWidth, alignment: .trailing) } }
-            }
-        }
+        .chartYAxis(.hidden)
+        .chartBackground { yLabels($0, [(0, "0"), (cpus / 2, "\(Int(cpus / 2))"), (cpus, "\(Int(cpus))")], font: .caption) }
         .chartOverlay { scrubber($0) }
+        .padding(.leading, labelColumn)
     }
 
     private func value(_ c: HourCache.Column, _ layer: String) -> Double {
@@ -989,20 +1013,15 @@ struct HourCard: View {
             if let scrub { RuleMark(x: .value("Time", scrub)).foregroundStyle(Color.primary.opacity(0.5)) }
         }
         .chartLegend(.hidden)
-        .chartXScale(domain: xDomain)
+        .chartXScale(domain: xDomain, range: .plotDimension(padding: 0))
         .chartYScale(domain: 0...top)
         .chartXAxis { xAxis }
-        .chartYAxis {
-            if p > 0 {
-                AxisMarks(position: .leading, values: [top - Double(p) / 2]) { _ in
-                    AxisValueLabel { Text("\(p) Performance").font(.caption2).frame(width: labelWidth, alignment: .trailing) }
-                }
-            }
-            AxisMarks(position: .leading, values: [Double(e) / 2]) { _ in
-                AxisValueLabel { Text(p > 0 ? "\(e) Efficiency" : "per CPU").font(.caption2).frame(width: labelWidth, alignment: .trailing) }
-            }
-        }
+        .chartYAxis(.hidden)
+        .chartBackground { yLabels($0, p > 0 ? [(top - Double(p) / 2, Text("\(p) ") + Text(Image(systemName: "bolt.fill"))),
+                                         (Double(e) / 2, Text("\(e) ") + Text(Image(systemName: "leaf.fill")))] : [(top / 2, Text("CPU"))]) }
         .chartOverlay { scrubber($0) }
+        .padding(.leading, labelColumn)
+        .help(p > 0 ? "A row per CPU, darker the busier: the \(p) performance cores (bolt) on top, the \(e) efficiency cores (leaf) below." : "A row per CPU, darker the busier.")
     }
 
     /// How many waited in each column: grey when the CPUs were full (fair), rose when they sat
@@ -1019,14 +1038,12 @@ struct HourCard: View {
             }
         }
         .chartLegend(.hidden)
-        .chartXScale(domain: xDomain)
+        .chartXScale(domain: xDomain, range: .plotDimension(padding: 0))
         .chartYScale(domain: 0...9)
         .chartXAxis(.hidden)
-        .chartYAxis {
-            AxisMarks(position: .leading, values: [4.5]) { _ in
-                AxisValueLabel { Text("wait").font(.caption2).frame(width: labelWidth, alignment: .trailing) }
-            }
-        }
+        .chartYAxis(.hidden)
+        .chartBackground { yLabels($0, [(4.5, "wait")]) }
+        .padding(.leading, labelColumn)
         .help("Jobs waiting: grey while the CPUs were full, a fair wait; rose while CPUs sat idle.")
     }
 
