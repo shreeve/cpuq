@@ -68,6 +68,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.status = s
                     self.problem = nil
                     self.graphs.add(s)
+                    Liveliness.shared.observe(load: s.load.first, cpus: Double(ProcessInfo.processInfo.activeProcessorCount))
                 case .failure(let e):
                     self.status = nil
                     self.problem = e.message
@@ -143,12 +144,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Fills `m` with the status and the commands.
+    /// Fills `m`: the status, the commands, then the jobs.
     private func fill(_ m: NSMenu) {
         guard let s = status else {
             m.addItem(text(problem ?? "reading cpuq status…", bold: false))
-            m.addItem(.separator())
-            m.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+            commands(m)
             return
         }
         let now = Date().timeIntervalSince1970
@@ -156,6 +156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.addItem(text("cpuq \(s.version)  ·  \(s.held) of \(s.budget) cores in use", bold: true))
         let load = s.load.first.map { String(format: "%.1f", $0) } ?? "?"
         m.addItem(text("load \(load)  ·  memory \(s.memoryPressure)  ·  gate \(s.gate.text)", bold: false))
+        commands(m)
 
         if !s.holders.isEmpty {
             m.addItem(.separator())
@@ -201,6 +202,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 m.addItem(text(String(format: "%@ (%d)   %.1f", o.name, o.pid, o.using), bold: false))
             }
         }
+    }
+
+    /// The commands, from Show Graphs to Quit: always the same, so they stay where the hand
+    /// expects them, above however many jobs follow.
+    private func commands(_ m: NSMenu) {
         m.addItem(.separator())
         m.addItem(withTitle: "Show Graphs…", action: #selector(showGraphs), keyEquivalent: "g").target = self
         m.addItem(themeItem())
@@ -248,6 +254,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             a.state = id == Theme.appearanceName ? .on : .off
             sub.addItem(a)
         }
+        sub.addItem(.separator())
+        let fx = NSMenuItem(title: "Visual Effects", action: #selector(toggleEffects), keyEquivalent: "")
+        fx.target = self
+        fx.state = Liveliness.shared.effects ? .on : .off
+        sub.addItem(fx)
         item.submenu = sub
         return item
     }
@@ -258,6 +269,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // GraphsView redraws itself on the stored theme; the window's frame and border too.
         graphsWindow?.contentView?.needsDisplay = true
         graphsWindow?.invalidateShadow()
+    }
+
+    @objc private func toggleEffects() {
+        Liveliness.shared.effects.toggle()
     }
 
     @objc private func pickAppearance(_ sender: NSMenuItem) {
@@ -285,6 +300,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: window, queue: .main) { _ in
                 MainActor.assumeIsolated { Liveliness.shared.poke() }
+            }
+            // Covered, minimized or on another space: no frames for effects nobody sees.
+            NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main) { [weak window] _ in
+                MainActor.assumeIsolated { Liveliness.shared.visible = window?.occlusionState.contains(.visible) ?? false }
             }
             window.appearance = Theme.appearance
             // The window is the size it is given and no other: what is in it never grows or

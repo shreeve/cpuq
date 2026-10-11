@@ -372,6 +372,12 @@ struct GraphsView: View {
         .id(theme)
     }
 
+    /// Watches Liveliness itself, so the window is not drawn again each time the mouse moves.
+    private struct EffectsToggle: View {
+        @ObservedObject private var live = Liveliness.shared
+        var body: some View { Toggle("Visual Effects", isOn: $live.effects) }
+    }
+
     static let modes = [("auto", "Automatic"), ("light", "Light"), ("dark", "Dark")]
 
     /// The theme, from a drop-down or ⌘T for the next one.
@@ -380,6 +386,8 @@ struct GraphsView: View {
             ForEach(Theme.all, id: \.id) { t in
                 Toggle(t.name, isOn: Binding(get: { t.id == theme }, set: { _ in Theme.use(t.id) }))
             }
+            Divider()
+            EffectsToggle()
         } label: {
             Text((Theme.all.first { $0.id == theme } ?? Theme.all[0]).name + "  ") + Text("⌘T").foregroundStyle(Alive.ink3)
         }

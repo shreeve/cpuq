@@ -522,13 +522,33 @@ struct WaiterActions: View {
     }
 }
 
-/// Whether the window is being looked at closely: the mouse moving in it, or it being resized.
-/// The cells animate smoothly only then, and a second after it stops they drop to one frame a
-/// second, so an open window costs next to nothing.
+/// How lively the cells are. With visual effects on (the default), the water moves and bubbles
+/// rise at thirty frames a second while the window is on screen and the Mac has CPUs to spare
+/// (measured: about 7% of one CPU; fewer frames look jerky, sixty costs two to five times as much). When effects
+/// are off, the window is hidden, or the Mac is strained, the cells draw once a second and keep
+/// still, except while the mouse moves in the window or it is resized: then they move smoothly
+/// for a second, effects and all where effects are on.
 @MainActor
 final class Liveliness: ObservableObject {
     static let shared = Liveliness()
+    /// The mouse moved in the window, or it was resized, within the last second.
     @Published private(set) var lively = false
+    /// Water and bubbles: the user's choice, kept between launches.
+    @Published var effects = UserDefaults.standard.object(forKey: "visualEffects") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(effects, forKey: "visualEffects") }
+    }
+    /// The Mac is strained: more threads want to run than it has CPUs to spare for frames.
+    @Published private(set) var strained = false
+    /// Some of the window shows on screen.
+    @Published var visible = true
+
+    /// Effects run on their own: on, in view and with CPUs to spare.
+    var ambient: Bool { effects && visible && !strained }
+    /// The water and bubbles move in this frame.
+    var moving: Bool { effects && (lively || ambient) }
+    /// Seconds between frames.
+    var interval: Double { lively || ambient ? 1.0 / 30 : 1 }
+
     private var until = Date.distantPast
     private var timer: Timer?
 
@@ -545,6 +565,14 @@ final class Liveliness: ObservableObject {
                 self.timer = nil
             }
         }
+    }
+
+    /// A new 1-minute load from cpuq: strained once it passes the CPUs by half, eased once it
+    /// falls back under them, so it does not flicker at the edge.
+    func observe(load: Double?, cpus: Double) {
+        guard let load else { return }
+        let now = strained ? load >= cpus : load >= cpus * 1.5
+        if now != strained { strained = now }
     }
 }
 
@@ -595,14 +623,13 @@ struct CellsCanvas: View {
 
     @ObservedObject private var live = Liveliness.shared
 
-    /// Once a second, to keep the app light; thirty times a second while the mouse moves in the
-    /// window or it is resized, so it feels alive when someone is looking at it closely.
+    /// At the rate Liveliness sets: once a second at rest, more with effects or the mouse moving.
     var body: some View {
-        TimelineView(.animation(minimumInterval: live.lively ? 1.0 / 30 : 1, paused: reduceMotion)) { tl in
+        TimelineView(.animation(minimumInterval: live.interval, paused: reduceMotion)) { tl in
             Canvas { gc, size in
                 let t = tl.date.timeIntervalSinceReferenceDate
                 motion.step(toward: moment, at: t, instantly: reduceMotion)
-                draw(&gc, size: size, t: reduceMotion ? 0 : t)
+                draw(&gc, size: size, t: reduceMotion || !live.moving ? 0 : t)
             }
         }
     }
@@ -643,14 +670,14 @@ struct CellsCanvas: View {
                    with: .radialGradient(Gradient(colors: [color.opacity(dark ? 0.34 : 0.22), color.opacity(0)]), center: .zero, startRadius: 0, endRadius: r))
         }
         // Bubbles: a few rise through each busy cell, more the busier it is; only while the
-        // cells move smoothly, as a bubble jumping once a second looks wrong.
+        // effects move (t is 0 when they keep still), as a bubble jumping once a second looks wrong.
         let dt = motion.lastFrame == 0 ? 0 : min(t - motion.lastFrame, 0.1)
         motion.lastFrame = t
-        if !live.lively { motion.bubbles = [] }
-        if t > 0 && live.lively {
+        if t == 0 { motion.bubbles = [] }
+        if t > 0 {
             for c in 0..<n {
                 let level = min(max(total - Double(c), 0), 1)
-                if level > 0.15 && Double.random(in: 0..<1) < 0.035 * level {
+                if level > 0.15 && Double.random(in: 0..<1) < 1.05 * level * dt {
                     motion.bubbles.append((c, Double.random(in: 4...max(w - 4, 5)), bottom - 2, Double.random(in: 10...26), Double.random(in: 0.7...1.8)))
                 }
             }

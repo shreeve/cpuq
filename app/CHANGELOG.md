@@ -3,6 +3,17 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.22 — 2026-10-11
+
+- Visual effects: the water moves and bubbles rise on their own again, at 30 frames a second,
+  whenever the window is on screen. That costs about 6% of one CPU (1% with effects off).
+  Turn them off under Theme ▸ Visual Effects, in the menu or the window's theme drop-down.
+- They pause by themselves when the Mac is strained (1-minute load above 1.5× its CPUs, until
+  it falls back under 1×), and when the window is covered, minimized or on another space. Then
+  the cells redraw once a second, smoothly only while the mouse moves in the window.
+- The menu keeps Show Graphs… through Quit in one place, right under the status lines; the
+  running and waiting jobs follow below, so Quit no longer moves with the number of jobs.
+
 ## 0.13.21 — 2026-10-09
 
 - Much lighter: the cells redraw once a second, and smoothly (30 times a second) only while
