@@ -1000,12 +1000,13 @@ t_fair() {
   setup fair
   export CPUQ_BUDGET=2
   local f=$T/order n k=0
-  # The holder outlasts queueing all four, even on a loaded machine.
-  "$CPUQ" run --cores 2 --label h:x -- sleep 4 & wait_held 2
+  # The holder lasts until all four are queued, however slow the machine.
+  "$CPUQ" run --cores 2 --label h:x -- sh -c "while [ ! -e $T/go ]; do sleep 0.1; done" & wait_held 2
   for n in a1 a2 a3 b1; do
     "$CPUQ" run --cores 1 --label "${n:0:1}:x" -- sh -c "echo $n >>$f; sleep 1" &
     k=$((k + 1)); wait_waiters $k
   done
+  touch "$T/go"
   wait
   export CPUQ_BUDGET=9
   # Two start at once, so compare the pairs: without turns a1 and a2 would go first.
