@@ -30,6 +30,7 @@ setup() {
   {
     echo "load_check = off"
     echo "pressure_check = off"
+    echo "min_disk = off" # t_min_disk tests it; the rest must not hang on the host's disk
     echo "poll = 0.2"
     echo "active_cap = off" # a budget of 9 on a machine with fewer cores
     echo "admit = cores" # the reservation model; t_measured tests the default
@@ -1429,6 +1430,16 @@ t_min_available() {
   check "under min_available nothing starts (rc $rc, gate $state); above it, it does (rc $rc2)" "[ $rc = 75 ] && [ '$state' = 'low_memory with-available' ] && [ $rc2 = 0 ]"
 }
 
+t_min_disk() {
+  setup min-disk "min_disk = 1000000G"
+  "$CPUQ" run --cores 1 --max-wait 1 -- true 2>/dev/null; local rc=$?
+  local got; got=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; g = json.load(sys.stdin)["gate"]; print(g["state"], "with-free" if (g.get("disk_free") or 0) > 0 else "no-free", "with-path" if g.get("disk_path") else "no-path")')
+  local text; text=$("$CPUQ" status --no-usage | grep '^load')
+  setup min-disk-low "min_disk = 1M"
+  "$CPUQ" run --cores 1 --max-wait 1 -- true; local rc2=$?
+  check "under min_disk nothing starts (rc $rc, gate $got, '$text'); above it, it does (rc $rc2)" "[ $rc = 75 ] && [ '$got' = 'low_disk with-free with-path' ] && [[ '$text' == *'disk low'* ]] && [ $rc2 = 0 ]"
+}
+
 t_status() {
   setup status
   "$CPUQ" run --cores 4 --label build -- sleep 1.5 & wait_held 4
@@ -1443,7 +1454,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

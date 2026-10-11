@@ -2,6 +2,15 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.11.0 — 2026-10-11
+
+- A disk gate: cpuq admits nothing while the filesystem holding `$HOME` or the temp directory
+  has less than `min_disk` free (5G by default; `min_disk = off` turns it off). `cpuq status`
+  says which: `gate closed: disk low (3.2 GB free on /Users/me)`, and `--json` gives
+  `gate.state` `low_disk` with `disk_free` and `disk_path`. On 2026-10-11 one session's scratch
+  files filled this Mac's disk to its last byte, and every session's builds and tool calls
+  failed until they were deleted.
+
 ## 0.10.0 — 2026-10-10
 
 - `cpuq hook`: a Claude Code PreToolUse hook that enforces the queue where agents act. It refuses

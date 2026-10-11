@@ -17,6 +17,47 @@ extern "c" fn posix_spawnattr_setsigmask(attr: *c.posix_spawnattr_t, mask: *cons
 extern "c" fn posix_spawnattr_set_qos_class_np(attr: *c.posix_spawnattr_t, qos: c_uint) c_int;
 extern "c" fn qos_class_self() c_uint;
 
+/// macOS struct statfs (64-bit inodes), and Linux struct statvfs, alike in
+/// glibc and musl on 64-bit targets.
+const DarwinStatfs = extern struct {
+    bsize: u32,
+    iosize: i32,
+    blocks: u64,
+    bfree: u64,
+    bavail: u64,
+    files: u64,
+    ffree: u64,
+    fsid: [2]i32,
+    owner: u32,
+    type: u32,
+    flags: u32,
+    fssubtype: u32,
+    fstypename: [16]u8,
+    mntonname: [1024]u8,
+    mntfromname: [1024]u8,
+    flags_ext: u32,
+    reserved: [7]u32,
+};
+const LinuxStatvfs = extern struct {
+    bsize: c_ulong,
+    frsize: c_ulong,
+    blocks: u64,
+    bfree: u64,
+    bavail: u64,
+    files: u64,
+    ffree: u64,
+    favail: u64,
+    fsid: c_ulong,
+    flag: c_ulong,
+    namemax: c_ulong,
+    spare: [6]c_int,
+};
+// Intel macOS names the 64-bit-inode statfs statfs$INODE64.
+const darwin_statfs = @extern(*const fn ([*:0]const u8, *DarwinStatfs) callconv(.c) c_int, .{
+    .name = if (builtin.cpu.arch == .x86_64) "statfs$INODE64" else "statfs",
+});
+extern "c" fn statvfs(path: [*:0]const u8, buf: *LinuxStatvfs) c_int;
+
 const PRIO_PROCESS = 0;
 const QOS_CLASS_UTILITY = 0x11;
 const QOS_CLASS_BACKGROUND = 0x09;
@@ -122,6 +163,19 @@ pub fn memAvailable(io: Io) ?u64 {
         return kb * 1024;
     }
     return null;
+}
+
+/// Bytes free to an unprivileged writer on the filesystem holding `path`;
+/// null when unreadable.
+pub fn diskFree(path: [*:0]const u8) ?u64 {
+    if (is_darwin) {
+        var s: DarwinStatfs = undefined;
+        if (darwin_statfs(path, &s) != 0) return null;
+        return s.bavail *| s.bsize;
+    }
+    var s: LinuxStatvfs = undefined;
+    if (statvfs(path, &s) != 0) return null;
+    return s.bavail *| s.frsize;
 }
 
 /// macOS kern.memorystatus_vm_pressure_level; Linux /proc/pressure/memory

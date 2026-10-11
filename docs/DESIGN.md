@@ -150,6 +150,12 @@ The head admits nothing while one of these is closed:
   more, when the file exists. `pressure_check = off` turns it off.
 - **Low memory.** With `min_available` set, available memory under it: Linux `MemAvailable`,
   macOS the kernel's free share (`kern.memorystatus_level`) of `hw.memsize`.
+- **Low disk.** Less than `min_disk` (5G by default) free to an ordinary user (`f_bavail`) on the
+  filesystem holding `$HOME` or the one holding the state directory, the temp directory where
+  builds and agents keep scratch files; status names the fuller of the two. It is on by default
+  because a full disk breaks everything at once: on 2026-10-11 one session's scratch copies of a
+  database filled this Mac's disk to its last byte, and every session's builds and tool calls
+  failed. It cannot stop a running job from filling the disk; it keeps new ones from piling on.
 - **The load valve** (`load_check`, or `--no-load-check` per run). Under measured admission it
   gates exclusive runs only; under `admit = cores`, every job. It reads the machine's whole
   1-minute load, cpuq's own jobs included, so it catches load from outside cpuq and jobs that use

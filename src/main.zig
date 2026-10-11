@@ -107,6 +107,9 @@ const Ctx = struct {
     cfg_path: []const u8 = "",
     /// The config file's modification time when last read (0: none read).
     cfg_mtime: i96 = 0,
+    /// The paths `min_disk` watches, found on first use (a waiter reads the
+    /// gates twice a second, for hours).
+    disk_paths: ?[2]?[:0]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) void {
@@ -235,7 +238,27 @@ fn machine(ctx: *Ctx) policy.Machine {
         .load1 = sys.loadAverage()[0],
         .pressure = if (ctx.cfg.pressure_check) sys.memoryPressure(ctx.io, ctx.cfg.pressure_psi) else .off,
         .available = if (ctx.cfg.min_available > 0) sys.memAvailable(ctx.io) else null,
+        .disk = if (ctx.cfg.min_disk > 0) leastDisk(ctx) else null,
     };
+}
+
+/// The fuller of the filesystems `min_disk` watches: the one holding $HOME,
+/// and the one holding the state directory (the temp directory, where
+/// builds and agents keep scratch files).
+fn leastDisk(ctx: *Ctx) ?policy.Disk {
+    const paths = ctx.disk_paths orelse blk: {
+        const home: ?[:0]const u8 = if (ctx.env.get("HOME")) |h| ctx.arena.dupeSentinel(u8, h, 0) catch null else null;
+        const dir: ?[:0]const u8 = ctx.arena.dupeSentinel(u8, stateDir(ctx), 0) catch null;
+        ctx.disk_paths = .{ home, dir };
+        break :blk ctx.disk_paths.?;
+    };
+    var least: ?policy.Disk = null;
+    for (paths) |maybe| {
+        const path = maybe orelse continue;
+        const free = sys.diskFree(path) orelse continue;
+        if (least == null or free < least.?.free) least = .{ .free = free, .path = path };
+    }
+    return least;
 }
 
 fn envBudget(ctx: *Ctx) ?u32 {
@@ -1166,6 +1189,7 @@ fn gateText(buf: []u8, g: policy.Gate, budget: u32) []const u8 {
         .open => "open",
         .pressure => "closed: memory pressure",
         .low_memory => |av| std.mem.print(buf, "closed: memory low ({d:.1} GB available)", .{@as(f64, @floatFromInt(av)) / (1 << 30)}) catch "closed: memory low",
+        .low_disk => |d| std.mem.print(buf, "closed: disk low ({d:.1} GB free on {s})", .{ @as(f64, @floatFromInt(d.free)) / (1 << 30), d.path }) catch "closed: disk low",
         .load => |l| std.mem.print(buf, "closed: load {d:.1} (valve tripped; budget {d})", .{ l, budget }) catch "closed: load",
         .spacing => |l| std.mem.print(buf, "spacing admissions: load {d:.1} over budget {d}", .{ l, budget }) catch "spacing",
     };
@@ -2728,14 +2752,18 @@ const JsonWaiter = struct {
     since: i64 = 0,
 };
 
-/// The gate in a form a program can act on: `state` is open, pressure, load
-/// (the valve is tripped) or spacing (one admission per 10 s), and `load` is
+/// The gate in a form a program can act on: `state` is open, pressure,
+/// low_memory, low_disk, load (the valve is tripped) or spacing (one
+/// admission per 10 s), and `load` is
 /// the 1-minute load behind a load or spacing state.
 const JsonGate = struct {
     state: []const u8 = "",
     load: ?f64 = null,
     /// With `state` low_memory: the bytes of memory available.
     available: ?u64 = null,
+    /// With `state` low_disk: the bytes free, and a path on that filesystem.
+    disk_free: ?u64 = null,
+    disk_path: ?[]const u8 = null,
     text: []const u8 = "",
     /// The load valve's thresholds, when the load check is on: it trips above
     /// `trip` while the CPUs are at least `busy_trip` busy, and reopens at
@@ -3003,12 +3031,13 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
         .open => "open",
         .pressure => "closed: memory",
         .low_memory => |av| a.print("closed: {d:.1} GB free", .{@as(f64, @floatFromInt(av)) / (1 << 30)}) catch "closed: memory",
+        .low_disk => |d| a.print("closed: disk {d:.1} GB", .{@as(f64, @floatFromInt(d.free)) / (1 << 30)}) catch "closed: disk",
         .load => |l| a.print("closed: load {d:.1}", .{l}) catch "closed",
         .spacing => |l| a.print("spacing: load {d:.1}", .{l}) catch "spacing",
     }, .tint = switch (v.gate) {
         .open => .good,
         .spacing => .warn,
-        .load, .pressure, .low_memory => .bad,
+        .load, .pressure, .low_memory, .low_disk => .bad,
     } };
     const free = v.budget -| v.held;
     const summary: table.Table = .{
@@ -3358,6 +3387,8 @@ fn statusRemote(ctx: *Ctx, host: []const u8, json: bool, measure: bool) u8 {
         .{ .spacing = st.gate.load orelse 0 }
     else if (std.mem.eql(u8, st.gate.state, "low_memory"))
         .{ .low_memory = st.gate.available orelse 0 }
+    else if (std.mem.eql(u8, st.gate.state, "low_disk"))
+        .{ .low_disk = .{ .free = st.gate.disk_free orelse 0, .path = st.gate.disk_path orelse "" } }
     else
         .open;
     const waiters = a.dupe(JsonWaiter, st.waiters) catch st.waiters;
@@ -3479,10 +3510,18 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
                 .state = @tagName(g),
                 .load = switch (g) {
                     .load, .spacing => |l| l,
-                    .open, .pressure, .low_memory => null,
+                    .open, .pressure, .low_memory, .low_disk => null,
                 },
                 .available = switch (g) {
                     .low_memory => |av| av,
+                    else => null,
+                },
+                .disk_free = switch (g) {
+                    .low_disk => |d| d.free,
+                    else => null,
+                },
+                .disk_path = switch (g) {
+                    .low_disk => |d| d.path,
                     else => null,
                 },
                 .text = gate_text,

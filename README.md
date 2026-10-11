@@ -275,6 +275,9 @@ The gates hold the whole queue while they are closed:
 - **memory pressure** (`pressure_check`): macOS's critical level; on Linux, `some avg10` in
   `/proc/pressure/memory` at `pressure_psi` (10) or more;
 - **low memory** (`min_available`, off by default): available memory under that size;
+- **low disk** (`min_disk`, 5G): less than that free on the filesystem holding `$HOME` or the one
+  holding cpuq's state directory (the temp directory). A full disk fails every job and every tool
+  that writes a file, so the queue holds new ones until there is room;
 - **the load valve** (`load_check`): the 1-minute load over the budget plus `load_margin` while
   the CPUs are at least 90% busy. Under measured admission it gates only exclusive runs, though
   `cpuq status` shows it either way. `--no-load-check` skips it for one run.
@@ -460,6 +463,7 @@ re-reads the file when it changes; an invalid edit keeps the settings in force a
 | `pressure_check` | on | admit nothing under memory pressure |
 | `pressure_psi` | 10 | Linux: the `some avg10` percentage that counts as pressure |
 | `min_available` | off | admit nothing while available memory is under this (e.g. `6G`) |
+| `min_disk` | 5G | admit nothing while `$HOME`'s or the temp directory's filesystem has less free than this; off turns it off |
 | `max_memory` | off | stop a job whose processes together use more memory than this (e.g. `16G`) |
 | `exclusive` | on | grant `--exclusive`; off, it runs as an ordinary job |
 | `window_gap` | 0 | seconds after an exclusive run ends during which waiting ones go behind other work |

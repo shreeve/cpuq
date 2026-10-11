@@ -103,6 +103,12 @@ pub const Config = struct {
     /// Admit nothing while the memory the kernel says is available falls
     /// under this, in bytes (`min_available`, e.g. 6G); 0 leaves it unchecked.
     min_available: u64 = 0,
+    /// Admit nothing while the filesystem holding $HOME or cpuq's state
+    /// directory (the temp directory) has less than this free, in bytes
+    /// (`min_disk`, e.g. 5G); 0 leaves it unchecked. A full disk fails every
+    /// job and every tool that writes a file; on 2026-10-11 one session's
+    /// scratch files filled this Mac's disk to its last byte.
+    min_disk: u64 = 5 << 30,
     /// Lend the cores a holder has left idle for a minute to the head of the
     /// queue (`lend`).
     lend: bool = true,
@@ -199,6 +205,8 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             cfg.target = t;
         } else if (std.mem.eql(u8, key, "settle")) {
             cfg.settle_s = parseCount(value) orelse return bad(diag, "settle must be a whole number of seconds, at least 1");
+        } else if (std.mem.eql(u8, key, "min_disk")) {
+            cfg.min_disk = parseBytes(value) orelse return bad(diag, "min_disk must be off or a size such as 5G or 512M");
         } else if (std.mem.eql(u8, key, "min_available")) {
             cfg.min_available = parseBytes(value) orelse return bad(diag, "min_available must be off or a size such as 6G or 512M");
         } else if (std.mem.eql(u8, key, "max_memory")) {
@@ -402,6 +410,16 @@ pub const Machine = struct {
     /// Memory available, in bytes (Linux MemAvailable; macOS the kernel's
     /// free share of memory); null when not read.
     available: ?u64 = null,
+    /// The least free of the filesystems `min_disk` watches; null when not
+    /// read.
+    disk: ?Disk = null,
+};
+
+/// A filesystem's free space: the bytes an unprivileged writer may still
+/// use, and a path on it.
+pub const Disk = struct {
+    free: u64,
+    path: []const u8,
 };
 
 pub const Gate = union(enum) {
@@ -409,6 +427,8 @@ pub const Gate = union(enum) {
     pressure,
     /// Available memory under `min_available`: the bytes available.
     low_memory: u64,
+    /// A watched filesystem with less than `min_disk` free.
+    low_disk: Disk,
     load: f64,
     spacing: f64,
 };
@@ -418,6 +438,7 @@ pub const Gate = union(enum) {
 pub fn gate(cfg: Config, m: Machine, budget: u32, valve: ?*Valve, now: i64) Gate {
     if (cfg.pressure_check and m.pressure == .high) return .pressure;
     if (cfg.min_available > 0) if (m.available) |av| if (av < cfg.min_available) return .{ .low_memory = av };
+    if (cfg.min_disk > 0) if (m.disk) |d| if (d.free < cfg.min_disk) return .{ .low_disk = d };
     if (valve) |v| if (cfg.load_check) switch (v.check(now, m.load1, budget, cfg.load_margin, m.busy)) {
         .open => {},
         .tripped => return .{ .load = m.load1 },
@@ -791,6 +812,18 @@ test "memory pressure gate" {
     try testing.expectEqual(Gate.pressure, gate(cfg, squeezed, 8, null, 0));
     try testing.expectEqual(Gate.open, gate(.{ .pressure_check = false }, squeezed, 8, null, 0));
     try testing.expectEqual(Gate.open, gate(cfg, .{ .active = 10, .load1 = 3, .pressure = .unknown }, 8, null, 0));
+}
+
+test "disk gate" {
+    const cfg: Config = .{}; // min_disk 5G
+    const roomy: Machine = .{ .active = 10, .load1 = 3, .pressure = .normal, .disk = .{ .free = 80 << 30, .path = "/home/u" } };
+    try testing.expectEqual(Gate.open, gate(cfg, roomy, 8, null, 0));
+    const full: Disk = .{ .free = 1 << 30, .path = "/tmp" };
+    const tight: Machine = .{ .active = 10, .load1 = 3, .pressure = .normal, .disk = full };
+    try testing.expectEqual(Gate{ .low_disk = full }, gate(cfg, tight, 8, null, 0));
+    try testing.expectEqual(Gate.open, gate(.{ .min_disk = 0 }, tight, 8, null, 0));
+    // Unread (null): never closes the gate.
+    try testing.expectEqual(Gate.open, gate(cfg, .{ .active = 10, .load1 = 3, .pressure = .normal }, 8, null, 0));
 }
 
 test "load safety valve with hysteresis" {
