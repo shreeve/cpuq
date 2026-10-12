@@ -1003,7 +1003,9 @@ t_fair() {
   # The holder lasts until all four are queued, however slow the machine.
   "$CPUQ" run --cores 2 --label h:x -- sh -c "while [ ! -e $T/go ]; do sleep 0.1; done" & wait_held 2
   for n in a1 a2 a3 b1; do
-    "$CPUQ" run --cores 1 --label "${n:0:1}:x" -- sh -c "echo $n >>$f; sleep 1" &
+    # 3 s, not 1: should b1 wake late to its turn (twice on a 4-CPU CI
+    # runner it was still asleep when a1 ended), a2 would rightly go first.
+    "$CPUQ" run --cores 1 --label "${n:0:1}:x" -- sh -c "echo $n >>$f; sleep 3" &
     k=$((k + 1)); wait_waiters $k
   done
   touch "$T/go"
