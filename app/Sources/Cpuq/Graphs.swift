@@ -117,7 +117,7 @@ final class GraphModel {
         return (UserDefaults.standard.dictionary(forKey: "projectPalette") as? [String: Int]) ?? [:]
     }()
 
-    var budget: Int { max(status?.budget ?? 8, 1) }
+    var budget: Int { max(status?.capacity ?? 8, 1) }
 
     func add(_ s: Status, at now: Date = Date()) {
         status = s

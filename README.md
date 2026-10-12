@@ -197,7 +197,8 @@ token whose hold has ended is ignored, and the run queues as usual.
 job (label, cores in use, cores active, priority, how long, pid, command); every waiter (order,
 cores asked for, priority, how long, ETA, command); and the named leases. On a terminal it draws
 boxed tables in color (`NO_COLOR` drops the color): a job keeping fewer than half its cores
-active shows in yellow, since it asks for too much. Anywhere else it prints plain text, with a
+active shows in yellow, since it asks for too much. Under measured admission they count the
+cores handed out against the CPUs online (`CPUS`); under `admit = cores`, against the budget. Anywhere else it prints plain text, with a
 line `admit   by measured use, up to N CPUs`. A running job marked `*` is one whose cpuq is
 gone while its command still runs. When work outside cpuq uses a CPU or more, or a gate is
 closed, status names the busiest such processes.

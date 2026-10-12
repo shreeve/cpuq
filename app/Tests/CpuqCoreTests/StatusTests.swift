@@ -109,3 +109,13 @@ import Testing
     #expect(all?.count == ProcessInfo.processInfo.processorCount)
     #expect(all?.allSatisfy { $0.total >= $0.busy } == true)
 }
+
+@Test func capacityIsTheCPUsUnderMeasuredAdmission() throws {
+    // This Mac: 10 CPUs, `budget = 14` kept for exclusive runs, admitted by measured use.
+    let measured = try Status.decode(Data(#"{"budget": 14, "held": 8, "admit": "measured", "target": 11, "active_cores": 10}"#.utf8))
+    #expect(measured.capacity == 10)
+    let cores = try Status.decode(Data(#"{"budget": 8, "held": 8, "admit": "cores", "active_cores": 10}"#.utf8))
+    #expect(cores.capacity == 8)
+    let older = try Status.decode(Data(#"{"budget": 8, "held": 2}"#.utf8))
+    #expect(older.capacity == 8)
+}

@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.24 — 2026-10-12
+
+- The menu-bar meter, its tooltip and the menu count the cores in use against the CPUs online
+  ("8 of 10 cores in use") when cpuq admits by measured use, not against its `budget`, which can
+  be set above the CPU count ("8 of 14").
+
 ## 0.13.23 — 2026-10-11
 
 - Visual effects are one decision: on and the Mac not strained, the water moves and bubbles

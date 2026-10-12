@@ -74,8 +74,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.problem = e.message
                 }
                 let s = self.status
-                self.item.button?.image = self.chip(level: meterLevel(held: s?.held ?? 0, budget: s?.budget ?? 0))
-                self.item.button?.toolTip = s.map { "cpuq: \($0.held) of \($0.budget) cores in use · gate \($0.gate.text)" } ?? "cpuq: \(self.problem ?? "")"
+                self.item.button?.image = self.chip(level: meterLevel(held: s?.held ?? 0, budget: s?.capacity ?? 0))
+                self.item.button?.toolTip = s.map { "cpuq: \($0.held) of \($0.capacity) cores in use · gate \($0.gate.text)" } ?? "cpuq: \(self.problem ?? "")"
                 if self.menu.highlightedItem != nil || self.menu.numberOfItems == 0 { return }
                 self.rebuild()
             }
@@ -153,7 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let now = Date().timeIntervalSince1970
         let controls = supportsControls(version: s.version)
-        m.addItem(text("cpuq \(s.version)  ·  \(s.held) of \(s.budget) cores in use", bold: true))
+        m.addItem(text("cpuq \(s.version)  ·  \(s.held) of \(s.capacity) cores in use", bold: true))
         let load = s.load.first.map { String(format: "%.1f", $0) } ?? "?"
         m.addItem(text("load \(load)  ·  memory \(s.memoryPressure)  ·  gate \(s.gate.text)", bold: false))
         commands(m)

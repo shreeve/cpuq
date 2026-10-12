@@ -14,6 +14,8 @@ public struct Status: Decodable, Sendable, Equatable {
     /// CPUs) or "cores" (by the cores they hold, up to `budget`); empty from older cpuq.
     public var admit = ""
     public var target: Double?
+    /// The CPUs online (`active_cores`, cpuq 0.8 and later); 0 from older cpuq.
+    public var activeCores = 0
     public var gate = Gate()
     public var holders: [Holder] = []
     public var waiters: [Waiter] = []
@@ -21,7 +23,7 @@ public struct Status: Decodable, Sendable, Equatable {
     public var outside: [Outside] = []
 
     public struct Gate: Decodable, Sendable, Equatable {
-        /// open, pressure, load or spacing.
+        /// open, pressure, low_memory, low_disk, load or spacing.
         public var state = "open"
         public var load: Double?
         public var text = "open"
@@ -83,7 +85,7 @@ public struct Status: Decodable, Sendable, Equatable {
 // Decoding with defaults: a missing key keeps the property's default.
 extension Status {
     private enum Keys: String, CodingKey {
-        case schema, version, budget, held, free, load, memoryPressure, gate, holders, waiters, leases, outside, admit, target
+        case schema, version, budget, held, free, load, memoryPressure, gate, holders, waiters, leases, outside, admit, target, activeCores
     }
 
     public init(from decoder: any Decoder) throws {
@@ -97,6 +99,7 @@ extension Status {
         memoryPressure = try c.decodeIfPresent(String.self, forKey: .memoryPressure) ?? ""
         admit = try c.decodeIfPresent(String.self, forKey: .admit) ?? ""
         target = try c.decodeIfPresent(Double.self, forKey: .target)
+        activeCores = try c.decodeIfPresent(Int.self, forKey: .activeCores) ?? 0
         gate = try c.decodeIfPresent(Gate.self, forKey: .gate) ?? Gate()
         holders = try c.decodeIfPresent([Holder].self, forKey: .holders) ?? []
         waiters = try c.decodeIfPresent([Waiter].self, forKey: .waiters) ?? []
@@ -168,6 +171,15 @@ extension Status.Outside {
         pid = try c.decodeIfPresent(Int.self, forKey: .pid) ?? 0
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
         using = try c.decodeIfPresent(Double.self, forKey: .using) ?? 0
+    }
+}
+
+extension Status {
+    /// The cores to count use against: under measured admission the CPUs online,
+    /// since `budget` there is only an exclusive run's size and can exceed them
+    /// (a Mac with 10 CPUs and `budget = 14`); under `admit = cores`, the budget.
+    public var capacity: Int {
+        admit == "measured" && activeCores > 0 ? activeCores : budget
     }
 }
 

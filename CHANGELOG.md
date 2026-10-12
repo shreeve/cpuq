@@ -2,6 +2,13 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.11.1 — 2026-10-12
+
+- `cpuq status` on a terminal counts the cores handed out against the CPUs online under measured
+  admission (`CPUS 10`, `in use: 8 of 10 CPUs`), not against `budget`, which there only sizes an
+  exclusive run and may be set above the CPU count: a 10-CPU Mac with `budget = 14` showed
+  `BUDGET 14` and `8 of 14 cores`.
+
 ## 0.11.0 — 2026-10-11
 
 - A disk gate: cpuq admits nothing while the filesystem holding `$HOME` or the temp directory

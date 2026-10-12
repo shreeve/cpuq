@@ -2964,7 +2964,12 @@ const JsonStatus = struct {
 };
 
 const StatusView = struct {
+    /// The cores use is counted against: under measured admission the CPUs
+    /// online (`budget` there only sizes an exclusive run, and may be set
+    /// above the CPU count); under `admit = cores`, the budget.
     budget: u32,
+    /// Whether `budget` is the CPUs online (measured admission).
+    cpus: bool = false,
     held: u32,
     load: [3]f64,
     pressure: policy.Pressure,
@@ -3043,7 +3048,7 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
     const summary: table.Table = .{
         .title = a.print("cpuq {s}{s}{s}", .{ v.version orelse version, if (short_host.len != 0) " · " else "", short_host }) catch "cpuq",
         .columns = &.{
-            .{ .head = "BUDGET", .alignment = .right },
+            .{ .head = if (v.cpus) "CPUS" else "BUDGET", .alignment = .right },
             .{ .head = "IN USE", .alignment = .right },
             .{ .head = "FREE", .alignment = .right },
             .{ .head = "LOAD", .sub = "1 5 15" },
@@ -3081,7 +3086,7 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
             }) catch continue) catch {};
         }
         const t: table.Table = .{
-            .title = a.print("in use: {d} of {d} cores", .{ v.held, v.budget }) catch "in use",
+            .title = a.print("in use: {d} of {d} {s}", .{ v.held, v.budget, if (v.cpus) "CPUs" else "cores" }) catch "in use",
             .columns = &.{
                 .{ .head = "LABEL" },
                 .{ .head = "IN USE", .alignment = .right },
@@ -3392,8 +3397,10 @@ fn statusRemote(ctx: *Ctx, host: []const u8, json: bool, measure: bool) u8 {
     else
         .open;
     const waiters = a.dupe(JsonWaiter, st.waiters) catch st.waiters;
+    const remote_cpus = std.mem.eql(u8, st.admit, "measured") and st.active_cores > 0;
     statusBoxed(ctx, .{
-        .budget = st.budget,
+        .budget = if (remote_cpus) st.active_cores else st.budget,
+        .cpus = remote_cpus,
         .held = st.held,
         .load = st.load,
         .pressure = std.meta.stringToEnum(policy.Pressure, st.memory_pressure) orelse .unknown,
@@ -3539,8 +3546,10 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
         return 0;
     }
     if (std.c.isatty(1) != 0) {
+        const by_cpus = ctx.cfg.admit == .measured;
         statusBoxed(ctx, .{
-            .budget = budget,
+            .budget = if (by_cpus) m.active else budget,
+            .cpus = by_cpus,
             .held = held,
             .load = load,
             .pressure = m.pressure,
