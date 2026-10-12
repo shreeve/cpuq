@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.25 — 2026-10-12
+
+- An update that relaunches the app with the graphs window open opens it again; until now the
+  app came back as only its menu-bar chip, which looked as if it had never relaunched. Since the
+  version being replaced does the remembering, this starts with the update after 0.13.25.
+
 ## 0.13.24 — 2026-10-12
 
 - The menu-bar meter, its tooltip and the menu count the cores in use against the CPUs online

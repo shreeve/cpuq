@@ -23,9 +23,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// to replace itself.
     private let updater = SPUStandardUpdaterController(
         startingUpdater: Bundle.main.bundleURL.pathExtension == "app",
-        updaterDelegate: nil,
+        updaterDelegate: AppDelegate.relaunch,
         userDriverDelegate: nil
     )
+    /// Sparkle holds its delegate weakly.
+    private static let relaunch = UpdateRelaunch()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         item.button?.image = chip(level: 0)
@@ -34,8 +36,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.menu = menu
         rebuild()
         poll()
+        // An update relaunched the app with the graphs window open: open it again. A menu-bar
+        // app otherwise comes back as only its chip, and the update looks as if it never relaunched.
+        AppDelegate.relaunch.graphsOpen = { [weak self] in self?.graphsWindow?.isVisible ?? false }
+        let reopen = UserDefaults.standard.bool(forKey: UpdateRelaunch.key)
+        UserDefaults.standard.removeObject(forKey: UpdateRelaunch.key)
         // For testing a build: open the graphs window at launch.
-        if ProcessInfo.processInfo.environment["CPUQ_SHOW_GRAPHS"] != nil { showGraphs() }
+        if reopen || ProcessInfo.processInfo.environment["CPUQ_SHOW_GRAPHS"] != nil { showGraphs() }
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
         }
@@ -467,6 +474,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
 extension NSFont {
     var bold: NSFont { NSFontManager.shared.convert(self, toHaveTrait: .boldFontMask) }
+}
+
+/// Notes, as Sparkle relaunches the app after an update, whether the graphs window was open.
+final class UpdateRelaunch: NSObject, SPUUpdaterDelegate {
+    static let key = "graphsOpenAtUpdate"
+    var graphsOpen: () -> Bool = { false }
+
+    func updaterWillRelaunchApplication(_ updater: SPUUpdater) {
+        UserDefaults.standard.set(graphsOpen(), forKey: Self.key)
+        UserDefaults.standard.synchronize()
+    }
 }
 
 let app = NSApplication.shared
