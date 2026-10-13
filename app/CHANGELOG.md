@@ -3,6 +3,15 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.13.26 — 2026-10-12
+
+- Time from before the app started is no longer called idle. The app rebuilds the minutes before
+  it launched from cpuq (when each job started, when each waiter queued) but has no CPU readings
+  for them, and it counted that unknown as zero: just after launch on a Mac at load 62 it showed
+  "2 waiting · 10 CPUs idle" and "waited with CPUs idle 4 min". Needless waiting is now judged
+  only where the app measured the CPUs; a job already running at launch is drawn at its first
+  reading rather than at nothing; and pointing at that time says "Not watched".
+
 ## 0.13.25 — 2026-10-12
 
 - An update that relaunches the app with the graphs window open opens it again; until now the

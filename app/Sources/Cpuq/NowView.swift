@@ -87,8 +87,12 @@ struct Moment {
 
     var total: Double { shares.reduce(0) { $0 + $1.cpu } + outside }
     var free: Double { max(cpus - total, 0) }
-    /// Jobs waited while CPUs sat idle with the gate open: the case to fix.
-    var needless: Bool { !waiters.isEmpty && free >= 2 && gateShut == nil && window == nil }
+    /// The app was running then and measured the CPUs; before it was, jobs and waits are known
+    /// from cpuq but how busy the CPUs were is not.
+    var watched = true
+    /// Jobs waited while CPUs sat idle with the gate open: the case to fix. Never judged from
+    /// a moment the app did not watch: unknown CPU is not idle CPU.
+    var needless: Bool { watched && !waiters.isEmpty && free >= 2 && gateShut == nil && window == nil }
 
     /// No more than the CPUs, whatever the readings say.
     mutating func fit() {
@@ -135,6 +139,7 @@ struct Moment {
         let jobs = out.total
         let sample = m.samples.min { abs($0.at.timeIntervalSince(t)) < abs($1.at.timeIntervalSince(t)) }
             .flatMap { abs($0.at.timeIntervalSince(t)) < 15 ? $0 : nil }
+        out.watched = sample != nil
         if let sample {
             out.load = sample.load
             out.outside = sample.busy.map { max($0 * cpus - jobs, 0) } ?? sample.outside
@@ -171,7 +176,7 @@ final class HourCache {
         var window = false
         var perCPU: [Double]?
         var total: Double { shares.values.reduce(0, +) + outside }
-        var needless: Bool { waiting > 0 && cpus - total >= 2 && !gateShut && !window }
+        var needless: Bool { watched && waiting > 0 && cpus - total >= 2 && !gateShut && !window }
     }
 
     struct Hour {
@@ -224,7 +229,9 @@ final class HourCache {
                 let o = max(0, min(c.to, b.to ?? end).timeIntervalSince(max(c.from, b.from))) / step
                 guard o > 0 else { continue }
                 let cpu: Double?
-                if let s = sum[i], let k = n[i] { cpu = s / Double(k) } else if firstReading == nil || c.to <= firstReading! { cpu = b.average } else { cpu = nil }
+                // A job already running when the app started has no average yet: before its
+                // first reading, count it at that reading rather than at nothing.
+                if let s = sum[i], let k = n[i] { cpu = s / Double(k) } else if firstReading == nil || c.to <= firstReading! { cpu = b.average ?? b.active.first?.cores } else { cpu = nil }
                 if let cpu { cols[i].shares[b.project, default: 0] += cpu * o }
             }
         }
@@ -379,6 +386,8 @@ struct HeroCard: View {
         if let w = moment.window {
             verdict("lock.fill", "Timing window", moment.windowHolds ? "\(w) has the Mac alone" : "\(w) waits for the Mac to empty",
                     tint: Alive.windowTint)
+        } else if !moment.watched {
+            verdict("eye.slash", "Not watched", "The app wasn't running then: how busy the CPUs were is unknown")
         } else if moment.needless {
             verdict("exclamationmark.triangle.fill", "\(moment.waiters.count) waiting while \(free) CPUs sit idle",
                     "Waiting with room to spare", tint: Alive.rose)
@@ -398,6 +407,8 @@ struct HeroCard: View {
         if let longest = moment.waiters.map({ ref.timeIntervalSince($0.since) }).max() {
             if moment.window != nil {
                 verdict("clock", "\(moment.waiters.count) waiting \(duration(longest))", "They start when the window ends")
+            } else if !moment.watched {
+                verdict("clock", "\(moment.waiters.count) waiting \(duration(longest))", "Whether CPUs were free is unknown")
             } else if moment.needless {
                 verdict("clock.fill", "Longest wait \(duration(longest))", "This is the case to fix", tint: Alive.rose)
             } else if moment.gateShut != nil {
