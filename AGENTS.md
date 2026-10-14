@@ -49,9 +49,10 @@ branch names: history sizes jobs and estimates waits by label.
 
 ## Another machine
 
-When this machine's queue is long (about 5 or more waiting in `cpuq status`) and another machine
-you can use has room (`cpuq status --host HOST`), run work that doesn't need this OS there,
-through that machine's own cpuq:
+When this machine is full (anyone waiting in `cpuq status`, or the 1-minute load above its CPU
+count) and another machine you can use has room (`cpuq status --host HOST`: nobody waiting, load
+under its CPU count), run work that doesn't need this OS there, through that machine's own cpuq.
+Don't wait for a long queue: a job sent at the first wait spares everyone behind it. For example:
 
     ssh HOST 'cd repo && cpuq run --label app:build --cores 2-8 -- sh -c "make -j\"\$CPUQ_CORES\""'
 
