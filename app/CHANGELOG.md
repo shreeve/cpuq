@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.17.4 — 2026-10-15
+
+- When more jobs run or wait than the Jobs card shows, its bottom edge says "+1 more ↓" (or
+  however many). 0.17.3's always-visible scroll bar didn't show on macOS, which draws scroll bars
+  over the content and hides them when idle.
+
 ## 0.17.3 — 2026-10-15
 
 - Pointing at an earlier moment redraws the CPU grid for that moment at once. It used to keep

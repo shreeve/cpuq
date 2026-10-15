@@ -1159,10 +1159,19 @@ struct HourCard: View {
 
 // MARK: - Jobs
 
+private struct JobsScrollKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
 struct JobsCard: View {
     let model: GraphModel
     private var cpus: Double { model.cpus }
     var control: ((String, Int, String) -> Void)?
+    /// The list's visible height and how far it is scrolled: what's below the card's edge.
+    @State private var listHeight: CGFloat = 0
+    @State private var scrolled: CGFloat = 0
+    private let rowHeight: CGFloat = 21
 
     var body: some View {
         let s = model.status
@@ -1190,10 +1199,26 @@ struct JobsCard: View {
                         Text("Nothing running or waiting.").foregroundStyle(Alive.ink2).frame(maxWidth: .infinity, alignment: .leading).frame(height: 21)
                     }
                 }
+                .background(GeometryReader { g in
+                    Color.clear.preference(key: JobsScrollKey.self, value: -g.frame(in: .named("jobs")).minY)
+                })
             }
-            // Shown whenever rows run past the card's edge: macOS hides an idle scroller, and a
-            // job below the edge looked like no job at all ("4 running", three rows).
-            .scrollIndicators(.visible)
+            .coordinateSpace(name: "jobs")
+            .onPreferenceChange(JobsScrollKey.self) { scrolled = $0 }
+            .background(GeometryReader { g in
+                Color.clear.onAppear { listHeight = g.size.height }.onChange(of: g.size.height) { _, h in listHeight = h }
+            })
+            // macOS hides an idle scroller, so rows past the card's edge say so: "4 running" with
+            // three rows in sight looked like a job had gone missing.
+            .overlay(alignment: .bottomTrailing) {
+                let below = holders.count + waiters.count - Int(((listHeight + scrolled) / rowHeight).rounded(.down))
+                if below > 0 {
+                    Text("+\(below) more ↓").font(.system(size: 11, weight: .medium)).foregroundStyle(Alive.ink2)
+                        .padding(.horizontal, 7).padding(.vertical, 2)
+                        .background(Capsule().fill(Alive.glass)).overlay(Capsule().strokeBorder(Alive.glassEdge))
+                        .allowsHitTesting(false)
+                }
+            }
         }
         .padding(.horizontal, 18).padding(.vertical, 10)
         .card()
