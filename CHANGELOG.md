@@ -2,17 +2,24 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
-## 0.19.2 — 2026-10-15
+## 0.19.3 — 2026-10-15
 
 - **`.git` ships as a git of the copy's own** (`--ship .git`, or a `.git` line in `.cpuq-spill`):
   only git's parts of the repo (objects, refs, packed-refs, config, info, shallow) and the
   worktree's own HEAD and index. A worktree's `.git` file becomes a repo on the host, and build
   stores and caches kept under `.git` stay here, so `git ls-files` works on a spill host.
+- **The time left is reckoned from when a job began counting**, not from its start: a build
+  before its tests made the first estimates hours long. The job's cpuq notes its first count
+  (`progress_since`, `progress_base` in its record).
+- `cpuq note` on a job that has only just started, or is still waiting, keeps: the job's own
+  cpuq no longer writes its record back over the new note.
 - A job's progress file is its own: a `cpuq run` started inside another job's environment, but
   not nested in it, no longer takes that job's `CPUQ_PROGRESS` (nor leaves the file behind).
 - `cpuq status` piped or read by a program shows a running job's progress on a line under it
   (`4210/12629 33% · 3 failing · ~9m left`), and a job without one its estimate from history
   (`~12m left (usually 46m)`, or `over its usual 46m`).
+
+(0.19.2 was tagged but never published; its changes are in 0.19.3.)
 
 ## 0.19.1 — 2026-10-15
 

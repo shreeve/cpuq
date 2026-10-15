@@ -1059,9 +1059,11 @@ t_progress() {
   # A job that writes DONE TOTAL FAILING to $CPUQ_PROGRESS shows it, and the time left, in status;
   # the file goes when the job ends.
   setup progress
-  "$CPUQ" run --cores 1 --label proj:matrix -- sh -c 'for d in 0 100 200 300 400; do echo "$d 1000 2" > "$CPUQ_PROGRESS.tmp"; mv "$CPUQ_PROGRESS.tmp" "$CPUQ_PROGRESS"; sleep 1; done; echo "$CPUQ_PROGRESS" > '"$T/path" & wait_held 1
-  sleep 2.5
-  local got; got=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; h = json.load(sys.stdin)["holders"][0]; p = h["progress"]; print(p["total"], p["failing"], h["left_from"], h["left"] > 0)')
+  # It builds for 3 s, then counts 100 a second: the time left goes by its rate since it began
+  # counting (about 7 s at the look), not by its whole run (which would say over 15).
+  "$CPUQ" run --cores 1 --label proj:matrix -- sh -c 'sleep 3; for d in 0 100 200 300 400 500 600; do echo "$d 1000 2" > "$CPUQ_PROGRESS.tmp"; mv "$CPUQ_PROGRESS.tmp" "$CPUQ_PROGRESS"; sleep 1; done; echo "$CPUQ_PROGRESS" > '"$T/path" & wait_held 1
+  sleep 7
+  local got; got=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; h = json.load(sys.stdin)["holders"][0]; p = h["progress"]; print(p["total"], p["failing"], h["left_from"], 3 < h["left"] < 13)')
   local line; line=$("$CPUQ" status --no-usage | grep -c '/1000 .*% · 2 failing · ~')
   wait
   local gone=yes; [ -e "$(cat "$T/path")" ] && gone=no

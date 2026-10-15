@@ -1182,6 +1182,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
                 giveUp(ctx, st, ticket_name, now - start, job);
             } else if (std.mem.eql(u8, action, "first")) {
                 rec.first = true;
+                keepNote(a, io, ticket, &rec);
                 rewriteRecord(io, ticket, rec);
                 std.debug.print("cpuq: moved to the front by hand\n", .{});
             } else if (std.mem.eql(u8, action, "start")) {
@@ -1513,6 +1514,7 @@ fn admitted(ctx: *Ctx, st: *state.State, o: RunOptions, rec: *state.Record, gran
     // The lease is named by the ticket number; should a live job hold that
     // name anyway, take a fresh number rather than wait.
     var lease_name: []const u8 = undefined;
+    keepNote(ctx.arena, io, ticket, rec);
     const lease = for (0..3) |_| {
         lease_name = state.leaseName(ctx.arena.alloc(u8, 16) catch fail("out of memory", .{}), rec.ticket, o.exclusive);
         break st.createLease(rec.*, lease_name) catch |err| switch (err) {
@@ -1717,6 +1719,7 @@ fn watchChild(ctx: *Ctx, pid: std.c.pid_t, label: []const u8) sys.Waited {
         // The first look at half a second, then every 2.
         if (tick < 5 or (tick - 5) % 20 != 0) continue;
         if (sys.reapChild(pid)) |w| return lastLook(ctx, &arena_state, peakAtLeastAverage(withMemory(w, stopped, peak), start_ms), label);
+        markCounting(ctx);
         _ = arena_state.reset(.retain_capacity);
         const a = arena_state.allocator();
         const procs = sys.processes(ctx.io, a);
@@ -1806,6 +1809,31 @@ fn signalTree(a: std.mem.Allocator, procs: []const sys.Proc, root: std.c.pid_t, 
     };
 }
 
+/// The lease this run holds and its state, for watchChild's look at the job's progress.
+var counting_lease: ?*Lease = null;
+var counting_state: ?*state.State = null;
+
+/// The job's first count: when it came and what it said, kept in its record, so its time left
+/// is reckoned from its rate since it began counting, not from its start (a build first, say).
+fn markCounting(ctx: *Ctx) void {
+    const l = counting_lease orelse return;
+    if (l.record.progress_since != 0 or l.record.progress.len == 0) return;
+    const p = readProgress(ctx.io, l.record.progress) orelse return;
+    const st = counting_state orelse return;
+    st.lock() catch return;
+    defer st.unlock();
+    l.record.progress_since = nowSeconds(ctx.io);
+    l.record.progress_base = p.done;
+    keepNote(ctx.arena, ctx.io, l.file, &l.record);
+    rewriteRecord(ctx.io, l.file, l.record);
+}
+
+/// Before a job rewrites its own record: the note on file, which `cpuq note` may have set since
+/// (the job never changes its own).
+fn keepNote(a: std.mem.Allocator, io: Io, f: Io.File, r: *state.Record) void {
+    if (state.readRecord(io, a, f)) |on_file| r.note = on_file.note;
+}
+
 /// Writes a lease's record over the old one, from the start. A record has no
 /// size limit (a command can be a long inline script), so it goes through a
 /// positional writer rather than a fixed buffer, which once dropped records
@@ -1892,13 +1920,21 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
     if (pipe[1] >= 0) sys.closeFd(pipe[1]);
     const waited: sys.Waited = if (spawned) |pid| blk: {
         sys.setChild(pid);
+        // Under the lock `cpuq note` takes, so a note it sets now is kept, not written over.
+        st.lock() catch {};
         lease.record.child = pid;
+        keepNote(ctx.arena, io, lease.file, &lease.record);
         rewriteRecord(io, lease.file, lease.record);
         if (exclusive_cores) |*x| {
             x.lease.record.child = pid;
+            keepNote(ctx.arena, io, x.lease.file, &x.lease.record);
             rewriteRecord(io, x.lease.file, x.lease.record);
         }
+        st.unlock();
+        counting_lease = &lease;
+        counting_state = st;
         const w = watchChild(ctx, pid, lease.job.base.label);
+        counting_lease = null;
         // The command is done: what it left behind in its scope (a daemon, a test program a
         // killed runner started) goes too, so nothing runs on unaccounted. systemd removes
         // the emptied scope.
@@ -2943,7 +2979,10 @@ fn cmdControl(ctx: *Ctx, comptime action: []const u8, args: []const [:0]const u8
         if (!for_waiters and r.child <= 0) {
             var tries: u32 = 0;
             while (r.child <= 0 and tries < 20) : (tries += 1) {
+                // Unlocked meanwhile: the job takes the lock to write its child pid.
+                st.unlock();
                 ctx.io.sleep(.fromMilliseconds(50), .awake) catch {};
+                lockOrFail(&st);
                 r = state.leaseRecord(&st, a, e.name) orelse break;
             }
             if (tries != 0) procs = sys.processes(ctx.io, a);
@@ -4520,8 +4559,12 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
         h.progress = readProgress(ctx.io, l.record.progress);
         h.typical = if (rt_all) |rt| rt.typical(l.record.label) else null;
         const ran: f64 = @floatFromInt(@max(now - l.record.since, 0));
-        if (h.progress) |p| if (p.done != 0 and ran > 0) {
-            h.left = ran * @as(f64, @floatFromInt(p.total - p.done)) / @as(f64, @floatFromInt(p.done));
+        // The rate since it began counting (its build before that is no guide), or, from a
+        // cpuq that doesn't note when that was, since it started.
+        const counting: f64 = if (l.record.progress_since != 0) @floatFromInt(@max(now - l.record.progress_since, 0)) else ran;
+        const base: u64 = if (l.record.progress_since != 0) l.record.progress_base else 0;
+        if (h.progress) |p| if (p.done > base and counting > 0) {
+            h.left = counting * @as(f64, @floatFromInt(p.total -| p.done)) / @as(f64, @floatFromInt(p.done - base));
             h.left_from = "progress";
         };
         if (h.left == null) if (h.typical) |t| {

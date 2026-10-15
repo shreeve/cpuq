@@ -288,6 +288,10 @@ pub const Record = struct {
     note: []const u8 = "",
     /// The file the job reports its progress in (`CPUQ_PROGRESS`): `DONE TOTAL FAILING`.
     progress: []const u8 = "",
+    /// When the job first reported a count (unix seconds; 0 before), and the count it reported
+    /// then: its rate is reckoned from there, not from its start.
+    progress_since: i64 = 0,
+    progress_base: u64 = 0,
 
     pub fn write(r: Record, w: *Io.Writer) Io.Writer.Error!void {
         try w.print("ticket={d}\npid={d}\nchild={d}\ncores={d}\nmax={d}\npriority={t}\nexclusive={d}\nsince={d}\n", .{
@@ -308,6 +312,7 @@ pub const Record = struct {
             try w.writeAll("progress=");
             try writeLine(w, r.progress);
         }
+        if (r.progress_since != 0) try w.print("progress_since={d}\nprogress_base={d}\n", .{ r.progress_since, r.progress_base });
     }
 
     fn writeLine(w: *Io.Writer, text: []const u8) Io.Writer.Error!void {
@@ -335,6 +340,8 @@ pub const Record = struct {
             if (std.mem.eql(u8, k, "opaque")) r.hidden = std.mem.eql(u8, v, "1");
             if (std.mem.eql(u8, k, "note")) r.note = v;
             if (std.mem.eql(u8, k, "progress")) r.progress = v;
+            if (std.mem.eql(u8, k, "progress_since")) r.progress_since = std.fmt.parseInt(i64, v, 10) catch 0;
+            if (std.mem.eql(u8, k, "progress_base")) r.progress_base = std.fmt.parseInt(u64, v, 10) catch 0;
         }
         return r;
     }
@@ -369,6 +376,12 @@ pub fn writeRecord(io: Io, file: Io.File, r: Record) !void {
     var fw = file.writerStreaming(io, &buf);
     try r.write(&fw.interface);
     try fw.interface.flush();
+}
+
+/// The record in an open ticket or lease file, or null while it holds none.
+pub fn readRecord(io: Io, arena: std.mem.Allocator, file: Io.File) ?Record {
+    const r = Record.parse(readAll(io, arena, file));
+    return if (r.ticket == 0) null else r;
 }
 
 fn readAll(io: Io, arena: std.mem.Allocator, file: Io.File) []const u8 {

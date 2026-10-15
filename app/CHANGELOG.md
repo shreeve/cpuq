@@ -3,6 +3,14 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.19.1 — 2026-10-15
+
+- A job that reports its progress has a completion bar in the Jobs card, with its percent beside
+  it, and "679 of 3,870 · 2 failing · ~26m left" after. A job that doesn't keeps its CPU bar.
+- The right of each running job shows its CPU used of the cores it reserved: "25.4 of 32".
+- With cpuq 0.19.3 the time left is reckoned from when the job began counting, so a build before
+  its tests no longer makes the first estimates hours long.
+
 ## 0.19.0 — 2026-10-15
 
 - A running job that reports its progress (cpuq 0.19's `CPUQ_PROGRESS`) shows how far it is in

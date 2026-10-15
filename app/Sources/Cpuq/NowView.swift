@@ -54,13 +54,11 @@ func roughly(_ s: TimeInterval) -> String {
     return "\(m / 60)h " + String(format: "%02dm", m % 60)
 }
 
-/// How far a running job is: "4,210/12,629 33% · 3 failing · ~9m left" from its own count,
+/// How far a running job is: "4,210 of 12,629 · 3 failing · ~9m left" from its own count,
 /// or "usually 46m" from its label's history.
 func progressText(_ h: Status.Holder) -> Text {
     if let p = h.progress, p.total > 0 {
-        let pct = Int((Double(p.done) / Double(p.total) * 100).rounded(.down))
-        var t = Text("\(p.done.formatted())/\(p.total.formatted()) ").foregroundStyle(Alive.ink)
-            + Text("\(pct)%").fontWeight(.medium).foregroundStyle(Alive.ink)
+        var t = Text("\(p.done.formatted()) of \(p.total.formatted())").foregroundStyle(Alive.ink)
         if p.failing > 0 { t = t + Text(" · \(p.failing.formatted()) failing").foregroundStyle(.red) }
         if let left = h.left, h.leftFrom == "progress" { t = t + Text(" · ~\(roughly(left)) left").foregroundStyle(Alive.ink2) }
         return t
@@ -1208,7 +1206,7 @@ struct JobsCard: View {
                 Text("· \(holders.count) running · \(waiters.count) waiting").font(.system(size: 13, weight: .medium)).foregroundStyle(Alive.ink)
                 Spacer()
                 ViewThatFits(in: .horizontal) {
-                    Text("bar = CPU actually used (0–\(Int(scale))) · reserved = the job’s ‑j ticket")
+                    Text("bar = how far a job is, when it says; else CPU used (0–\(Int(scale))) · CPU used of the cores reserved")
                     Text("bar = CPU used (0–\(Int(scale)))")
                     Color.clear.frame(width: 0, height: 0)
                 }
@@ -1250,6 +1248,8 @@ struct JobsCard: View {
     private func running(_ h: Status.Holder, scale: Double) -> some View {
         let project = GraphModel.group(h.label, h.note)
         let use = h.using ?? 0
+        // How far it is, when it says (DONE of TOTAL); else the bar is its CPU.
+        let done: Double? = h.progress.flatMap { $0.total > 0 ? min(Double($0.done) / Double($0.total), 1) : nil }
         return HStack(spacing: 10) {
             Circle().fill(model.color(project)).frame(width: 8, height: 8)
             // The note after the label, quieter: "rig:corpus  #224 markers".
@@ -1260,12 +1260,14 @@ struct JobsCard: View {
                 GeometryReader { g in
                     ZStack(alignment: .leading) {
                         Capsule().fill(Alive.track)
-                        Capsule().fill(model.color(project)).frame(width: g.size.width * min(use / scale, 1))
+                        Capsule().fill(model.color(project)).frame(width: g.size.width * (done ?? min(use / scale, 1)))
                     }
                 }
                 .frame(maxWidth: 300).frame(height: 8)
                 if h.paused {
                     Text("paused").foregroundStyle(.orange).frame(width: 52, alignment: .leading)
+                } else if let done {
+                    Text("\(Int((done * 100).rounded(.down)))%").fontWeight(.medium).foregroundStyle(Alive.ink).frame(width: 52, alignment: .leading)
                 } else if h.using == nil {
                     Text("starting").foregroundStyle(Alive.ink2).frame(width: 52, alignment: .leading)
                 } else {
@@ -1274,7 +1276,7 @@ struct JobsCard: View {
             }
             progressText(h).lineLimit(1).truncationMode(.tail)
                 .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading).padding(.leading, 6)
-            Text(h.exclusive ? "timing window" : "\(h.cores) reserved").font(.system(size: 11.5))
+            Text(h.exclusive ? "timing window" : h.using.map { String(format: "%.1f of %d", $0, h.cores) } ?? "\(h.cores) reserved").font(.system(size: 11.5))
                 .foregroundStyle(h.exclusive ? Alive.windowTint : Alive.ink3).frame(width: 100, alignment: .trailing)
             Text(duration(Date().timeIntervalSince1970 - Double(h.since))).foregroundStyle(Alive.ink2).frame(width: 64, alignment: .trailing)
         }
