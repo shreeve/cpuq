@@ -13,11 +13,8 @@ struct NowView: View {
 
     /// The moment under the pointer in the hour chart; nil for now.
     @State private var scrub: Date?
-    @AppStorage("hourMode") private var hourMode = HourMode.stacked
     @State private var cache = HourCache()
     @State private var motion = CellMotion()
-
-    enum HourMode: String { case stacked, cores }
 
     var body: some View {
         guard model.status != nil else {
@@ -26,28 +23,19 @@ struct NowView: View {
         let end = Date()
         let hour = cache.hour(model, end: end)
         let shown = scrub.map { Moment.at($0, model) } ?? Moment.now(model)
-        return AnyView(GeometryReader { geo in
-            let gap = 12.0
-            let hero = geo.size.height < 560 ? 200.0 : 232.0
-            let rows = min((model.status?.holders.count ?? 0) + (model.status?.waiters.count ?? 0), 8)
-            let jobsNeed = 40 + Double(max(rows, 1)) * 21
-            let hist = min(max(geo.size.height - hero - jobsNeed - 2 * gap, 150), 300)
-            let jobs = max(geo.size.height - hero - hist - 2 * gap, 60)
-            VStack(spacing: gap) {
-                HeroCard(model: model, moment: shown, motion: motion, control: control)
-                    .frame(height: hero)
-                HourCard(model: model, hour: hour, mode: $hourMode, scrub: $scrub)
-                    .frame(height: hist)
-                JobsCard(model: model, control: control)
-                    .frame(height: jobs)
-            }
-        })
+        // One page per machine, top to bottom: now, the hour (both charts), the jobs, and
+        // history; every section's height is the user's to drag.
+        return AnyView(SplitColumn(key: "page.splits", defaults: [0.24, 0.38, 0.19, 0.19], minimums: [196, 190, 64, 96], sections: [
+            AnyView(HeroCard(model: model, moment: shown, motion: motion, control: control)),
+            AnyView(HourCard(model: model, hour: hour, scrub: $scrub)),
+            AnyView(JobsCard(model: model, control: control)),
+            AnyView(HistoryCard(model: model)),
+        ]))
     }
 }
 
 // MARK: - What the views show
 
-private let cpus = Double(ProcessInfo.processInfo.activeProcessorCount)
 
 /// Seconds as "4s", "1m 01s", "2h 03m".
 func duration(_ s: TimeInterval) -> String {
@@ -84,6 +72,8 @@ struct Moment {
     var windowHolds = false
     /// The 1-minute load: threads running or ready to run, the demand on the CPUs.
     var load: Double?
+    /// The machine's CPUs.
+    var cpus = 1.0
 
     var total: Double { shares.reduce(0) { $0 + $1.cpu } + outside }
     var free: Double { max(cpus - total, 0) }
@@ -108,13 +98,14 @@ struct Moment {
         var by: [String: Double] = [:]
         for h in s.holders { by[GraphModel.project(h.label), default: 0] += h.using ?? 0 }
         var out = Moment()
+        out.cpus = m.cpus
         out.shares = by.keys.sorted { (m.slot($0), $0) < (m.slot($1), $1) }.map { Share(project: $0, cpu: by[$0] ?? 0) }
         let jobs = out.total
         // The rest of what the Mac measured busy, beyond cpuq's jobs, is other work.
-        if let busy = m.samples.last?.busy { out.outside = max(busy * cpus - jobs, 0) } else { out.outside = s.outside.reduce(0) { $0 + $1.using } }
+        if let busy = m.samples.last?.busy { out.outside = max(busy * m.cpus - jobs, 0) } else { out.outside = s.outside.reduce(0) { $0 + $1.using } }
         out.waiters = s.waiters.map {
             Waiter(id: "\($0.pid)-\($0.since)", pid: $0.pid, label: GraphModel.label($0.label, $0.command), project: GraphModel.project($0.label),
-                   asks: GraphModel.wants($0), need: $0.exclusive ? Int(cpus) : max($0.cores, 1), since: Date(timeIntervalSince1970: Double($0.since)))
+                   asks: GraphModel.wants($0), need: $0.exclusive ? Int(m.cpus) : max($0.cores, 1), since: Date(timeIntervalSince1970: Double($0.since)))
         }
         out.gateShut = s.gate.state == "open" ? nil : s.gate.text
         out.load = s.load.first
@@ -135,6 +126,7 @@ struct Moment {
             by[b.project, default: 0] += near.flatMap { abs($0.at.timeIntervalSince(t)) < 15 ? $0.cores : nil } ?? b.average ?? 0
         }
         var out = Moment(at: t)
+        out.cpus = m.cpus
         out.shares = by.keys.sorted { (m.slot($0), $0) < (m.slot($1), $1) }.map { Share(project: $0, cpu: by[$0] ?? 0) }
         let jobs = out.total
         let sample = m.samples.min { abs($0.at.timeIntervalSince(t)) < abs($1.at.timeIntervalSince(t)) }
@@ -142,7 +134,7 @@ struct Moment {
         out.watched = sample != nil
         if let sample {
             out.load = sample.load
-            out.outside = sample.busy.map { max($0 * cpus - jobs, 0) } ?? sample.outside
+            out.outside = sample.busy.map { max($0 * m.cpus - jobs, 0) } ?? sample.outside
             if !sample.gateOpen { out.gateShut = sample.gateText }
         }
         if let b = m.blocks.first(where: { $0.exclusive && $0.from <= t && ($0.to ?? .distantFuture) >= t }) {
@@ -175,6 +167,8 @@ final class HourCache {
         /// A timing window held the Mac or waited for it to empty: waiting then was on purpose.
         var window = false
         var perCPU: [Double]?
+        /// The machine's CPUs.
+        var cpus = 1.0
         var total: Double { shares.values.reduce(0, +) + outside }
         var needless: Bool { watched && waiting > 0 && cpus - total >= 2 && !gateShut && !window }
     }
@@ -213,7 +207,7 @@ final class HourCache {
         let start = Date(timeIntervalSince1970: (end.addingTimeInterval(-span).timeIntervalSince1970 / step).rounded(.down) * step)
         let total = Int((end.timeIntervalSince(start) / step).rounded(.up))
         var cols = (0..<total).map { c in
-            Column(from: start.addingTimeInterval(Double(c) * step), to: start.addingTimeInterval(Double(c + 1) * step))
+            Column(from: start.addingTimeInterval(Double(c) * step), to: start.addingTimeInterval(Double(c + 1) * step), cpus: m.cpus)
         }
         let index = { (t: Date) -> Int in Int((t.timeIntervalSince(start) / step).rounded(.down)) }
         // Each job's CPU in each column: its readings there, else (before the app watched) its
@@ -249,12 +243,12 @@ final class HourCache {
             }
         }
         for i in 0..<total {
-            if let (b, k) = busy[i] { cols[i].watched = true; cols[i].outside = max(b / Double(k) * cpus - cols[i].shares.values.reduce(0, +), 0) }
+            if let (b, k) = busy[i] { cols[i].watched = true; cols[i].outside = max(b / Double(k) * m.cpus - cols[i].shares.values.reduce(0, +), 0) }
             if let (s, k) = shut[i] { cols[i].gateShut = s * 2 >= k }
             if let (p, k) = per[i], k > 0 { cols[i].perCPU = p.map { $0 / Double(k) } }
             // Never more than the CPUs.
             let t = cols[i].total
-            if t > cpus { let f = cpus / t; cols[i].shares = cols[i].shares.mapValues { $0 * f }; cols[i].outside *= f }
+            if t > m.cpus { let f = m.cpus / t; cols[i].shares = cols[i].shares.mapValues { $0 * f }; cols[i].outside *= f }
             cols[i].waiting = m.waits.filter { $0.from < cols[i].to && ($0.to ?? end) > cols[i].from }.count
             let c = cols[i]
             cols[i].window = m.blocks.contains { $0.exclusive && $0.from < c.to && ($0.to ?? end) > c.from }
@@ -279,6 +273,7 @@ final class HourCache {
 /// cpuq's gate, memory and load, at the right of the toolbar.
 struct StatusChips: View {
     let model: GraphModel
+    private var cpus: Double { model.cpus }
     var body: some View {
         if let s = model.status {
             HStack(spacing: 14) {
@@ -292,10 +287,10 @@ struct StatusChips: View {
                 }
                 if let load = s.load.first {
                     HStack(spacing: 4) {
-                        Text("Load").foregroundStyle(Alive.ink2)
+                        Text("Demand (1 min)").foregroundStyle(Alive.ink2)
                         Text(String(format: "%.1f", load)).fontWeight(.medium).monospacedDigit().foregroundStyle(Alive.ink)
                     }
-                    .help("Threads running or ready to run, averaged over a minute, on \(Int(cpus)) CPUs: above \(Int(cpus)) the Mac is overbooked, which keeps every CPU busy.")
+                    .help("The load: threads running or ready to run, averaged over the last minute, on \(Int(cpus)) CPUs. It is demand, not work done, and lags: \"CPUs busy\" is the CPU time actually spent in the last few seconds. Above \(Int(cpus)) the machine is overbooked: every CPU busy, and threads waiting for one.")
                 }
             }
             .font(.system(size: 12))
@@ -308,6 +303,7 @@ struct StatusChips: View {
 
 struct HeroCard: View {
     let model: GraphModel
+    private var cpus: Double { model.cpus }
     let moment: Moment
     let motion: CellMotion
     var control: ((String, Int, String) -> Void)?
@@ -318,7 +314,7 @@ struct HeroCard: View {
             GeometryReader { geo in
                 let tray = geo.size.width >= 470
                 // Cells grow to 44 points wide; past that the waiting tray takes the extra width.
-                let cells = cpus * 44 + (cpus - 1) * 6
+                let cells = cpus > Double(CellsCanvas.gridAbove) ? max(geo.size.width * 0.6, 300) : cpus * 44 + (cpus - 1) * 6
                 let trayWidth = tray ? max(180, geo.size.width - cells - 36) : 0
                 // The cells' canvas runs down behind the legend, so their glow has room to spread
                 // out in full and fade before the card's edge.
@@ -395,7 +391,8 @@ struct HeroCard: View {
             verdict("pause.circle.fill", "cpuq's gate is shut", shut.hasPrefix("closed: ") ? String(shut.dropFirst(8)) : shut, tint: .orange)
         } else if moment.total >= cpus * 0.8 {
             verdict("checkmark.circle", "Working at full capacity", "\(free) CPUs free")
-        } else if moment.total < 1.5 && moment.waiters.isEmpty {
+        } else if moment.total < 1.5 && moment.waiters.isEmpty && moment.shares.allSatisfy({ $0.cpu < 0.05 }) {
+            // Quiet only with no cpuq job at work: on a big machine one running job is a sliver.
             verdict("moon.zzz", "Quiet", "Nothing to run")
         } else {
             verdict("circle.lefthalf.filled", "Partly busy", "\(free) CPUs free")
@@ -624,6 +621,7 @@ final class CellMotion {
 /// is reduced.
 struct CellsCanvas: View {
     let model: GraphModel
+    private var cpus: Double { model.cpus }
     let moment: Moment
     let motion: CellMotion
     let trayWidth: Double
@@ -645,8 +643,13 @@ struct CellsCanvas: View {
         }
     }
 
+    /// More CPUs than glass cells fit (pup's 22, a cloud machine's 96): rows of flat tiles, filled
+    /// in the same order and colors, with no waves or bubbles at that size.
+    static let gridAbove = 16
+
     private func draw(_ gc: inout GraphicsContext, size: CGSize, t: Double) {
         let n = Int(cpus)
+        if n > Self.gridAbove { return drawGrid(&gc, size: size, n: n) }
         let gap = 6.0
         let x0 = trayWidth + (trayWidth > 0 ? 30 : 0)
         let top = 26.0, bottom = size.height - 16 - below
@@ -758,46 +761,73 @@ struct CellsCanvas: View {
     }
 }
 
+extension CellsCanvas {
+    private func drawGrid(_ gc: inout GraphicsContext, size: CGSize, n: Int) {
+        let x0 = trayWidth + (trayWidth > 0 ? 30 : 0)
+        let top = 26.0, bottom = size.height - 16 - below
+        let width = max(size.width - x0, 40), height = max(bottom - top, 20)
+        let gap = 3.0
+        // The fewest rows (at most 8) that keep a tile at least 12 points wide.
+        var rows = 1
+        while rows < 8 && (width - gap * Double((n + rows - 1) / rows - 1)) / Double((n + rows - 1) / rows) < 12 { rows += 1 }
+        let perRow = (n + rows - 1) / rows
+        let w = (width - gap * Double(perRow - 1)) / Double(perRow)
+        let h = (height - gap * Double(rows - 1)) / Double(rows)
+        var layers: [(Color, Double, Double)] = []
+        var acc = 0.0
+        let keys = moment.shares.map(\.project)
+        for k in keys + motion.fill.keys.filter({ $0 != "~outside" && !keys.contains($0) }) {
+            let v = motion.fill[k] ?? 0
+            layers.append((model.color(k), acc, acc + v)); acc += v
+        }
+        let ov = motion.fill["~outside"] ?? 0
+        layers.append((Alive.out, acc, acc + ov))
+        for c in 0..<n {
+            let x = x0 + Double(c % perRow) * (w + gap), y = top + Double(c / perRow) * (h + gap)
+            let cell = CGRect(x: x, y: y, width: w, height: h)
+            let shape = Path(roundedRect: cell, cornerRadius: min(4, w / 4))
+            gc.fill(shape, with: .color(Alive.glass))
+            var inner = gc
+            inner.clip(to: shape)
+            for (color, a, b) in layers {
+                let lo = min(max(a - Double(c), 0), 1), hi = min(max(b - Double(c), 0), 1)
+                guard hi - lo > 0.004 else { continue }
+                inner.fill(Path(CGRect(x: x, y: y + h - hi * h, width: w, height: (hi - lo) * h)), with: .color(color))
+            }
+            gc.stroke(Path(roundedRect: cell.insetBy(dx: 0.5, dy: 0.5), cornerRadius: min(4, w / 4)), with: .color(Alive.glassEdge), lineWidth: 1)
+        }
+        gc.draw(Text("\(n) CPUs").font(.system(size: 10)).foregroundColor(Alive.ink3),
+                at: CGPoint(x: x0 + width / 2, y: bottom + 9))
+    }
+}
+
 // MARK: - The last hour
 
 struct HourCard: View {
     let model: GraphModel
+    private var cpus: Double { model.cpus }
     let hour: HourCache.Hour
-    @Binding var mode: NowView.HourMode
     @Binding var scrub: Date?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 Text(title).eyebrow()
-                Picker("", selection: $mode) {
-                    (Text("Stacked ") + Text("⌘1").foregroundStyle(Alive.ink3)).tag(NowView.HourMode.stacked)
-                    (Text("Per Core ") + Text("⌘2").foregroundStyle(Alive.ink3)).tag(NowView.HourMode.cores)
-                }
-                .pickerStyle(.segmented).labelsHidden().controlSize(.small).fixedSize()
-                .background { shortcuts }
                 Spacer()
                 summary.font(.caption).lineLimit(1).minimumScaleFactor(0.8)
             }
-            Group {
-                if mode == .stacked { stacked } else { cores }
-            }
+            // Both charts at once, on one time axis, Per Core's labels under both; the line
+            // between them drags. One wait strip serves both.
+            SplitColumn(key: "hour.splits", defaults: [0.5, 0.5], minimums: [56, 56], gap: 8, sections: [
+                AnyView(stacked.contextMenu { clearMenu }),
+                AnyView(cores.contextMenu { clearMenu }),
+            ])
             .frame(maxHeight: .infinity)
-            .contextMenu { clearMenu }
             waitStrip.frame(height: 20)
                 .contextMenu { clearMenu }
         }
         .padding(.horizontal, 18).padding(.vertical, 12)
         .card()
-    }
-
-    /// ⌘1 shows Stacked and ⌘2 Per Core, through buttons nobody sees.
-    private var shortcuts: some View {
-        ZStack {
-            Button("") { mode = .stacked }.keyboardShortcut("1", modifiers: .command)
-            Button("") { mode = .cores }.keyboardShortcut("2", modifiers: .command)
-        }
-        .opacity(0).allowsHitTesting(false).accessibilityHidden(true)
     }
 
     /// The charts' right-click menu: forget what is older than the moment under the pointer, or
@@ -983,7 +1013,7 @@ struct HourCard: View {
         .chartLegend(.hidden)
         .chartXScale(domain: xDomain, range: .plotDimension(padding: 0))
         .chartYScale(domain: 0...cpus)
-        .chartXAxis { xAxis }
+        .chartXAxis(.hidden)
         .chartYAxis(.hidden)
         .chartBackground { yLabels($0, [(0, "0"), (cpus / 2, "\(Int(cpus / 2))"), (cpus, "\(Int(cpus))")], font: .caption) }
         .chartOverlay { scrubber($0) }
@@ -1079,6 +1109,7 @@ struct HourCard: View {
 
 struct JobsCard: View {
     let model: GraphModel
+    private var cpus: Double { model.cpus }
     var control: ((String, Int, String) -> Void)?
 
     var body: some View {

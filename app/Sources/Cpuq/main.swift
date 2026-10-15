@@ -16,6 +16,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var timer: Timer?
     private var polling = false
     private let graphs = GraphModel()
+    /// The spill hosts in cpuq's config, each a page of the window beside this Mac's.
+    private var remotes: [GraphModel] = []
+    private var remotePolling: Set<String> = []
     private var graphsWindow: NSWindow?
     private let sizeGuard = MinimumSize()
     private var historyTimer: Timer?
@@ -35,6 +38,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         item.menu = menu
         rebuild()
+        loadMachines()
         poll()
         // An update relaunched the app with the graphs window open: open it again. A menu-bar
         // app otherwise comes back as only its chip, and the update looks as if it never relaunched.
@@ -44,7 +48,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // For testing a build: open the graphs window at launch.
         if reopen || ProcessInfo.processInfo.environment["CPUQ_SHOW_GRAPHS"] != nil { showGraphs() }
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.poll() }
+            MainActor.assumeIsolated {
+                self?.poll()
+                self?.pollRemotes()
+            }
         }
     }
 
@@ -89,7 +96,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// The spill hosts named in cpuq's config (`spill`, `spill_start.HOST`).
+    private func loadMachines() {
+        let path = ProcessInfo.processInfo.environment["CPUQ_CONFIG"] ?? NSHomeDirectory() + "/.config/cpuq/config"
+        let text = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+        remotes = spillHosts(config: text).map { GraphModel(machine: Machine(id: $0.host, start: $0.start)) }
+    }
+
+    /// Each spill host's status over ssh, while the window is open: nobody watches it otherwise,
+    /// and a stopped cloud machine need not be dialed every 3 seconds for the menu.
+    private func pollRemotes() {
+        guard graphsWindow?.isVisible ?? false else { return }
+        for m in remotes where !remotePolling.contains(m.machine.id) {
+            let host = m.machine.id
+            remotePolling.insert(host)
+            Task.detached(priority: .utility) {
+                let result = Self.remote(host, ["status", "--json"])
+                await MainActor.run {
+                    self.remotePolling.remove(host)
+                    switch result {
+                    case .success(let data):
+                        if let s = try? Status.decode(data) { m.add(s) } else { m.failed("its cpuq answered in a form this app cannot read") }
+                    case .failure(let e): m.failed(e.message)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runs a stopped machine's `spill_start` command (a cloud VM's start script), then polls it.
+    private func startMachine(_ m: GraphModel) {
+        guard let command = m.machine.start, !m.starting else { return }
+        m.starting = true
+        m.startNote = nil
+        Task.detached(priority: .userInitiated) {
+            let (ok, last) = Self.shell(command)
+            await MainActor.run {
+                m.starting = false
+                m.startNote = ok ? nil : "Its start command failed: \(last)"
+                self.pollRemotes()
+            }
+        }
+    }
+
+    /// Runs `command` with sh, with Homebrew's directories on PATH (an app opened from the Finder
+    /// gets only the system's, and a cloud machine's start script needs gcloud): whether it
+    /// succeeded, and the last line it printed.
+    nonisolated private static func shell(_ command: String) -> (Bool, String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", command]
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
+        p.environment = env
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = out
+        p.standardInput = FileHandle.nullDevice
+        do { try p.run() } catch { return (false, error.localizedDescription) }
+        let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        p.waitUntilExit()
+        // The scripts color their lines; keep the words.
+        let plain = text.replacingOccurrences(of: "\u{1B}\\[[0-9;]*m", with: "", options: .regularExpression)
+        let last = plain.split(separator: "\n").last.map(String.init) ?? ""
+        return (p.terminationStatus == 0, last)
+    }
+
     struct Problem: Error { let message: String }
+
+    /// Runs cpuq on `host` over ssh and returns what it printed; a failure carries ssh's or
+    /// cpuq's first line of complaint.
+    nonisolated private static func remote(_ host: String, _ arguments: [String]) -> Result<Data, Problem> {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        p.arguments = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, (["cpuq"] + arguments).joined(separator: " ")]
+        let out = Pipe(), err = Pipe()
+        p.standardOutput = out
+        p.standardError = err
+        p.standardInput = FileHandle.nullDevice
+        do { try p.run() } catch { return .failure(Problem(message: "cannot run ssh: \(error.localizedDescription)")) }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        let complaint = err.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else {
+            let line = String(decoding: complaint, as: UTF8.self).split(separator: "\n").first.map(String.init)
+            return .failure(Problem(message: line ?? "ssh \(host) failed (\(p.terminationStatus))"))
+        }
+        return .success(data)
+    }
 
     nonisolated private static func readStatus() -> Result<Status, Problem> {
         switch run(["status", "--json"]) {
@@ -315,7 +409,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             window.appearance = Theme.appearance
             // The window is the size it is given and no other: what is in it never grows or
             // shrinks it, and everything in it fits, the charts sharing what height there is.
-            let host = NSHostingView(rootView: GraphsView(model: graphs, control: { [weak self] action, pid, who in self?.perform(action, pid: String(pid), who: who) }))
+            let host = NSHostingView(rootView: GraphsView(models: [graphs] + remotes, control: { [weak self] machine, action, pid, who in
+                self?.perform(action, pid: String(pid), who: who, on: machine)
+            }, start: { [weak self] model in self?.startMachine(model) }))
             host.sizingOptions = []
             // The minimum as constraints the window cannot break: contentMinSize alone let a
             // drag, a tile or an accessibility resize take the window down to a sliver.
@@ -349,9 +445,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 MainActor.assumeIsolated { self?.refreshHistory() }
             }
         }
-        refreshHistory()
         NSApp.activate()
         graphsWindow?.makeKeyAndOrderFront(nil)
+        // Once it is on screen: refreshHistory skips a window nobody sees, so read before
+        // this, the history waited a minute for the next refresh.
+        refreshHistory()
+        pollRemotes()
     }
 
     private func refreshHistory() {
@@ -359,6 +458,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task.detached(priority: .utility) {
             let jobs = Self.readHistory()
             await MainActor.run { self.graphs.setHistory(jobs) }
+        }
+        for m in remotes {
+            let host = m.machine.id
+            Task.detached(priority: .utility) {
+                guard case .success(let data) = Self.remote(host, ["history", "--json", "--limit", "500"]),
+                      let jobs = try? Job.decodeList(data) else { return }
+                await MainActor.run { m.setHistory(jobs) }
+            }
         }
     }
 
@@ -385,7 +492,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         perform(info[0], pid: info[1], who: info[2])
     }
 
-    func perform(_ action: String, pid: String, who: String) {
+    func perform(_ action: String, pid: String, who: String, on machine: Machine = .local) {
         let ask: (String, String)? = switch action {
         case "start": ("Start \(who) now?", "It starts past the queue and the budget, so the load goes up until other jobs finish.")
         case "stop": ("Stop \(who)?", "Its work so far is lost; it gets SIGTERM and can clean up.")
@@ -400,9 +507,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSApp.activate()
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
+        let host: String? = machine.isLocal ? nil : machine.id
         Task.detached(priority: .userInitiated) {
-            _ = Self.run([action, pid])
-            await MainActor.run { self.poll() }
+            if let host { _ = Self.remote(host, [action, pid]) } else { _ = Self.run([action, pid]) }
+            await MainActor.run {
+                self.poll()
+                self.pollRemotes()
+            }
         }
     }
 

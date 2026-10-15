@@ -119,3 +119,20 @@ import Testing
     let older = try Status.decode(Data(#"{"budget": 8, "held": 2}"#.utf8))
     #expect(older.capacity == 8)
 }
+
+@Test func readsSpillHostsFromTheConfig() {
+    let hosts = spillHosts(config: """
+    admit = measured
+    spill = pup, burst   # in order
+    spill_start.burst = ~/runbooks/host-gcp-burst/start
+    """)
+    #expect(hosts.map(\.host) == ["pup", "burst"])
+    #expect(hosts[0].start == nil && hosts[1].start == "~/runbooks/host-gcp-burst/start")
+    #expect(spillHosts(config: "budget = 8\n").isEmpty)
+}
+
+@Test func decodesAnotherMachinesCPUTicks() throws {
+    let s = try Status.decode(Data(#"{"budget": 20, "held": 4, "active_cores": 2, "cpu_ticks": [[10, 100], [30, 100]]}"#.utf8))
+    #expect(s.ticks?.each.count == 2)
+    #expect(s.ticks?.all == CPUTicks(busy: 40, total: 200))
+}

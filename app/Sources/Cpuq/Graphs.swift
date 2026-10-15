@@ -2,8 +2,32 @@ import Charts
 import CpuqCore
 import SwiftUI
 
-/// What the activity window shows: the budget's cores as lanes over the recent past, each cell
-/// empty, held or busy, and the jobs `cpuq history` remembers.
+/// A machine whose cpuq the window shows: this Mac, or a spill host reached over ssh.
+struct Machine: Hashable, Identifiable {
+    /// Where the window's "cleared before" mark is kept for it.
+    var clearedKey: String { isLocal ? "clearedBefore" : "clearedBefore.\(id)" }
+
+    /// "local", or the ssh name.
+    let id: String
+    var isLocal: Bool { id == "local" }
+    /// The name shown: this Mac's host name (short, as `cpuq status` titles it), or the ssh name.
+    var name: String {
+        guard isLocal else { return id }
+        // gethostname, as cpuq titles its status: ProcessInfo's hostName can be a network name
+        // with a suffix ("pop-2") that is not the machine's own.
+        var buf = [CChar](repeating: 0, count: 256)
+        let full = gethostname(&buf, buf.count) == 0 ? String(decoding: buf.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self) : ""
+        let host = full.split(separator: ".").first.map(String.init) ?? ""
+        return host.isEmpty || host == "localhost" ? "This Mac" : host
+    }
+    /// How to start it when it is stopped (`spill_start.HOST` in cpuq's config), if it can be.
+    var start: String? = nil
+
+    static let local = Machine(id: "local")
+}
+
+/// What the activity window shows of one machine: its CPUs over the recent past, the jobs it
+/// ran and waited for, and the jobs its `cpuq history` remembers.
 @Observable
 final class GraphModel {
     /// A job's hold on its cores.
@@ -106,10 +130,41 @@ final class GraphModel {
     private(set) var started = Date()
     private(set) var totals: [Totals] = []
     private var seeded = false
-    private var ticks = CPUTicks.now()
-    private var cpuTicks = CPUTicks.perCPU()
-    /// The performance cores: how many (the last CPUs) and their name; nil on one kind of core.
-    let performance = CPUTicks.performanceCores()
+    let machine: Machine
+    private var ticks: CPUTicks?
+    private var cpuTicks: [CPUTicks]?
+    /// The performance cores: how many (the last CPUs) and their name; nil on one kind of core
+    /// (and for another machine, whose kinds of core the app cannot see).
+    let performance: (count: Int, name: String)?
+    /// When the last status came, and why the last poll failed: nil while the machine answers.
+    private(set) var problem: String?
+
+    init(machine: Machine = .local) {
+        self.machine = machine
+        performance = machine.isLocal ? CPUTicks.performanceCores() : nil
+        if machine.isLocal {
+            ticks = CPUTicks.now()
+            cpuTicks = CPUTicks.perCPU()
+        }
+        cleared = {
+            let t = UserDefaults.standard.double(forKey: machine.clearedKey)
+            return t > 0 ? Date(timeIntervalSince1970: t) : nil
+        }()
+    }
+
+    /// The machine's CPUs: this Mac's online, or what the other machine's cpuq reports.
+    var cpus: Double {
+        if machine.isLocal { return Double(ProcessInfo.processInfo.activeProcessorCount) }
+        if let n = status?.activeCores, n > 0 { return Double(n) }
+        return Double(max(status?.cpuTicks?.count ?? 1, 1))
+    }
+
+    /// The machine did not answer: why. The last status stays for the charts.
+    func failed(_ why: String) { problem = why }
+
+    /// Its start command is running (the Start button), and what it last said.
+    var starting = false
+    var startNote: String?
     /// Each project's palette slot, assigned the first time it is seen and kept across launches,
     /// so a project's color never changes as others come and go.
     private var slots: [String: Int] = {
@@ -121,6 +176,7 @@ final class GraphModel {
 
     func add(_ s: Status, at now: Date = Date()) {
         status = s
+        problem = nil
         var running: Set<String> = []
         for h in s.holders {
             let id = "\(h.pid)-\(h.since)"
@@ -149,10 +205,12 @@ final class GraphModel {
         }
         for i in waits.indices where waits[i].to == nil && !queued.contains(waits[i].id) { waits[i].to = now }
 
-        let t = CPUTicks.now()
+        // This Mac's CPUs are read here; another machine's come with its status.
+        let remote = machine.isLocal ? nil : s.ticks
+        let t = machine.isLocal ? CPUTicks.now() : remote?.all
         let busy = ticks.flatMap { a in t.flatMap { CPUTicks.busy(from: a, to: $0) } }
         ticks = t
-        let each = CPUTicks.perCPU()
+        let each = machine.isLocal ? CPUTicks.perCPU() : remote?.each
         var perCPU: [Double]? = nil
         if let a = cpuTicks, let b = each, a.count == b.count {
             perCPU = zip(a, b).map { CPUTicks.busy(from: $0, to: $1) ?? 0 }
@@ -287,16 +345,13 @@ final class GraphModel {
 
     /// Where the window's data was cleared from, if it was: nothing older is shown, after a
     /// relaunch too (the seed from history skips it). cpuq's own history is untouched.
-    private(set) var cleared: Date? = {
-        let t = UserDefaults.standard.double(forKey: "clearedBefore")
-        return t > 0 ? Date(timeIntervalSince1970: t) : nil
-    }()
+    private(set) var cleared: Date?
 
     /// Forgets everything older than `cutoff`: jobs and waits that ended before it go, those
     /// that span it are cut at it, and so are the readings.
     func clear(before cutoff: Date) {
         cleared = cutoff
-        UserDefaults.standard.set(cutoff.timeIntervalSince1970, forKey: "clearedBefore")
+        UserDefaults.standard.set(cutoff.timeIntervalSince1970, forKey: machine.clearedKey)
         blocks.removeAll { ($0.to ?? .distantFuture) <= cutoff }
         for i in blocks.indices where blocks[i].from < cutoff {
             blocks[i].from = cutoff
@@ -339,10 +394,22 @@ final class GraphModel {
 }
 
 struct GraphsView: View {
-    let model: GraphModel
-    /// Runs a job action (`cpuq ACTION PID`), asking first where it costs something.
-    var control: ((String, Int, String) -> Void)? = nil
-    @State private var tab = 0
+    /// This Mac first, then the spill hosts in cpuq's config.
+    let models: [GraphModel]
+    /// Runs a job action (`cpuq ACTION PID` on its machine), asking first where it costs something.
+    var control: ((Machine, String, Int, String) -> Void)? = nil
+    /// Starts a stopped machine with its `spill_start` command.
+    var start: ((GraphModel) -> Void)? = nil
+    /// The machine shown: ⌘1 for this Mac, ⌘2 and on for the spill hosts.
+    @AppStorage("machine") private var shown = "local"
+
+    private var model: GraphModel { models.first { $0.machine.id == shown } ?? models[0] }
+
+    private var act: ((String, Int, String) -> Void)? {
+        guard let control else { return nil }
+        let machine = model.machine
+        return { action, pid, who in control(machine, action, pid, who) }
+    }
     /// Read here so that a new theme draws the whole window again.
     @AppStorage("theme") private var theme = "alive"
     @AppStorage("appearance") private var appearance = "auto"
@@ -350,26 +417,64 @@ struct GraphsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
-                Picker("", selection: $tab) {
-                    Text("Now").tag(0)
-                    Text("History").tag(1)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(maxWidth: 200)
+                if models.count > 1 { machinePicker }
                 themeMenu
                 modeMenu
                 Spacer(minLength: 8)
                 // The chips give way first when the window is narrow.
-                if tab == 0 { ViewThatFits(in: .horizontal) { StatusChips(model: model); Color.clear.frame(width: 0, height: 0) } }
+                ViewThatFits(in: .horizontal) { StatusChips(model: model); Color.clear.frame(width: 0, height: 0) }
             }
-            if tab == 0 { NowView(model: model, control: control) } else { history }
+            if model.status == nil, let problem = model.problem {
+                unreachable(problem)
+            } else {
+                NowView(model: model, control: act).id(model.machine.id)
+            }
         }
         .padding(16)
         .frame(minWidth: Self.minimumSize.width, maxWidth: .infinity, minHeight: Self.minimumSize.height, maxHeight: .infinity, alignment: .topLeading)
         .background(Alive.window)
         .background(WindowAppearance(name: appearance))
         .id(theme)
+    }
+
+    /// The machines, ⌘1 to ⌘9 in order.
+    private var machinePicker: some View {
+        Picker("", selection: $shown) {
+            ForEach(Array(models.enumerated()), id: \.element.machine.id) { i, m in
+                (Text(m.machine.name + " ") + Text("⌘\(i + 1)").foregroundStyle(Alive.ink3)).tag(m.machine.id)
+            }
+        }
+        .pickerStyle(.segmented).labelsHidden().fixedSize()
+        .help("The machine shown: this Mac, then the spill hosts in cpuq's config")
+        .background {
+            ZStack {
+                ForEach(Array(models.prefix(9).enumerated()), id: \.element.machine.id) { i, m in
+                    Button("") { shown = m.machine.id }.keyboardShortcut(KeyEquivalent(Character("\(i + 1)")), modifiers: .command)
+                }
+            }
+            .opacity(0).allowsHitTesting(false).accessibilityHidden(true)
+        }
+    }
+
+    /// A machine that does not answer: stopped, asleep or unreachable.
+    private func unreachable(_ problem: String) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: "powersleep").font(.system(size: 34)).foregroundStyle(Alive.ink3)
+            Text("\(model.machine.name) is not answering").font(.title3.weight(.semibold))
+            Text(problem).font(.callout).foregroundStyle(Alive.ink2).multilineTextAlignment(.center).frame(maxWidth: 420)
+            if model.machine.start != nil {
+                Text("cpuq starts it when this Mac and the others are full; it stops itself when idle.")
+                    .font(.caption).foregroundStyle(Alive.ink3)
+                if let start {
+                    Button(model.starting ? "Starting \(model.machine.name)…" : "Start \(model.machine.name)") { start(model) }
+                        .disabled(model.starting)
+                        .padding(.top, 6)
+                        .help("Runs its start command (spill_start.\(model.machine.id) in cpuq's config); it bills from now until it stops.")
+                }
+                if let note = model.startNote { Text(note).font(.caption).foregroundStyle(Alive.ink2).multilineTextAlignment(.center).frame(maxWidth: 420) }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     /// Watches Liveliness itself, so the window is not drawn again each time the mouse moves.
@@ -425,29 +530,42 @@ struct GraphsView: View {
     /// The smallest the window goes: at this size everything in it still fits.
     static let minimumSize = CGSize(width: 560, height: 620)
 
-    // MARK: History
+}
 
-    private var history: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Finished jobs by project, from cpuq history").font(.headline)
-            Table(model.totals) {
-                TableColumn("Project") { t in
-                    HStack(spacing: 6) { Circle().fill(model.color(t.project)).frame(width: 8, height: 8); Text(t.project) }
-                }
-                TableColumn("Jobs") { t in Text("\(t.jobs)").monospacedDigit() }.width(50)
-                TableColumn("Core-hours in use") { t in Text(String(format: "%.2f", t.held)).monospacedDigit() }
-                TableColumn("Active") { t in Text(String(format: "%.2f", t.used)).monospacedDigit() }
-                TableColumn("Share") { t in
-                    Text("\(Int((t.efficiency * 100).rounded()))%").monospacedDigit()
-                        .foregroundStyle(t.efficiency < 0.5 ? Color.orange : Color.primary)
-                }
-                TableColumn("Median wait") { t in Text(age(t.medianWait)).monospacedDigit() }
-                TableColumn("Longest wait") { t in Text(age(t.longestWait)).monospacedDigit() }
+/// A machine's finished jobs by project, from its `cpuq history`.
+struct HistoryCard: View {
+    let model: GraphModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("HISTORY").eyebrow()
+                Text("finished jobs by project, from cpuq history").font(.caption).foregroundStyle(Alive.ink3)
+                Spacer()
             }
             if model.totals.isEmpty {
                 Text("cpuq history has no finished jobs yet.").font(.caption).foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            } else {
+                Table(model.totals) {
+                    TableColumn("Project") { t in
+                        HStack(spacing: 6) { Circle().fill(model.color(t.project)).frame(width: 8, height: 8); Text(t.project) }
+                    }
+                    TableColumn("Jobs") { t in Text("\(t.jobs)").monospacedDigit() }.width(50)
+                    TableColumn("Core-hours in use") { t in Text(String(format: "%.2f", t.held)).monospacedDigit() }
+                    TableColumn("Active") { t in Text(String(format: "%.2f", t.used)).monospacedDigit() }
+                    TableColumn("Share") { t in
+                        Text("\(Int((t.efficiency * 100).rounded()))%").monospacedDigit()
+                            .foregroundStyle(t.efficiency < 0.5 ? Color.orange : Color.primary)
+                    }
+                    TableColumn("Median wait") { t in Text(age(t.medianWait)).monospacedDigit() }
+                    TableColumn("Longest wait") { t in Text(age(t.longestWait)).monospacedDigit() }
+                }
+                .scrollContentBackground(.hidden)
             }
         }
+        .padding(.horizontal, 18).padding(.vertical, 12)
+        .card()
     }
 }
 

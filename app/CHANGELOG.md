@@ -3,6 +3,24 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.14.0 — 2026-10-15
+
+- One page per machine: this Mac (⌘1), then each spill host in cpuq's config (`spill = pup,
+  burst`: ⌘2, ⌘3, …), read over ssh while the window is open. Each page shows that machine's CPUs
+  right now, its last hour, its jobs and its history, and job actions (pause, stop, start now)
+  act on that machine. A machine with many CPUs draws them as rows of tiles (pup's 22, a cloud
+  machine's 96). Another machine's CPU charts need cpuq 0.12.0 there.
+- A stopped cloud machine's page says so, with a Start button that runs its `spill_start`
+  command; it stops itself when idle.
+- Stacked and Per Core always show together, one above the other, on one time axis with one
+  wait strip; Now and History are one page. Every section's height drags (the faint handles
+  between them; double-click one to put the sizes back), and the sizes are kept.
+- History loads as the window opens, not a minute later.
+- The toolbar's Load is now "Demand (1 min)", and its tooltip says how it differs from CPUs
+  busy: threads wanting a CPU averaged over a minute, against CPU time spent in the last few
+  seconds.
+- "Quiet · Nothing to run" no longer shows while a job runs on a big machine.
+
 ## 0.13.26 — 2026-10-12
 
 - Time from before the app started is no longer called idle. The app rebuilds the minutes before

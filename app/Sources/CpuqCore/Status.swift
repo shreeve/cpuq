@@ -16,6 +16,9 @@ public struct Status: Decodable, Sendable, Equatable {
     public var target: Double?
     /// The CPUs online (`active_cores`, cpuq 0.8 and later); 0 from older cpuq.
     public var activeCores = 0
+    /// Each CPU's time so far, `[busy, total]`, cumulative (`cpu_ticks`, cpuq 0.12.1 and later):
+    /// another machine's CPUs, drawn from the difference between two statuses.
+    public var cpuTicks: [[UInt64]]?
     public var gate = Gate()
     public var holders: [Holder] = []
     public var waiters: [Waiter] = []
@@ -85,7 +88,7 @@ public struct Status: Decodable, Sendable, Equatable {
 // Decoding with defaults: a missing key keeps the property's default.
 extension Status {
     private enum Keys: String, CodingKey {
-        case schema, version, budget, held, free, load, memoryPressure, gate, holders, waiters, leases, outside, admit, target, activeCores
+        case schema, version, budget, held, free, load, memoryPressure, gate, holders, waiters, leases, outside, admit, target, activeCores, cpuTicks
     }
 
     public init(from decoder: any Decoder) throws {
@@ -100,6 +103,7 @@ extension Status {
         admit = try c.decodeIfPresent(String.self, forKey: .admit) ?? ""
         target = try c.decodeIfPresent(Double.self, forKey: .target)
         activeCores = try c.decodeIfPresent(Int.self, forKey: .activeCores) ?? 0
+        cpuTicks = try c.decodeIfPresent([[UInt64]].self, forKey: .cpuTicks)
         gate = try c.decodeIfPresent(Gate.self, forKey: .gate) ?? Gate()
         holders = try c.decodeIfPresent([Holder].self, forKey: .holders) ?? []
         waiters = try c.decodeIfPresent([Waiter].self, forKey: .waiters) ?? []
@@ -175,6 +179,13 @@ extension Status.Outside {
 }
 
 extension Status {
+    /// Its CPU readings as CPUTicks: the machine's in all, and each CPU's; nil when cpuq gave none.
+    public var ticks: (all: CPUTicks, each: [CPUTicks])? {
+        guard let t = cpuTicks, !t.isEmpty, t.allSatisfy({ $0.count == 2 }) else { return nil }
+        let each = t.map { CPUTicks(busy: $0[0], total: $0[1]) }
+        return (CPUTicks(busy: each.reduce(0) { $0 + $1.busy }, total: each.reduce(0) { $0 + $1.total }), each)
+    }
+
     /// The cores to count use against: under measured admission the CPUs online,
     /// since `budget` there is only an exclusive run's size and can exceed them
     /// (a Mac with 10 CPUs and `budget = 14`); under `admit = cores`, the budget.
@@ -263,4 +274,24 @@ public struct Job: Decodable, Sendable, Equatable {
     public static func decodeList(_ data: Data) throws -> [Job] {
         try JSONDecoder().decode([Job].self, from: data)
     }
+}
+
+/// The spill hosts cpuq's config names (`spill = HOST, ...`), in order, each with the command that
+/// starts it when it is stopped (`spill_start.HOST = COMMAND`), if any: the machines the window
+/// shows beside this Mac.
+public func spillHosts(config text: String) -> [(host: String, start: String?)] {
+    var hosts: [String] = []
+    var starts: [String: String] = [:]
+    for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        let line = raw.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false).first ?? ""
+        guard let eq = line.firstIndex(of: "=") else { continue }
+        let key = line[..<eq].trimmingCharacters(in: .whitespaces)
+        let value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+        if key == "spill" {
+            hosts = value.split(whereSeparator: { $0 == "," || $0 == " " || $0 == "\t" }).map(String.init)
+        } else if key.hasPrefix("spill_start."), key.count > "spill_start.".count {
+            starts[String(key.dropFirst("spill_start.".count))] = value
+        }
+    }
+    return hosts.map { ($0, starts[$0]) }
 }
