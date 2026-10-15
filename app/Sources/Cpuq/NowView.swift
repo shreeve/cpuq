@@ -22,10 +22,11 @@ struct NowView: View {
         }
         let end = Date()
         let hour = cache.hour(model, end: end)
-        let shown = scrub.map { Moment.at($0, model) } ?? Moment.now(model)
+        // Mid-drag the page shows now: a moment replayed under the pointer would reshape it.
+        let shown = (SplitDrag.shared.active ? nil : scrub).map { Moment.at($0, model) } ?? Moment.now(model)
         // One page per machine, top to bottom: now, the hour (both charts), the jobs, and
         // history; every section's height is the user's to drag.
-        return AnyView(SplitColumn(key: "page.splits", defaults: [0.24, 0.38, 0.19, 0.19], minimums: [196, 190, 64, 96], sections: [
+        return AnyView(SplitColumn(key: "page.splits", defaults: [0.24, 0.38, 0.19, 0.19], minimums: [196, 230, 64, 96], bleed: 10, sections: [
             AnyView(HeroCard(model: model, moment: shown, motion: motion, control: control)),
             AnyView(HourCard(model: model, hour: hour, scrub: $scrub)),
             AnyView(JobsCard(model: model, control: control)),
@@ -1118,6 +1119,7 @@ struct HourCard: View {
         GeometryReader { geo in
             Rectangle().fill(.clear).contentShape(Rectangle())
                 .onContinuousHover { phase in
+                    if SplitDrag.shared.active { scrub = nil; return }
                     switch phase {
                     case .active(let p):
                         guard let frame = proxy.plotFrame else { return }

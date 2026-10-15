@@ -3,6 +3,15 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.14.2 — 2026-10-15
+
+- Dragging a section no longer jumps: crossing the hour chart mid-drag replayed past moments in
+  the cards above, reshaping the page under the pointer; the charts ignore the pointer while a
+  handle is held.
+- A section never draws over its neighbors: as the hour card shrank, Per Core's cells spilled onto
+  Stacked. Each section is clipped to its own height (cards keep their shadows), and the hour card
+  keeps the least height its two charts need.
+
 ## 0.14.1 — 2026-10-15
 
 - Smoother: Per Core paints its cells in one pass instead of as a chart mark each (11,520 of

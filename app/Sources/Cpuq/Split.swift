@@ -1,6 +1,14 @@
 import AppKit
 import SwiftUI
 
+/// Whether any section handle is being dragged: the charts ignore the pointer meanwhile, so
+/// crossing them mid-drag does not replay a past moment and reshape the page under the drag.
+@Observable
+final class SplitDrag {
+    static let shared = SplitDrag()
+    var active = false
+}
+
 /// Sections stacked top to bottom, each as tall as its share of the room, with a handle between
 /// each pair that drags height from one to the other. The shares are kept under `key` across
 /// launches; double-clicking a handle puts the shares back to `defaults`.
@@ -12,6 +20,9 @@ struct SplitColumn: View {
     let minimums: [CGFloat]
     /// The handle's height: the gap between sections.
     var gap: CGFloat = 12
+    /// How far past its frame a section may draw (a card's shadow) before it is clipped: nothing
+    /// a section holds spills over its neighbors when the drag makes it small.
+    var bleed: CGFloat = 0
     let sections: [AnyView]
 
     @AppStorage private var stored: String
@@ -20,11 +31,12 @@ struct SplitColumn: View {
     @State private var live: [Double]?
     @State private var hovered: Int?
 
-    init(key: String, defaults: [Double], minimums: [CGFloat], gap: CGFloat = 12, sections: [AnyView]) {
+    init(key: String, defaults: [Double], minimums: [CGFloat], gap: CGFloat = 12, bleed: CGFloat = 0, sections: [AnyView]) {
         self.key = key
         self.defaults = defaults
         self.minimums = minimums
         self.gap = gap
+        self.bleed = bleed
         self.sections = sections
         _stored = AppStorage(wrappedValue: "", key)
     }
@@ -44,7 +56,7 @@ struct SplitColumn: View {
             let heights = Self.layout(shares, room: room, minimums: minimums)
             VStack(spacing: 0) {
                 ForEach(sections.indices, id: \.self) { i in
-                    sections[i].frame(height: heights[i])
+                    sections[i].frame(height: heights[i]).clipShape(Rectangle().inset(by: -bleed))
                     if i < sections.count - 1 { handle(i, room: room) }
                 }
             }
@@ -83,7 +95,10 @@ struct SplitColumn: View {
                 DragGesture(minimumDistance: 1)
                     .onChanged { v in
                         let start = dragStart ?? shares
-                        if dragStart == nil { dragStart = start }
+                        if dragStart == nil {
+                            dragStart = start
+                            SplitDrag.shared.active = true
+                        }
                         guard room > 0 else { return }
                         let pair = start[i] + start[i + 1]
                         let lo = Double(minimums[i] / room), hi = pair - Double(minimums[i + 1] / room)
@@ -97,6 +112,7 @@ struct SplitColumn: View {
                         if let live { stored = live.map { String(format: "%.4f", $0) }.joined(separator: ",") }
                         live = nil
                         dragStart = nil
+                        SplitDrag.shared.active = false
                     }
             )
             .onTapGesture(count: 2) {
