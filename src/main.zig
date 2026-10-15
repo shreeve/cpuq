@@ -6,6 +6,7 @@ const Io = std.Io;
 const policy = @import("policy.zig");
 const state = @import("state.zig");
 const sys = @import("sys.zig");
+const gitship = @import("gitship.zig");
 
 const history = @import("history.zig");
 const hook = @import("hook.zig");
@@ -853,39 +854,12 @@ fn repoPath(p: []const u8) bool {
     return p.len != 0 and p[0] != '/' and std.mem.find(u8, p, "..") == null;
 }
 
-/// `.git` shipped (`--ship .git`, or a `.git` line in `.cpuq-spill`): the copy gets a
-/// standalone git, `.git` a directory with only git's own parts of the common dir (objects,
-/// refs, packed-refs, config, info, shallow) and the worktree's own HEAD and index. Whatever
-/// else a repo keeps under .git (build stores, caches, notes) stays here, and a worktree's
-/// `.git` file, a path on this machine, becomes a repo there. After the first copy rsync
-/// sends only what changed. The error text when it fails, else null.
+/// `.git` shipped (`--ship .git`, or a `.git` line in `.cpuq-spill`): the copy gets a git of
+/// its own, git's parts only (gitship.zig). The error text when it fails, else null.
 fn shipGit(ctx: *Ctx, root: []const u8, host: []const u8, dir: []const u8) ?[]const u8 {
     const a = ctx.arena;
-    const r = std.process.run(a, ctx.io, .{ .argv = &.{ "git", "-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir", "--git-dir" } }) catch return "--ship .git: cannot run git";
-    if (!r.term.success()) return "--ship .git: not a git repository";
-    var lines = std.mem.tokenizeScalar(u8, r.stdout, '\n');
-    const common = lines.next() orelse return "--ship .git: git gave no git directory";
-    const own = lines.next() orelse common;
-    const in_worktree = !std.mem.eql(u8, common, own);
-    const dest = a.print("{s}:{s}/.git/", .{ host, dir }) catch return "out of memory";
-    // A `.git` file there (a worktree's, shipped as it was) gives way to the directory.
-    const make = a.print("--rsync-path=d={s}; [ -d \"$d\" ] || rm -f \"$d\"; mkdir -p \"$d\" && rsync", .{shellQuote(a, a.print("{s}/.git", .{dir}) catch "")}) catch return "out of memory";
-    var argv: std.ArrayList([]const u8) = .empty;
-    argv.appendSlice(a, &.{ "rsync", "-a", "--delete", make, "--include=/config", "--include=/packed-refs", "--include=/shallow", "--include=/objects/***", "--include=/refs/***", "--include=/info/***" }) catch return "out of memory";
-    if (!in_worktree) argv.appendSlice(a, &.{ "--include=/HEAD", "--include=/index" }) catch return "out of memory";
-    argv.appendSlice(a, &.{ "--exclude=*", a.print("{s}/", .{common}) catch "", dest }) catch return "out of memory";
-    const c = std.process.run(a, ctx.io, .{ .argv = argv.items }) catch return "--ship .git: cannot run rsync";
-    if (!c.term.success()) return a.print("--ship .git: {s}", .{std.mem.trim(u8, c.stderr, " \n")}) catch "--ship .git: rsync failed";
-    if (!in_worktree) return null;
-    // The worktree's own: which commit it's on, and its index.
-    var own_argv: std.ArrayList([]const u8) = .empty;
-    own_argv.appendSlice(a, &.{ "rsync", "-a", a.print("{s}/HEAD", .{own}) catch "" }) catch return "out of memory";
-    const index = a.print("{s}/index", .{own}) catch "";
-    if (Io.Dir.cwd().access(ctx.io, index, .{})) |_| own_argv.append(a, index) catch {} else |_| {}
-    own_argv.append(a, dest) catch return "out of memory";
-    const w = std.process.run(a, ctx.io, .{ .argv = own_argv.items }) catch return "--ship .git: cannot run rsync";
-    if (!w.term.success()) return a.print("--ship .git: {s}", .{std.mem.trim(u8, w.stderr, " \n")}) catch "--ship .git: rsync failed";
-    return null;
+    const e = gitship.ship(a, ctx.io, "rsync", root, host, a.print("{s}/.git", .{dir}) catch return "out of memory") orelse return null;
+    return a.print("--ship .git: {s}", .{e}) catch e;
 }
 
 /// The paths a spilled job ships beyond the tracked files: its --ship paths, then the repo's

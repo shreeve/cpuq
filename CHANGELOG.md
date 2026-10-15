@@ -2,6 +2,12 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.20.0 — 2026-10-15
+
+- **`"git": true` in a submit spec** ships the repo's git to the copy, git's own parts only (a
+  worktree's too), as `--ship .git` does for a spilled job: for a job that runs `git ls-files`.
+  `.git` as it is here never syncs with a submitted job, excluded or not.
+
 ## 0.19.3 — 2026-10-15
 
 - **`.git` ships as a git of the copy's own** (`--ship .git`, or a `.git` line in `.cpuq-spill`):

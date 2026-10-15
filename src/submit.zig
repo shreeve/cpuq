@@ -18,6 +18,7 @@ const Io = std.Io;
 const c = std.c;
 const policy = @import("policy.zig");
 const sys = @import("sys.zig");
+const gitship = @import("gitship.zig");
 
 pub const Cx = struct {
     io: Io,
@@ -101,6 +102,9 @@ const Spec = struct {
     caches: ?Map = null,
     report: ?[]const u8 = null,
     @"return": []const []const u8 = &.{},
+    /// The repo's git, git's own parts only (gitship.zig), as the copy's `.git`: for a job that
+    /// runs `git ls-files` and the like. Never the `.git` here as it is.
+    git: bool = false,
 };
 
 /// What goes to the host: the spec as this job runs it, resolved.
@@ -145,6 +149,7 @@ const Record = struct {
     exclude: []const []const u8 = &.{},
     @"return": []const []const u8 = &.{},
     deps: ?Map = null,
+    git: bool = false,
     on: []const []const u8 = &.{},
     payload: []const u8,
 };
@@ -453,7 +458,7 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
     const spec_abs = realpath(cx, sp) orelse return fail2("{s}: not found", .{sp});
     const text = readFile(cx, spec_abs) orelse return fail2("{s}: can't be read", .{sp});
     const spec = std.json.parseFromSliceLeaky(Spec, cx.a, text, .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err|
-        return fail2("spec {s}: {t} (fields: label, run, setup, cores, on, time, mem, tools, env, exclude, deps, caches, report, return)", .{ sp, err });
+        return fail2("spec {s}: {t} (fields: label, run, setup, cores, on, time, mem, tools, env, exclude, deps, caches, report, return, git)", .{ sp, err });
     const top_run = run(cx, &.{ "git", "-C", std.fs.path.dirname(spec_abs) orelse ".", "rev-parse", "--show-toplevel" }, null);
     const dir = if (top_run.ok) std.mem.trim(u8, top_run.out, " \n") else (std.fs.path.dirname(spec_abs) orelse ".");
     if (std.mem.findScalar(u8, spec.label, ':') == null) return fail2("spec {s}: \"label\" must be project:task, not '{s}'", .{ sp, spec.label });
@@ -471,6 +476,9 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
     excludes.appendSlice(cx.a, spec.exclude) catch {};
     excludes.appendSlice(cx.a, spec.@"return") catch {};
     excludes.append(cx.a, ".cpuq-generation") catch {};
+    // `.git` never syncs as it is here (a worktree's is a path on this machine, a repo's can
+    // hold far more than git): with "git", the sync ships git's own parts.
+    excludes.append(cx.a, ".git") catch {};
     var dep_digests: std.ArrayList([]const u8) = .empty;
     if (spec.deps) |deps| {
         var it = deps.map.iterator();
@@ -558,6 +566,7 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
         .exclude = excludes.items,
         .@"return" = spec.@"return",
         .deps = spec.deps,
+        .git = spec.git,
         .on = spec.on,
         .payload = jsonString(cx, payload),
     };
@@ -961,6 +970,14 @@ fn sync(cx: Cx, rec: *const Record, host: []const u8) bool {
     argv.append(cx.a, cx.a.print("{s}/", .{dest}) catch return false) catch return false;
     if (std.mem.eql(u8, host, "here")) Io.Dir.cwd().createDirPath(cx.io, cx.a.print("{s}/{s}", .{ home(cx), rec.copy }) catch "") catch {};
     if (!run(cx, argv.items, null).ok) return false;
+    if (rec.git) {
+        const here = std.mem.eql(u8, host, "here");
+        const git_dir = cx.a.print("{s}{s}{s}/.git", .{ if (here) home(cx) else "", if (here) "/" else "", rec.copy }) catch return false;
+        if (gitship.ship(cx.a, cx.io, rsync, rec.dir, if (here) null else host, git_dir)) |e| {
+            std.debug.print("cpuq: {s}\n", .{e});
+            return false;
+        }
+    }
     // Each dep's tracked files, with their mtimes.
     if (rec.deps) |deps| {
         var it = deps.map.iterator();

@@ -483,7 +483,7 @@ rest:
   "cores": "8-32",
   "on": ["burst", "here"],
   "time": "60m",
-  "exclude": [".git", ".zig-cache", "zig-out"],
+  "exclude": [".zig-cache", "zig-out"],
   "caches": { "PROJ_RESULTS_CACHE": "results" },
   "report": "test/results.jsonl",
   "return": ["test/results.jsonl"]
@@ -513,7 +513,9 @@ rest:
 - **The note:** `--note`, or else the worktree's branch, shows beside the label everywhere.
   `cpuq note PID|LABEL TEXT [--host HOST]` changes a running job's note.
 - **What travels:**
-  - everything in the repo but `exclude`;
+  - everything in the repo but `exclude` and `.git`;
+  - `"git": true` ships the repo's git, git's own parts only (a worktree's too), for a job that
+    runs `git ls-files` and the like;
   - a directory holding something like a credential (`.env`, `*.pem`, `id_*`) is refused;
   - `caches` live on the host, outside the copy, shared by all of a project's runs;
   - `deps` ship a sibling repo's tracked files.

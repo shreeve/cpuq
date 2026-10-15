@@ -85,6 +85,7 @@ never write them.
 | `caches` | `"ENV": "name"`: `~/cpuq-spill/c/PROJECT/name` on the host, created, exported as `ENV`, never synced or deleted by a sync | none |
 | `report` | JSON lines the job appends: `{"id", "ok", "status", "reason", "artifact"}`. Truncated at each attempt's start. It drives progress counts and the failure list | none |
 | `return` | paths copied back into the directory when the job ends; excluded from the sync | none |
+| `git` | `true`: the copy gets the repo's git as `.git`, git's own parts only (objects, refs, packed-refs, config, info, shallow, and the worktree's HEAD and index). `.git` as it is here never syncs | `false` |
 
 - **Defaults:** the directory is the git top of the spec's repo, and its realpath must be under
   `submit_roots` (default `~/Data/Code`).

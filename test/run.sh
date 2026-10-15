@@ -1087,11 +1087,14 @@ t_submit() {
     printf '%s\n' '{ "label": "t:slow", "run": "sleep 30", "time": "1s", "cores": "1" }' > cpuq/slow.json
     printf '%s\n' '{ "label": "t:ret", "run": "mkdir -p out && echo made > out/x", "return": ["out"], "cores": "1" }' > cpuq/ret.json
     printf '%s\n' '{ "label": "t:long", "run": "sleep 6", "cores": "1" }' > cpuq/long.json
+    printf '%s\n' '{ "label": "t:git", "run": "git rev-parse HEAD > gitsaw && git ls-files | wc -l >> gitsaw", "git": true, "return": ["gitsaw"], "cores": "1" }' > cpuq/git.json
     git add -A && git commit -qm init
     "$CPUQ" submit cpuq/pass.json -- one two >"$T/pass" 2>/dev/null; echo "pass=$?"
     "$CPUQ" submit cpuq/fail.json >"$T/fail" 2>/dev/null; echo "fail=$?"
     "$CPUQ" submit cpuq/slow.json >/dev/null 2>&1; echo "slow=$?"
     "$CPUQ" submit cpuq/ret.json >/dev/null 2>&1; echo "ret=$?"; cat out/x 2>/dev/null
+    "$CPUQ" submit cpuq/git.json >/dev/null 2>&1; echo "git=$?"
+    [ "$(head -1 gitsaw 2>/dev/null)" = "$(git rev-parse HEAD)" ] && [ "$(tail -1 gitsaw | tr -d ' ')" = "$(git ls-files | wc -l | tr -d ' ')" ] && echo gitsaw
     "$CPUQ" submit cpuq/long.json >"$T/first" 2>/dev/null & local first=$!
     sleep 2
     "$CPUQ" submit cpuq/long.json --max-wait 1 2>/dev/null | head -1 | sed 's/^job [0-9a-f]* (attached.*/attached/'
@@ -1103,7 +1106,7 @@ t_submit() {
   ) >"$T/out" 2>&1
   local got; got=$(tr '\n' ' ' < "$T/out")
   local tail_ok=0; grep -q 'args=one two' "$HOME/.local/state/cpuq/jobs/"*/tail.log 2>/dev/null || grep -rq 'args=one two' "$T/xdg" && tail_ok=1
-  check "submit: pass 0, fail 1, timeout 124, return copied, attach, changed code 2, --replace 0 and the old CANCELLED 76, a credential 2 (got: $got)" "[[ '$got' == 'pass=0 fail=1 slow=124 ret=0 made attached changed=2 replace=0 replaced=76 secret=2 ' ]]"
+  check "submit: pass 0, fail 1, timeout 124, return copied, a spec's git there, attach, changed code 2, --replace 0 and the old CANCELLED 76, a credential 2 (got: $got)" "[[ '$got' == 'pass=0 fail=1 slow=124 ret=0 made git=0 gitsaw attached changed=2 replace=0 replaced=76 secret=2 ' ]]"
   check "submit: the report's failure is listed, and the job got its arguments" "grep -q 'fail  t2  boom' '$T/fail' && [ $tail_ok = 1 ]"
   export HOME=$was_home
   unset XDG_STATE_HOME
