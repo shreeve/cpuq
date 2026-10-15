@@ -1,16 +1,12 @@
 # Submitting work: a directory and a spec, and cpuq does the rest
 
-Status: design v3, 2026-10-15. It has been through two rounds of review by seven reviewers:
-- a GCP engineer and an AWS engineer;
-- a Linux systems engineer;
-- a distributed-systems professor;
-- a build/CI infrastructure engineer;
-- a security engineer;
-- an agent-experience designer.
+Status: design v4, 2026-10-15: the contract for cpuq 0.18.
 
-In both rounds every reviewer's verdict was "build with changes". Round two's findings are in
-"What round two changed", at the end. Some systemd behaviour was checked on pup itself, not
-assumed.
+v3 went through three rounds with seven reviewers:
+- GCP, AWS, Linux systems, distributed systems, build/CI, security and agent experience.
+
+v4 takes their final round. "Decided against or later", at the end, lists what 0.18 deliberately
+leaves out.
 
 ## The idea
 
@@ -20,47 +16,44 @@ An agent names a spec kept in its repo:
 
 cpuq does the rest:
 
-- picks a machine that can run the job;
+- picks a machine;
 - syncs a snapshot of the work there, moving only what changed;
-- runs it under limits, owned by that machine;
+- runs it there, owned by that machine;
 - shows progress;
-- brings back a verdict that names exactly which code it tested, with a short failure report;
+- brings back a verdict that names the code it tested, with a short failure report;
 - cleans up.
 
-The agent never names cores, `-j`, hosts, ssh, rsync or cleanup.
+## Identity
 
-## Identity: the input digest
+- **The snapshot digest** is a hash of what the job sees:
+  - `git ls-files -s`;
+  - the content of modified and untracked files that ship;
+  - size and mtime of ignored files that ship;
+  - the same for each `deps` source.
 
-Every job has an **input digest**, a hash of:
+  Outside git, it covers every file's path, size and mtime. It's taken before the sync and checked
+  again after it; an edit made during the sync means syncing again.
+- **The job digest** is the snapshot digest plus the spec, `-- ARGS`, `--env` and `tools`.
+- **A copy's generation** is the snapshot digest it holds (`.cpuq-generation` in the copy).
 
-- the snapshot: for a git work tree, `git ls-files -s` plus the hashes of modified and untracked
-  files that will be shipped; otherwise the contents;
-- the `deps`;
-- the spec;
-- the `-- ARGS` and `--env`;
-- the declared `tools` versions.
+Each digest has its own use:
 
-It's computed before the sync and checked again after (an edit made during the sync means
-syncing again). Each sync of a copy records its **generation**, the digest it holds.
-
-Everything that could otherwise give a verdict for the wrong code uses the digest:
-
-- **A resubmit** attaches to a queued or running job only when the digests match. Otherwise it
-  stops with exit 2: `an older snapshot is running (7f3a, 12m in): --replace to cancel it and
-  start this one, --again to run both`.
-- **A retry** after host loss reruns the same generation, already on the host, with no new sync
-  and no need for the Mac.
-- **Every verdict line and `result.json`** name the digest, so a PASS says which code passed.
+| Use | Rule |
+|---|---|
+| Attach | a resubmit for the same worktree and label attaches to the job queued or running only when the **job digests** match. Otherwise it ends `NOT STARTED`, exit 2: `--replace` cancels the old job and starts this one; `--again` queues it behind |
+| Copy | jobs on one copy run **one at a time**, under the copy's lock. A job's sync happens under that lock |
+| Retry | after host loss it reruns on the host's copy only if the copy still holds the job's generation, with no new sync |
+| Verdicts | every verdict and `result.json` name the job digest |
 
 ## Specs
 
-Specs live in the repo (`cpuq/*.json`). The cpuq session writes and maintains them; agents run
-them and never write them. The project decides which specs a change must pass.
+Specs are kept in the repo (`cpuq/*.json`). The cpuq session writes them; agents run them and
+never write them.
 
 ```json
 {
   "label": "rig:matrix",
-  "setup": "zig build -j$CPUQ_CORES -Dnexus=$NEXUS_BIN",
+  "setup": "(cd deps/nexus && zig build -Doptimize=safe -p \"$NEXUS_OUT\") && zig build -j$CPUQ_CORES -Dnexus=$NEXUS_OUT/bin/nexus",
   "run": "python3 test/matrix.py -j $CPUQ_CORES --delta \"$@\"",
   "cores": "8-32",
   "on": ["burst", "pup"],
@@ -69,284 +62,185 @@ them and never write them. The project decides which specs a change must pass.
   "tools": { "zig": "0.17.0" },
   "env": { "JSON_REQUIRE_DATA": "1" },
   "exclude": [".git", ".zig-cache", "zig-out"],
-  "deps": { "deps/nexus-src": "../nexus" },
-  "caches": { "RIG_RESULTS_CACHE": "rig-results", "RIG_BUILD_STORE": "rig-build-store", "ZIG_GLOBAL_CACHE_DIR": "zig", "NEXUS_OUT": "nexus" },
+  "deps": { "deps/nexus": "../nexus" },
+  "caches": { "RIG_RESULTS_CACHE": "rig-results", "NEXUS_OUT": "nexus" },
   "report": "test/results.jsonl",
-  "return": ["test/results.jsonl", "test/failures"],
-  "replaces": ["./test/run", "test/matrix.py"]
+  "return": ["test/results.jsonl", "test/failures"]
 }
 ```
 
 | field | meaning | default |
 |---|---|---|
-| `label` | `project:task`: the job's name in queues, history and `cpuq jobs` | required |
-| `run` | `sh -c RUN cpuq ARGS...` at the copy's top, with `$CPUQ_CORES`; `cpuq submit SPEC -- ARGS` passes ARGS as `"$@"` | required |
-| `setup` | run first, in the same job and place (a build); a failure is a FAIL | none |
-| `cores` | `N` or `MIN-MAX`, sized from that host's own history | history, else 2 |
-| `on` | hosts in order of preference: `"here"`, host names, `"linux"`, `"macos"`. A host that bills (one with `spill_start`) is started only when named here | `["here"]` |
-| `time` | wall time once admitted, enforced by the host's cpuq; required on a host that bills | 2h there |
-| `mem` | the whole job's memory: `MemoryMax`, with swap off | none |
-| `tools` | versions checked on the host before the run; a mismatch is NOT RUN | none |
-| `env` | variables, sent over the ssh connection, never in a command line; keys `[A-Z_][A-Z0-9_]*` | none |
-| `exclude` | paths that never travel; patterns `[A-Za-z0-9._/*?-]`, always passed as `--exclude=/PAT` | none |
-| `deps` | `"path in copy": "path outside dir"`: sources from outside the directory, copied with their mtimes. Under the same path rules as `dir`. Binaries don't travel between OSes; build them on the host with `setup` into a cache | none |
-| `caches` | `"ENV": "name"`: a directory on each host per project and name, shared by that project's copies, never synced and never deleted by a sync, exported as `ENV`. Each has a size budget, and eviction renames entries into a trash directory, never `rm` under a running job | none |
-| `report` | JSON lines appended as the job goes: `{"id", "ok": bool, "status": "<the runner's own word>", "reason", "duration_ms", "attempt", "artifact"}`. Progress and the failure report come from it. The exit status decides the verdict and the report explains it | none |
-| `return` | paths copied back when the job ends, pass or fail; excluded from the sync; `--safe-links`; size-capped | none |
-| `replaces` | commands this spec stands for: `cpuq hook` refuses them and names the spec. A repro line uses the spec (`cpuq submit cpuq/suite.json -- proof.loan.3`) | none |
+| `label` | `project:task` | required |
+| `run` | `sh -c RUN cpuq ARGS...` at the copy's top, with `$CPUQ_CORES`; `-- ARGS` become `"$@"` | required |
+| `setup` | run first, in the same job | none |
+| `cores` | `N` or `MIN-MAX` | that host's history, else 2 |
+| `on` | hosts in order: `"here"` or host names. A host with `spill_start` is started only when named here | `["here"]` |
+| `time` | wall time from admission, enforced by `cpuq cap --time` around setup and run; required on a host with `spill_start` | 2h there, none here |
+| `mem` | memory of the whole job, by `cpuq cap --mem` (the kernel's memory.max inside a Linux job) | none |
+| `tools` | `{"zig": "0.17.0"}`: `zig version` etc. checked on the host before the run; a mismatch is NOT RUN | none |
+| `env` | variables for setup and run, written to the job's own files on the host, never on a command line | none |
+| `exclude` | path prefixes in the directory that never travel | none |
+| `deps` | `"target in copy": "source outside"`: a source directory's tracked files (`git ls-files`), with mtimes. Binaries are built on the host by `setup` | none |
+| `caches` | `"ENV": "name"`: `~/cpuq-spill/c/PROJECT/name` on the host, created, exported as `ENV`, never synced or deleted by a sync | none |
+| `report` | JSON lines the job appends: `{"id", "ok", "status", "reason", "artifact"}`. Truncated at each attempt's start. It drives progress counts and the failure list | none |
+| `return` | paths copied back into the directory when the job ends; excluded from the sync | none |
 
-The directory is the git top of the spec's repo. `cpuq submit` prints it, with the file count,
-before the first sync. A spec error is one line naming the field, exit 2.
+- **Defaults:** the directory is the git top of the spec's repo, and its realpath must be under
+  `submit_roots` (default `~/Data/Code`).
+- **Spec errors:** one line naming the field, exit 2.
+- **Refused directories:** one holding `.env*`, `*.pem`, `id_*`, `.netrc` or `.npmrc` that isn't
+  excluded.
 
-## Submitting and following
+## Commands
 
-    cpuq submit SPEC [-- ARGS] [--env K=V] [--replace | --again]
-    cpuq jobs                          this worktree's jobs, newest first; --all for all
-    cpuq job [ID|last] [--label L]     state, host, CPUs, memory, progress, digest, verdict
-    cpuq job ... --wait [--max-wait S]
-    cpuq job ... --tail N              part of its output; logs are never printed whole
-    cpuq job ... --cancel              another worktree's job also needs --force
+    cpuq submit SPEC [-- ARGS] [--env K=V]... [--replace | --again]
+    cpuq jobs [--all]                    this worktree's jobs, newest first
+    cpuq job [ID | last] [--label L]     state, host, progress, verdict
+    cpuq job ... --wait [--max-wait S]   wait, then exit as the job did
+    cpuq job ... --tail N                the output's last N lines
+    cpuq job ... --json                  everything, as fields
+    cpuq job ... --cancel                stop it (another worktree's job also needs --force)
 
-- **Every submit is supervised.**
-  - `cpuq submit` prints the job id on its first line, then waits.
-  - Killing its client never stops the job. Agents run it in the background and are notified when
-    it ends.
-  - After compaction, `cpuq job last --wait` finds the job again.
-  - `cpuq hook` refuses a foreground `cpuq submit`, and `job --wait` without `--max-wait`, by
-    reading `run_in_background`.
-- **The last line is always a verdict:**
+- **`cpuq submit` and the job are independent.**
+  - It prints `job ID` on its first line, starts a supervisor that outlives it, and then waits.
+  - Killing it never stops the job.
+  - Agents run it in the background. After compaction: `cpuq jobs`, then `cpuq job ID --wait`, in
+    the background.
+  - `cpuq job last` names the other jobs of the worktree that are running, if any.
+- **The last line is always a verdict.**
 
-      PASS        rig:matrix  7f3a1c  38m40s  burst  32 cores  11409: 6840 ok, 4569 rejected
-      FAIL        rig:matrix  7f3a1c  exit 1  38m40s  burst  3 of 11409 failed
-      TIMEOUT     rig:matrix  7f3a1c  stopped at the 90m limit: a limit, may be a hang in your change
-      OOM         rig:matrix  7f3a1c  stopped at the 96G limit: a limit, may be a leak in your change
-      NOT RUN     rig:matrix  7f3a1c  burst over today's budget until 00:00: not your code, don't resubmit before then
-      LOST        rig:matrix  7f3a1c  burst preempted twice: not your code, resubmit once
-      CANCELLED   rig:matrix  7f3a1c  by cpuq job --cancel: not your code
-      CPUQ ERROR  rig:matrix  7f3a1c  rsync to burst failed (…): not your code, report it
-      RUNNING     rig:matrix  7f3a1c  41m on burst: still running; cpuq job last --wait
+      PASS         rig:matrix  9c1e5f2a  38m40s  burst  32 cores  11409: 6840 ok, 4569 rejected
+      FAIL         rig:matrix  9c1e5f2a  exit 1  38m40s  burst  3 of 11409 failed
+      TIMEOUT      rig:matrix  9c1e5f2a  stopped at 90m: a limit, may be a hang in your change
+      OOM          rig:matrix  9c1e5f2a  stopped at 96G: a limit, may be a leak in your change
+      NOT RUN      rig:matrix  9c1e5f2a  no host could take it (burst: zig 0.16.0, wanted 0.17.0): not your code
+      NOT STARTED  rig:matrix  9c1e5f2a  older snapshot running (4be1, 12m in): --replace or --again
+      LOST         rig:matrix  9c1e5f2a  burst went away twice: not your code, resubmit once
+      CANCELLED    rig:matrix  9c1e5f2a  by cpuq job --cancel: not your code
+      CPUQ ERROR   rig:matrix  9c1e5f2a  rsync to burst failed (...): not your code, report it
+      RUNNING      rig:matrix  9c1e5f2a  41m on burst: still running; cpuq job 9c1e --wait
 
   - On FAIL, the lines before the verdict are the first 20 failures from `report` (id, reason,
-    repro, artifact), or else the output's last 30 lines.
-  - Secrets are redacted from all of it.
-- **Exit status:**
+    artifact), else the output's last 30 lines.
+- **Exit codes:**
 
   | verdict | exit |
   |---|---|
   | PASS | 0 |
-  | FAIL | 1, always; the job's own code is in the verdict and in `--json` |
-  | TIMEOUT | 124 |
-  | OOM | 122 |
+  | FAIL | 1 (the job's own exit code is in the line and in `--json`) |
+  | NOT STARTED | 2 |
+  | RUNNING | 3 |
+  | LOST | 69 |
   | NOT RUN | 75 |
   | CANCELLED | 76 |
-  | LOST | 69 |
+  | OOM | 122 |
+  | TIMEOUT | 124 |
   | CPUQ ERROR | 125 |
-  | RUNNING | 3 |
 
-  These numbers never pass through from the job, so each means only what cpuq says.
-- **Progress** goes on stderr. Off a terminal: one line at each state change, and every 5
-  minutes, under 100 characters:
+  None of these is ever the job's own exit code.
+- **Progress:** on stderr, one line at each state change and every 5 minutes, under 100
+  characters.
 
-      rig:matrix  running  burst  12m  27.8 CPUs  41G  4210/12034  3 failing
+      rig:matrix  running  burst  12m  4210 done  3 failing
 
 ## How a job runs
 
-1. **Place.** The first host in `on`'s order that's feasible and has room now.
-   - *Feasible* means up or startable, the right OS, `mem` within its RAM, its copies quota with
-     room, `tools` matching, and under budget.
-   - *If none has room:* start the first named billing host, under budget, re-checking
-     feasibility against the shape it actually started as.
-   - *Otherwise* queue at the first feasible host that's up.
-   - A host stays held with a lease from placement until the job is queued there, so its idle
-     stop can't intervene.
-2. **Sync.**
-   - *Where:* the copy is `~/cpuq-spill/w/PROJECT/ID`, the same absolute path on pup and burst
-     (both `/home/shreeve`; burst's is the ZFS dataset, with lz4 and dedup). ID is a hash of the
-     origin host and the directory's realpath, so worktrees with the same name in different
-     places never share a copy.
-   - *What:* `rsync -a --delete` of the snapshot, less `exclude` and `return`, plus `deps`.
-     "here" is a local copy too, so a job always runs a snapshot.
-   - *Locking:* each copy has a readers–writer lock where a waiting sync goes ahead of new
-     readers. A job joins a copy only at its own generation, re-checked after taking the shared
-     lock. Eviction takes the exclusive lock.
-   - *The wait:* time spent waiting for the copy lock counts in the queue estimate. A short job
-     stuck behind a long one on an older generation gets a second copy.
-3. **Run, owned by the host.**
-   - *The unit.* On Linux each job is a transient systemd **service** of the host's cpuq (scopes
-     ignore `DelegateSubgroup`, as checked on pup's systemd 259). It has
-     `DelegateSubgroup=sup`, `OOMPolicy=continue`, `MemoryMax`, `MemorySwapMax=0`, and
-     `StandardOutput=append:` to the job's log. `RuntimeMaxSec` is only a backstop, set to the
-     longest wait plus `time`.
-   - *cpuq run* sits in `sup/`. It holds the lease, takes the cores, enables `+memory +pids` for
-     the unit's children, and starts the command into `job/` with `clone3(CLONE_INTO_CGROUP)`.
-     It enforces `time` from admission. It watches CPU and memory from the cgroups, with no
-     process walk. At the end it kills `job/` and any caps (never `sup/`), then writes the
-     verdict.
-   - *Cleanup:* `ExecStopPost` removes the job's `TMPDIR`.
-   - *State:* the state, output and report live on the host in `~/.local/state/cpuq/jobs/ID/`
-     (0700). The supervisor on the submitting machine owns the job's life before that (placing,
-     starting the host, syncing) and after it (fetching results, retrying). Each phase is a state
-     written by atomic rename, under the supervisor's own flock. A job whose flock nobody holds is
-     reconciled by the next `cpuq job`: reattach, fetch, or mark LOST.
-4. **Finish.**
-   - *On the host:* the verdict goes into `result.json`, with `report` read and secrets redacted.
-   - *The supervisor* fetches `result.json`, `return` and the output's tail at once, so nothing
-     has to start a stopped VM to read a verdict. Until it does, the host's idle stop sees a
-     "results waiting" lease, capped at 30 minutes.
-   - *History* records the spec path, label, digest and host, not the expanded command.
-5. **Host lost.**
-   - A unit ordered before `user@.service` stops records why the host stopped, *before* any job
-     is stopped. The reasons are preemption (`instance/preempted`), `--max-run-duration`, the idle
-     stop, or a shutdown.
-   - A verdict is written only after checking that record. So any stop the job didn't cause is
-     host loss, never FAIL.
-   - The supervisor restarts the host (when the budget allows) and reruns the same generation
-     once, then gives LOST. With no supervisor alive, or with secrets that were never stored,
-     it's LOST at once.
+1. **Place.** Take the first host in `on` that is reachable, has room (nobody waiting, load under
+   its CPUs, gate open), and has the RAM for `mem`.
+   - If none has room, queue at the first one that's reachable.
+   - If none is reachable, start the first one named with a `spill_start` command.
+   - A host whose cpuq is older than this one is refused, with the install command.
+2. **Start, owned by the host.** The spec, env, ARGS and the job's identity go to
+   `~/.local/state/cpuq/jobs/ID/` on the host, by ssh stdin. Then:
+   - **Linux:** `systemd-run --user --unit cpuq-job-ID --collect --expand-environment=no
+     -p RuntimeMaxSec=… cpuq _job ID`. The unit name makes a repeated start (a lost connection,
+     a retry) refuse instead of doubling the job.
+   - **macOS** (`here` on the Mac): `cpuq _job ID` in its own session.
+3. **Lock and sync.**
+   - `_job` takes the copy's lock: `~/cpuq-spill/w/PROJECT/ID12`, where ID12 is a hash of the
+     origin machine and the directory's realpath.
+   - It says "ready". The supervisor rsyncs the snapshot (`-a --delete`, less `exclude`,
+     `return`, the `deps` targets and `.cpuq-generation`), then each dep's tracked files, then
+     writes the generation. `_job` checks it.
+4. **Run.**
+   - `cpuq run --label L --cores C -- cpuq cap --time T --mem M -- sh -c 'SETUP && RUN' cpuq ARGS`,
+     in the copy.
+   - The environment: `env`, `caches` and a `TMPDIR` of the job's own.
+   - Output goes to the job's `output.log`, and the report is truncated first.
+   - `tools` are checked before anything runs.
+   - The job is cpuq run's like any other: it queues there, takes cores, gets a cgroup that is
+     killed when the command ends, and lands in history. cap enforces `time` from admission, and
+     `mem` as the kernel's limit inside the job.
+5. **Finish on the host.**
+   - The verdict comes from the exit code and cap's last line, with the report read for counts and
+     failures.
+   - It's written to `result.json`, and `TMPDIR` is removed.
+   - The lock is released, then the unit ends.
+6. **Fetch.** The supervisor polls the host's state every 5 seconds over ssh. At the end it copies
+   back `result.json`, the output's last 200 lines and `return`. A host's idle stop counts a job
+   whose results haven't been fetched yet, for at most 30 minutes.
+7. **Host lost.**
+   - The supervisor owns retries. When the host stops answering, it checks three times, 5
+     seconds apart.
+   - It then starts the host again (`spill_start`), and reruns `_job ID` once, but only if the copy
+     still holds the job's generation.
+   - Otherwise, or after a second loss, the job is LOST.
+   - With no supervisor left, the next `cpuq job` reconciles: it finds the result on the host, or
+     the job still running, or marks it LOST.
 
-## `cpuq cap`, for each program a runner starts
+## State
 
-    cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] -- PROGRAM ARGS...
-
-- **Linux, inside a job (`CPUQ_CGROUP`):**
-  - *Birth:* PROGRAM is born in a cgroup of its own beside `job/`, by
-    `clone3(CLONE_INTO_CGROUP)`, with `exit_signal` SIGCHLD. Before exec the child makes only
-    async-signal-safe calls. It falls back to fork and a move on ENOSYS, EACCES or EBUSY.
-  - *Limits:* the cgroup has `memory.max`, `memory.swap.max=0`, `memory.oom.group=1` and
-    `pids.max`.
-  - *Blame:* "stopped for memory" is read from the cap's own `memory.events.local`.
-  - *Stopping:* `cgroup.kill`.
-  - *No escape:* `CPUQ_CGROUP` isn't passed on, so a nested cap can't escape its parent.
-- **Elsewhere:**
-  - PROGRAM gets its own process group.
-  - Memory is read once a second from its own tree. On Linux that's
-    `/proc/PID/task/TID/children`, read to EOF. On macOS it's `proc_listchildpids`.
-  - Stopping repeats freeze, walk, SIGKILL and `killpg` until nothing is left. A Linux
-    subreaper and PDEATHSIG (re-checked against `getppid` once armed) keep orphans in reach.
-- **`--time` alone uses no cgroup.**
-- **Waiting:** the program's end wakes cpuq at once, through a signal pipe. The handler saves
-  errno, signals are blocked across the fork, and a deadline is a timer. Orphans are reaped as
-  they end. Buffers are on the stack, so a long cap doesn't grow.
-- **Exit:** PROGRAM's own, or death by its signal. 122 for memory, 124 for time and 121 for
-  output each come with one line on stderr.
-- **Measured on burst before Rig switches:**
-  - 14,000 calls, for cost per call and for dying memcgs in `cgroup.stat` (slots are reused if
-    those pile up);
-  - Rig's 2048 MB limit, recalibrated, since `memory.max` counts page cache, tmpfs and kernel
-    memory, which `ps` RSS didn't.
+- **On the submitting machine:** `~/.local/state/cpuq/jobs/ID/`, holding `job.json` (spec path,
+  label, worktree, digests, host, attempts), `state` (written by atomic rename), `progress`,
+  `result.json` and `tail.log`.
+  - The supervisor holds `lock` with flock for as long as it lives. An unlocked job that hasn't
+    finished is reconciled by whoever next finds it.
+- **On the host:** `~/.local/state/cpuq/jobs/ID/`, holding `spec.json`, `env` (0600), `state`,
+  `output.log` and `result.json`.
+- **Retention:** records are kept 14 days. Copies and caches are listed by `cpuq copies` and
+  removed by `cpuq copies --clean`.
 
 ## Safety
 
-- **Paths:**
-  - `dir` and each `deps` source must resolve (realpath) under `submit_roots` (default
-    `~/Data/Code`), never `$HOME` or above it.
-  - Targets must be relative, with no `..` and no symlink on the way (lstat).
-  - A copy is always `w/PROJECT/ID`, so `--delete` can only touch it.
+- **Paths:** `dir` and every `deps` source must be under `submit_roots`, by realpath.
+  - Targets, `return`, `exclude` and `report` are relative, with no `..`.
+  - A copy is always `w/PROJECT/ID12`.
   - Job ids are hex.
-  - rsync is pinned by absolute path to a 3.x build, not macOS's `/usr/bin/rsync`.
-- **Secrets:**
-  - *Never shipped:* a directory isn't shipped if it holds `.env*`, `*.pem`, `id_*`, `.netrc`,
-    `.npmrc` or `credentials*.json` (unless excluded). Its `deps` are checked the same way.
-  - *Sources:* a `secrets` field gives the only way in: Keychain items named `cpuq-*`, or files
-    under `~/.config/cpuq/secrets/`.
-  - *Resolving:* in the foreground. A locked keychain fails at once, with no wait on a prompt.
-  - *Delivery:* sent over ssh stdin into a 0600 file under `/run/user/UID/cpuq/ID` (tmpfs),
-    which the job reads into its environment. Never in unit properties, a command line, the copy,
-    history or a log. Deleted when the job ends.
-  - *Redaction:* values of 8 characters or more are redacted when written on the host, from
-    output, the report, `result.json` and returned files.
-  - *Retries:* a retry with no supervisor alive can't have the secrets, so it's LOST.
-- **Cost:**
-  - A billing host is started only by a spec that names it, and every job there has a `time`.
-  - The host keeps its own uptime ledger on its disk. `spill_budget.burst` (hours a month,
-    matched to the $100 budget alert) is checked at every start and every submit, including
-    retries.
-  - `--max-run-duration` on the VM is a backstop.
-  - Placement refuses a job whose `time` won't fit in the VM's remaining run time.
-  - Each start is logged: by whom, for which spec, when, and for how long.
-- **Hosts:**
-  - burst has no service account; verify checks the metadata server gives no token.
-  - `block-project-ssh-keys` is set.
-  - ssh: a deny rule ranked above the project's allow, by secure tag, admits only the current
-    egress addresses, and `start` updates them when they change.
-  - Host keys are pinned from guest attributes.
-- **Who may send work where:** a label allowlist per remote host (`submit_remote.burst = rig:*`),
-  plus the cost caps. A cgroup controls resources but doesn't contain anything: it stops
-  accidents, not attacks.
+  - rsync runs from an absolute path. `return` uses `--safe-links`.
+- **Cost:** a host that bills is started only when named. Every job there has a `time`, and the
+  VM has `--max-run-duration` (6h) as a backstop.
+- **Trust:** everything on a host runs as one user, who has sudo on burst. A cgroup limits
+  resources but contains nothing: these are guardrails against accidents, not against an attacker.
+  burst has no cloud service account and blocks project-wide ssh keys.
 
-## Housekeeping
+## Decided against or later
 
-- **Copies** are evicted least-recently-used past 80% of the host's quota, under their lock.
-  `cpuq copies [HOST]` lists them and `--clean` removes them.
-- **Caches** are evicted by their own budgets.
-- **Job records** are kept 14 days.
-- **cpuq versions:** on each connect, a host's cpuq is checked. When it's older, the matching
-  release for that host's OS and architecture is installed (checksum-verified), never the Mac's
-  own binary.
-- **systemd-tmpfiles** is kept out of `~/cpuq-spill`, which it doesn't touch today.
+| item | decision | why |
+|---|---|---|
+| A results cache in cpuq | **no** | unsound at job level; the project's own per-test cache is right (it lives in `caches`) |
+| `secrets` | **later** | no spec needs one yet; until then a directory holding key files is refused |
+| Redacting output and returned files | later, with `secrets` | |
+| A readers–writer copy lock and a second copy | **no** | one job at a time per copy, under one lock, is enough; the copy-lock wait is part of the queue |
+| Cache size budgets and eviction | later | `cpuq copies --clean` and the dataset quota until then |
+| Auto-installing cpuq on hosts | **no** | refused with the install command instead |
+| Placement scoring and cost weights | **no** | `on` order, for three machines |
+| `spill_budget` hours | later (0.18.x) | the 6h VM backstop and `time` cover it until then |
+| The hook reading `replaces` | later | the brief says it until then |
+| Preemption marker unit on the host | later (runbook) | until then any lost host counts as lost, with one retry |
+| ZFS dedup on burst | **kept**, measured | 1.40× on new writes at about zero kernel CPU so far; revisit if write latency shows |
 
-## Releases
-
-1. **Now: cpuq 0.16.3.** A failed sync under `--spill-to` exits 125 instead of running here.
-2. **Now: the burst runbook.**
-   - *No service account:* `set-service-account` on the stopped VM, so no rebuild.
-   - *ssh:* `block-project-ssh-keys`, guest attributes on, and the deny-by-tag rule.
-   - *`start`:* waits through STOPPING, resets the shape to -96, and falls back to -64 or -48
-     when Spot capacity runs out.
-   - *The idle stop:* counts leases, and needs three failed status reads in a row.
-   - *Ordering:* the stop-reason unit runs before `user@.service`.
-   - *The rest:* `--max-run-duration`, no unattended upgrades, `zfs sync=disabled`, labels on
-     both disks, and a system drop-in that takes oomd's kill policy off `user@.service`.
-3. **0.17.**
-   - `cpuq cap` as above.
-   - Each Linux `cpuq run` job gets a scope with `Delegate=yes`. A small helper moves the job
-     into `job/` once, and enables `+memory +pids`, `OOMPolicy=continue` and `MemorySwapMax=0`.
-   - CPU and memory are read from cgroups.
-   - The 14,000-call measurement.
-4. **0.18.** `cpuq submit`, `jobs` and `job` as above, with `cpuq hook`'s `replaces` and
-   background checks (the agent brief depends on them).
-5. **Later.** History keyed by host shape; a CPU-time limit for `cap`.
-
-## For Rig
-
-An agent's whole protocol, the brief:
+## For agents (the brief)
 
 ```
 Heavy work goes through repo specs in cpuq/*.json; don't edit, copy or write specs.
 Start one with Bash run_in_background:  cpuq submit cpuq/suite.json [-- TEST FILTER]
 You're notified at the end. The last line is the verdict, and the exit status matches it:
-  PASS 0 | FAIL 1: your code; the failures and their repro commands are printed above it.
-  TIMEOUT / OOM: a limit; often a hang or leak in your change; check cpuq job last --tail 100.
+  PASS 0 | FAIL 1: your code; failures and their repro commands are printed above it.
+  TIMEOUT / OOM: a limit, often a hang or leak in your change: cpuq job ID --tail 100.
   NOT RUN / LOST / CANCELLED / CPUQ ERROR: not your code; follow the hint on the line.
-Never cat logs; use cpuq job last --tail N.
-After compaction: cpuq jobs, then cpuq job last --wait (in the background).
-Resubmitting unchanged work attaches; after edits, use --replace. Never loop.
+Never cat logs. After compaction: cpuq jobs, then cpuq job ID --wait in the background.
+Same code resubmitted attaches. After edits, --replace; a repro beside a full run, --again.
 Never add -j, --cores, hosts, ssh or rm -rf; never cancel another worktree's job.
+Never loop on a non-code verdict.
 ```
-
-Rig decides which specs each kind of change must pass. Rig provides:
-
-- `test/results.jsonl` from matrix.py and test/run;
-- failing programs kept under `test/failures` (capped);
-- nexus built from source by `setup` into its cache, keeping its path and mtime stable (or a
-  synced `src/parser.zig` accepted when `rig.grammar` hasn't changed).
-
-## What round two changed
-
-| change | from |
-|---|---|
-| Attach and retry by input digest; verdicts name it (v2 could PASS code the agent no longer had) | AWS, professor, CI, agent DX |
-| A retry reruns the same generation on the host, with no new sync | professor, CI |
-| Supervisor phases as flock'd states, reconciled when found orphaned | professor |
-| Results fetched at once, behind a "results waiting" lease | AWS, professor |
-| The stop reason recorded before jobs are stopped; any stop the job didn't cause is host loss | GCP |
-| Transient services, not scopes; cpuq enables the controllers; time from admission | Linux (tested on pup) |
-| OOM read from `memory.events.local`; `OOMPolicy=continue`; swap off; oomd handled by a system drop-in | Linux |
-| FAIL always exits 1; CANCELLED 76; a RUNNING verdict; TIMEOUT/OOM may be your code | agent DX |
-| A secrets lifecycle that a host-owned job can keep, from restricted sources | security |
-| Copies keyed by hash of origin and realpath; under home, not `/var/tmp` (tmpfiles ages that) | professor, security, Linux, CI |
-| Placement by `on` order: first feasible with room, then start, then queue; no scoring | AWS, GCP, professor |
-| `tools` versions; `deps` are sources, built on the host; caches with budgets | CI |
-| Budget in hours a month from the host's own ledger, checked at every submit | GCP, security |
-| Release binaries matched to each host, not the Mac's | AWS, security, professor |
-| The copy lock gives a waiting sync priority and re-checks the generation; eviction takes the lock | professor, Linux |
