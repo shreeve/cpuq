@@ -1454,6 +1454,9 @@ t_spill_to() {
   local out rc
   out=$("$CPUQ" run --spill-to cpuq-test-nohost.invalid --cores 1 -- echo ran-here 2>&1); rc=$?
   "$CPUQ" run --spill --spill-to x --cores 1 -- true 2>/dev/null; local both=$?
+  "$CPUQ" run --spill-to x --ship ../out --cores 1 -- true 2>/dev/null; local outside=$?
+  "$CPUQ" run --ship vendor --cores 1 -- true 2>/dev/null; local alone=$?
+  [ $outside = 2 ] && [ $alone = 2 ] || both=fail
   check "--spill-to an unreachable host without spill_start fails (rc $rc: '$out'), never running here; --spill with --spill-to is refused (rc $both)" \
     "[[ $rc = 125 && '$out' == *'does not answer'* && '$out' != *ran-here* && $both = 2 ]]"
 }

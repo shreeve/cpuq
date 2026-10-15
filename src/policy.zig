@@ -140,6 +140,12 @@ pub const Config = struct {
     /// `ssh HOST` works.
     spill_starts: [max_spill_starts]SpillStart = @splat(.{}),
     spill_start_count: u8 = 0,
+    /// What a spilled job's shell exports on HOST before cpuq runs it there:
+    /// `spill_env.HOST = PATH=$HOME/.local/go/bin:$PATH` (one or more shell
+    /// assignments, expanded by HOST's shell). An ssh command's shell reads
+    /// no login profile, so tools under ~/.local are off its PATH.
+    spill_envs: [max_spill_starts]SpillStart = @splat(.{}),
+    spill_env_count: u8 = 0,
 
     /// The spill hosts, in order.
     pub fn spillHosts(self: *const Config) std.mem.TokenIterator(u8, .any) {
@@ -149,6 +155,12 @@ pub const Config = struct {
     /// The command that starts `host`, if one is configured.
     pub fn spillStart(self: *const Config, host: []const u8) ?[]const u8 {
         for (self.spill_starts[0..self.spill_start_count]) |s| if (std.mem.eql(u8, s.host, host)) return s.cmd;
+        return null;
+    }
+
+    /// The assignments a job spilled to `host` exports there, if any.
+    pub fn spillEnv(self: *const Config, host: []const u8) ?[]const u8 {
+        for (self.spill_envs[0..self.spill_env_count]) |s| if (std.mem.eql(u8, s.host, host)) return s.cmd;
         return null;
     }
 };
@@ -241,6 +253,13 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             if (cfg.spill_start_count == max_spill_starts) return bad(diag, "at most 8 spill_start commands");
             cfg.spill_starts[cfg.spill_start_count] = .{ .host = host, .cmd = value };
             cfg.spill_start_count += 1;
+        } else if (std.mem.startsWith(u8, key, "spill_env.")) {
+            const host = key["spill_env.".len..];
+            if (host.len == 0) return bad(diag, "spill_env needs a host: spill_env.HOST = NAME=VALUE");
+            if (std.mem.findScalar(u8, value, '=') == null) return bad(diag, "spill_env needs assignments: NAME=VALUE ...");
+            if (cfg.spill_env_count == max_spill_starts) return bad(diag, "at most 8 spill_env lines");
+            cfg.spill_envs[cfg.spill_env_count] = .{ .host = host, .cmd = value };
+            cfg.spill_env_count += 1;
         } else if (std.mem.eql(u8, key, "min_disk")) {
             cfg.min_disk = parseBytes(value) orelse return bad(diag, "min_disk must be off or a size such as 5G or 512M");
         } else if (std.mem.eql(u8, key, "min_available")) {
@@ -863,6 +882,10 @@ test "spill hosts and their start commands" {
     try testing.expectEqualStrings("burst", it.next().?);
     try testing.expectEqual(@as(?[]const u8, null), it.next());
     try testing.expectEqualStrings("~/runbooks/host-gcp-burst/start", cfg.spillStart("burst").?);
+    try parseConfig("spill_env.pup = PATH=$HOME/.local/go/bin:$PATH\n", &cfg, &diag);
+    try testing.expectEqualStrings("PATH=$HOME/.local/go/bin:$PATH", cfg.spillEnv("pup").?);
+    try testing.expectEqual(@as(?[]const u8, null), cfg.spillEnv("burst"));
+    try testing.expectError(error.ConfigInvalid, parseConfig("spill_env.pup = nothing\n", &cfg, &diag));
     try testing.expectEqual(@as(?[]const u8, null), cfg.spillStart("pup"));
     try testing.expectError(error.ConfigInvalid, parseConfig("spill_start. = x\n", &cfg, &diag));
 }

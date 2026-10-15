@@ -2,6 +2,17 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.14.0 — 2026-10-15
+
+- A spilled job ships gitignored paths it needs: listed in the repo's `.cpuq-spill` (a path a line)
+  or given with `--ship PATH`, `.git` included, so a test suite that reads a vendored tree or runs
+  `git ls-files` works there. Other gitignored paths still never ship, and a host's own build
+  caches stay warm.
+- `cpuq status --json` gives `boot_time`, when the machine booted, so a reader can tell how long a
+  cloud machine has been up and billing.
+- `spill_env.HOST = NAME=VALUE ...` in the config: exported on HOST before a spilled job runs, for
+  tools under `~/.local` that a command run over ssh does not find on its PATH.
+
 ## 0.13.0 — 2026-10-15
 
 - `cpuq run --spill-to HOST`: runs the job on HOST whatever this machine's state, the repo copied

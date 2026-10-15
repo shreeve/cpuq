@@ -52,6 +52,8 @@ const usage =
     \\  --spill-to HOST       run on HOST, here full or not: queue there if it is busy,
     \\                        start it if stopped (config `spill_start.HOST`)
     \\  --return PATH         with --spill or --spill-to: copy PATH back here afterwards
+    \\  --ship PATH           with --spill or --spill-to: copy PATH there too, gitignored
+    \\                        or not, .git included (also listed in .cpuq-spill)
     \\
     \\lease options (NAME: letters, digits, . _ -):
     \\  --slots N             let N hold NAME at once (default 1)
@@ -314,6 +316,9 @@ const RunOptions = struct {
     /// `--return PATH` (with --spill): copied back from the spill host after.
     returns: [max_returns][]const u8 = undefined,
     return_count: u8 = 0,
+    /// `--ship PATH` (with --spill): copied there although gitignored (or .git).
+    ships: [max_returns][]const u8 = undefined,
+    ship_count: u8 = 0,
     /// `--tethered` (internal, what --spill runs on the spill host): stdin
     /// carries the caller's heartbeats; when they stop, the job stops.
     tethered: bool = false,
@@ -340,7 +345,7 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             name = kv[0];
             inline_value = kv[1];
         }
-        const takes_value = for ([_][]const u8{ "--cores", "--priority", "--label", "--max-wait", "--qos", "--host", "--slots", "--return", "--spill-to" }) |v| {
+        const takes_value = for ([_][]const u8{ "--cores", "--priority", "--label", "--max-wait", "--qos", "--host", "--slots", "--return", "--spill-to", "--ship" }) |v| {
             if (std.mem.eql(u8, name, v)) break true;
         } else false;
         var value: []const u8 = "";
@@ -357,7 +362,7 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             _ = usageError("{s} takes no value", .{name});
             return null;
         }
-        for ([_][]const u8{ "--cores", "--no-load-check", "--qos", "--opaque", "--spill", "--return", "--tethered", "--spill-to" }) |r| {
+        for ([_][]const u8{ "--cores", "--no-load-check", "--qos", "--opaque", "--spill", "--return", "--tethered", "--spill-to", "--ship" }) |r| {
             if (std.mem.eql(u8, name, r)) o.run_only = r;
         }
         if (std.mem.eql(u8, name, "--cores")) {
@@ -408,6 +413,17 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             o.spill_to = value;
         } else if (std.mem.eql(u8, name, "--tethered")) {
             o.tethered = true;
+        } else if (std.mem.eql(u8, name, "--ship")) {
+            if (!repoPath(value)) {
+                _ = usageError("--ship needs a path inside the repo, not '{s}'", .{value});
+                return null;
+            }
+            if (o.ship_count == max_returns) {
+                _ = usageError("at most {d} --ship paths", .{max_returns});
+                return null;
+            }
+            o.ships[o.ship_count] = value;
+            o.ship_count += 1;
         } else if (std.mem.eql(u8, name, "--return")) {
             if (value.len == 0 or value[0] == '/' or std.mem.find(u8, value, "..") != null) {
                 _ = usageError("--return needs a path inside the repo, not '{s}'", .{value});
@@ -495,7 +511,7 @@ fn cmdRun(ctx: *Ctx, args: []const [:0]const u8) u8 {
 
     loadConfig(ctx);
     if (o.exclusive and !ctx.cfg.exclusive) o.exclusive = exclusiveOff(o.label);
-    if (o.return_count != 0 and !o.spill and o.spill_to == null) return usageError("--return goes with --spill or --spill-to", .{});
+    if ((o.return_count != 0 or o.ship_count != 0) and !o.spill and o.spill_to == null) return usageError("--return and --ship go with --spill or --spill-to", .{});
     if (o.spill and o.spill_to != null) return usageError("--spill and --spill-to: choose one", .{});
     if (o.tethered) tether();
     if (o.spill or o.spill_to != null) {
@@ -669,12 +685,28 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     const dir = a.print("cpuq-spill{s}", .{root}) catch fail("out of memory", .{});
     std.debug.print("cpuq: {s}; running {s} on {s}\n", .{ why, if (o.label.len != 0) o.label else o.cmd[0], host });
 
-    const sync = [_][]const u8{
-        "rsync",                                                                          "-a", "--delete", "--exclude=/.git", "--filter=:- .gitignore",
+    // What ships beyond the tracked files: --ship paths and the repo's .cpuq-spill list, each
+    // included (with the folders above it) ahead of the rules that leave out .git and what
+    // .gitignore names; rsync takes the first rule that matches.
+    var sync: std.ArrayList([]const u8) = .empty;
+    sync.appendSlice(a, &.{ "rsync", "-a", "--delete" }) catch fail("out of memory", .{});
+    for (shipList(ctx, root, o)) |path| {
+        var parts = std.mem.splitScalar(u8, path, '/');
+        var above: std.ArrayList(u8) = .empty;
+        while (parts.next()) |part| {
+            if (parts.peek() == null) break;
+            above.print(a, "/{s}", .{part}) catch {};
+            sync.append(a, a.print("--include={s}/", .{above.items}) catch "") catch {};
+        }
+        const is_dir = if (Io.Dir.cwd().statFile(io, a.print("{s}/{s}", .{ root, path }) catch "", .{})) |st| st.kind == .directory else |_| true;
+        sync.append(a, a.print("--include=/{s}{s}", .{ path, if (is_dir) "/***" else "" }) catch "") catch {};
+    }
+    sync.appendSlice(a, &.{
+        "--exclude=/.git",                                                                "--filter=:- .gitignore",
         a.print("--rsync-path=mkdir -p {s} && rsync", .{shellQuote(a, dir)}) catch "", a.print("{s}/", .{root}) catch "",
         a.print("{s}:{s}/", .{ host, dir }) catch "",
-    };
-    const copied = std.process.run(a, io, .{ .argv = &sync }) catch |err| fail("rsync: {t}", .{err});
+    }) catch fail("out of memory", .{});
+    const copied = std.process.run(a, io, .{ .argv = sync.items }) catch |err| fail("rsync: {t}", .{err});
     if (!copied.term.success()) {
         std.debug.print("cpuq: could not copy {s} to {s}: {s}; running here\n", .{ root, host, std.mem.trim(u8, copied.stderr, " \n") });
         return runHere(ctx, o);
@@ -683,7 +715,11 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     // ssh joins its arguments into one line for the remote shell, so
     // everything is quoted for it.
     var remote: std.ArrayList(u8) = .empty;
-    remote.print(a, "cd {s} && exec cpuq run --tethered --priority {t}", .{ shellQuote(a, a.print("{s}{s}", .{ dir, rel }) catch dir), o.priority }) catch fail("out of memory", .{});
+    remote.print(a, "cd {s} && ", .{shellQuote(a, a.print("{s}{s}", .{ dir, rel }) catch dir)}) catch fail("out of memory", .{});
+    // `spill_env.HOST`: the user's own shell assignments, expanded there (an ssh command's
+    // shell reads no login profile, so ~/.local tools are off its PATH).
+    if (ctx.cfg.spillEnv(host)) |env| remote.print(a, "export {s} && ", .{env}) catch {};
+    remote.print(a, "exec cpuq run --tethered --priority {t}", .{o.priority}) catch fail("out of memory", .{});
     if (o.label.len != 0) remote.print(a, " --label {s}", .{shellQuote(a, o.label)}) catch {};
     if (o.cores_given) remote.print(a, " --cores {d}-{d}", .{ o.request.min, o.request.max }) catch {};
     if (o.max_wait) |mw| remote.print(a, " --max-wait {d}", .{mw}) catch {};
@@ -739,6 +775,33 @@ fn hostWentAway(ctx: *Ctx, host: []const u8) bool {
         if (probeHost(ctx, host) == .gone) return true;
     }
     return false;
+}
+
+/// A path inside the repo: relative, with no `..`.
+fn repoPath(p: []const u8) bool {
+    return p.len != 0 and p[0] != '/' and std.mem.find(u8, p, "..") == null;
+}
+
+/// The paths a spilled job ships beyond the tracked files: its --ship paths, then the repo's
+/// `.cpuq-spill` list (a path a line, `#` comments), each inside the repo. Trailing slashes are
+/// dropped; anything else is said and skipped.
+fn shipList(ctx: *Ctx, root: []const u8, o: RunOptions) []const []const u8 {
+    const a = ctx.arena;
+    var out: std.ArrayList([]const u8) = .empty;
+    for (o.ships[0..o.ship_count]) |p| out.append(a, std.mem.trimEnd(u8, p, "/")) catch {};
+    const list = a.print("{s}/.cpuq-spill", .{root}) catch return out.items;
+    const text = Io.Dir.cwd().readFileAlloc(ctx.io, list, a, .limited(1 << 16)) catch return out.items;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, std.mem.trim(u8, if (std.mem.findScalar(u8, raw, '#')) |i| raw[0..i] else raw, " \t\r"), "/");
+        if (line.len == 0) continue;
+        if (!repoPath(line)) {
+            std.debug.print("cpuq: .cpuq-spill: '{s}' is not a path inside the repo; skipped\n", .{line});
+            continue;
+        }
+        out.append(a, line) catch {};
+    }
+    return out.items;
 }
 
 /// The top of the git work tree holding the working directory, if any.
@@ -3258,6 +3321,9 @@ const JsonStatus = struct {
     /// kernel's order: cumulative, so a reader takes the difference between
     /// two statuses. Cpuq.app draws another machine's CPUs from it.
     cpu_ticks: ?[]const [2]u64 = null,
+    /// When the machine booted, in Unix seconds: how long a cloud machine has
+    /// been up (and billing).
+    boot_time: ?i64 = null,
 };
 
 const StatusView = struct {
@@ -3655,6 +3721,11 @@ fn statusHosts(ctx: *Ctx, hosts: []const []const u8, json: bool, measure: bool) 
     return rc;
 }
 
+fn bootSeconds(io: Io) ?i64 {
+    const t = sys.bootTime(io);
+    return if (t > 0) @intFromFloat(t) else null;
+}
+
 fn cpuTicksJson(io: Io, a: std.mem.Allocator) ?[]const [2]u64 {
     const ticks = sys.perCpuTicks(io, a) orelse return null;
     const out = a.alloc([2]u64, ticks.len) catch return null;
@@ -3845,6 +3916,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
             .leases = named.items,
             .outside = smp.outside,
             .cpu_ticks = cpuTicksJson(ctx.io, a),
+            .boot_time = bootSeconds(ctx.io),
         };
         std.json.Stringify.value(s, .{ .whitespace = .indent_2 }, w) catch {};
         w.writeAll("\n") catch {};

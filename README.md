@@ -332,6 +332,7 @@ window's work. It needs measured admission.
 
     cpuq run --spill [run options] [--return PATH]... -- CMD ARGS...
     cpuq run --spill-to HOST [run options] [--return PATH]... -- CMD ARGS...
+    (either with --ship PATH... to copy gitignored paths, or .git, too)
 
 `--spill` runs the job here while this machine has room. When it is full (anyone waiting, the
 1-minute load above its CPUs, or a gate shut), it tries the machines named by `spill` in the
@@ -350,6 +351,13 @@ starts in the same subdirectory, with the same options; its output streams back,
 status is cpuq's. `--return PATH` copies a path (relative to the working directory) back
 afterwards, for a build's output; it repeats.
 
+- **Gitignored paths a job needs** (a vendored tree its tests read, or `.git` for `git ls-files`)
+  ship too when listed in `.cpuq-spill` at the repo's top, a path a line (`#` comments), or given
+  with `--ship PATH`. A gitignored path not listed never ships, and never leaves the host's copy
+  either: a build cache there (`.zig-cache`) stays warm from one run to the next.
+- **Tools under `~/.local`** are off the PATH of a command run over ssh, whose shell reads no login
+  profile. `spill_env.HOST = PATH=$HOME/.local/go/bin:$PATH` in the config is exported on HOST
+  before the job: shell assignments, expanded there.
 - **The command must not reach outside the repo.** Absolute paths here (a scratch directory, a
   file in another checkout) do not exist on the other machine, and nothing writes back except
   `--return`.
@@ -506,6 +514,7 @@ re-reads the file when it changes; an invalid edit keeps the settings in force a
 | `max_memory` | off | stop a job whose processes together use more memory than this (e.g. `16G`) |
 | `spill` | none | ssh hosts `--spill` may send a job to, in order (commas or spaces) |
 | `spill_start.HOST` | none | a command (run with sh) that starts HOST when it is stopped; it returns once ssh works |
+| `spill_env.HOST` | none | shell assignments a spilled job exports on HOST, e.g. `PATH=$HOME/.local/go/bin:$PATH` |
 | `exclusive` | on | grant `--exclusive`; off, it runs as an ordinary job |
 | `window_gap` | 0 | seconds after an exclusive run ends during which waiting ones go behind other work |
 | `cpu_weights` | off | Linux: run each job in a scope weighted by its grant |
