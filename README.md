@@ -243,16 +243,37 @@ restarted). A summary follows: the median and longest wait, and active cores aga
 use on average, which says how to size `--cores`. `--label` filters (`app:*` for a prefix), and
 `--json` gives the jobs to a program.
 
+### cpuq record
+
+    cpuq record [--interval SECONDS]      # foreground; --install keeps one running
+    cpuq record --install | --uninstall
+    cpuq samples [--since UNIX-SECONDS]   # default: the last hour
+
+An optional recorder. Every 3 seconds it writes one JSON line to `samples.jsonl` beside the
+history: each CPU's busy share since the last line, the 1-minute load, cores handed out, jobs
+waiting, and the gate. The file moves to `samples.jsonl.1` past 12 MB, so the two together hold
+at least a day even for 96 CPUs. Only one recorder runs per machine; a second exits at once.
+`cpuq status --json` says whether one is running (`recorder`). It only watches: nothing waits on
+it, and every other command works the same without it.
+
+`--install` keeps one running as a launchd agent (macOS) or a systemd user service (Linux,
+lingering where `loginctl` allows, so it runs without a login), restarted if it stops. It exits
+when its binary is replaced, so an upgrade restarts it on the new one. Cpuq.app reads its
+samples to draw the hour before the app was opened, on each machine.
+
 ### Cpuq.app (macOS)
 
-[`app/`](app/) holds Cpuq.app, a menu-bar companion. Its chip fills a cell per quarter of the
-budget handed out; its menu shows what runs, what waits and the named leases, with Pause,
-Resume, Stop, Move to Front, Start Now and Cancel. Show Graphs opens a window with a Now tab (the
-CPUs busy right now, each project's share, who waits and why, and the last hour, Stacked by
-project (⌘1) or Per Core (⌘2), one lane per CPU, rose where jobs waited beside idle CPUs) and a
-History tab (`cpuq history` summed by project). Seven themes, each light and dark, switch with
-⌘T and ⌘M. It only reads `cpuq status --json` and `cpuq history --json`. Install it with
-`brew install --cask shreeve/tap/cpuq-app`.
+[`app/`](app/) holds Cpuq.app. Its window has a page per machine: this Mac (⌘1), then each spill
+host in the config (⌘2, ⌘3…), read over ssh while the window is open. Each page shows the CPUs
+busy right now with each project's share and who waits and why; the last hour, Stacked by project
+and Per Core (one lane per CPU) together, rose where jobs waited beside idle CPUs; the jobs, with
+their actions on right-click; and `cpuq history` summed by project. Every section's height drags.
+While the window is open it is an ordinary app (Dock icon, menu bar, ⌘Tab); closed, only its
+menu bar chip remains, which stays calm while all is well, turns orange when the gate is shut or
+jobs wait beside idle CPUs, and shows ☁ with uptime and this month's hours while a cloud machine
+runs. It notifies, once each, when the gate stays shut, jobs keep waiting beside idle CPUs, or a
+cloud machine sits idle and billing. It only reads `cpuq status`, `history` and `samples`.
+Install it with `brew install --cask shreeve/tap/cpuq-app`.
 
 ## Waiting and order
 

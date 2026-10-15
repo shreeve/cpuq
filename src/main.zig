@@ -30,6 +30,8 @@ const usage =
     \\       cpuq history [--label PATTERN] [--limit N] [--json]
     \\       cpuq first|start|cancel|pause|resume|stop LABEL|PID [--all]
     \\       cpuq doctor [--host HOST]
+    \\       cpuq record [--interval SECONDS] | --install | --uninstall
+    \\       cpuq samples [--since UNIX-SECONDS]
     \\       cpuq hook                (an agent harness's pre-command hook)
     \\       cpuq budget | qos | --version | --help
     \\
@@ -75,6 +77,10 @@ const usage =
     \\  doctor                what's wrong that cpuq sees but can't stop: work
     \\                        outside it, jobs over their grant, parked jobs,
     \\                        requests too big to start; exit 1 if any
+    \\  record                sample this machine every 3 s (CPUs busy, load, cores held,
+    \\                        waiting, gate) into a day of samples beside the history;
+    \\                        --install keeps it running (launchd / systemd --user)
+    \\  samples               the recorded samples since a time, one JSON line each
     \\  hook                  Claude Code PreToolUse hook: refuses heavy commands
     \\                        outside cpuq or misusing it (exit 2, fix on stderr)
     \\  budget | qos          print the budget | this process's scheduling class
@@ -150,6 +156,8 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
     if (std.mem.eql(u8, cmd, "wait")) return cmdWait(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "history")) return cmdHistory(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "doctor")) return cmdDoctor(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "record")) return cmdRecord(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "samples")) return cmdSamples(ctx, args[1..]);
     inline for (.{ "first", "start", "cancel", "pause", "resume", "stop" }) |action| {
         if (std.mem.eql(u8, cmd, action)) return cmdControl(ctx, action, args[1..]);
     }
@@ -839,6 +847,17 @@ fn nowFloat(io: Io) f64 {
 /// The history file: CPUQ_HISTORY; else beside an explicit CPUQ_DIR, so a
 /// separate queue keeps a separate history; else under XDG_STATE_HOME or
 /// ~/.local/state, outside /tmp, so it outlives a reboot.
+/// The recorder's samples, beside the history: a day or more of the machine every few seconds.
+fn samplesPath(ctx: *Ctx) []const u8 {
+    const h = historyPath(ctx);
+    const dir = std.fs.path.dirname(h) orelse return "";
+    return std.mem.concat(ctx.arena, u8, &.{ dir, "/samples.jsonl" }) catch "";
+}
+
+/// Past this size the samples file moves to samples.jsonl.1 (one kept), so the two hold at
+/// least a day even for a 96-CPU machine sampled every 3 s, and never grow past twice this.
+const samples_rotate_bytes = 12 << 20;
+
 fn historyPath(ctx: *Ctx) []const u8 {
     if (ctx.env.get("CPUQ_HISTORY")) |p| return p;
     if (ctx.env.get("CPUQ_DIR")) |d| return std.mem.concat(ctx.arena, u8, &.{ d, "/history.jsonl" }) catch "";
@@ -2872,6 +2891,230 @@ fn aliveForHistory(pid: i32) bool {
 
 /// `cpuq history [--label PATTERN] [--limit N] [--json]`: finished, lost and
 /// running jobs from the history file, newest first, with a summary.
+/// `cpuq record`: samples this machine every few seconds into samples.jsonl beside the
+/// history, one JSON line each: `t` (Unix seconds), `cpu` (each CPU's busy share since the last
+/// sample, in percent, in the kernel's order), `load` (1-minute), `held` (cores handed out),
+/// `wait` (jobs waiting) and `gate`. It only watches: nothing in cpuq waits on it or reads it but
+/// `cpuq samples`, and every command works the same without it. One runs per machine (a lock
+/// beside the file); it exits when its own binary is replaced, so the service that keeps it
+/// running starts the new one. `--install` sets up that service: a launchd agent on macOS, a
+/// systemd user service on Linux.
+fn cmdRecord(ctx: *Ctx, args: []const [:0]const u8) u8 {
+    const io = ctx.io;
+    var interval_ms: u64 = 3000;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const x = args[i];
+        if (std.mem.eql(u8, x, "--install")) return installRecorder(ctx, true);
+        if (std.mem.eql(u8, x, "--uninstall")) return installRecorder(ctx, false);
+        if (std.mem.eql(u8, x, "--interval") and i + 1 < args.len) {
+            i += 1;
+            const secs = std.fmt.parseFloat(f64, args[i]) catch return usageError("--interval needs seconds, not '{s}'", .{args[i]});
+            if (secs < 0.1 or secs > 3600) return usageError("--interval must be between 0.1 and 3600 seconds", .{});
+            interval_ms = @intFromFloat(secs * 1000);
+        } else return usageError("unknown option '{s}'", .{x});
+    }
+    const path = samplesPath(ctx);
+    if (path.len == 0) fail("no HOME, so nowhere to keep samples", .{});
+    const cwd = Io.Dir.cwd();
+    if (std.fs.path.dirname(path)) |d| cwd.createDirPath(io, d) catch |err| fail("{s}: {t}", .{ d, err });
+    const lock_path = ctx.arena.print("{s}.lock", .{path}) catch fail("out of memory", .{});
+    const lock = cwd.createFile(io, lock_path, .{ .lock = .exclusive, .lock_nonblocking = true, .truncate = false }) catch |err| switch (err) {
+        error.WouldBlock => {
+            std.debug.print("cpuq: a recorder is already sampling this machine ({s})\n", .{path});
+            return 0;
+        },
+        else => fail("{s}: {t}", .{ lock_path, err }),
+    };
+    defer lock.close(io);
+
+    // Replaced on upgrade: exit, and launchd or systemd starts the new one.
+    const exe = std.process.executablePathAlloc(io, ctx.arena) catch null;
+    const born: i96 = if (exe) |e| (if (cwd.statFile(io, e, .{})) |st| st.mtime.nanoseconds else |_| 0) else 0;
+
+    var st = openState(ctx);
+    var prev = sys.perCpuTicks(io, ctx.arena);
+    var n: u64 = 0;
+    std.debug.print("cpuq: recording this machine every {d:.1} s into {s}\n", .{ @as(f64, @floatFromInt(interval_ms)) / 1000, path });
+    while (true) : (n += 1) {
+        io.sleep(.fromMilliseconds(@intCast(interval_ms)), .awake) catch {};
+        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const now = nowSeconds(io);
+        const ticks = sys.perCpuTicks(io, a);
+        var line: std.ArrayList(u8) = .empty;
+        line.print(a, "{{\"t\":{d},\"cpu\":[", .{now}) catch continue;
+        if (prev != null and ticks != null and prev.?.len == ticks.?.len) {
+            for (prev.?, ticks.?, 0..) |p, q, k| {
+                const pct: u32 = if (sys.busyBetween(p, q)) |b| @intFromFloat(@round(b * 100)) else 0;
+                line.print(a, "{s}{d}", .{ if (k == 0) "" else ",", pct }) catch {};
+            }
+        }
+        // The next sample's baseline outlives this pass's arena.
+        if (ticks) |t| prev = ctx.arena.dupe(sys.Ticks, t) catch prev;
+        lockOrFail(&st);
+        const queue = state.scanQueue(&st, a, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{});
+        const held = state.heldTokens(&st) catch 0;
+        st.unlock();
+        const m = machine(ctx);
+        const g = policy.gate(ctx.cfg, m, budgetNow(ctx, m), null, now);
+        line.print(a, "],\"load\":{d:.2},\"held\":{d},\"wait\":{d},\"gate\":\"{t}\"}}\n", .{ sys.loadAverage()[0], held, queue.len, g }) catch continue;
+        appendSample(io, path, line.items);
+        if (n % 20 == 19) {
+            if (exe) |e| {
+                const now_mtime: i96 = if (cwd.statFile(io, e, .{})) |s2| s2.mtime.nanoseconds else |_| 0;
+                if (now_mtime != born) {
+                    std.debug.print("cpuq: {s} was replaced; exiting for the new one\n", .{e});
+                    return 0;
+                }
+            }
+            reloadConfig(ctx);
+        }
+    }
+}
+
+/// Appends one sample, rotating the file to .1 past samples_rotate_bytes; a whole line goes in
+/// one write, so a reader never sees half of one.
+fn appendSample(io: Io, path: []const u8, line: []const u8) void {
+    const cwd = Io.Dir.cwd();
+    if (cwd.statFile(io, path, .{})) |st| {
+        if (st.size > samples_rotate_bytes) {
+            var buf: [1024]u8 = undefined;
+            const old = std.mem.print(&buf, "{s}.1", .{path}) catch return;
+            cwd.rename(path, cwd, old, io) catch {};
+        }
+    } else |_| {}
+    var pbuf: [1024]u8 = undefined;
+    if (path.len >= pbuf.len) return;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+    const fd = std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    _ = std.c.write(fd, line.ptr, line.len);
+}
+
+/// Whether a recorder holds the samples lock now.
+fn recorderRunning(ctx: *Ctx) bool {
+    const path = samplesPath(ctx);
+    if (path.len == 0) return false;
+    const lock_path = ctx.arena.print("{s}.lock", .{path}) catch return false;
+    const f = Io.Dir.cwd().openFile(ctx.io, lock_path, .{}) catch return false;
+    defer f.close(ctx.io);
+    const free = f.tryLock(ctx.io, .shared) catch return false;
+    if (free) f.unlock(ctx.io);
+    return !free;
+}
+
+/// `cpuq samples [--since T]`: the recorded samples from T (Unix seconds; default the last hour)
+/// on, oldest first, one JSON line each, from samples.jsonl.1 and samples.jsonl.
+fn cmdSamples(ctx: *Ctx, args: []const [:0]const u8) u8 {
+    const io = ctx.io;
+    const a = ctx.arena;
+    var since: i64 = nowSeconds(io) - 3600;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--since") and i + 1 < args.len) {
+            i += 1;
+            since = std.fmt.parseInt(i64, args[i], 10) catch return usageError("--since needs Unix seconds, not '{s}'", .{args[i]});
+        } else return usageError("unknown option '{s}'", .{args[i]});
+    }
+    const path = samplesPath(ctx);
+    for ([_][]const u8{ a.print("{s}.1", .{path}) catch "", path }) |p| {
+        const text = Io.Dir.cwd().readFileAlloc(io, p, a, .limited(64 << 20)) catch continue;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            const head = "{\"t\":";
+            if (!std.mem.startsWith(u8, line, head)) continue;
+            const end = std.mem.findScalar(u8, line[head.len..], ',') orelse continue;
+            const t = std.fmt.parseInt(i64, line[head.len..][0..end], 10) catch continue;
+            if (t < since) continue;
+            ctx.out.writeAll(line) catch return exit_failure;
+            ctx.out.writeAll("\n") catch return exit_failure;
+        }
+    }
+    ctx.out.flush() catch {};
+    return 0;
+}
+
+/// `cpuq record --install` (or --uninstall): keeps the recorder running for this user, started
+/// at login (and at boot, where systemd allows lingering), restarted if it exits.
+fn installRecorder(ctx: *Ctx, install: bool) u8 {
+    const io = ctx.io;
+    const a = ctx.arena;
+    const home = ctx.env.get("HOME") orelse fail("no HOME", .{});
+    const exe = std.process.executablePathAlloc(io, a) catch |err| fail("cannot find this cpuq: {t}", .{err});
+    const cwd = Io.Dir.cwd();
+    if (@import("builtin").os.tag.isDarwin()) {
+        const label = "com.github.shreeve.cpuq.record";
+        const plist = a.print("{s}/Library/LaunchAgents/{s}.plist", .{ home, label }) catch fail("out of memory", .{});
+        const domain = a.print("gui/{d}", .{sys.getuid()}) catch fail("out of memory", .{});
+        _ = std.process.run(a, io, .{ .argv = &.{ "launchctl", "bootout", a.print("{s}/{s}", .{ domain, label }) catch "" } }) catch {};
+        if (!install) {
+            cwd.deleteFile(io, plist) catch {};
+            ctx.out.writeAll("cpuq record: uninstalled (launchd agent removed)\n") catch {};
+            return 0;
+        }
+        cwd.createDirPath(io, std.fs.path.dirname(plist).?) catch {};
+        const body = a.print(
+            \\<?xml version="1.0" encoding="UTF-8"?>
+            \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            \\<plist version="1.0">
+            \\<dict>
+            \\  <key>Label</key><string>{s}</string>
+            \\  <key>ProgramArguments</key><array><string>{s}</string><string>record</string></array>
+            \\  <key>RunAtLoad</key><true/>
+            \\  <key>KeepAlive</key><true/>
+            \\  <key>ProcessType</key><string>Background</string>
+            \\  <key>StandardErrorPath</key><string>{s}/Library/Logs/cpuq-record.log</string>
+            \\</dict>
+            \\</plist>
+            \\
+        , .{ label, exe, home }) catch fail("out of memory", .{});
+        cwd.writeFile(io, .{ .sub_path = plist, .data = body }) catch |err| fail("{s}: {t}", .{ plist, err });
+        const r = std.process.run(a, io, .{ .argv = &.{ "launchctl", "bootstrap", domain, plist } }) catch |err| fail("launchctl: {t}", .{err});
+        if (!r.term.success()) fail("launchctl bootstrap: {s}", .{std.mem.trim(u8, r.stderr, " \n")});
+        ctx.out.print("cpuq record: installed as launchd agent {s}, running now\n", .{label}) catch {};
+        return 0;
+    }
+    const unit_dir = a.print("{s}/.config/systemd/user", .{home}) catch fail("out of memory", .{});
+    const unit = a.print("{s}/cpuq-record.service", .{unit_dir}) catch fail("out of memory", .{});
+    if (!install) {
+        _ = std.process.run(a, io, .{ .argv = &.{ "systemctl", "--user", "disable", "--now", "cpuq-record.service" } }) catch {};
+        cwd.deleteFile(io, unit) catch {};
+        _ = std.process.run(a, io, .{ .argv = &.{ "systemctl", "--user", "daemon-reload" } }) catch {};
+        ctx.out.writeAll("cpuq record: uninstalled (systemd user service removed)\n") catch {};
+        return 0;
+    }
+    cwd.createDirPath(io, unit_dir) catch {};
+    const body = a.print(
+        \\[Unit]
+        \\Description=cpuq record: samples this machine for cpuq samples and Cpuq.app
+        \\
+        \\[Service]
+        \\ExecStart={s} record
+        \\Restart=always
+        \\RestartSec=5
+        \\Nice=10
+        \\
+        \\[Install]
+        \\WantedBy=default.target
+        \\
+    , .{exe}) catch fail("out of memory", .{});
+    cwd.writeFile(io, .{ .sub_path = unit, .data = body }) catch |err| fail("{s}: {t}", .{ unit, err });
+    for ([_][]const []const u8{ &.{ "systemctl", "--user", "daemon-reload" }, &.{ "systemctl", "--user", "enable", "--now", "cpuq-record.service" } }) |argv| {
+        const r = std.process.run(a, io, .{ .argv = argv }) catch |err| fail("systemctl: {t}", .{err});
+        if (!r.term.success()) fail("{s}: {s}", .{ argv[2], std.mem.trim(u8, r.stderr, " \n") });
+    }
+    // Without lingering, user services stop at logout and start only at login.
+    const user = ctx.env.get("USER") orelse "";
+    const linger = std.process.run(a, io, .{ .argv = &.{ "loginctl", "enable-linger", user } }) catch null;
+    const lingers = linger != null and linger.?.term.success();
+    ctx.out.print("cpuq record: installed as systemd user service cpuq-record, running now{s}\n", .{if (lingers) " (lingering: it runs without a login)" else "; `loginctl enable-linger` failed, so it runs only while you are logged in"}) catch {};
+    return 0;
+}
+
 fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
     var pattern: ?[]const u8 = null;
     var limit: usize = 20;
@@ -3324,6 +3567,8 @@ const JsonStatus = struct {
     /// When the machine booted, in Unix seconds: how long a cloud machine has
     /// been up (and billing).
     boot_time: ?i64 = null,
+    /// Whether `cpuq record` is sampling this machine (`cpuq samples` has its past).
+    recorder: bool = false,
 };
 
 const StatusView = struct {
@@ -3917,6 +4162,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
             .outside = smp.outside,
             .cpu_ticks = cpuTicksJson(ctx.io, a),
             .boot_time = bootSeconds(ctx.io),
+            .recorder = recorderRunning(ctx),
         };
         std.json.Stringify.value(s, .{ .whitespace = .indent_2 }, w) catch {};
         w.writeAll("\n") catch {};

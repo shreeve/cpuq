@@ -2,6 +2,16 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.15.0 — 2026-10-15
+
+- `cpuq record`: an optional recorder that samples the machine every 3 seconds into samples.jsonl
+  beside the history (each CPU's busy share, the load, cores handed out, jobs waiting, the gate),
+  rotated past 12 MB, at least a day kept. One runs per machine. `--install` keeps it running as a
+  launchd agent or a systemd user service; it exits when its binary is replaced, so upgrades
+  restart it. It only watches: nothing else needs it.
+- `cpuq samples [--since T]`: the recorded samples, a JSON line each.
+- `cpuq status --json` says whether a recorder runs (`recorder`).
+
 ## 0.14.0 — 2026-10-15
 
 - A spilled job ships gitignored paths it needs: listed in the repo's `.cpuq-spill` (a path a line)

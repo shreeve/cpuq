@@ -1474,6 +1474,26 @@ t_tethered() {
     "[[ '$out' == done && $rc = 143 && $took -lt 10 ]]"
 }
 
+t_record() {
+  # cpuq record samples the machine into samples.jsonl beside the history; one runs at a time,
+  # status says whether one does, and cpuq samples gives its lines from a time on.
+  setup record
+  export CPUQ_HISTORY=$T/history.jsonl
+  "$CPUQ" run --cores 2 --label held -- sleep 2 & wait_held 2
+  "$CPUQ" record --interval 0.2 2>/dev/null & local r=$!
+  sleep 1.2
+  "$CPUQ" record --interval 0.2 2>/dev/null; local second=$?
+  local on; on=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print(json.load(sys.stdin)["recorder"])')
+  kill $r; wait $r 2>/dev/null; wait
+  local got; got=$("$CPUQ" samples --since 0 | python3 -c 'import json, sys
+s = [json.loads(l) for l in sys.stdin]
+print(len(s), all(x["gate"] == "open" for x in s), max(x["held"] for x in s), len(s[-1]["cpu"]) > 0)')
+  local future; future=$("$CPUQ" samples --since 9999999999 | wc -l | tr -d ' ')
+  unset CPUQ_HISTORY
+  check "record samples while another refuses to start (rc $second), status sees it ($on), and samples gives them from a time on (count, gate open, held, cpus: $got; none from the future: $future)" \
+    "[[ $second = 0 && $on = True && '$got' == *' True 2 True' && $future = 0 ]] && [ \$(echo '$got' | cut -d' ' -f1) -ge 3 ]"
+}
+
 t_min_disk() {
   setup min-disk "min_disk = 1000000G"
   "$CPUQ" run --cores 1 --max-wait 1 -- true 2>/dev/null; local rc=$?
@@ -1498,7 +1518,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to tethered status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to tethered record status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

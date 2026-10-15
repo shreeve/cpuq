@@ -7,6 +7,10 @@ the waiter at the front of the queue is the *head*.
 
 ## No daemon
 
+Nothing admits, holds or decides but the `cpuq` processes of the jobs themselves. The optional
+recorder (`cpuq record`) only samples: no command waits on it or needs it, so a machine without
+one works the same, and one that dies takes nothing with it.
+
 Every hold is a `flock(2)` on a file in a state directory, so the kernel releases it when the
 last process holding the descriptor exits, however it exits. Only `flock(2)` is used, never
 fcntl locks: an flock belongs to the open file description, survives fork and exec, and is not
