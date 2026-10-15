@@ -345,7 +345,10 @@ struct HeroCard: View {
                 // out in full and fade before the card's edge.
                 ZStack(alignment: .bottomTrailing) {
                     ZStack(alignment: .topLeading) {
+                        // Keyed by the moment pointed at: the canvas's timeline redraws on its own
+                        // tick, and the grid kept showing now beside a legend for then.
                         CellsCanvas(model: model, moment: moment, motion: motion, trayWidth: tray ? trayWidth + 6 : 0, below: 22)
+                            .id(moment.at)
                         if tray { WaitingTray(model: model, moment: moment, control: control).frame(width: trayWidth) }
                     }
                     legend
@@ -1188,7 +1191,9 @@ struct JobsCard: View {
                     }
                 }
             }
-            .scrollIndicators(.automatic)
+            // Shown whenever rows run past the card's edge: macOS hides an idle scroller, and a
+            // job below the edge looked like no job at all ("4 running", three rows).
+            .scrollIndicators(.visible)
         }
         .padding(.horizontal, 18).padding(.vertical, 10)
         .card()

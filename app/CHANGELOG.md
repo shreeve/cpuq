@@ -3,6 +3,15 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.17.3 — 2026-10-15
+
+- Pointing at an earlier moment redraws the CPU grid for that moment at once. It used to keep
+  showing now beside numbers and a legend for then.
+- The Jobs list shows its scroll bar whenever more jobs run than fit: "4 running" with three rows
+  in sight looked like a job had gone missing.
+- History's Share is a dash for a project with next to nothing held: used of held, for a
+  one-second job, was noise (and showed orange).
+
 ## 0.17.2 — 2026-10-15
 
 - The stacked chart's top and bottom labels ("96", "0") and its "quiet · nothing queued" note are

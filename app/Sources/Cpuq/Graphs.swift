@@ -605,8 +605,13 @@ struct HistoryCard: View {
                     TableColumn("Core-hours in use") { t in Text(String(format: "%.2f", t.held)).monospacedDigit() }
                     TableColumn("Active") { t in Text(String(format: "%.2f", t.used)).monospacedDigit() }
                     TableColumn("Share") { t in
-                        Text("\(Int((t.efficiency * 100).rounded()))%").monospacedDigit()
-                            .foregroundStyle(t.efficiency < 0.5 ? Color.orange : Color.primary)
+                        // Used of held: noise for a project with next to nothing held.
+                        if t.held < 0.01 {
+                            Text("–").foregroundStyle(.secondary)
+                        } else {
+                            Text("\(Int((t.efficiency * 100).rounded()))%").monospacedDigit()
+                                .foregroundStyle(t.efficiency < 0.5 ? Color.orange : Color.primary)
+                        }
                     }
                     TableColumn("Median wait") { t in Text(age(t.medianWait)).monospacedDigit() }
                     TableColumn("Longest wait") { t in Text(age(t.longestWait)).monospacedDigit() }
