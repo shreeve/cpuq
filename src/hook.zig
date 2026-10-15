@@ -330,17 +330,48 @@ fn sshRemote(a: std.mem.Allocator, w: []const []const u8) ?Remote {
     return null;
 }
 
+/// The index of the first word that redirects (`>log`, `2>`, `<in`, `&>x`), or `w.len`.
+fn firstRedirect(w: []const []const u8) usize {
+    for (w, 0..) |x, i| {
+        var j: usize = 0;
+        while (j < x.len and std.ascii.isDigit(x[j])) j += 1;
+        if (j < x.len and (x[j] == '>' or x[j] == '<')) return i;
+        if (std.mem.startsWith(u8, x, "&>")) return i;
+    }
+    return w.len;
+}
+
+/// The redirections, each with a space before it, less a last operator left
+/// without its target (`2>&1` reaches the hook as `2>`, cut at the `&`).
+fn redirections(a: std.mem.Allocator, w: []const []const u8) []const u8 {
+    var n = w.len;
+    if (n != 0) {
+        const last = w[n - 1];
+        if (last.len != 0 and (last[last.len - 1] == '>' or last[last.len - 1] == '<')) n -= 1;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    for (w[0..n]) |x| {
+        out.append(a, ' ') catch return "";
+        out.appendSlice(a, x) catch return "";
+    }
+    return out.items;
+}
+
 /// What to run instead: the command under cpuq, the grant passed on.
 fn suggest(a: std.mem.Allocator, w: []const []const u8, project: []const u8, host: ?[]const u8) []const u8 {
     const prog = std.fs.path.basename(w[0]);
     const label = a.print("{s}:{s}", .{ if (project.len != 0) project else "proj", if (std.mem.eql(u8, prog, "pytest") or std.mem.eql(u8, prog, "xcodebuild")) "test" else "build" }) catch "proj:build";
     const original = std.mem.join(a, " ", w) catch "CMD";
+    // A jobs flag goes before the redirections (`zig build >log 2>&1`), not after them.
+    const k = firstRedirect(w);
+    const args = std.mem.join(a, " ", w[0..k]) catch "CMD";
+    const redirs = redirections(a, w[k..]);
     const inner = if (std.mem.eql(u8, prog, "zig") and !hasJobs(w))
-        a.print("sh -c '{s} -j\"$CPUQ_CORES\"'", .{original}) catch original
+        a.print("sh -c '{s} -j\"$CPUQ_CORES\"{s}'", .{ args, redirs }) catch original
     else if (std.mem.eql(u8, prog, "cargo"))
         a.print("sh -c 'CARGO_BUILD_JOBS=\"$CPUQ_CORES\" {s}'", .{original}) catch original
     else if (std.mem.eql(u8, prog, "xcodebuild"))
-        a.print("sh -c '{s} -jobs \"$CPUQ_CORES\"'", .{original}) catch original
+        a.print("sh -c '{s} -jobs \"$CPUQ_CORES\"{s}'", .{ args, redirs }) catch original
     else
         original;
     const opaque_opt = if (hidesWork(w)) " --opaque" else "";
@@ -585,4 +616,18 @@ test "misused cpuq runs are refused" {
     // Hidden work without --opaque.
     try std.testing.expect(refused("cpuq run --cores 4 -- incus exec ydb -- make"));
     try std.testing.expect(refused("cpuq run --cores 4 -- xcodebuild test -destination 'platform=iOS Simulator,name=iPhone 17'"));
+}
+
+test "a suggested jobs flag goes before the redirections" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings(
+        "cpuq run --label app:build --cores 2-6 -- sh -c 'zig build -j\"$CPUQ_CORES\" >/dev/null'",
+        suggest(a, &.{ "zig", "build", ">/dev/null", "2>" }, "app", null),
+    );
+    try std.testing.expectEqualStrings(
+        "cpuq run --label app:build --cores 2-6 -- sh -c 'zig build test -j\"$CPUQ_CORES\" 2>log'",
+        suggest(a, &.{ "zig", "build", "test", "2>log" }, "app", null),
+    );
 }

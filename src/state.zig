@@ -286,6 +286,8 @@ pub const Record = struct {
     /// `--note`: what the job is for (a PR, a branch), shown beside its label but never
     /// matched, sized or timed by.
     note: []const u8 = "",
+    /// The file the job reports its progress in (`CPUQ_PROGRESS`): `DONE TOTAL FAILING`.
+    progress: []const u8 = "",
 
     pub fn write(r: Record, w: *Io.Writer) Io.Writer.Error!void {
         try w.print("ticket={d}\npid={d}\nchild={d}\ncores={d}\nmax={d}\npriority={t}\nexclusive={d}\nsince={d}\n", .{
@@ -301,6 +303,10 @@ pub const Record = struct {
         if (r.note.len != 0) {
             try w.writeAll("note=");
             try writeLine(w, r.note);
+        }
+        if (r.progress.len != 0) {
+            try w.writeAll("progress=");
+            try writeLine(w, r.progress);
         }
     }
 
@@ -328,6 +334,7 @@ pub const Record = struct {
             if (std.mem.eql(u8, k, "first")) r.first = std.mem.eql(u8, v, "1");
             if (std.mem.eql(u8, k, "opaque")) r.hidden = std.mem.eql(u8, v, "1");
             if (std.mem.eql(u8, k, "note")) r.note = v;
+            if (std.mem.eql(u8, k, "progress")) r.progress = v;
         }
         return r;
     }
@@ -474,6 +481,11 @@ pub fn scanLeases(s: *State, arena: std.mem.Allocator, only_exclusive: bool) ![]
     }
     std.mem.sortUnstable(Entry, list.items, {}, lessEntry);
     return list.items;
+}
+
+/// The record of the lease named `name`, or null once it is gone.
+pub fn leaseRecord(s: *State, arena: std.mem.Allocator, name: []const u8) ?Record {
+    return probe(s.io, arena, s.leases, name);
 }
 
 /// The number of held tokens. Call with the admission lock held.

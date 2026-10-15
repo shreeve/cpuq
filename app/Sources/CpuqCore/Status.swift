@@ -58,6 +58,21 @@ public struct Status: Decodable, Sendable, Equatable {
         public var note = ""
         public var command = ""
         public var since = 0
+        /// How far it is, as it reports through `CPUQ_PROGRESS` (cpuq 0.19 and later).
+        public var progress: Progress?
+        /// Seconds left: from its progress, or else from its label's usual time.
+        public var left: Double?
+        /// Where `left` comes from: "progress" or "history".
+        public var leftFrom = ""
+        /// Its label's usual run time, in seconds, from history.
+        public var typical: Double?
+    }
+
+    /// A job's own count: `DONE TOTAL FAILING`.
+    public struct Progress: Decodable, Sendable, Equatable {
+        public var done = 0
+        public var total = 0
+        public var failing = 0
     }
 
     public struct Waiter: Decodable, Sendable, Equatable {
@@ -160,7 +175,7 @@ extension Status.Gate {
 }
 
 extension Status.Holder {
-    private enum Keys: String, CodingKey { case pid, cores, slots, paused, using, priority, exclusive, label, note, command, since }
+    private enum Keys: String, CodingKey { case pid, cores, slots, paused, using, priority, exclusive, label, note, command, since, progress, left, typical, leftFrom }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         pid = try c.decodeIfPresent(Int.self, forKey: .pid) ?? 0
@@ -174,6 +189,10 @@ extension Status.Holder {
         note = try c.decodeIfPresent(String.self, forKey: .note) ?? ""
         command = try c.decodeIfPresent(String.self, forKey: .command) ?? ""
         since = try c.decodeIfPresent(Int.self, forKey: .since) ?? 0
+        progress = try? c.decodeIfPresent(Status.Progress.self, forKey: .progress)
+        left = try c.decodeIfPresent(Double.self, forKey: .left)
+        leftFrom = try c.decodeIfPresent(String.self, forKey: .leftFrom) ?? ""
+        typical = try c.decodeIfPresent(Double.self, forKey: .typical)
     }
 }
 

@@ -129,6 +129,12 @@ every process (`ps`):
 - **`--mem` on Linux inside a job** counts page cache and tmpfs too, so a limit tuned on the Mac
   can trip on Linux.
 
+A runner that knows its test count reports progress, so status shows how far it is and the time
+left (`4210/12629 33% · 3 failing · ~9m left`): one line, `DONE TOTAL FAILING`, written whole at
+most once a second and once at the end:
+
+    printf '%d %d %d\n' "$done" "$total" "$failing" > "$CPUQ_PROGRESS.tmp" && mv "$CPUQ_PROGRESS.tmp" "$CPUQ_PROGRESS"
+
 ## Exit status
 
 - CMD's own status passes through; 128+N: CMD was killed by signal N.

@@ -299,6 +299,24 @@ can spend a large part of a big machine doing nothing else: one did, about 17 of
 - **Either way:** PROGRAM's end wakes cpuq at once, and anything PROGRAM left running is stopped.
   It costs about half a millisecond a call.
 
+### Progress: CPUQ_PROGRESS
+
+A job that knows how much work it has (a test runner with 12,629 tests) can say how far it is:
+cpuq gives every job a file, `$CPUQ_PROGRESS`, to write one line to, `DONE TOTAL FAILING`:
+
+    printf '%d %d %d\n' "$done" "$total" "$failing" > "$CPUQ_PROGRESS.tmp" && mv "$CPUQ_PROGRESS.tmp" "$CPUQ_PROGRESS"
+
+- **Write it whole:** to `.tmp`, then rename it over, so no reader sees half a line. Write it at
+  most once a second, and once more at the end.
+- **What it shows:** `cpuq status` puts it under the job, with the time left from its rate so
+  far: `12m · 4210/12629 33% · 3 failing · ~9m left`. The `--json` holder has `progress`
+  (`done`, `total`, `failing`), `left` in seconds, `left_from` (`progress`) and `typical`.
+- **A job that writes nothing** shows its label's usual time instead, from history, with
+  `left_from` `history`.
+- **Inside another machine's job** (`--spill`, `cpuq submit`) the file is that machine's, and
+  `cpuq status --host HOST` (and Cpuq.app) shows it there. `cpuq submit` prints it as it follows.
+- The file is removed when the job ends.
+
 ### Cpuq.app (macOS)
 
 [`app/`](app/) holds Cpuq.app. Its window has a page per machine: this Mac (⌘1), then each spill
@@ -750,6 +768,7 @@ In this mode a few things keep reserved cores from sitting idle:
 | `NO_COLOR` | draw `cpuq status` and `cpuq history` without color |
 | `CPUQ_CORES` | set for CMD: its grant |
 | `CPUQ_TOKEN` | set for CMD: its hold, which makes runs inside it nested |
+| `CPUQ_PROGRESS` | set for CMD: a file it may write `DONE TOTAL FAILING` to, shown in `cpuq status` |
 | `CPUQ_LEASES` | set for CMD: the named leases it runs inside, `NAME=ID` here and `NAME@HOST=ID:PID` on HOST |
 | `MAKEFLAGS` | set for CMD: a GNU make jobserver with `CPUQ_CORES` slots; other flags kept |
 

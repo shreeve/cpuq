@@ -886,6 +886,7 @@ fn place(cx: Cx, rec: *const Record) ?[]const u8 {
 const Peeked = struct {
     state: []const u8 = "none",
     done: u64 = 0,
+    total: u64 = 0,
     failing: u64 = 0,
     last: []const u8 = "",
 };
@@ -996,7 +997,9 @@ fn watch(cx: Cx, rec: *Record, payload: *Payload, host: []const u8) u8 {
         misses = 0;
         if (std.mem.eql(u8, p.state, "done")) return finish(cx, rec, host);
         if (std.mem.eql(u8, p.state, "none")) return lostOrRetry(cx, rec, payload, host);
-        const progress = if (p.done != 0)
+        const progress = if (p.total != 0)
+            cx.a.print("{d}/{d} ({d}%)  {d} failing", .{ p.done, p.total, p.done * 100 / p.total, p.failing }) catch ""
+        else if (p.done != 0)
             cx.a.print("{d} done  {d} failing  {s}", .{ p.done, p.failing, p.last[0..@min(p.last.len, 60)] }) catch ""
         else
             p.last[0..@min(p.last.len, 80)];
@@ -1172,6 +1175,9 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
     const tmp = jobFile(cx, id, "tmp");
     Io.Dir.cwd().createDirPath(cx.io, tmp) catch {};
     env.put("TMPDIR", tmp) catch {};
+    // The job's progress (`DONE TOTAL FAILING`), where _peek finds it; cpuq run keeps it.
+    Io.Dir.cwd().deleteFile(cx.io, jobFile(cx, id, "progress")) catch {};
+    env.put("CPUQ_PROGRESS", jobFile(cx, id, "progress")) catch {};
     if (p.report) |r| if (inside(r)) Io.Dir.cwd().deleteFile(cx.io, cx.a.print("{s}/{s}", .{ copy, r }) catch "") catch {};
 
     // cpuq run takes the cores and the job's cgroup; cap enforces time from admission, and memory.
@@ -1304,6 +1310,19 @@ pub fn cmdPeek(cx: Cx, args: []const [:0]const u8) u8 {
     if (st != null and !std.mem.eql(u8, p.state, "done") and !jobRunning(cx, id)) p.state = "none";
     if (std.mem.eql(u8, p.state, "running")) {
         p.last = lastLine(cx, jobFile(cx, id, "output.log"));
+        // What the job reports, when it does (CPUQ_PROGRESS).
+        if (readFile(cx, jobFile(cx, id, "progress"))) |text| {
+            var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
+            const d = std.fmt.parseInt(u64, it.next() orelse "", 10) catch 0;
+            const t = std.fmt.parseInt(u64, it.next() orelse "", 10) catch 0;
+            if (t != 0) {
+                p.done = @min(d, t);
+                p.total = t;
+                p.failing = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0;
+                cx.out.print("{s}\n", .{jsonString(cx, p)}) catch {};
+                return 0;
+            }
+        }
         if (readFile(cx, jobFile(cx, id, "payload.json"))) |text| {
             if (std.json.parseFromSliceLeaky(Payload, cx.a, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always })) |pl| {
                 if (pl.report) |rp| if (inside(rp)) {

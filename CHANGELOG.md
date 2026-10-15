@@ -2,9 +2,22 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
-## 0.18.2 — 2026-10-15
+## 0.19.0 — 2026-10-15
 
+- **Progress.** Every job gets `CPUQ_PROGRESS`, a file it may write `DONE TOTAL FAILING` to
+  (`4210 12629 3`). `cpuq status` then shows how far it is, and the time left reckoned from its
+  rate: `12m · 4210/12629 33% · 3 failing · ~9m left`. A job that writes nothing shows its usual
+  time from history instead. In `status --json` a holder has `progress`, `left`, `left_from`
+  (`progress` or `history`) and `typical`. A submitted job's supervisor prints the same progress.
 - `cpuq note PID|LABEL TEXT [--all] [--host HOST]`: sets a running or waiting job's note after it
+  started (its PR opened later). `--host` sets it through that machine's cpuq, for a job sent
+  there. History keeps the note a job started with.
+- `cpuq pause`, `resume` and `stop` on a job that has only just started wait for its command to
+  start (up to a second), rather than finding no child to signal and doing nothing.
+- The hook's suggested command puts `-j"$CPUQ_CORES"` before the command's redirections, not
+  after them.
+
+(0.18.2 was tagged but never published; its change is in 0.19.0.) PID|LABEL TEXT [--all] [--host HOST]`: sets a running or waiting job's note after it
   started (its PR opened later). `--host` sets it through that machine's cpuq, for a job sent
   there. History keeps the note a job started with.
 

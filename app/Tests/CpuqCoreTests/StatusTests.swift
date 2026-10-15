@@ -172,3 +172,11 @@ import Testing
     #expect(Status.Memory.ofGB(1_395_864_371, 2_147_483_648) == "1.3 of 2.0 GB")
     #expect(try Status.decode(Data(#"{"schema":1}"#.utf8)).memory == nil)
 }
+
+@Test func decodesProgress() throws {
+    let json = #"{"schema":1,"holders":[{"pid":7,"label":"rig:matrix","progress":{"done":4210,"total":12629,"failing":3},"left":540,"left_from":"progress","typical":2760},{"pid":8,"label":"rig:probe"}]}"#
+    let s = try Status.decode(Data(json.utf8))
+    #expect(s.holders[0].progress == Status.Progress(done: 4210, total: 12629, failing: 3))
+    #expect(s.holders[0].left == 540 && s.holders[0].leftFrom == "progress" && s.holders[0].typical == 2760)
+    #expect(s.holders[1].progress == nil && s.holders[1].left == nil && s.holders[1].leftFrom == "")
+}

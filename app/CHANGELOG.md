@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.19.0 — 2026-10-15
+
+- A running job that reports its progress (cpuq 0.19's `CPUQ_PROGRESS`) shows how far it is in
+  the Jobs card, with the time left: "4,210/12,629 33% · 3 failing · ~9m left". Failures show
+  in red. A job that reports nothing shows its label's usual time, "usually 46m".
+
 ## 0.18.0 — 2026-10-15
 
 - A job's note (cpuq 0.18's `--note`, such as "#224 markers") shows beside its label in the Jobs

@@ -1777,6 +1777,9 @@ fn rewriteRecord(io: Io, f: Io.File, r: state.Record) void {
     fw.interface.flush() catch {};
 }
 
+/// The progress file this run made for its job, removed when the job ends.
+var own_progress: ?[]const u8 = null;
+
 fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, lease_in: Lease) u8 {
     const io = ctx.io;
     var lease = lease_in;
@@ -1805,6 +1808,17 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
         var num: [16]u8 = undefined;
         ctx.env.put("CPUQ_CORES", std.mem.print(&num, "{d}", .{k}) catch "1") catch fail("out of memory", .{});
         ctx.env.put("CPUQ_TOKEN", lease.name) catch fail("out of memory", .{});
+        // Where the job may report its progress (`DONE TOTAL FAILING`): one a caller set (cpuq
+        // submit's), else one of its own beside the queue, removed when it ends.
+        if (ctx.env.get("CPUQ_PROGRESS")) |p| {
+            lease.record.progress = p;
+        } else {
+            const p = std.mem.concat(ctx.arena, u8, &.{ stateDir(ctx), "/progress-", lease.name }) catch "";
+            Io.Dir.cwd().deleteFile(io, p) catch {};
+            ctx.env.put("CPUQ_PROGRESS", p) catch {};
+            lease.record.progress = p;
+            own_progress = p;
+        }
         pipe = sys.jobserverPipe(k - 1) catch |err| fail("jobserver: {t}", .{err});
         const flags = policy.makeflags(ctx.arena, ctx.env.get("MAKEFLAGS"), pipe[0], pipe[1]) catch fail("out of memory", .{});
         ctx.env.put("MAKEFLAGS", flags) catch fail("out of memory", .{});
@@ -1856,6 +1870,7 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
     if (window_noise) |*n| n.report(lease.job.base.label);
     own_lease = null;
     releaseExclusiveCores(ctx, waited);
+    if (own_progress) |p| Io.Dir.cwd().deleteFile(io, p) catch {};
     release(io, st, lease);
     logEnded(ctx, lease.job, k, waited);
     ctx.out.flush() catch {};
@@ -2863,9 +2878,19 @@ fn cmdControl(ctx: *Ctx, comptime action: []const u8, args: []const [:0]const u8
         for (hits.items) |e| std.debug.print("  {d}  {s}\n", .{ e.record.pid, e.record.label });
         return exit_usage;
     }
-    const procs = if (for_waiters) &[_]sys.Proc{} else sys.processes(ctx.io, a);
+    var procs = if (for_waiters) &[_]sys.Proc{} else sys.processes(ctx.io, a);
     for (hits.items) |e| {
-        const r = e.record;
+        var r = e.record;
+        // A job admitted a moment ago has its lease before its command: the
+        // child pid is written once the command has started, so wait for it.
+        if (!for_waiters and r.child <= 0) {
+            var tries: u32 = 0;
+            while (r.child <= 0 and tries < 20) : (tries += 1) {
+                ctx.io.sleep(.fromMilliseconds(50), .awake) catch {};
+                r = state.leaseRecord(&st, a, e.name) orelse break;
+            }
+            if (tries != 0) procs = sys.processes(ctx.io, a);
+        }
         const who = if (r.label.len != 0) r.label else r.cmd;
         if (for_waiters) {
             st.giveControl(e.name, action);
@@ -3561,6 +3586,14 @@ const JsonHolder = struct {
     /// Cores the command's process tree kept busy over the sample: CPU time
     /// over wall time; null when there is no command to measure.
     using: ?f64 = null,
+    /// What the job reported in its CPUQ_PROGRESS file, if it did.
+    progress: ?JsonProgress = null,
+    /// Seconds left: from its progress when it reports some, else from its label's typical run
+    /// time (`left_from` says which); null when neither is known.
+    left: ?f64 = null,
+    left_from: []const u8 = "",
+    /// How long its label's runs typically take, in seconds, from history.
+    typical: ?f64 = null,
     priority: []const u8 = "",
     exclusive: bool = false,
     label: []const u8 = "",
@@ -3569,6 +3602,21 @@ const JsonHolder = struct {
     command: []const u8 = "",
     since: i64 = 0,
 };
+
+const JsonProgress = struct { done: u64 = 0, total: u64 = 0, failing: u64 = 0 };
+
+/// A CPUQ_PROGRESS file's one line, `DONE TOTAL [FAILING]`; null when it says nothing usable.
+fn readProgress(io: Io, path: []const u8) ?JsonProgress {
+    if (path.len == 0) return null;
+    var buf: [128]u8 = undefined;
+    const text = Io.Dir.cwd().readFile(io, path, &buf) catch return null;
+    var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const done = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+    const total = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+    const failing = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0;
+    if (total == 0) return null;
+    return .{ .done = @min(done, total), .total = total, .failing = failing };
+}
 
 const JsonWaiter = struct {
     /// Seconds until it is expected to start, from the history of jobs
@@ -3733,6 +3781,22 @@ const JsonLease = struct {
     holders: []const JsonHolder = &.{},
     waiters: []const JsonWaiter = &.{},
 };
+
+/// How long a job has run, with how far it has got and how long it has left when known:
+/// "12m · 4210/12629 33% · ~9m left", or "12m · ~34m left" from its label's history.
+fn sinceText(a: std.mem.Allocator, h: JsonHolder, now: i64) []const u8 {
+    var b: [16]u8 = undefined;
+    const ran = a.dupe(u8, age(&b, now - h.since)) catch "?";
+    var lb: [16]u8 = undefined;
+    const left = if (h.left) |l| a.dupe(u8, age(&lb, @intFromFloat(l))) catch "?" else "";
+    if (h.progress) |p| {
+        const pct = p.done * 100 / @max(p.total, 1);
+        const failing = if (p.failing != 0) a.print(" · {d} failing", .{p.failing}) catch "" else "";
+        return a.print("{s} · {d}/{d} {d}%{s}{s}{s}", .{ ran, p.done, p.total, pct, failing, if (left.len != 0) " · ~" else "", if (left.len != 0) a.print("{s} left", .{left}) catch "" else "" }) catch ran;
+    }
+    if (left.len != 0) return a.print("{s} · ~{s} left", .{ ran, left }) catch ran;
+    return ran;
+}
 
 /// A label with its note after it, when it has one: "rig:corpus  #224 markers".
 fn withNote(a: std.mem.Allocator, label: []const u8, why: []const u8) []const u8 {
@@ -3948,13 +4012,12 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
                 // Using less than half the grant: the request is too big.
                 .tint = if (h.cores >= 2 and u * 2 < @as(f64, @floatFromInt(h.cores))) .warn else null,
             } else .{ .text = "-", .tint = .dim };
-            var b: [16]u8 = undefined;
             rows.append(a, a.dupe(C, &.{
                 .{ .text = withNote(a, h.label, h.note), .tint = .accent },
                 .{ .text = a.print("{d}", .{h.cores}) catch "?" },
                 using,
                 .{ .text = if (h.exclusive) "exclusive" else h.priority, .tint = if (h.exclusive) .warn else null },
-                .{ .text = a.dupe(u8, age(&b, v.now - h.since)) catch "?" },
+                .{ .text = sinceText(a, h, v.now) },
                 .{ .text = a.print("{d}{s}", .{ h.pid, if (h.holder_alive) "" else "*" }) catch "?", .tint = .dim },
                 .{ .text = h.command },
             }) catch continue) catch {};
@@ -4381,8 +4444,24 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
         if (h.lending) lending_label = if (l.record.label.len != 0) l.record.label else "a timing window";
     }
     const waiters = toWaiters(a, queue);
+    // How far each job has got, and how long it has left: from what it reports, else its label's
+    // typical run time.
+    const rt_all: ?RunTimes = if (holders.len + waiters.len != 0) RunTimes.load(ctx, a) else null;
+    for (holders, leases) |*h, l| {
+        h.progress = readProgress(ctx.io, l.record.progress);
+        h.typical = if (rt_all) |rt| rt.typical(l.record.label) else null;
+        const ran: f64 = @floatFromInt(@max(now - l.record.since, 0));
+        if (h.progress) |p| if (p.done != 0 and ran > 0) {
+            h.left = ran * @as(f64, @floatFromInt(p.total - p.done)) / @as(f64, @floatFromInt(p.done));
+            h.left_from = "progress";
+        };
+        if (h.left == null) if (h.typical) |t| {
+            h.left = @max(t - ran, 0);
+            h.left_from = "history";
+        };
+    }
     if (waiters.len != 0) {
-        const rt = RunTimes.load(ctx, a);
+        const rt = rt_all.?;
         if (ctx.cfg.admit == .measured) {
             const target = targetCpus(ctx);
             estimateIn(rt, target, target, holders, waiters, now);

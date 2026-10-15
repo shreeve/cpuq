@@ -46,6 +46,29 @@ func duration(_ s: TimeInterval) -> String {
     return "\(s / 3600)h " + String(format: "%02dm", s / 60 % 60)
 }
 
+/// A time to the minute, for an estimate: "<1m", "9m", "1h 05m".
+func roughly(_ s: TimeInterval) -> String {
+    let m = max(Int((s / 60).rounded()), 0)
+    if m < 1 { return "<1m" }
+    if m < 60 { return "\(m)m" }
+    return "\(m / 60)h " + String(format: "%02dm", m % 60)
+}
+
+/// How far a running job is: "4,210/12,629 33% · 3 failing · ~9m left" from its own count,
+/// or "usually 46m" from its label's history.
+func progressText(_ h: Status.Holder) -> Text {
+    if let p = h.progress, p.total > 0 {
+        let pct = Int((Double(p.done) / Double(p.total) * 100).rounded(.down))
+        var t = Text("\(p.done.formatted())/\(p.total.formatted()) ").foregroundStyle(Alive.ink)
+            + Text("\(pct)%").fontWeight(.medium).foregroundStyle(Alive.ink)
+        if p.failing > 0 { t = t + Text(" · \(p.failing.formatted()) failing").foregroundStyle(.red) }
+        if let left = h.left, h.leftFrom == "progress" { t = t + Text(" · ~\(roughly(left)) left").foregroundStyle(Alive.ink2) }
+        return t
+    }
+    if let typical = h.typical { return Text("usually \(roughly(typical))").foregroundStyle(Alive.ink3) }
+    return Text("")
+}
+
 /// The Mac at one moment: the CPU each project kept busy, other work, and who waited.
 struct Moment {
     struct Share { let project: String; let cpu: Double }
@@ -1249,7 +1272,8 @@ struct JobsCard: View {
                     Text(String(format: "%.1f", use)).fontWeight(.medium).foregroundStyle(Alive.ink).frame(width: 52, alignment: .leading)
                 }
             }
-            Spacer(minLength: 0)
+            progressText(h).lineLimit(1).truncationMode(.tail)
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading).padding(.leading, 6)
             Text(h.exclusive ? "timing window" : "\(h.cores) reserved").font(.system(size: 11.5))
                 .foregroundStyle(h.exclusive ? Alive.windowTint : Alive.ink3).frame(width: 100, alignment: .trailing)
             Text(duration(Date().timeIntervalSince1970 - Double(h.since))).foregroundStyle(Alive.ink2).frame(width: 64, alignment: .trailing)

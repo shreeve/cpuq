@@ -59,6 +59,17 @@ wait_held() {
   done
 }
 
+# wait_child [seconds]: until the first holder's command has started (its child pid is
+# recorded just after its lease).
+wait_child() {
+  local i=0
+  until [ "$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys
+h = json.load(sys.stdin)["holders"]; print(h[0]["child"] if h else 0)')" -gt 0 ]; do
+    i=$((i + 1)); [ $i -gt $((${1:-10} * 10)) ] && return 1
+    sleep 0.1
+  done
+}
+
 # wait_holder LABEL [seconds]: until a job labelled LABEL holds cores.
 wait_holder() {
   local i=0
@@ -156,7 +167,7 @@ t_kill_holder() {
 t_kill_cpuq_only() {
   setup kill-cpuq-only
   "$CPUQ" run --cores 9 --label survivor -- sleep 4 & local holder=$!
-  wait_held 9
+  wait_held 9; wait_child
   local t0; t0=$(now)
   kill -9 $holder
   sleep 1
@@ -1044,6 +1055,18 @@ t_note() {
   check "cpuq note sets a running job's note (got '$later')" "[ '$later' = '#229 inline' ]"
 }
 
+t_progress() {
+  # A job that writes DONE TOTAL FAILING to $CPUQ_PROGRESS shows it, and the time left, in status;
+  # the file goes when the job ends.
+  setup progress
+  "$CPUQ" run --cores 1 --label proj:matrix -- sh -c 'for d in 0 100 200 300 400; do echo "$d 1000 2" > "$CPUQ_PROGRESS.tmp"; mv "$CPUQ_PROGRESS.tmp" "$CPUQ_PROGRESS"; sleep 1; done; echo "$CPUQ_PROGRESS" > '"$T/path" & wait_held 1
+  sleep 2.5
+  local got; got=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; h = json.load(sys.stdin)["holders"][0]; p = h["progress"]; print(p["total"], p["failing"], h["left_from"], h["left"] > 0)')
+  wait
+  local gone=yes; [ -e "$(cat "$T/path")" ] && gone=no
+  check "status shows a job's reported progress and time left, and the file goes with it (got '$got', removed: $gone)" "[ '$got' = '1000 2 progress True' ] && [ $gone = yes ]"
+}
+
 t_submit() {
   # cpuq submit, on "here": verdicts and their exits, report failures, return, attach, NOT STARTED
   # and --replace, and a credential refused.
@@ -1498,7 +1521,7 @@ t_long_command() {
   # the child pid, which pause, stop and lending all go by.
   local pad; pad=$(printf 'x%.0s' $(seq 2000))
   "$CPUQ" run --cores 1 --label long -- sh -c "sleep 30.239 # $pad" & local p=$!
-  wait_held 1
+  wait_held 1; wait_child 3
   local child; child=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print(json.load(sys.stdin)["holders"][0]["child"])')
   "$CPUQ" stop long >/dev/null; wait $p
   check "a job whose command is over 1 KB still has its child pid recorded (got $child)" "[ '$child' -gt 0 ]"
@@ -1639,7 +1662,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to tethered record cap cgroups note submit status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to tethered record cap cgroups note progress submit status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"
