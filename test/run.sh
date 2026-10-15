@@ -1517,8 +1517,10 @@ t_status() {
   check "status shows the dir, the holder and the waiter" "[[ '$s' == *'dir     $CPUQ_DIR'* && '$s' == *build* && '$s' == *big* ]]"
   local j; j=$("$CPUQ" status --json | python3 -c 'import json, sys
 s = json.load(sys.stdin)
-print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s["gate"]["load"], s["memory_pressure"])' "$("$CPUQ" --version)")
-  check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
+m = s["memory"]
+print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s["gate"]["load"], s["memory_pressure"], 0 < m["used"] <= m["total"] and m["swap_used"] <= m["swap_total"])' "$("$CPUQ" --version)")
+  check "status --json has schema 1, the version, a structured gate, pressure off when unchecked, and memory (got '$j')" "[ '$j' = '1 True open None off True' ]"
+  check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
 TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to tethered record status}

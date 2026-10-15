@@ -219,11 +219,15 @@ closed, status names the busiest such processes.
 | `budget`, `held`, `free` | the budget, and the cores handed out and left of it |
 | `cores`, `active_cores` | the machine's CPUs, and those active now |
 | `load`, `memory_pressure` | the 1-, 5- and 15-minute load; `normal`, `high`, `unknown` or `off` |
-| `gate` | `state` (`open`, `pressure`, `low_memory`, `load` or `spacing`), `load`, `text`, and the valve's `trip`, `reopen` and `busy_trip` |
+| `memory` | bytes: `total`, `used` (Activity Monitor's Memory Used on macOS; the total less MemAvailable on Linux), `swap_total`, `swap_used`; null when unreadable |
+| `gate` | `state` (`open`, `pressure`, `low_memory`, `low_disk`, `load` or `spacing`), `load`, `available`, `disk_free`, `disk_path`, `text`, and the valve's `trip`, `reopen` and `busy_trip` |
 | `holders[]` | running jobs: `pid` (its cpuq), `holder_alive`, `child` (the command), `cores`, `slots`, `using` (cores active), `paused`, `priority`, `exclusive`, `label`, `command`, `since`, `ticket` |
 | `waiters[]` | in order: `order` (1 first), `cores` and `max` (the request), `priority`, `class` (after aging), `eta` (seconds; null when unknown), `exclusive`, `pid`, `label`, `command`, `since`, `ticket` |
 | `leases[]` | named leases held or waited for: `name`, `holders`, `waiters` |
 | `outside[]` | the busiest processes outside cpuq: `pid`, `name`, `using` |
+| `cpu_ticks` | each CPU's time so far, `[busy, total]`, cumulative: two statuses give each CPU's use between them |
+| `boot_time` | when the machine booted, Unix seconds |
+| `recorder` | whether `cpuq record` is sampling this machine |
 
 A waiter's ETA plays the queue forward with each label's typical run time from history; it is
 unknown while anything ahead of it has no history.

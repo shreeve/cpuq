@@ -3553,6 +3553,9 @@ const JsonStatus = struct {
     free: u32 = 0,
     load: [3]f64 = .{ 0, 0, 0 },
     memory_pressure: []const u8 = "",
+    /// Memory and swap in bytes: `used` is what Activity Monitor calls Memory
+    /// Used on macOS, the total less MemAvailable on Linux.
+    memory: ?sys.Memory = null,
     gate: JsonGate = .{},
     holders: []const JsonHolder = &.{},
     waiters: []const JsonWaiter = &.{},
@@ -3590,6 +3593,8 @@ const StatusView = struct {
     now: i64,
     /// The CPUs online: what the load is measured against.
     online: u32 = 0,
+    /// Memory and swap, when readable.
+    memory: ?sys.Memory = null,
     /// For another host's status: its name and its cpuq's version.
     host: ?[]const u8 = null,
     version: ?[]const u8 = null,
@@ -3634,12 +3639,24 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
     const short_host = v.host orelse std.mem.sliceTo(host, '.');
     const C = table.Cell;
 
-    const mem: C = switch (v.pressure) {
+    // Memory in use, tinted by the kernel's pressure; the word alone when it cannot be read.
+    const mem: C = if (v.memory) |m| .{
+        .text = a.print("{s}{s}", .{ ofGb(a, m.used, m.total), if (v.pressure == .high) ", pressure" else "" }) catch "?",
+        .tint = switch (v.pressure) {
+            .normal => .good,
+            .high => .bad,
+            .unknown, .off => null,
+        },
+    } else switch (v.pressure) {
         .normal => .{ .text = "normal", .tint = .good },
         .high => .{ .text = "pressure", .tint = .bad },
         .unknown => .{ .text = "unknown", .tint = .dim },
         .off => .{ .text = "off", .tint = .dim },
     };
+    const swap: C = if (v.memory) |m| (if (m.swap_total == 0)
+        .{ .text = "none", .tint = .dim }
+    else
+        .{ .text = ofGb(a, m.swap_used, m.swap_total), .tint = if (m.swap_used * 2 > m.swap_total) .warn else null }) else .{ .text = "-", .tint = .dim };
     const gate: C = .{ .text = switch (v.gate) {
         .open => "open",
         .pressure => "closed: memory",
@@ -3661,6 +3678,7 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
             .{ .head = "FREE", .alignment = .right },
             .{ .head = "LOAD", .sub = "1 5 15" },
             .{ .head = "MEMORY" },
+            .{ .head = "SWAP" },
             .{ .head = "GATE" },
         },
         .rows = &.{&.{
@@ -3669,6 +3687,7 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
             .{ .text = a.print("{d}", .{free}) catch "?", .tint = if (free == 0) .warn else .good },
             loadCell(a, v.load, v.online),
             mem,
+            swap,
             gate,
         }},
     };
@@ -3966,6 +3985,21 @@ fn statusHosts(ctx: *Ctx, hosts: []const []const u8, json: bool, measure: bool) 
     return rc;
 }
 
+/// "USED of TOTAL GB": a decimal when the total is below 10 GB, whole above
+/// ("97 of 128 GB", "1.3 of 2.0 GB").
+fn ofGb(a: std.mem.Allocator, used: u64, total: u64) []const u8 {
+    const u = @as(f64, @floatFromInt(used)) / (1 << 30);
+    const t = @as(f64, @floatFromInt(total)) / (1 << 30);
+    return (if (t < 9.95) a.print("{d:.1} of {d:.1} GB", .{ u, t }) else a.print("{d:.0} of {d:.0} GB", .{ u, t })) catch "?";
+}
+
+/// "97 of 128 GB used; swap 24 of 32 GB" (or "no swap").
+fn memoryText(a: std.mem.Allocator, m: sys.Memory) []const u8 {
+    const used = ofGb(a, m.used, m.total);
+    if (m.swap_total == 0) return a.print("{s} used; no swap", .{used}) catch used;
+    return a.print("{s} used; swap {s}", .{ used, ofGb(a, m.swap_used, m.swap_total) }) catch used;
+}
+
 fn bootSeconds(io: Io) ?i64 {
     const t = sys.bootTime(io);
     return if (t > 0) @intFromFloat(t) else null;
@@ -4024,6 +4058,7 @@ fn statusRemote(ctx: *Ctx, host: []const u8, json: bool, measure: bool) u8 {
         .held = st.held,
         .load = st.load,
         .pressure = std.meta.stringToEnum(policy.Pressure, st.memory_pressure) orelse .unknown,
+        .memory = st.memory,
         .gate = gate,
         .gate_text = st.gate.text,
         .holders = st.holders,
@@ -4133,6 +4168,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
             .free = budget -| held,
             .load = load,
             .memory_pressure = pressure,
+            .memory = sys.memory(ctx.io),
             .gate = .{
                 .state = @tagName(g),
                 .load = switch (g) {
@@ -4184,6 +4220,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
             .outside = smp.outside,
             .now = now,
             .online = m.active,
+            .memory = sys.memory(ctx.io),
         });
         return 0;
     }
@@ -4192,6 +4229,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
         w.print("admit   by measured use, up to {d} CPUs; {d} cores handed out ({d} online of {d})\n", .{ targetCpus(ctx), held, m.active, sys.totalCpus(ctx.io) }) catch {};
     } else w.print("budget  {d} cores ({d} online of {d}); in use {d}, free {d}\n", .{ budget, m.active, sys.totalCpus(ctx.io), held, budget -| held }) catch {};
     w.print("load    {d:.2} {d:.2} {d:.2}; memory pressure {s}; gate {s}\n", .{ load[0], load[1], load[2], pressure, gate_text }) catch {};
+    if (sys.memory(ctx.io)) |mem| w.print("memory  {s}\n", .{memoryText(a, mem)}) catch {};
     if (!ctx.cfg.exclusive) w.writeAll("note    exclusive runs are off here: --exclusive runs as an ordinary job\n") catch {};
     if (lending_label) |l| w.print("note    {s} is idle: its timing window lends the machine until it is used again\n", .{l}) catch {};
     if (showOutside(smp.outside, g)) {

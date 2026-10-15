@@ -2,6 +2,13 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.16.0 — 2026-10-15
+
+- `cpuq status` shows memory and swap in use: "memory  97 of 128 GB used; swap 24 of 32 GB", a
+  MEMORY and a SWAP column on a terminal, and `memory` in `--json` (`total`, `used`, `swap_total`,
+  `swap_used`, in bytes). Used is what Activity Monitor calls Memory Used on macOS, and the total
+  less MemAvailable on Linux: the file cache counts as free on both.
+
 ## 0.15.0 — 2026-10-15
 
 - `cpuq record`: an optional recorder that samples the machine every 3 seconds into samples.jsonl

@@ -221,6 +221,88 @@ pub fn memAvailable(io: Io) ?u64 {
     return null;
 }
 
+/// The machine's memory and swap, in bytes. `used` is what Activity Monitor
+/// calls Memory Used on macOS (app memory, wired and compressed); on Linux the
+/// total less MemAvailable. The file cache counts as free on both.
+pub const Memory = struct { total: u64, used: u64, swap_total: u64, swap_used: u64 };
+
+extern "c" fn host_statistics64(host: c_uint, flavor: c_int, info: *VmStatistics64, count: *c_uint) c_int;
+
+/// struct vm_statistics64 (mach/vm_statistics.h).
+const VmStatistics64 = extern struct {
+    free_count: u32,
+    active_count: u32,
+    inactive_count: u32,
+    wire_count: u32,
+    zero_fill_count: u64,
+    reactivations: u64,
+    pageins: u64,
+    pageouts: u64,
+    faults: u64,
+    cow_faults: u64,
+    lookups: u64,
+    hits: u64,
+    purges: u64,
+    purgeable_count: u32,
+    speculative_count: u32,
+    decompressions: u64,
+    compressions: u64,
+    swapins: u64,
+    swapouts: u64,
+    compressor_page_count: u32,
+    throttled_count: u32,
+    external_page_count: u32,
+    internal_page_count: u32,
+    total_uncompressed_pages_in_compressor: u64,
+};
+
+/// struct xsw_usage (sys/sysctl.h), vm.swapusage.
+const XswUsage = extern struct { total: u64, avail: u64, used: u64, pagesize: u32, encrypted: c_int };
+
+pub fn memory(io: Io) ?Memory {
+    if (is_darwin) {
+        var total: u64 = 0;
+        var len: usize = @sizeOf(u64);
+        if (c.sysctlbyname("hw.memsize", &total, &len, null, 0) != 0) return null;
+        var page: u64 = 0;
+        len = @sizeOf(u64);
+        if (c.sysctlbyname("hw.pagesize", &page, &len, null, 0) != 0) return null;
+        var vm: VmStatistics64 = undefined;
+        var count: c_uint = @sizeOf(VmStatistics64) / @sizeOf(c_int);
+        // HOST_VM_INFO64
+        if (host_statistics64(mach_host_self(), 4, &vm, &count) != 0) return null;
+        const pages = @as(u64, vm.internal_page_count -| vm.purgeable_count) + vm.wire_count + vm.compressor_page_count;
+        var swap: XswUsage = undefined;
+        len = @sizeOf(XswUsage);
+        const has_swap = c.sysctlbyname("vm.swapusage", &swap, &len, null, 0) == 0;
+        return .{
+            .total = total,
+            .used = @min(pages * page, total),
+            .swap_total = if (has_swap) swap.total else 0,
+            .swap_used = if (has_swap) swap.used else 0,
+        };
+    }
+    var buf: [4096]u8 = undefined;
+    const text = Io.Dir.cwd().readFile(io, "/proc/meminfo", &buf) catch return null;
+    var total: ?u64 = null;
+    var available: ?u64 = null;
+    var swap_total: u64 = 0;
+    var swap_free: u64 = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        var f = std.mem.tokenizeScalar(u8, line[colon + 1 ..], ' ');
+        const kb = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue;
+        const key = line[0..colon];
+        if (std.mem.eql(u8, key, "MemTotal")) total = kb * 1024;
+        if (std.mem.eql(u8, key, "MemAvailable")) available = kb * 1024;
+        if (std.mem.eql(u8, key, "SwapTotal")) swap_total = kb * 1024;
+        if (std.mem.eql(u8, key, "SwapFree")) swap_free = kb * 1024;
+    }
+    const t = total orelse return null;
+    return .{ .total = t, .used = t -| (available orelse return null), .swap_total = swap_total, .swap_used = swap_total -| swap_free };
+}
+
 /// Bytes free to an unprivileged writer on the filesystem holding `path`;
 /// null when unreadable.
 pub fn diskFree(path: [*:0]const u8) ?u64 {
