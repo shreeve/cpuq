@@ -82,7 +82,9 @@ struct Moment {
     var watched = true
     /// Jobs waited while CPUs sat idle with the gate open: the case to fix. Never judged from
     /// a moment the app did not watch: unknown CPU is not idle CPU.
-    var needless: Bool { watched && !waiters.isEmpty && free >= 2 && gateShut == nil && window == nil }
+    /// Free CPUs count as idle beside a waiter only when there are enough for the smallest one's
+    /// minimum: a job asking for 4 beside 2 free waits fairly.
+    var needless: Bool { watched && !waiters.isEmpty && free >= max(2, Double(waiters.map(\.need).min() ?? 2)) && gateShut == nil && window == nil }
 
     /// No more than the CPUs, whatever the readings say.
     mutating func fit() {
@@ -170,7 +172,9 @@ final class HourCache {
         /// The machine's CPUs.
         var cpus = 1.0
         var total: Double { shares.values.reduce(0, +) + outside }
-        var needless: Bool { watched && waiting > 0 && cpus - total >= 2 && !gateShut && !window }
+        /// The fewest CPUs any job waiting then asked for.
+        var minNeed = 2
+        var needless: Bool { watched && waiting > 0 && cpus - total >= Double(max(2, minNeed)) && !gateShut && !window }
     }
 
     struct Hour {
@@ -249,7 +253,9 @@ final class HourCache {
             // Never more than the CPUs.
             let t = cols[i].total
             if t > m.cpus { let f = m.cpus / t; cols[i].shares = cols[i].shares.mapValues { $0 * f }; cols[i].outside *= f }
-            cols[i].waiting = m.waits.filter { $0.from < cols[i].to && ($0.to ?? end) > cols[i].from }.count
+            let waiting = m.waits.filter { $0.from < cols[i].to && ($0.to ?? end) > cols[i].from }
+            cols[i].waiting = waiting.count
+            cols[i].minNeed = waiting.map(\.need).min() ?? 2
             let c = cols[i]
             cols[i].window = m.blocks.contains { $0.exclusive && $0.from < c.to && ($0.to ?? end) > c.from }
                 || m.waits.contains { $0.exclusive && $0.from < c.to && ($0.to ?? end) > c.from }
@@ -773,15 +779,14 @@ extension CellsCanvas {
         let perRow = (n + rows - 1) / rows
         let w = (width - gap * Double(perRow - 1)) / Double(perRow)
         let h = (height - gap * Double(rows - 1)) / Double(rows)
+        // The reading itself, not the eased fill the glass cells use: tiles do not animate, and
+        // easing let them lag the numbers (most of all while pointing at the hour).
         var layers: [(Color, Double, Double)] = []
         var acc = 0.0
-        let keys = moment.shares.map(\.project)
-        for k in keys + motion.fill.keys.filter({ $0 != "~outside" && !keys.contains($0) }) {
-            let v = motion.fill[k] ?? 0
-            layers.append((model.color(k), acc, acc + v)); acc += v
+        for share in moment.shares {
+            layers.append((model.color(share.project), acc, acc + share.cpu)); acc += share.cpu
         }
-        let ov = motion.fill["~outside"] ?? 0
-        layers.append((Alive.out, acc, acc + ov))
+        layers.append((Alive.out, acc, acc + moment.outside))
         for c in 0..<n {
             let x = x0 + Double(c % perRow) * (w + gap), y = top + Double(c / perRow) * (h + gap)
             let cell = CGRect(x: x, y: y, width: w, height: h)
@@ -1042,15 +1047,9 @@ struct HourCard: View {
                               yStart: .value("CPU", 0), yEnd: .value("CPU", top))
                     .foregroundStyle(Alive.rose.opacity(0.14))
             }
-            ForEach(Array(cols.enumerated()), id: \.offset) { _, c in
-                if let per = c.perCPU {
-                    ForEach(Array(per.enumerated()), id: \.offset) { cpu, busy in
-                        RectangleMark(xStart: .value("Time", c.from), xEnd: .value("Time", c.to),
-                                      yStart: .value("CPU", (rowOf[cpu] ?? 0) + 0.1), yEnd: .value("CPU", (rowOf[cpu] ?? 0) + 0.9))
-                            .foregroundStyle(Color.primary.opacity(0.05 + 0.8 * busy))
-                    }
-                }
-            }
+            // The cells themselves are painted behind the plot (chartBackground): a mark per CPU
+            // per column, 11,520 for a 96-CPU machine, made every redraw stutter.
+            RuleMark(y: .value("CPU", 0)).foregroundStyle(.clear)
             if let scrub { RuleMark(x: .value("Time", scrub)).foregroundStyle(Color.primary.opacity(0.5)) }
         }
         .chartLegend(.hidden)
@@ -1058,11 +1057,38 @@ struct HourCard: View {
         .chartYScale(domain: 0...top)
         .chartXAxis { xAxis }
         .chartYAxis(.hidden)
-        .chartBackground { yLabels($0, p > 0 ? [(top - Double(p) / 2, Text("\(p) ") + Text(Image(systemName: "bolt.fill"))),
-                                         (Double(e) / 2, Text("\(e) ") + Text(Image(systemName: "leaf.fill")))] : [(top / 2, Text("CPU"))]) }
+        .chartBackground { proxy in
+            ZStack {
+                heat(proxy, cols, rowOf: rowOf, top: top)
+                yLabels(proxy, p > 0 ? [(top - Double(p) / 2, Text("\(p) ") + Text(Image(systemName: "bolt.fill"))),
+                                        (Double(e) / 2, Text("\(e) ") + Text(Image(systemName: "leaf.fill")))] : [(top / 2, Text("CPU"))])
+            }
+        }
         .chartOverlay { scrubber($0) }
         .padding(.leading, labelColumn)
         .help(p > 0 ? "A row per CPU, darker the busier: the \(p) performance cores (bolt) on top, the \(e) efficiency cores (leaf) below." : "A row per CPU, darker the busier.")
+    }
+
+    /// Per Core's cells, a row per CPU, darker the busier, painted in one pass on the chart's own
+    /// time scale, so they line up with its axis and the scrubber.
+    private func heat(_ proxy: ChartProxy, _ cols: [HourCache.Column], rowOf: [Int: Double], top: Double) -> some View {
+        GeometryReader { geo in
+            if let frame = proxy.plotFrame {
+                let plot = geo[frame]
+                let rowHeight = plot.height / top
+                let cells: [(CGRect, Double)] = cols.flatMap { c -> [(CGRect, Double)] in
+                    guard let per = c.perCPU, let x0 = proxy.position(forX: c.from), let x1 = proxy.position(forX: c.to) else { return [] }
+                    return per.enumerated().map { cpu, busy in
+                        let r = rowOf[cpu] ?? 0
+                        return (CGRect(x: plot.minX + x0, y: plot.minY + plot.height - (r + 0.9) * rowHeight,
+                                       width: max(x1 - x0, 0.5), height: max(0.8 * rowHeight, 0.5)), busy)
+                    }
+                }
+                Canvas { gc, _ in
+                    for (rect, busy) in cells { gc.fill(Path(rect), with: .color(Color.primary.opacity(0.05 + 0.8 * busy))) }
+                }
+            }
+        }
     }
 
     /// How many waited in each column: grey when the CPUs were full (fair), rose when they sat
@@ -1191,7 +1217,7 @@ struct JobsCard: View {
         let need = w.exclusive ? cpus : Double(max(w.cores, 1))
         let gate = model.status?.gate.state ?? "open"
         let window = Moment.now(model).window
-        let needless = free >= 2 && gate == "open" && window == nil
+        let needless = free >= max(2, need) && gate == "open" && window == nil
         let why = w.exclusive ? "timing window: waits for the Mac to empty" : window != nil ? "waits for the timing window" : gate != "open" ? "the gate is shut" : needless ? "CPUs idle" : free >= need ? "starting" : "\(String(format: "%.1f", free)) free, so it holds"
         return HStack(spacing: 10) {
             Circle().strokeBorder(model.color(project), lineWidth: 2).frame(width: 8, height: 8)

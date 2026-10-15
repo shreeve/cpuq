@@ -16,6 +16,8 @@ struct SplitColumn: View {
 
     @AppStorage private var stored: String
     @State private var dragStart: [Double]?
+    /// The shares while a handle is dragged; saved when it is let go, not at every step.
+    @State private var live: [Double]?
     @State private var hovered: Int?
 
     init(key: String, defaults: [Double], minimums: [CGFloat], gap: CGFloat = 12, sections: [AnyView]) {
@@ -29,6 +31,7 @@ struct SplitColumn: View {
 
     /// The shares now: those kept, if they fit this column, else the defaults.
     private var shares: [Double] {
+        if let live { return live }
         let kept = stored.split(separator: ",").compactMap { Double($0) }
         let raw = kept.count == sections.count && kept.allSatisfy({ $0 > 0 }) ? kept : defaults
         let sum = raw.reduce(0, +)
@@ -88,11 +91,18 @@ struct SplitColumn: View {
                         var s = start
                         s[i] = min(max(start[i] + Double(v.translation.height / room), lo), hi)
                         s[i + 1] = pair - s[i]
-                        stored = s.map { String(format: "%.4f", $0) }.joined(separator: ",")
+                        live = s
                     }
-                    .onEnded { _ in dragStart = nil }
+                    .onEnded { _ in
+                        if let live { stored = live.map { String(format: "%.4f", $0) }.joined(separator: ",") }
+                        live = nil
+                        dragStart = nil
+                    }
             )
-            .onTapGesture(count: 2) { stored = "" }
+            .onTapGesture(count: 2) {
+                live = nil
+                stored = ""
+            }
             .help("Drag to resize; double-click to put the sizes back")
     }
 }

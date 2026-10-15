@@ -3,6 +3,17 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.14.1 — 2026-10-15
+
+- Smoother: Per Core paints its cells in one pass instead of as a chart mark each (11,520 of
+  them for a 96-CPU machine, 1,200 for a 10-CPU Mac), which made every redraw, hover and drag
+  stutter; and dragging a section saves its size when let go, not at every step.
+- A big machine's CPU tiles show the reading as it is, so they agree with the numbers beside
+  them; they eased toward it and lagged, most of all while pointing at the hour.
+- A wait counts as waiting beside idle CPUs only when enough were free for the smallest waiting
+  job's minimum: a job asking for 4 cores beside 2 free waits fairly, and is no longer shaded
+  rose or counted in "waited with CPUs idle".
+
 ## 0.14.0 — 2026-10-15
 
 - One page per machine: this Mac (⌘1), then each spill host in cpuq's config (`spill = pup,
