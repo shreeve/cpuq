@@ -487,11 +487,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     /// "App 0.17.1 · CLI 0.16.3", in grey: this app's version and the command-line cpuq it reads.
+    /// Enabled, as the lines below it are (it opens the window): a disabled item is drawn so faint
+    /// it can hardly be read.
     private func versions() -> NSMenuItem {
         var s = "App \(appVersion)"
         if let cli = status?.version, !cli.isEmpty { s += " · CLI \(cli)" }
-        let item = NSMenuItem(title: s, action: nil, keyEquivalent: "")
-        item.isEnabled = false
+        let item = NSMenuItem(title: s, action: #selector(showGraphs), keyEquivalent: "")
+        item.target = self
         item.attributedTitle = NSAttributedString(string: s, attributes: [.font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize), .foregroundColor: NSColor.secondaryLabelColor])
         return item
     }

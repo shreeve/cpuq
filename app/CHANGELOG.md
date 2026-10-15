@@ -3,6 +3,11 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.19.2 — 2026-10-15
+
+- The menu's version line ("App 0.19.2 · CLI 0.19.3") is readable: it was drawn as a disabled
+  item, too faint to see. Like the lines below it, it opens the window.
+
 ## 0.19.1 — 2026-10-15
 
 - A job that reports its progress has a completion bar in the Jobs card, with its percent beside
