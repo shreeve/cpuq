@@ -93,6 +93,9 @@ fn bad(comptime fmt: []const u8, args: anytype) u8 {
 
 var wake: [2]c.fd_t = .{ -1, -1 };
 var child_pid = std.atomic.Value(c.pid_t).init(0);
+/// Without a cgroup the program leads a process group of its own, which a terminal's ^C no longer
+/// reaches: cpuq's signals go to that whole group.
+var to_group = std.atomic.Value(bool).init(false);
 
 const passed_on = [_]c.SIG{ .HUP, .INT, .QUIT, .TERM };
 
@@ -102,7 +105,7 @@ fn onSignal(sig: c.SIG, _: *const c.siginfo_t, _: ?*anyopaque) callconv(.c) void
     // The program gets cpuq's own signals, as from `cpuq run`; its end decides cpuq's.
     if (sig != .CHLD) {
         const pid = child_pid.load(.acquire);
-        if (pid > 0) _ = c.kill(pid, sig);
+        if (pid > 0) _ = c.kill(if (to_group.load(.acquire)) -pid else pid, sig);
     }
     if (wake[1] >= 0) _ = c.write(wake[1], "x", 1);
 }
@@ -259,17 +262,23 @@ const Cgroup = struct {
     }
 };
 
-/// Whether this process is in `parent` or below it: a stale CPUQ_CGROUP from some other job
-/// must not get cgroups made in it.
+/// Whether `parent` is the cpuq job this process runs in: a cpuq job's scope
+/// (`cpuq-….scope`) whose `job/` this process is in. A stale or stray
+/// CPUQ_CGROUP (another job's, or an ancestor such as the user's whole
+/// systemd tree) must not get cgroups made in it, outside this job's limits.
 fn insideOf(parent: []const u8) bool {
+    const name = std.fs.path.basename(parent);
+    if (!std.mem.startsWith(u8, name, "cpuq-") or !std.mem.endsWith(u8, name, ".scope")) return false;
     var buf: [1024]u8 = undefined;
     const text = readInto("/proc/self/cgroup", &buf) orelse return false;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         if (!std.mem.startsWith(u8, line, "0::")) continue;
         var full: [600]u8 = undefined;
+        var want: [600]u8 = undefined;
         const own = std.fmt.bufPrint(&full, "/sys/fs/cgroup{s}", .{line[3..]}) catch return false;
-        return std.mem.startsWith(u8, own, parent) and (own.len == parent.len or own[parent.len] == '/');
+        const job = std.fmt.bufPrint(&want, "{s}/job", .{parent}) catch return false;
+        return std.mem.eql(u8, own, job);
     }
     return false;
 }
@@ -590,7 +599,10 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
         c._exit(126);
     }
     const child: c.pid_t = @intCast(pid);
-    if (cgroup == null) _ = c.setpgid(child, child);
+    if (cgroup == null) {
+        _ = c.setpgid(child, child);
+        to_group.store(true, .release);
+    }
     child_pid.store(child, .release);
     _ = c.sigprocmask(c.SIG.SETMASK, &before, null);
     _ = c.close(report[1]);
@@ -658,8 +670,9 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
 
     // Whatever the program left running goes with it.
     if (cgroup) |cg| {
-        // The cap's own limit, not the job's or the machine's: those count in memory.events.
-        if (stop == .none and cg.field("memory.events.local", "oom_kill") != 0) stop = .memory;
+        // The cap's own limit: `oom` in its local events counts only memory.max reached here.
+        // `oom_kill` would also count a program killed for the job's limit or the machine's.
+        if (stop == .none and cg.field("memory.events.local", "oom") != 0) stop = .memory;
         cg.remove();
     }
     killTree(if (cgroup == null) child else 0);

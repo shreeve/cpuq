@@ -991,18 +991,22 @@ t_cap() {
   "$CPUQ" cap --output 1K -- sh -c 'head -c 100000 /dev/zero; sleep 10' >"$T/out" 2>"$T/err"; local rc_out=$?
   "$CPUQ" cap --output 1K -- true 2>/dev/null | cat; local rc_pipe=${PIPESTATUS[0]}
   "$CPUQ" cap -- sh -c 'kill -TERM $$'; local rc_sig=$?
-  "$CPUQ" cap --mem 1G -- sh -c 'sleep 77 & exit 0'; sleep 0.3
-  local left=0; pgrep -f '^sleep 77$' >/dev/null && left=1
+  # A duration no other session's process has, so the check can't see theirs.
+  local nap="77.$$"
+  "$CPUQ" cap --mem 1G -- sh -c "sleep $nap & exit 0"; sleep 0.3
+  local left=0; pgrep -f "^sleep $nap\$" >/dev/null && left=1
   check "cap passes the exit on (7: $rc_exit), not found 127 ($rc_missing), time 124 ($rc_time after ${dt}s), memory 122 ($rc_mem; escaped the group: $rc_escaped), output 121 ($rc_out), a pipe refused 2 ($rc_pipe), a signal as itself 143 ($rc_sig), nothing left behind ($left)" "[ $rc_exit = 7 ] && [ $rc_missing = 127 ] && [ $rc_time = 124 ] && python3 -c 'import sys; sys.exit(0 if $dt < 3 else 1)' && [ $rc_mem = 122 ] && [ $rc_escaped = 122 ] && [ $rc_out = 121 ] && [ $rc_pipe = 2 ] && [ $rc_sig = 143 ] && [ $left = 0 ]"
 }
 
 t_cgroups() {
+  # (CPUQ_CGROUP is cleared where a check needs no job around it: the suite may itself run inside
+  # a cpuq job, whose scope a nested run rightly inherits.)
   # Linux with a user systemd: a job runs in a delegated scope, its command in job/, with
   # CPUQ_CGROUP naming the scope, and a cap inside it gets a cgroup of its own the kernel stops
   # at the limit (far sooner than the once-a-second read elsewhere).
   setup cgroups
   if [ "$(uname)" != Linux ] || ! systemd-run --user --scope --quiet true 2>/dev/null; then
-    local got; got=$("$CPUQ" run --cores 1 --label plain -- sh -c 'echo "cg=${CPUQ_CGROUP:-none}"')
+    local got; got=$(env -u CPUQ_CGROUP "$CPUQ" run --cores 1 --label plain -- sh -c 'echo "cg=${CPUQ_CGROUP:-none}"')
     check "without a user systemd a job runs as it is (got $got)" "[ '$got' = 'cg=none' ]"
     return
   fi
@@ -1014,7 +1018,7 @@ t_cgroups() {
   # A command's own ${...} reaches its shell untouched: systemd-run (254 and later) would expand it.
   local lit; lit=$("$CPUQ" run --cores 1 --label literal -- sh -c 'x=abc/job; echo "${x%/job}"' 2>&1)
   check "a job's \${x%/job} reaches its shell (got '$lit')" "[ '$lit' = abc ]"
-  local off; off=$(sed 's/^cgroups.*//' "$CPUQ_CONFIG" > "$T/c" && echo "cgroups = off" >> "$T/c" && CPUQ_CONFIG="$T/c" "$CPUQ" run --cores 1 --label plain -- sh -c 'echo "cg=${CPUQ_CGROUP:-none}"')
+  local off; off=$(sed 's/^cgroups.*//' "$CPUQ_CONFIG" > "$T/c" && echo "cgroups = off" >> "$T/c" && CPUQ_CONFIG="$T/c" env -u CPUQ_CGROUP "$CPUQ" run --cores 1 --label plain -- sh -c 'echo "cg=${CPUQ_CGROUP:-none}"')
   check "cgroups = off leaves a job as it is (got $off)" "[ '$off' = 'cg=none' ]"
 }
 

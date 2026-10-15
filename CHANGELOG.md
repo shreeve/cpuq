@@ -2,6 +2,22 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.17.1 — 2026-10-15
+
+- `cpuq hook` judges the command inside `cpuq cap` as if typed alone: cap limits a program but
+  doesn't queue it, so `cpuq cap -- zig build test` outside cpuq is refused like `zig build test`.
+- `cpuq cap` blames itself for memory only when its own limit was reached (`oom` in its cgroup's
+  `memory.events.local`): a program killed for the job's limit, or the machine's, is no longer
+  reported as "used more than --mem".
+- `cpuq cap` makes cgroups only in the job it runs in (a `cpuq-….scope` whose `job/` holds it), not
+  in any cgroup a stray `CPUQ_CGROUP` names.
+- Without a cgroup, `cpuq cap` passes its signals to the program's whole process group, so ^C
+  reaches what the program started.
+- A job queued while cpuq was upgraded starts: its scope ran `cpuq _job` from the replaced
+  binary's path, "… (deleted)".
+- Where systemd user scopes don't work, the failed probe is remembered for ten minutes, like a
+  working one.
+
 ## 0.17.0 — 2026-10-15
 
 - `cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] -- PROGRAM`: one program under

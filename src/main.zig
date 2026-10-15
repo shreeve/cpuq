@@ -1859,12 +1859,15 @@ fn weightedArgv(ctx: *Ctx, exe: [:0]const u8, argv: [:null]?[*:0]const u8, cores
     return out.ptr;
 }
 
-/// This binary's own path (Linux: /proc/self/exe), for `cpuq _job`.
+/// This binary's own path (Linux: /proc/self/exe), for `cpuq _job`. A cpuq
+/// replaced while this one waited in the queue reads "PATH (deleted)": the
+/// new binary at PATH runs `_job` as well.
 fn selfExe(a: std.mem.Allocator) ?[]const u8 {
     var buf: [4096]u8 = undefined;
     const n = std.c.readlink("/proc/self/exe", &buf, buf.len);
     if (n <= 0) return null;
-    return a.dupe(u8, buf[0..@intCast(n)]) catch null;
+    const path = buf[0..@intCast(n)];
+    return a.dupe(u8, if (std.mem.endsWith(u8, path, " (deleted)")) path[0 .. path.len - " (deleted)".len] else path) catch null;
 }
 
 /// `cpuq _job -- EXE ARGS...`, run by systemd-run inside a job's delegated
@@ -1931,6 +1934,7 @@ fn scopesWork(ctx: *Ctx, run: [:0]const u8) Scopes {
         if (age_ns >= 0 and age_ns < 600 * std.time.ns_per_s) {
             var buf: [16]u8 = undefined;
             const kept = cwd.readFile(io, path, &buf) catch "";
+            if (std.mem.startsWith(u8, kept, "none")) return .none;
             return if (std.mem.startsWith(u8, kept, "plain")) .plain else .literal;
         }
     } else |_| {}
@@ -1949,6 +1953,9 @@ fn scopesWork(ctx: *Ctx, run: [:0]const u8) Scopes {
         cwd.writeFile(io, .{ .sub_path = path, .data = @tagName(t.scopes) }) catch {};
         return t.scopes;
     }
+    // Remembered too: where the user's systemd can't be reached, a job shouldn't pay for two
+    // systemd-run spawns every time.
+    cwd.writeFile(io, .{ .sub_path = path, .data = "none" }) catch {};
     return .none;
 }
 

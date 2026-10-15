@@ -248,6 +248,18 @@ fn stripWrappers(words: []const []const u8) []const []const u8 {
             continue;
         }
         const prog = std.fs.path.basename(x);
+        // `cpuq cap` limits one program but neither queues it nor takes cores:
+        // what it runs is judged as if typed alone.
+        if (std.mem.eql(u8, prog, "cpuq") and w.len > 1 and std.mem.eql(u8, w[1], "cap")) {
+            w = w[2..];
+            while (w.len > 0 and w[0].len > 1 and w[0][0] == '-') {
+                const opt = w[0];
+                w = w[1..];
+                if (std.mem.eql(u8, opt, "--")) break;
+                if (std.mem.findScalar(u8, opt, '=') == null and w.len > 0) w = w[1..];
+            }
+            continue;
+        }
         const wrapper = for ([_][]const u8{ "nice", "time", "env", "exec", "command", "nohup", "caffeinate", "stdbuf", "timeout", "nocache", "ionice", "chrt", "taskset", "unbuffer" }) |p| {
             if (std.mem.eql(u8, prog, p)) break true;
         } else false;
@@ -519,6 +531,11 @@ test "light and wrapped commands pass" {
     try std.testing.expect(!refused("cpuq run --label app:build -- make"));
     try std.testing.expect(!refused("ssh pup 'cd repo && cpuq run --label app:build -- make'"));
     try std.testing.expect(!refused("cpuq run --label lede:test --cores 4 --opaque -- nice xcodebuild test -destination 'platform=iOS Simulator,id=X' -jobs 4"));
+    // cpuq cap limits a program but doesn't queue it: heavy work inside it is still refused.
+    try std.testing.expect(refused("cpuq cap --time 600s -- zig build test"));
+    try std.testing.expect(refused("cpuq cap --mem=2G -- make"));
+    try std.testing.expect(!refused("cpuq cap --mem 2G --time 120s -- ./a.out"));
+    try std.testing.expect(!refused("cpuq run --label app:test --cores 1 -- cpuq cap --mem 2G -- ./a.out"));
 }
 
 test "a heredoc's body is data unless a shell reads it" {
