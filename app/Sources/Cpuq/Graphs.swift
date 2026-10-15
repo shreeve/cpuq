@@ -160,7 +160,22 @@ final class GraphModel {
     }
 
     /// The machine did not answer: why. The last status stays for the charts.
-    func failed(_ why: String) { problem = why }
+    func failed(_ why: String) {
+        problem = why
+        upSince = nil
+    }
+
+    /// Since when it has answered without a break, as the app saw it.
+    private(set) var upSince: Date?
+
+    /// A cloud machine (one cpuq can start) that is up, and so costing money.
+    var isCloudRunning: Bool { machine.start != nil && problem == nil && upSince != nil }
+
+    /// How long it has been up, as the app saw it: "23m", "1h 05m".
+    var upFor: String {
+        let s = Int(Date().timeIntervalSince(upSince ?? Date()))
+        return s < 3600 ? "\(max(s / 60, 1))m" : "\(s / 3600)h " + String(format: "%02dm", s / 60 % 60)
+    }
 
     /// Its start command is running (the Start button), and what it last said.
     var starting = false
@@ -177,6 +192,7 @@ final class GraphModel {
     func add(_ s: Status, at now: Date = Date()) {
         status = s
         problem = nil
+        if upSince == nil { upSince = now }
         var running: Set<String> = []
         for h in s.holders {
             let id = "\(h.pid)-\(h.since)"

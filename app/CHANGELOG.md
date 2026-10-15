@@ -3,6 +3,23 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.15.0 — 2026-10-15
+
+- An ordinary app while its window is open: a Dock icon, ⌘Tab, and a menu bar of its own (Cpuq:
+  About, Check for Updates, Settings ⌘,; View: the machines ⌘1 ⌘2 ⌘3, Theme, Open Live View in
+  Terminal ⌘L; Window). Closed, it is the menu bar chip again. Clicking the Dock icon opens the
+  window.
+- The chip's menu is short: the app's and cpuq's versions at the top, one line of cores in use and
+  jobs waiting, a line for each thing wrong (and only then), then Open Cpuq, Settings, Check for
+  Updates and Quit. The theme moved to View; the running and waiting jobs, with their actions, are
+  in the window (right-click a job).
+- The chip stays calm while all is well. It turns orange when cpuq's gate is shut or jobs wait
+  beside idle CPUs, is struck through when cpuq cannot be read, and shows ☁ and how long while a
+  cloud machine runs. Cloud machines are looked at once a minute even with the window closed.
+- Settings (⌘,): show in the menu bar, the Dock icon always or only while the window is open, and
+  open at login. Without the menu bar item, the Dock icon stays.
+- About Cpuq gives the app's version, and the cpuq it reads and where.
+
 ## 0.14.2 — 2026-10-15
 
 - Dragging a section no longer jumps: crossing the hour chart mid-drag replayed past moments in

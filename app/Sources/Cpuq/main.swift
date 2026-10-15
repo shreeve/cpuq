@@ -3,8 +3,9 @@ import CpuqCore
 import Sparkle
 import SwiftUI
 
-/// The cpuq menu-bar app: the chip in the menu bar fills a cell per quarter
-/// of the budget held, and its menu shows the queue. It only reads
+/// Cpuq.app: a window with a page per machine, and a chip in the menu bar that stays calm while
+/// all is well. While the window is open it is an ordinary app (Dock icon, menu bar, ⌘Tab); closed,
+/// only the chip remains (Settings can keep the Dock icon, or drop the chip). It only reads
 /// `cpuq status --json`; cpuq itself needs no app.
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -20,6 +21,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var remotes: [GraphModel] = []
     private var remotePolling: Set<String> = []
     private var graphsWindow: NSWindow?
+    private var settingsWindow: NSWindow?
+    /// The View menu (machines, theme, live view), its checkmarks set as it opens.
+    private var viewMenu: NSMenu?
+    /// Ticks of the 3-second timer, for the once-a-minute look at cloud machines.
+    private var ticks = 0
     private let sizeGuard = MinimumSize()
     private var historyTimer: Timer?
     /// Sparkle, running only in a Cpuq.app bundle: a binary run from the build folder never offers
@@ -34,12 +40,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         item.button?.image = chip(level: 0)
+        item.button?.imagePosition = .imageLeading
         item.button?.toolTip = "cpuq"
         menu.delegate = self
         item.menu = menu
-        rebuild()
         loadMachines()
+        rebuild()
+        // One window: macOS's tab bar items would only clutter View.
+        NSWindow.allowsAutomaticWindowTabbing = false
+        NSApp.mainMenu = mainMenu()
+        applyShape()
+        // Settings changes the shape as it is toggled.
+        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.applyShape() }
+        }
         poll()
+        pollClouds()
         // An update relaunched the app with the graphs window open: open it again. A menu-bar
         // app otherwise comes back as only its chip, and the update looks as if it never relaunched.
         AppDelegate.relaunch.graphsOpen = { [weak self] in self?.graphsWindow?.isVisible ?? false }
@@ -49,18 +65,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if reopen || ProcessInfo.processInfo.environment["CPUQ_SHOW_GRAPHS"] != nil { showGraphs() }
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.poll()
-                self?.pollRemotes()
+                guard let self else { return }
+                self.poll()
+                self.pollRemotes()
+                self.ticks += 1
+                if self.ticks % 20 == 0 { self.pollClouds() }
             }
         }
     }
 
-    func menuWillOpen(_ menu: NSMenu) {
+    /// The Dock icon clicked (or the app opened again from the Finder): the window.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        showGraphs()
+        return true
+    }
+
+    func menuNeedsUpdate(_ m: NSMenu) {
+        if m === viewMenu { markView(m) }
+    }
+
+    func menuWillOpen(_ m: NSMenu) {
+        guard m === menu else { return }
         rebuild()
         menuOpen = true
     }
 
-    func menuDidClose(_ menu: NSMenu) {
+    func menuDidClose(_ m: NSMenu) {
+        guard m === menu else { return }
         menuOpen = false
         if rebuildOnClose {
             rebuildOnClose = false
@@ -87,9 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.status = nil
                     self.problem = e.message
                 }
-                let s = self.status
-                self.item.button?.image = self.chip(level: meterLevel(held: s?.held ?? 0, budget: s?.capacity ?? 0))
-                self.item.button?.toolTip = s.map { "cpuq: \($0.held) of \($0.capacity) cores in use · gate \($0.gate.text)" } ?? "cpuq: \(self.problem ?? "")"
+                self.updateChip()
                 if self.menu.highlightedItem != nil || self.menu.numberOfItems == 0 { return }
                 self.rebuild()
             }
@@ -107,19 +136,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// and a stopped cloud machine need not be dialed every 3 seconds for the menu.
     private func pollRemotes() {
         guard graphsWindow?.isVisible ?? false else { return }
-        for m in remotes where !remotePolling.contains(m.machine.id) {
-            let host = m.machine.id
-            remotePolling.insert(host)
-            Task.detached(priority: .utility) {
-                let result = Self.remote(host, ["status", "--json"])
-                await MainActor.run {
-                    self.remotePolling.remove(host)
-                    switch result {
-                    case .success(let data):
-                        if let s = try? Status.decode(data) { m.add(s) } else { m.failed("its cpuq answered in a form this app cannot read") }
-                    case .failure(let e): m.failed(e.message)
-                    }
+        for m in remotes { pollRemote(m) }
+    }
+
+    /// The cloud machines (those cpuq can start) once a minute even with the window closed: one
+    /// running costs money, and the chip says so whether anyone is looking or not.
+    private func pollClouds() {
+        guard !(graphsWindow?.isVisible ?? false) else { return }
+        for m in remotes where m.machine.start != nil { pollRemote(m) }
+    }
+
+    private func pollRemote(_ m: GraphModel) {
+        let host = m.machine.id
+        guard !remotePolling.contains(host) else { return }
+        remotePolling.insert(host)
+        Task.detached(priority: .utility) {
+            let result = Self.remote(host, ["status", "--json"])
+            await MainActor.run {
+                self.remotePolling.remove(host)
+                switch result {
+                case .success(let data):
+                    if let s = try? Status.decode(data) { m.add(s) } else { m.failed("its cpuq answered in a form this app cannot read") }
+                case .failure(let e): m.failed(e.message)
                 }
+                self.updateChip()
             }
         }
     }
@@ -245,91 +285,178 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Fills `m`: the status, the commands, then the jobs.
+    /// Fills the chip's menu: the versions, one line of how it stands, a line for each thing
+    /// wrong (and only then), and the commands. The jobs, the theme and the details live in the
+    /// window.
     private func fill(_ m: NSMenu) {
-        guard let s = status else {
+        m.addItem(versions())
+        if let s = status {
+            let waiting = s.waiters.count
+            m.addItem(text("\(s.held) of \(s.capacity) cores in use" + (waiting > 0 ? " · \(waiting) waiting" : ""), bold: true))
+        } else {
             m.addItem(text(problem ?? "reading cpuq status…", bold: false))
-            commands(m)
-            return
         }
-        let now = Date().timeIntervalSince1970
-        let controls = supportsControls(version: s.version)
-        m.addItem(text("cpuq \(s.version)  ·  \(s.held) of \(s.capacity) cores in use", bold: true))
-        let load = s.load.first.map { String(format: "%.1f", $0) } ?? "?"
-        m.addItem(text("load \(load)  ·  memory \(s.memoryPressure)  ·  gate \(s.gate.text)", bold: false))
-        commands(m)
-
-        if !s.holders.isEmpty {
-            m.addItem(.separator())
-            m.addItem(section("Running"))
-            for h in s.holders {
-                let using = h.using.map { String(format: "%.1f", $0) } ?? "–"
-                let item = text("\(name(h.label, h.command))   \(h.cores) in use · \(using) active · \(age(now - Double(h.since)))\(h.paused ? " · paused" : "")", bold: false)
-                if controls && !h.exclusive {
-                    item.submenu = jobMenu([
-                        h.paused ? ("Resume", "resume") : ("Pause", "pause"),
-                        ("Stop…", "stop"),
-                    ], pid: h.pid, who: name(h.label, h.command))
-                }
-                m.addItem(item)
-            }
-        }
-        if !s.waiters.isEmpty {
-            m.addItem(.separator())
-            m.addItem(section("Waiting"))
-            for w in s.waiters {
-                let cores = w.exclusive ? "exclusive" : (w.max > w.cores ? "\(w.cores)–\(w.max)" : "\(w.cores)")
-                let eta = w.eta.map { $0 < 1 ? "next" : "~" + age($0) } ?? "?"
-                let item = text("\(w.order). \(name(w.label, w.command))   \(cores) cores · ETA \(eta)", bold: false)
-                if controls {
-                    item.submenu = jobMenu([("Move to Front", "first"), ("Start Now…", "start"), ("Cancel", "cancel")], pid: w.pid, who: name(w.label, w.command))
-                }
-                m.addItem(item)
-            }
-        }
-        if !s.leases.isEmpty {
-            m.addItem(.separator())
-            m.addItem(section("Leases"))
-            for l in s.leases {
-                let by = l.holders.map { name($0.label, $0.command) }.joined(separator: ", ")
-                m.addItem(text("\(l.name)   \(by.isEmpty ? "free" : by) · \(l.waiters.count) waiting", bold: false))
-            }
-        }
-        let outside = s.outside.reduce(0) { $0 + $1.using }
-        if outside >= 1 {
-            m.addItem(.separator())
-            m.addItem(section(String(format: "Outside cpuq: %.1f cores active", outside)))
-            for o in s.outside {
-                m.addItem(text(String(format: "%@ (%d)   %.1f", o.name, o.pid, o.using), bold: false))
-            }
-        }
-    }
-
-    /// The commands, from Show Graphs to Quit: always the same, so they stay where the hand
-    /// expects them, above however many jobs follow.
-    private func commands(_ m: NSMenu) {
+        for line in alerts() { m.addItem(text(line, bold: false)) }
         m.addItem(.separator())
-        m.addItem(withTitle: "Show Graphs…", action: #selector(showGraphs), keyEquivalent: "g").target = self
-        m.addItem(themeItem())
-        m.addItem(withTitle: "Open Live View in Terminal", action: #selector(openLiveView), keyEquivalent: "l").target = self
+        m.addItem(withTitle: "Open Cpuq", action: #selector(showGraphs), keyEquivalent: "g").target = self
+        m.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",").target = self
         if Bundle.main.bundleURL.pathExtension == "app" {
             let check = NSMenuItem(title: "Check for Updates…", action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)), keyEquivalent: "")
             check.target = updater
             m.addItem(check)
         }
-        m.addItem(versions())
-        m.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        m.addItem(.separator())
+        m.addItem(withTitle: "Quit Cpuq", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }
 
-    /// "Cpuq.app 0.13.18 · cpuq 0.8.11", in grey: the app's version and the cpuq it reads.
+    /// What is wrong, a line each: the gate shut, jobs waiting beside idle CPUs, a cloud machine
+    /// running (and costing money). Empty while all is well.
+    private func alerts() -> [String] {
+        var out: [String] = []
+        if let s = status {
+            if s.gate.state != "open" { out.append("⚠︎ cpuq's gate is \(s.gate.text)") }
+            let now = Moment.now(graphs)
+            if now.needless { out.append("⚠︎ \(now.waiters.count) waiting beside idle CPUs") }
+        }
+        for m in remotes where m.isCloudRunning {
+            let held = m.status.map { " · \($0.held) of \(Int(m.cpus)) cores in use" } ?? ""
+            out.append("☁︎ \(m.machine.name) running · \(m.upFor)\(held)")
+        }
+        return out
+    }
+
+    /// The chip: calm while all is well; orange while something is wrong (the gate shut, or jobs
+    /// waiting beside idle CPUs); struck through when cpuq cannot be read; and "☁ 23m" beside it
+    /// while a cloud machine runs.
+    private func updateChip() {
+        let s = status
+        let wrong = s.map { $0.gate.state != "open" || Moment.now(graphs).needless } ?? false
+        item.button?.image = chip(level: meterLevel(held: s?.held ?? 0, budget: s?.capacity ?? 0), tint: wrong ? .systemOrange : nil, broken: s == nil)
+        let clouds = remotes.filter(\.isCloudRunning)
+        item.button?.title = clouds.isEmpty ? "" : " ☁ " + clouds.map(\.upFor).joined(separator: " ")
+        var tip = s.map { "cpuq: \($0.held) of \($0.capacity) cores in use" + ($0.waiters.isEmpty ? "" : " · \($0.waiters.count) waiting") } ?? "cpuq: \(problem ?? "cannot read cpuq")"
+        for line in alerts() { tip += "\n" + line }
+        item.button?.toolTip = tip
+    }
+
+    /// "Cpuq 0.14.3 · cpuq 0.13.0", in grey: the app's version and the cpuq it reads.
     private func versions() -> NSMenuItem {
-        let app = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
-        var s = "Cpuq.app \(app)"
+        var s = "Cpuq \(appVersion)"
         if let cli = status?.version, !cli.isEmpty { s += " · cpuq \(cli)" }
         let item = NSMenuItem(title: s, action: nil, keyEquivalent: "")
         item.isEnabled = false
         item.attributedTitle = NSAttributedString(string: s, attributes: [.font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize), .foregroundColor: NSColor.secondaryLabelColor])
         return item
+    }
+
+    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev" }
+
+    // MARK: - The app's shape
+
+    /// An ordinary app (Dock icon, menu bar, ⌘Tab) while the window is open, or always if Settings
+    /// says so, or whenever the chip is hidden (else nothing would reach it); otherwise only the
+    /// chip.
+    private func applyShape() {
+        let chip = Prefs.showInMenuBar
+        if item.isVisible != chip { item.isVisible = chip }
+        let open = graphsWindow?.isVisible ?? false
+        let want: NSApplication.ActivationPolicy = open || Prefs.dockAlways || !chip ? .regular : .accessory
+        guard NSApp.activationPolicy() != want else { return }
+        NSApp.setActivationPolicy(want)
+        if want == .regular && open { NSApp.activate() }
+    }
+
+    /// The menu bar while Cpuq is an ordinary app: Cpuq, View (the machines, the theme, the live
+    /// view) and Window.
+    private func mainMenu() -> NSMenu {
+        let main = NSMenu()
+        let appMenu = NSMenu(title: "Cpuq")
+        appMenu.addItem(withTitle: "About Cpuq", action: #selector(showAbout), keyEquivalent: "").target = self
+        if Bundle.main.bundleURL.pathExtension == "app" {
+            let check = NSMenuItem(title: "Check for Updates…", action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)), keyEquivalent: "")
+            check.target = updater
+            appMenu.addItem(check)
+        }
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",").target = self
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Hide Cpuq", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h").keyEquivalentModifierMask = [.command, .option]
+        appMenu.addItem(withTitle: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Quit Cpuq", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        main.addItem(withTitle: "Cpuq", action: nil, keyEquivalent: "").submenu = appMenu
+
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        main.addItem(withTitle: "Edit", action: nil, keyEquivalent: "").submenu = edit
+
+        let view = NSMenu(title: "View")
+        view.delegate = self
+        for (i, m) in ([graphs] + remotes).enumerated() {
+            let pick = NSMenuItem(title: m.machine.name, action: #selector(pickMachine(_:)), keyEquivalent: i < 9 ? "\(i + 1)" : "")
+            pick.target = self
+            pick.representedObject = m.machine.id
+            view.addItem(pick)
+        }
+        view.addItem(.separator())
+        view.addItem(themeItem())
+        view.addItem(.separator())
+        view.addItem(withTitle: "Open Live View in Terminal", action: #selector(openLiveView), keyEquivalent: "l").target = self
+        viewMenu = view
+        main.addItem(withTitle: "View", action: nil, keyEquivalent: "").submenu = view
+
+        let window = NSMenu(title: "Window")
+        window.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "")
+        window.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        window.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        window.addItem(.separator())
+        window.addItem(withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
+        NSApp.windowsMenu = window
+        main.addItem(withTitle: "Window", action: nil, keyEquivalent: "").submenu = window
+        return main
+    }
+
+    /// The View menu's checkmarks as it opens: the machine shown, and the theme's.
+    private func markView(_ view: NSMenu) {
+        let shown = UserDefaults.standard.string(forKey: "machine") ?? "local"
+        for item in view.items where item.action == #selector(pickMachine(_:)) {
+            item.state = item.representedObject as? String == shown ? .on : .off
+        }
+        if let theme = view.items.first(where: { $0.title == "Theme" }) { theme.submenu = themeItem().submenu }
+    }
+
+    @objc private func pickMachine(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        UserDefaults.standard.set(id, forKey: "machine")
+        showGraphs()
+    }
+
+    @objc private func showAbout() {
+        NSApp.activate()
+        var credits = "Reads cpuq"
+        if let cli = status?.version, !cli.isEmpty { credits += " \(cli)" }
+        if let path = findCpuq() { credits += " at \(path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))" }
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .applicationName: "Cpuq",
+            .applicationVersion: appVersion,
+            .version: "",
+            .credits: NSAttributedString(string: credits, attributes: [.font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize), .foregroundColor: NSColor.secondaryLabelColor]),
+        ])
+    }
+
+    @objc private func showSettings() {
+        if settingsWindow == nil {
+            let window = NSWindow(contentRect: .zero, styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window.title = "Cpuq Settings"
+            window.isReleasedWhenClosed = false
+            window.contentView = NSHostingView(rootView: SettingsView())
+            window.center()
+            settingsWindow = window
+        }
+        NSApp.activate()
+        settingsWindow?.makeKeyAndOrderFront(nil)
     }
 
     // MARK: - Themes
@@ -440,6 +567,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 window.setFrame(frame, display: false)
             }
             graphsWindow = window
+            // Closed, the app goes back to being the chip (unless Settings keeps the Dock icon).
+            NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in
+                DispatchQueue.main.async { MainActor.assumeIsolated { self?.applyShape() } }
+            }
             // History changes slowly: read it now and each minute while the window is open.
             historyTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.refreshHistory() }
@@ -447,6 +578,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         NSApp.activate()
         graphsWindow?.makeKeyAndOrderFront(nil)
+        applyShape()
         // Once it is on screen: refreshHistory skips a window nobody sees, so read before
         // this, the history waited a minute for the next refresh.
         refreshHistory()
@@ -471,25 +603,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func name(_ label: String, _ command: String) -> String {
         label.isEmpty ? String(command.split(separator: " ").first ?? "job") : label
-    }
-
-    /// A job's actions: each runs `cpuq ACTION PID`.
-    private func jobMenu(_ actions: [(String, String)], pid: Int, who: String) -> NSMenu {
-        let menu = NSMenu()
-        for (title, action) in actions {
-            let item = NSMenuItem(title: title, action: #selector(control(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = [action, String(pid), who]
-            menu.addItem(item)
-        }
-        return menu
-    }
-
-    /// Runs a job action, asking first for the two that cost something: starting a job past the
-    /// budget raises the load, and stopping one throws its work away.
-    @objc private func control(_ sender: NSMenuItem) {
-        guard let info = sender.representedObject as? [String], info.count == 3 else { return }
-        perform(info[0], pid: info[1], who: info[2])
     }
 
     func perform(_ action: String, pid: String, who: String, on machine: Machine = .local) {
@@ -527,11 +640,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
-    private func section(_ s: String) -> NSMenuItem {
-        if #available(macOS 14, *) { return NSMenuItem.sectionHeader(title: s) }
-        return text(s, bold: true)
-    }
-
     @objc private func openLiveView() {
         guard let path = findCpuq() else { return }
         // `status --watch` is cpuq 0.4.0's; an older cpuq gets the same view
@@ -548,13 +656,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// The chip, 18 pt: the app icon's geometry (assets/menubar/cpuqTemplate-N.svg),
     /// pins and body stroked, the four cores filled, `level` of them solid and
     /// the rest at 30%. A template image, so the system tints it.
-    private func chip(level: Int) -> NSImage {
+    private func chip(level: Int, tint: NSColor? = nil, broken: Bool = false) -> NSImage {
         let image = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
             guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+            let ink = tint ?? .black
             ctx.translateBy(x: 9, y: 9)
             ctx.scaleBy(x: 0.0321, y: 0.0321)
             ctx.translateBy(x: -444.5, y: -452)
-            ctx.setStrokeColor(NSColor.black.cgColor)
+            ctx.setStrokeColor(ink.cgColor)
             ctx.setLineCap(.round)
             ctx.setLineWidth(40)
             for x in [382.0, 472, 562] {
@@ -572,13 +681,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ctx.strokePath()
             let cells = [CGPoint(x: 348, y: 328), CGPoint(x: 486, y: 328), CGPoint(x: 348, y: 466), CGPoint(x: 486, y: 466)]
             for (i, origin) in cells.enumerated() {
-                ctx.setFillColor(NSColor.black.withAlphaComponent(i < level ? 1 : 0.3).cgColor)
+                ctx.setFillColor(ink.withAlphaComponent(i < level ? 1 : 0.3).cgColor)
                 ctx.addPath(CGPath(roundedRect: CGRect(origin: origin, size: CGSize(width: 110, height: 110)), cornerWidth: 24, cornerHeight: 24, transform: nil))
                 ctx.fillPath()
             }
+            if broken {
+                // Struck through: cpuq cannot be read, which an empty chip would hide.
+                ctx.setLineWidth(56)
+                ctx.move(to: CGPoint(x: 240, y: 660)); ctx.addLine(to: CGPoint(x: 660, y: 240))
+                ctx.strokePath()
+            }
             return true
         }
-        image.isTemplate = true
+        // A template image takes the menu bar's own color; a tinted one keeps its orange.
+        image.isTemplate = tint == nil
         return image
     }
 }
@@ -601,7 +717,7 @@ final class UpdateRelaunch: NSObject, SPUUpdaterDelegate {
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
-// A menu-bar app: no Dock icon, no main window.
+// The chip at first; applyShape makes it an ordinary app while the window is open.
 app.setActivationPolicy(.accessory)
 app.run()
 
