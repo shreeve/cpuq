@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.15.3 — 2026-10-15
+
+- A running cloud machine's chip reads "☁ 23m / 14h": up since it booted, and its running hours
+  this month, added up from its own boot journal (every boot this calendar month), so the month's
+  use is plain at a glance. The menu says the same in words.
+
 ## 0.15.2 — 2026-10-15
 
 - Dragging a section is steady: the drag was measured on the handle itself, which moves with the

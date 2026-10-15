@@ -167,6 +167,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 case .failure(let e): m.failed(e.message)
                 }
                 self.updateChip()
+                self.countMonth(m)
+            }
+        }
+    }
+
+    /// A running cloud machine's hours this month, from its boot journal, every 5 minutes.
+    private func countMonth(_ m: GraphModel) {
+        guard m.isCloudRunning, Date().timeIntervalSince(m.monthCheckedAt ?? .distantPast) > 300 else { return }
+        m.monthCheckedAt = Date()
+        let host = m.machine.id
+        let since = Calendar.current.dateInterval(of: .month, for: Date())?.start ?? Date()
+        Task.detached(priority: .utility) {
+            guard case .success(let data) = Self.remoteCommand(host, "journalctl --list-boots -o json --no-pager"),
+                  let seconds = runningSeconds(boots: data, since: since) else { return }
+            await MainActor.run {
+                m.monthHours = seconds / 3600
+                self.updateChip()
             }
         }
     }
@@ -214,9 +231,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     /// Runs cpuq on `host` over ssh and returns what it printed; a failure carries ssh's or
     /// cpuq's first line of complaint.
     nonisolated private static func remote(_ host: String, _ arguments: [String]) -> Result<Data, Problem> {
+        remoteCommand(host, (["cpuq"] + arguments).joined(separator: " "))
+    }
+
+    nonisolated private static func remoteCommand(_ host: String, _ command: String) -> Result<Data, Problem> {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        p.arguments = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, (["cpuq"] + arguments).joined(separator: " ")]
+        p.arguments = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, command]
         let out = Pipe(), err = Pipe()
         p.standardOutput = out
         p.standardError = err
@@ -327,7 +348,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
         for m in remotes where m.isCloudRunning {
             let held = m.status.map { " · \($0.held) of \(Int(m.cpus)) cores in use" } ?? ""
-            out.append("☁︎ \(m.machine.name) running · \(m.upFor)\(held)")
+            let month = m.monthHours.map { " · " + GraphModel.hours($0) + " this month" } ?? ""
+            out.append("☁︎ \(m.machine.name) running · up \(m.upFor)\(month)\(held)")
         }
         return out
     }
@@ -340,7 +362,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let wrong = s.map { $0.gate.state != "open" || Moment.now(graphs).needless } ?? false
         item.button?.image = chip(level: meterLevel(held: s?.held ?? 0, budget: s?.capacity ?? 0), tint: wrong ? .systemOrange : nil, broken: s == nil)
         let clouds = remotes.filter(\.isCloudRunning)
-        item.button?.title = clouds.isEmpty ? "" : " ☁ " + clouds.map(\.upFor).joined(separator: " ")
+        // "☁ 23m / 14h": up since it booted, and its hours this month.
+        item.button?.title = clouds.isEmpty ? "" : " ☁ " + clouds.map { $0.upFor + ($0.monthHours.map { " / " + GraphModel.hours($0) } ?? "") }.joined(separator: "  ")
         var tip = s.map { "cpuq: \($0.held) of \($0.capacity) cores in use" + ($0.waiters.isEmpty ? "" : " · \($0.waiters.count) waiting") } ?? "cpuq: \(problem ?? "cannot read cpuq")"
         for line in alerts() { tip += "\n" + line }
         item.button?.toolTip = tip

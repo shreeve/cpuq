@@ -136,3 +136,17 @@ import Testing
     #expect(s.ticks?.each.count == 2)
     #expect(s.ticks?.all == CPUTicks(busy: 40, total: 200))
 }
+
+@Test func addsUpAMonthsBoots() throws {
+    // Three boots: one before the month began (half inside it), one inside, one still running.
+    let since = Date(timeIntervalSince1970: 1_000_000)
+    let now = Date(timeIntervalSince1970: 1_010_000)
+    let boots = """
+    [{"index": -2, "first_entry": \(999_000.0 * 1e6), "last_entry": \(1_002_000.0 * 1e6)},
+     {"index": -1, "first_entry": \(1_003_000.0 * 1e6), "last_entry": \(1_004_000.0 * 1e6)},
+     {"index": 0, "first_entry": \(1_009_000.0 * 1e6), "last_entry": \(1_009_500.0 * 1e6)}]
+    """
+    let seconds = runningSeconds(boots: Data(boots.utf8), since: since, now: now)
+    #expect(seconds == 4000.0, "got \(String(describing: seconds))")
+    #expect(runningSeconds(boots: Data("not json".utf8), since: since) == nil)
+}

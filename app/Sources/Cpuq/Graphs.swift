@@ -168,6 +168,16 @@ final class GraphModel {
     /// Since when it has answered without a break, as the app saw it.
     private(set) var upSince: Date?
 
+    /// Its running hours this month (a cloud machine's, from its boot journal), and when they
+    /// were last counted.
+    var monthHours: Double?
+    var monthCheckedAt: Date?
+
+    /// Hours: "1.9h" under ten, "14h" from there.
+    static func hours(_ h: Double) -> String {
+        h < 10 ? String(format: "%.1fh", h) : "\(Int(h.rounded()))h"
+    }
+
     /// A cloud machine (one cpuq can start) that is up, and so costing money.
     var isCloudRunning: Bool { machine.start != nil && problem == nil && upSince != nil }
 

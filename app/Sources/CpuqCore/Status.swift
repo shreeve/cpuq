@@ -299,3 +299,21 @@ public func spillHosts(config text: String) -> [(host: String, start: String?)] 
     }
     return hosts.map { ($0, starts[$0]) }
 }
+
+/// How long a machine has run since `since`, from `journalctl --list-boots -o json`: each boot
+/// from its first journal entry to its last, the boot still running (index 0) to `now`. Nil when
+/// the list cannot be read.
+public func runningSeconds(boots data: Data, since: Date, now: Date = Date()) -> Double? {
+    struct Boot: Decodable {
+        let index: Int
+        let first_entry: Double
+        let last_entry: Double
+    }
+    guard let boots = try? JSONDecoder().decode([Boot].self, from: data) else { return nil }
+    let from = since.timeIntervalSince1970, to = now.timeIntervalSince1970
+    return boots.reduce(0) { sum, b in
+        let start = max(b.first_entry / 1e6, from)
+        let end = min(b.index == 0 ? to : b.last_entry / 1e6, to)
+        return sum + max(end - start, 0)
+    }
+}
