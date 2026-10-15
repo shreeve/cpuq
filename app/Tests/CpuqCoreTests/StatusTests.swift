@@ -150,3 +150,15 @@ import Testing
     #expect(seconds == 4000.0, "got \(String(describing: seconds))")
     #expect(runningSeconds(boots: Data("not json".utf8), since: since) == nil)
 }
+
+@Test func decodesRecordedSamples() {
+    let text = """
+    {"t":1792038868,"cpu":[46,35],"load":2.24,"held":2,"wait":1,"gate":"open"}
+    not a sample
+    {"t":1792038871,"cpu":[0,100],"load":2.5,"held":0,"wait":0,"gate":"low_disk"}
+    """
+    let s = RecordedSample.decodeLines(Data(text.utf8))
+    #expect(s.count == 2)
+    #expect(s[0].cpu == [46, 35] && s[0].held == 2 && s[0].wait == 1)
+    #expect(s[1].gate == "low_disk")
+}

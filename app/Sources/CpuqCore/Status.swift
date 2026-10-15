@@ -317,3 +317,21 @@ public func runningSeconds(boots data: Data, since: Date, now: Date = Date()) ->
         return sum + max(end - start, 0)
     }
 }
+
+/// One of `cpuq record`'s samples, as `cpuq samples` prints them (cpuq 0.15 and later): when, each
+/// CPU's busy share since the sample before (percent), the 1-minute load, cores held, jobs
+/// waiting, and the gate.
+public struct RecordedSample: Decodable, Sendable, Equatable {
+    public let t: Double
+    public let cpu: [Double]
+    public let load: Double
+    public let held: Int
+    public let wait: Int
+    public let gate: String
+
+    /// `cpuq samples` output, a JSON line each; lines it cannot read are skipped.
+    public static func decodeLines(_ data: Data) -> [RecordedSample] {
+        let decoder = JSONDecoder()
+        return data.split(separator: UInt8(ascii: "\n")).compactMap { try? decoder.decode(RecordedSample.self, from: Data($0)) }
+    }
+}

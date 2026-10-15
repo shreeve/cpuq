@@ -159,6 +159,28 @@ final class GraphModel {
         return Double(max(status?.cpuTicks?.count ?? 1, 1))
     }
 
+    /// Whether the past from `cpuq samples` has been read in (once per machine).
+    var backfilled = false
+
+    /// The hour before the app watched, from the machine's recorder: its readings go in ahead of
+    /// the app's own, so the charts and the idle-wait judgement have the CPUs from before launch.
+    func backfill(_ recorded: [RecordedSample], now: Date = Date()) {
+        backfilled = true
+        let first = samples.first?.at ?? now
+        let since = max(now.addingTimeInterval(-Self.keep), cleared ?? .distantPast)
+        let older = recorded.compactMap { r -> Sample? in
+            let at = Date(timeIntervalSince1970: r.t)
+            guard at >= since, at < first.addingTimeInterval(-1), !r.cpu.isEmpty else { return nil }
+            let per = r.cpu.map { $0 / 100 }
+            return Sample(at: at, inUse: r.held, active: 0, outside: 0, load: r.load, waiting: r.wait,
+                          gate: r.gate, gateText: r.gate == "open" ? "open" : r.gate.replacingOccurrences(of: "_", with: " "),
+                          busy: per.reduce(0, +) / Double(per.count), perCPU: per)
+        }
+        guard !older.isEmpty else { return }
+        samples = older.sorted { $0.at < $1.at } + samples
+        if let oldest = older.first?.at, oldest < started { started = oldest }
+    }
+
     /// The machine did not answer: why. The last status stays for the charts.
     func failed(_ why: String) {
         problem = why

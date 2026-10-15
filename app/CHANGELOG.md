@@ -3,6 +3,13 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.16.0 — 2026-10-15
+
+- The charts start full: on opening, each machine's page fills in the hour before from that
+  machine's recorder (`cpuq record`, cpuq 0.15), so a relaunch or an update no longer starts the
+  hour, the Per Core view and the idle-CPU judgement from nothing. A machine without a recorder
+  starts from launch, as before.
+
 ## 0.15.3 — 2026-10-15
 
 - A running cloud machine's chip reads "☁ 23m / 14h": up since it booted, and its running hours

@@ -120,6 +120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                     self.status = s
                     self.problem = nil
                     self.graphs.add(s)
+                    if !self.graphs.backfilled { self.backfill(self.graphs) }
                     Liveliness.shared.observe(load: s.load.first, cpus: Double(ProcessInfo.processInfo.activeProcessorCount))
                 case .failure(let e):
                     self.status = nil
@@ -163,12 +164,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 self.remotePolling.remove(host)
                 switch result {
                 case .success(let data):
-                    if let s = try? Status.decode(data) { m.add(s) } else { m.failed("its cpuq answered in a form this app cannot read") }
+                    if let s = try? Status.decode(data) {
+                        m.add(s)
+                        if !m.backfilled { self.backfill(m) }
+                    } else { m.failed("its cpuq answered in a form this app cannot read") }
                 case .failure(let e): m.failed(e.message)
                 }
                 self.updateChip()
                 self.countMonth(m)
             }
+        }
+    }
+
+    /// The last hour from the machine's recorder (`cpuq samples`), once: nothing when it records
+    /// nothing, or its cpuq is older than 0.15.
+    private func backfill(_ m: GraphModel) {
+        m.backfilled = true
+        let host: String? = m.machine.isLocal ? nil : m.machine.id
+        let since = ["samples", "--since", String(Int(Date().timeIntervalSince1970) - 3600)]
+        Task.detached(priority: .utility) {
+            let result = host.map { Self.remote($0, since) } ?? Self.run(since)
+            guard case .success(let data) = result else { return }
+            let recorded = RecordedSample.decodeLines(data)
+            await MainActor.run { m.backfill(recorded) }
         }
     }
 
