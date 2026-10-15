@@ -78,6 +78,7 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32
         .instead = quotedInside(a, cmd.text),
     };
     var opaque_flag = false;
+    var elsewhere = false;
     var min_cores: ?u32 = null;
     // A lease's name comes first.
     var i: usize = if (std.mem.eql(u8, sub, "lease")) 3 else 2;
@@ -89,6 +90,8 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32
         }
         if (o.len == 0 or o[0] != '-') break;
         if (std.mem.eql(u8, o, "--opaque")) opaque_flag = true;
+        // Sent to another machine: its size, not this one's, judges the request.
+        if (std.mem.eql(u8, o, "--spill-to") or std.mem.startsWith(u8, o, "--spill-to=") or std.mem.eql(u8, o, "--spill")) elsewhere = true;
         const value: ?[]const u8 = if (std.mem.startsWith(u8, o, "--cores=")) o["--cores=".len..] else if (std.mem.eql(u8, o, "--cores") and i + 1 < w.len) w[i + 1] else null;
         if (value) |v| min_cores = std.fmt.parseInt(u32, std.mem.sliceTo(v, '-'), 10) catch null;
         // Options that take a value skip it.
@@ -97,7 +100,7 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32
         }
     }
     // Over half the CPUs, and more than 2: a minimum of 2 fits even a small machine.
-    if (min_cores) |m| if (m > @max(cpus / 2, 2)) return .{
+    if (min_cores) |m| if (!elsewhere and m > @max(cpus / 2, 2)) return .{
         .reason = a.print("asking for at least {d} cores on a {d}-CPU machine: a request over half the CPUs waits until the machine is nearly empty", .{ m, cpus }) catch "too many cores asked for",
         .instead = "ask for a range the job can shrink to, such as --cores 2-6, and pass \"$CPUQ_CORES\" on; run big jobs on the larger machine",
     };
@@ -256,7 +259,9 @@ fn stripWrappers(words: []const []const u8) []const []const u8 {
                 const opt = w[0];
                 w = w[1..];
                 if (std.mem.eql(u8, opt, "--")) break;
-                if (std.mem.findScalar(u8, opt, '=') == null and w.len > 0) w = w[1..];
+                for ([_][]const u8{ "--mem", "--time", "--output", "--pids" }) |takes| {
+                    if (std.mem.eql(u8, opt, takes) and w.len > 0) w = w[1..];
+                }
             }
             continue;
         }
@@ -531,6 +536,8 @@ test "light and wrapped commands pass" {
     try std.testing.expect(!refused("cpuq run --label app:build -- make"));
     try std.testing.expect(!refused("ssh pup 'cd repo && cpuq run --label app:build -- make'"));
     try std.testing.expect(!refused("cpuq run --label lede:test --cores 4 --opaque -- nice xcodebuild test -destination 'platform=iOS Simulator,id=X' -jobs 4"));
+    // A request for a bigger machine is judged by that machine, not this one.
+    try std.testing.expect(!refused("cpuq run --spill-to burst --label proj:matrix --cores 8-32 -- sh -c 'zig build -j\"$CPUQ_CORES\"'"));
     // cpuq cap limits a program but doesn't queue it: heavy work inside it is still refused.
     try std.testing.expect(refused("cpuq cap --time 600s -- zig build test"));
     try std.testing.expect(refused("cpuq cap --mem=2G -- make"));

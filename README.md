@@ -441,9 +441,11 @@ A test suite that takes an hour on a laptop takes minutes on a 96-CPU cloud mach
 goes there whole, keeps its caches warm, and cleans up after itself. This is how an agent sends
 one:
 
-    cpuq run --spill-to burst --label proj:matrix --cores 8-32 -- sh -c '
-      zig build -j"$CPUQ_CORES" &&
-      PROJ_RESULTS_CACHE=$HOME/cpuq-spill/c/proj/results ./test/run -j "$CPUQ_CORES" >.zig-cache/gate.log 2>&1
+    cpuq run --spill-to burst --label proj:matrix --cores 8-32 --return .zig-cache/gate.log -- sh -c '
+      : >.zig-cache/gate.log
+      mkdir -p "$HOME/cpuq-spill/c/proj/results"
+      zig build -j"$CPUQ_CORES" >>.zig-cache/gate.log 2>&1 &&
+      PROJ_RESULTS_CACHE=$HOME/cpuq-spill/c/proj/results timeout 90m ./test/run -j "$CPUQ_CORES" >>.zig-cache/gate.log 2>&1
       rc=$?
       grep -E "^(fail|FAIL)" .zig-cache/gate.log | head -20; tail -2 .zig-cache/gate.log
       rm -rf .zig-cache/proj-test
@@ -455,19 +457,34 @@ one:
   once and more queue on the host. Every tool inside takes `$CPUQ_CORES`.
 - **Caches outside the copy.** Each worktree gets its own copy on the host, so a cache inside it
   is cold for every new branch. A path under `$HOME/cpuq-spill/c/PROJECT/`, outside every copy,
-  is shared by all of a project's runs there. A results cache keyed by content (one entry per
-  test and input) then carries a pass from one branch to the next.
+  is shared by all of a project's runs there. A results cache keyed by content then carries a
+  pass from one branch to the next.
+  - That's sound only when the key covers everything that decides a result: the inputs, the
+    compiler's own hash, flags, and toolchain.
+  - Entries are written by renaming into place, since runs share the cache.
+  - Nothing evicts these caches yet, so watch their size (`du -sh ~/cpuq-spill/c/*` on the host).
+- **A fresh log each run:** the copy keeps the last one, so the command empties it first. Without
+  that, a failed build would report the previous run's failures.
+- **A time limit inside the command** (`timeout 90m`): a hung test otherwise keeps a billing
+  machine busy, and its idle stop never comes.
 - **Scratch deleted at the end**, after the status is saved, in the same command. The copy
-  persists between runs, so whatever a run leaves stays on the host's disk.
-- **A short report:** the failures and the summary line on the terminal, and the full log in the
-  copy. The exit status is the run's own.
+  persists between runs, so whatever a run leaves stays on the host's disk. Paths are relative to
+  the copy: never `rm -rf "$X/…"` with a variable that might be empty.
+- **A short report:** the failures and the summary line on the terminal. `--return` brings the
+  full log back; otherwise it stays on the host. The exit status is the run's own.
 - **Run it as a background command.** It waits in the host's queue, then runs as long as it
   takes, often past an agent tool's timeout.
-- **Tools the host lacks** are fetched or built there by the command itself, beside the copy
-  (`../tool`), where later runs find them already built.
+- **Tools the host lacks** are built there, pinned, under the project's cache
+  (`$HOME/cpuq-spill/c/PROJECT/tools/NAME-COMMIT`), so later runs find them already built, and no
+  branch can swap in a different one.
+  - Fetched by commit or checksum, never by a branch or tag that can move.
+  - A private source is shipped from here with `--ship`: never put a token on the host to clone
+    it.
 - **Per-program limits** in a test runner come from `cpuq cap`, never from a watchdog listing
   every process.
 - **Only work that doesn't need this OS** goes there.
+- **The hook judges a `--spill-to` request by the host it goes to**, so `--cores 8-32` for a
+  96-CPU machine isn't refused on a 10-CPU laptop.
 - **The first run of a branch is cold:** it copies the repo and builds from scratch. Later runs
   move only what changed.
 

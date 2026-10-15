@@ -2,6 +2,20 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.17.2 — 2026-10-15
+
+- When a Linux job's command ends, whatever it left running in its scope is stopped
+  (`cgroup.kill`), and systemd removes the scope: a test program a cancelled runner started, or a
+  daemon left behind, no longer runs on unaccounted (and keeps a cloud machine from idling off).
+- The hook judges a `cpuq run --spill-to HOST` (or `--spill`) request by that machine, not this
+  one: `--cores 8-32` for a 96-CPU host is no longer refused on a 10-CPU Mac.
+- The hook knows which `cpuq cap` options take a value, so a bare flag can't hide a program.
+- Without a cgroup, a program that left its own process group still gets cpuq cap's signals.
+- A failed probe for systemd user scopes is remembered a minute, not ten, and only where the
+  user's systemd is set up: a single job started without it can no longer take every job's
+  cgroup away. It says so once on stderr.
+- `cpuq cap -- /no/such/path` exits 127 (not found), not 126.
+
 ## 0.17.1 — 2026-10-15
 
 - `cpuq hook` judges the command inside `cpuq cap` as if typed alone: cap limits a program but

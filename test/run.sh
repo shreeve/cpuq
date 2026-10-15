@@ -982,6 +982,7 @@ t_cap() {
   setup cap
   "$CPUQ" cap -- sh -c 'exit 7'; local rc_exit=$?
   "$CPUQ" cap -- cpuq-test-no-such-program 2>/dev/null; local rc_missing=$?
+  "$CPUQ" cap -- /cpuq-test/no/such/program 2>/dev/null; [ $? = 127 ] || rc_missing="$rc_missing, by path $?"
   local t0; t0=$(now)
   "$CPUQ" cap --time 1s -- sleep 30 2>/dev/null; local rc_time=$?
   local dt; dt=$(python3 -c "print('%.1f' % ($(now) - $t0))")
@@ -1015,6 +1016,11 @@ t_cgroups() {
   "$CPUQ" run --cores 1 --label capped -- "$CPUQ" cap --mem 64M -- python3 -c 'import time; x = bytearray(256 << 20); time.sleep(10)' 2>/dev/null; local rc=$?
   local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
   check "a job runs in its scope's job/ with CPUQ_CGROUP and memory for its children (got $got); a cap there is stopped by the kernel ($rc after ${dt}s)" "[[ '$got' == *'.scope/job /sys/fs/cgroup/'*'.scope '*memory* ]] && [ $rc = 122 ] && python3 -c 'import sys; sys.exit(0 if $dt < 0.9 else 1)'"
+  # What a job leaves running in its scope is stopped when its command ends.
+  local nap="88.$$"
+  "$CPUQ" run --cores 1 --label leaver -- sh -c "sleep $nap >/dev/null 2>&1 & exit 0"; sleep 0.5
+  local left=0; pgrep -f "^sleep $nap\$" >/dev/null && left=1
+  check "what a job leaves running in its scope is stopped when it ends (left: $left)" "[ $left = 0 ]"
   # A command's own ${...} reaches its shell untouched: systemd-run (254 and later) would expand it.
   local lit; lit=$("$CPUQ" run --cores 1 --label literal -- sh -c 'x=abc/job; echo "${x%/job}"' 2>&1)
   check "a job's \${x%/job} reaches its shell (got '$lit')" "[ '$lit' = abc ]"

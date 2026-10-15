@@ -1794,6 +1794,8 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
     // it is weighted by its grant, so a crowded machine's CPU time divides by
     // grant however many threads a job starts.
     const weighted: ?[*:null]const ?[*:0]const u8 = if (o.lease == null and !lease.record.exclusive and (ctx.cfg.cpu_weights or ctx.cfg.cgroups)) weightedArgv(ctx, exe, argv, k, lease.name) else null;
+    // Where that scope's cgroup is: when the command ends, whatever it left in it is stopped.
+    const scope_dir: ?[:0]const u8 = if (weighted != null) ctx.arena.printSentinel("/sys/fs/cgroup/user.slice/user-{d}.slice/user@{d}.service/app.slice/cpuq-{s}-{d}.scope", .{ std.c.getuid(), std.c.getuid(), lease.name, sys.getpid() }, 0) catch null else null;
     const spawned = if (weighted) |wv| sys.spawn(wv[0].?, wv, @ptrCast(envp.slice.ptr), qos) else sys.spawn(exe, argv.ptr, @ptrCast(envp.slice.ptr), qos);
     if (pipe[0] >= 0) sys.closeFd(pipe[0]);
     if (pipe[1] >= 0) sys.closeFd(pipe[1]);
@@ -1805,7 +1807,14 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
             x.lease.record.child = pid;
             rewriteRecord(io, x.lease.file, x.lease.record);
         }
-        break :blk watchChild(ctx, pid, lease.job.base.label);
+        const w = watchChild(ctx, pid, lease.job.base.label);
+        // The command is done: what it left behind in its scope (a daemon, a test program a
+        // killed runner started) goes too, so nothing runs on unaccounted. systemd removes
+        // the emptied scope.
+        if (scope_dir) |d| {
+            if (ctx.arena.printSentinel("{s}/cgroup.kill", .{d}, 0)) |kp| _ = writeSmall(kp, "1") else |_| {}
+        }
+        break :blk w;
     } else |err| blk: {
         std.debug.print("cpuq: {s}: {t}\n", .{ o.cmd[0], err });
         break :blk .{ .exit = .{ .code = if (err == error.FileNotFound) exit_notfound else exit_noexec } };
@@ -1931,10 +1940,14 @@ fn scopesWork(ctx: *Ctx, run: [:0]const u8) Scopes {
     const cwd = Io.Dir.cwd();
     if (cwd.statFile(io, path, .{})) |st| {
         const age_ns = Io.Clock.real.now(io).toNanoseconds() - st.mtime.toNanoseconds();
-        if (age_ns >= 0 and age_ns < 600 * std.time.ns_per_s) {
-            var buf: [16]u8 = undefined;
-            const kept = cwd.readFile(io, path, &buf) catch "";
-            if (std.mem.startsWith(u8, kept, "none")) return .none;
+        var buf: [16]u8 = undefined;
+        const kept = cwd.readFile(io, path, &buf) catch "";
+        // A failure is kept a minute only: one probe from a shell without the user's systemd, or
+        // during a hiccup, must not take every job's cgroup away for long.
+        const none = std.mem.startsWith(u8, kept, "none");
+        const keep_s: i96 = if (none) 60 else 600;
+        if (age_ns >= 0 and age_ns < keep_s * std.time.ns_per_s) {
+            if (none) return .none;
             return if (std.mem.startsWith(u8, kept, "plain")) .plain else .literal;
         }
     } else |_| {}
@@ -1953,9 +1966,12 @@ fn scopesWork(ctx: *Ctx, run: [:0]const u8) Scopes {
         cwd.writeFile(io, .{ .sub_path = path, .data = @tagName(t.scopes) }) catch {};
         return t.scopes;
     }
-    // Remembered too: where the user's systemd can't be reached, a job shouldn't pay for two
-    // systemd-run spawns every time.
-    cwd.writeFile(io, .{ .sub_path = path, .data = "none" }) catch {};
+    // Remembered for a minute, where the user's systemd is set up (a session without
+    // XDG_RUNTIME_DIR simply can't reach it, and says nothing about the machine).
+    if (ctx.env.get("XDG_RUNTIME_DIR") != null) {
+        cwd.writeFile(io, .{ .sub_path = path, .data = "none" }) catch {};
+        if (ctx.cfg.cgroups) std.debug.print("cpuq: systemd user scopes don't work here, so jobs run without a cgroup of their own (cpuq cap then reads memory once a second)\n", .{});
+    }
     return .none;
 }
 

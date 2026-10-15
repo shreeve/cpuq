@@ -71,21 +71,45 @@ that machine's own cpuq:
 
 Never run it there outside cpuq: its queue can't share what it doesn't see.
 
-A big job sent to a cloud host keeps a fixed label, asks for at most a third of the host's CPUs
-(`--cores 8-32` on 96), puts its caches under `$HOME/cpuq-spill/c/PROJECT/` (outside the
-per-worktree copy, so every branch shares them), deletes its scratch at the end of the same
-command (`rc=$?; rm -rf SCRATCH; exit $rc`), and runs in the background. More: README's "Big jobs
-on a cloud host".
+A big job for a cloud host, run in the background:
+
+    cpuq run --spill-to burst --label proj:matrix --cores 8-32 --return .zig-cache/gate.log -- sh -c '
+      : >.zig-cache/gate.log; mkdir -p "$HOME/cpuq-spill/c/proj/results"
+      zig build -j"$CPUQ_CORES" >>.zig-cache/gate.log 2>&1 &&
+      PROJ_RESULTS_CACHE=$HOME/cpuq-spill/c/proj/results timeout 90m ./test/run -j "$CPUQ_CORES" >>.zig-cache/gate.log 2>&1
+      rc=$?; grep -E "^(fail|FAIL)" .zig-cache/gate.log | head -20; tail -2 .zig-cache/gate.log
+      rm -rf .zig-cache/proj-test; exit $rc'
+
+- **The label** stays the same on every run, never a branch name.
+- **The cores:** at most a third of the host's CPUs.
+- **Caches** go under `$HOME/cpuq-spill/c/PROJECT/`, outside the per-worktree copy, so every
+  branch shares them.
+- **A time limit** inside the command.
+- **Scratch** is deleted at the end, with relative paths.
+- **Tools the host lacks** are pinned by commit under that cache, never fetched unpinned.
+
+More: README's "Big jobs on a cloud host".
 
 ## Test runners
 
-A runner that starts many programs limits each with `cpuq cap` rather than watching them itself
-(never a `ps` of the whole machine per program):
+A runner that starts many programs limits each with `cpuq cap`, never with a watchdog that lists
+every process (`ps`):
 
-    cpuq cap --mem 2G --time 120s --output 1M -- PROGRAM ARGS...
+    cpuq run --label proj:test --cores 2-6 -- sh -c './test/run -j "$CPUQ_CORES"'
+    cpuq cap --mem 2G --time 120s --output 1M --pids 512 -- PROGRAM ARGS...   # in the runner, per program
 
-It exits with PROGRAM's status, or 122 (memory), 124 (time) or 121 (output) when it stopped it.
-stdout and stderr must be files for `--output`.
+- **cap is a limit, not a queue:** it takes no cores, and the hook judges what it runs as if typed
+  alone.
+- **Put it inside `cpuq run`, never around it:** its `--time` would count the time spent queued.
+- **Exit:**
+  - PROGRAM's own status, or 128+N if signal N killed it;
+  - 122 memory, 124 time (as GNU timeout) or 121 output when cap stopped it, each with one stderr
+    line;
+  - 2 on bad usage, before PROGRAM runs.
+- **`--output`** needs stdout and stderr redirected to files or /dev/null. A pipe (`| tee`) exits
+  2: don't count that as a test failure.
+- **`--mem` on Linux inside a job** counts page cache and tmpfs too, so a limit tuned on the Mac
+  can trip on Linux.
 
 ## Exit status
 

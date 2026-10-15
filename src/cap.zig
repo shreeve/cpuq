@@ -105,7 +105,8 @@ fn onSignal(sig: c.SIG, _: *const c.siginfo_t, _: ?*anyopaque) callconv(.c) void
     // The program gets cpuq's own signals, as from `cpuq run`; its end decides cpuq's.
     if (sig != .CHLD) {
         const pid = child_pid.load(.acquire);
-        if (pid > 0) _ = c.kill(if (to_group.load(.acquire)) -pid else pid, sig);
+        // A program that left its group (setsid) is reached by its pid.
+        if (pid > 0 and !(to_group.load(.acquire) and c.kill(-pid, sig) == 0)) _ = c.kill(pid, sig);
     }
     if (wake[1] >= 0) _ = c.write(wake[1], "x", 1);
 }
@@ -466,7 +467,10 @@ const Output = struct {
 
 /// PROGRAM's path: as given when it has a slash, else the first executable on PATH.
 fn findProgram(a: std.mem.Allocator, name: []const u8, path_env: ?[]const u8) ?[:0]const u8 {
-    if (std.mem.findScalar(u8, name, '/') != null) return a.dupeSentinel(u8, name, 0) catch null;
+    if (std.mem.findScalar(u8, name, '/') != null) {
+        const full = a.dupeSentinel(u8, name, 0) catch return null;
+        return if (infoOf(-1, full) != null) full else null;
+    }
     var dirs = std.mem.splitScalar(u8, path_env orelse "/usr/local/bin:/usr/bin:/bin", ':');
     while (dirs.next()) |d| {
         const full = a.printSentinel("{s}/{s}", .{ if (d.len == 0) "." else d, name }, 0) catch return null;
@@ -619,6 +623,10 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
         var status: c_int = 0;
         while (c.waitpid(child, &status, 0) < 0 and c.errno(-1) == .INTR) {}
         if (cgroup) |cg| cg.remove();
+        if (note[1] == @intFromEnum(c.E.NOENT)) {
+            std.debug.print("cpuq cap: {s}: not found\n", .{cmd[0]});
+            return 127;
+        }
         std.debug.print("cpuq cap: {s}: can't be run\n", .{cmd[0]});
         return 126;
     }
