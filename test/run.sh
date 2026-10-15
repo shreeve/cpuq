@@ -622,6 +622,9 @@ t_wait() {
   "$CPUQ" wait --label 'job:*'; local rc=$?
   local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
   check "cpuq wait --label 'job:*' returns when the last matching job ends (exit $rc after ${dt}s)" "[ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if 0.8 < $dt < 6 else 1)'"
+  # job:a's cores can show as held for a moment after it ends: see them go first, so the 2 held
+  # below are long's.
+  wait_held 0
   "$CPUQ" run --label long -- sleep 3 & wait_held 2
   "$CPUQ" wait --label long --max-wait 1; rc=$?
   check "cpuq wait --max-wait gives up with 75 (got $rc)" "[ $rc = 75 ]"
