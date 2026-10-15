@@ -3,6 +3,11 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.17.1 — 2026-10-15
+
+- The menu's version line says which is which: "App 0.17.1 · CLI 0.16.3", for this app and the
+  command-line cpuq it reads. "Cpuq" and "cpuq" told them apart by one capital letter.
+
 ## 0.17.0 — 2026-10-15
 
 - Each machine's page shows its memory and swap in use beside the gate and the demand: "RAM 97 of

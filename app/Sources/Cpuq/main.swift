@@ -486,10 +486,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         completionHandler()
     }
 
-    /// "Cpuq 0.14.3 · cpuq 0.13.0", in grey: the app's version and the cpuq it reads.
+    /// "App 0.17.1 · CLI 0.16.3", in grey: this app's version and the command-line cpuq it reads.
     private func versions() -> NSMenuItem {
-        var s = "Cpuq \(appVersion)"
-        if let cli = status?.version, !cli.isEmpty { s += " · cpuq \(cli)" }
+        var s = "App \(appVersion)"
+        if let cli = status?.version, !cli.isEmpty { s += " · CLI \(cli)" }
         let item = NSMenuItem(title: s, action: nil, keyEquivalent: "")
         item.isEnabled = false
         item.attributedTitle = NSAttributedString(string: s, attributes: [.font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize), .foregroundColor: NSColor.secondaryLabelColor])
