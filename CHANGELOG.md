@@ -2,6 +2,11 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.16.1 — 2026-10-15
+
+- The disk gate also watches `~/cpuq-spill`, where jobs spilled to this machine land, when it is a
+  filesystem of its own (burst's ZFS dataset): their scratch fills it, not `$HOME`'s.
+
 ## 0.16.0 — 2026-10-15
 
 - `cpuq status` shows memory and swap in use: "memory  97 of 128 GB used; swap 24 of 32 GB", a

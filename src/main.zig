@@ -123,7 +123,7 @@ const Ctx = struct {
     cfg_mtime: i96 = 0,
     /// The paths `min_disk` watches, found on first use (a waiter reads the
     /// gates twice a second, for hours).
-    disk_paths: ?[2]?[:0]const u8 = null,
+    disk_paths: ?[3]?[:0]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) void {
@@ -265,7 +265,13 @@ fn leastDisk(ctx: *Ctx) ?policy.Disk {
     const paths = ctx.disk_paths orelse blk: {
         const home: ?[:0]const u8 = if (ctx.env.get("HOME")) |h| ctx.arena.dupeSentinel(u8, h, 0) catch null else null;
         const dir: ?[:0]const u8 = ctx.arena.dupeSentinel(u8, stateDir(ctx), 0) catch null;
-        ctx.disk_paths = .{ home, dir };
+        // Where jobs spilled here from other machines land: on a machine that gives it its own
+        // filesystem (burst's ZFS dataset), the one their scratch fills. Absent, it is skipped.
+        const spill: ?[:0]const u8 = if (ctx.env.get("HOME")) |h| spill: {
+            const p = ctx.arena.print("{s}/cpuq-spill", .{h}) catch break :spill null;
+            break :spill ctx.arena.dupeSentinel(u8, p, 0) catch null;
+        } else null;
+        ctx.disk_paths = .{ home, dir, spill };
         break :blk ctx.disk_paths.?;
     };
     var least: ?policy.Disk = null;

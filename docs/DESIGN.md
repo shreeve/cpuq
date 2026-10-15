@@ -155,8 +155,10 @@ The head admits nothing while one of these is closed:
 - **Low memory.** With `min_available` set, available memory under it: Linux `MemAvailable`,
   macOS the kernel's free share (`kern.memorystatus_level`) of `hw.memsize`.
 - **Low disk.** Less than `min_disk` (5G by default) free to an ordinary user (`f_bavail`) on the
-  filesystem holding `$HOME` or the one holding the state directory, the temp directory where
-  builds and agents keep scratch files; status names the fuller of the two. It is on by default
+  filesystem holding `$HOME`, the one holding the state directory (the temp directory where
+  builds and agents keep scratch files), or `~/cpuq-spill`, where spilled jobs land, which a spill
+  host may give its own filesystem (burst's is a ZFS dataset with a quota); status names the
+  fullest. It is on by default
   because a full disk breaks everything at once: on 2026-10-11 one session's scratch copies of a
   database filled this Mac's disk to its last byte, and every session's builds and tool calls
   failed. It cannot stop a running job from filling the disk; it keeps new ones from piling on.
