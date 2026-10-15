@@ -171,9 +171,11 @@ final class GraphModel {
     /// A cloud machine (one cpuq can start) that is up, and so costing money.
     var isCloudRunning: Bool { machine.start != nil && problem == nil && upSince != nil }
 
-    /// How long it has been up, as the app saw it: "23m", "1h 05m".
+    /// How long it has been up: since it booted (cpuq 0.14 says when), else since the app first
+    /// saw it answer. "23m", "1h 05m".
     var upFor: String {
-        let s = Int(Date().timeIntervalSince(upSince ?? Date()))
+        let since = status?.bootTime.map { Date(timeIntervalSince1970: $0) } ?? upSince ?? Date()
+        let s = Int(Date().timeIntervalSince(since))
         return s < 3600 ? "\(max(s / 60, 1))m" : "\(s / 3600)h " + String(format: "%02dm", s / 60 % 60)
     }
 

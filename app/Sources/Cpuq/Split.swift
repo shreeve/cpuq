@@ -92,7 +92,10 @@ struct SplitColumn: View {
                 if inside { NSCursor.resizeUpDown.push(); hovered = i } else { NSCursor.pop(); hovered = nil }
             }
             .gesture(
-                DragGesture(minimumDistance: 1)
+                // Measured in the window, not on the handle: the handle moves with every step of
+                // the drag, so measured on itself each step fed back into the next, and the
+                // sections shook.
+                DragGesture(minimumDistance: 1, coordinateSpace: .global)
                     .onChanged { v in
                         let start = dragStart ?? shares
                         if dragStart == nil {

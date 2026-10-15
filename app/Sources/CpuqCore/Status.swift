@@ -19,6 +19,9 @@ public struct Status: Decodable, Sendable, Equatable {
     /// Each CPU's time so far, `[busy, total]`, cumulative (`cpu_ticks`, cpuq 0.12.1 and later):
     /// another machine's CPUs, drawn from the difference between two statuses.
     public var cpuTicks: [[UInt64]]?
+    /// When the machine booted, Unix seconds (`boot_time`, cpuq 0.14 and later): how long a cloud
+    /// machine has been up.
+    public var bootTime: Double?
     public var gate = Gate()
     public var holders: [Holder] = []
     public var waiters: [Waiter] = []
@@ -88,7 +91,7 @@ public struct Status: Decodable, Sendable, Equatable {
 // Decoding with defaults: a missing key keeps the property's default.
 extension Status {
     private enum Keys: String, CodingKey {
-        case schema, version, budget, held, free, load, memoryPressure, gate, holders, waiters, leases, outside, admit, target, activeCores, cpuTicks
+        case schema, version, budget, held, free, load, memoryPressure, gate, holders, waiters, leases, outside, admit, target, activeCores, cpuTicks, bootTime
     }
 
     public init(from decoder: any Decoder) throws {
@@ -104,6 +107,7 @@ extension Status {
         target = try c.decodeIfPresent(Double.self, forKey: .target)
         activeCores = try c.decodeIfPresent(Int.self, forKey: .activeCores) ?? 0
         cpuTicks = try c.decodeIfPresent([[UInt64]].self, forKey: .cpuTicks)
+        bootTime = try c.decodeIfPresent(Double.self, forKey: .bootTime)
         gate = try c.decodeIfPresent(Gate.self, forKey: .gate) ?? Gate()
         holders = try c.decodeIfPresent([Holder].self, forKey: .holders) ?? []
         waiters = try c.decodeIfPresent([Waiter].self, forKey: .waiters) ?? []

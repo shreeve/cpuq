@@ -3,6 +3,13 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.15.2 — 2026-10-15
+
+- Dragging a section is steady: the drag was measured on the handle itself, which moves with the
+  drag, so every step fed back into the next and the sections shook. It is measured in the window.
+- ☁ shows how long the cloud machine has been up since it booted (cpuq 0.14 reports it), not how
+  long the app has been watching it, which restarted with every relaunch of the app.
+
 ## 0.15.1 — 2026-10-15
 
 - Notifications, each once when something goes wrong and stays so, never again until it has come
