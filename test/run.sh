@@ -1112,6 +1112,46 @@ t_submit() {
   unset XDG_STATE_HOME
 }
 
+t_packs() {
+  # Packs: a spec asks for a tool by version; the first job builds it into the store
+  # (~/cpuq/packs/NAME/VERSION), later ones reuse it, `latest` links to it, and the job finds it
+  # on its PATH and as NAME. Here the tool is a local git repo whose build counts its runs.
+  setup packs
+  local was_home=$HOME
+  export HOME=$T/home XDG_STATE_HOME=$T/xdg
+  mkdir -p "$HOME" "$T/roots/repo/cpuq" "$T/roots/tool"
+  echo "submit_roots = $T/roots" >> "$CPUQ_CONFIG"
+  (
+    cd "$T/roots/tool" && git init -q && git config user.email t@t && git config user.name t
+    printf '#!/bin/sh\necho tool-one\n' > tool.sh && git add -A && git commit -qm one
+  ) >/dev/null 2>&1
+  printf '{ "tool": { "git": "%s", "local": "%s", "build": "mkdir -p bin && cp tool.sh bin/tool && chmod +x bin/tool && echo x >> %s/builds", "bin": "bin/tool" } }\n' \
+    "$T/roots/tool" "$T/roots/tool" "$T" > "$(dirname "$CPUQ_CONFIG")/packs.json"
+  (
+    cd "$T/roots/repo" || exit 1
+    git init -q && git config user.email t@t && git config user.name t
+    printf '%s\n' '{ "label": "t:packs", "run": "tool; \"$TOOL\"", "packs": { "tool": "latest" }, "cores": "1" }' > cpuq/p.json
+    git add -A && git commit -qm init
+    "$CPUQ" submit cpuq/p.json >"$T/p1" 2>&1; echo "first=$?"
+    echo again > again.txt
+    "$CPUQ" submit cpuq/p.json >"$T/p2" 2>&1; echo "second=$?"
+    (cd "$T/roots/tool" && printf '#!/bin/sh\necho tool-two\n' > tool.sh && git commit -qam two)
+    echo third > again.txt
+    "$CPUQ" submit cpuq/p.json >"$T/p3" 2>&1; echo "third=$?"
+  ) >"$T/out" 2>&1
+  local got; got=$(tr '\n' ' ' < "$T/out")
+  local builds; builds=$(wc -l < "$T/builds" 2>/dev/null | tr -d ' ')
+  local saw; saw=$(cat "$HOME"/.local/state/cpuq/jobs/*/tail.log "$T"/xdg/cpuq/jobs/*/tail.log 2>/dev/null | grep -c '^tool-')
+  local latest; latest=$(readlink "$HOME/cpuq/packs/tool/latest")
+  local versions; versions=$(ls "$HOME/cpuq/packs/tool" | grep -cv latest)
+  local head; head=$(git -C "$T/roots/tool" rev-parse HEAD | cut -c1-12)
+  local two; two=$(cat "$HOME"/.local/state/cpuq/jobs/*/tail.log "$T"/xdg/cpuq/jobs/*/tail.log 2>/dev/null | grep -c '^tool-two')
+  check "packs: a job gets its tool on PATH and as TOOL ($got, $saw lines, $two of the new one), built once per version ($builds builds, $versions versions), latest -> the newest ($latest)" \
+    "[ '$got' = 'first=0 second=0 third=0 ' ] && [ '$saw' = 6 ] && [ '$two' = 2 ] && [ '$builds' = 2 ] && [ '$versions' = 2 ] && [ '$latest' = '$head' ]"
+  export HOME=$was_home
+  unset XDG_STATE_HOME
+}
+
 t_hook() {
   # cpuq hook: Claude Code's PreToolUse hook refuses heavy commands outside
   # cpuq (exit 2, the fix on stderr) and passes everything else.
@@ -1689,7 +1729,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git tethered record cap cgroups note progress submit status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git tethered record cap cgroups note progress submit packs status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

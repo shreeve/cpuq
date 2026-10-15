@@ -106,6 +106,8 @@ Where a repo keeps specs in `cpuq/*.json`, heavy work goes through them:
 - **After compaction:** `cpuq jobs`, then `cpuq job ID --wait` in the background.
 - **Resubmitting:** the same code attaches to the job already running. After edits use
   `--replace`. For a repro beside a full run, use `--again`.
+- **Tools a spec names in `packs`** (zig, rig, nexus at a version) are on the job's PATH there;
+  `cpuq packs --host burst` lists what a host has.
 - **Never** edit or write specs, add -j, --cores, hosts or rm -rf to them, loop on a verdict
   that isn't about your code, or cancel another worktree's job.
 

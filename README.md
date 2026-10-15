@@ -520,6 +520,47 @@ rest:
   - `caches` live on the host, outside the copy, shared by all of a project's runs;
   - `deps` ship a sibling repo's tracked files.
 
+#### Packs: tool versions on each host
+
+A job can ask for the tools it runs with, by version, and each host keeps them in a store, as
+mise does:
+
+    ~/cpuq/packs/zig/0.17.0/          zig's own release, its sha256 checked
+    ~/cpuq/packs/nexus/c28bef1a4d28/  built from that commit
+    ~/cpuq/packs/nexus/latest -> c28bef1a4d28
+    ~/cpuq/packs/rig/0.2.9/           built from the tag v0.2.9
+    ~/cpuq/packs/rig/stable -> 0.2.9
+
+```json
+"packs": { "zig": "0.17.0", "rig": "latest" }
+```
+
+- **Versions:** `latest` is the default branch's head, `stable` the newest release tag
+  (vX.Y.Z), `0.2.9` that tag, and a hash that commit, pushed or not. Each is resolved when the job
+  is submitted, so the job's identity holds the exact version and `latest` moves as main does.
+- **In the job:** each pack is on `PATH` by its binary's name and in `$NAME` (`$RIG`, `$ZIG`).
+- **Installed once, by the first job that needs it,** inside that job's grant and under a lock
+  per version: zig downloaded from ziglang.org, any other built from the source of its commit,
+  which cpuq ships from its checkout here (`git archive`) when the host lacks it. A version never
+  changes after; `latest` and `stable` are links to what they last were.
+- **Recipes** say how to build each, in `~/.config/cpuq/packs.json` beside the config:
+
+  ```json
+  {
+    "nexus": { "git": "https://github.com/shreeve/nexus", "local": "~/Data/Code/nexus",
+               "build": "zig build -Doptimize=safe -j\"$CPUQ_CORES\"", "bin": "bin/nexus",
+               "packs": { "zig": "0.17.0" } },
+    "rig":   { "git": "https://github.com/shreeve/rig", "local": "~/Data/Code/rig",
+               "build": "zig build -j\"$CPUQ_CORES\" -Dnexus=\"$NEXUS\"", "bin": "bin/rig",
+               "packs": { "zig": "0.17.0", "nexus": "latest" } }
+  }
+  ```
+
+  A recipe's `packs` are installed first and are on its build's PATH. zig needs no recipe. One
+  version of each pack per job: the job's own request wins over a recipe's.
+- **`cpuq packs [--host HOST]`** lists a store; **`cpuq packs install rig@stable --host burst`**
+  installs ahead of a job, under that host's queue. Hosts need cpuq 0.21 for packs.
+
 The full design, fields and rules are in [docs/SUBMIT.md](docs/SUBMIT.md). Hosts need cpuq 0.18.
 
 ### Big jobs on a cloud host

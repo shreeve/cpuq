@@ -85,6 +85,7 @@ never write them.
 | `caches` | `"ENV": "name"`: `~/cpuq-spill/c/PROJECT/name` on the host, created, exported as `ENV`, never synced or deleted by a sync | none |
 | `report` | JSON lines the job appends: `{"id", "ok", "status", "reason", "artifact"}`. Truncated at each attempt's start. It drives progress counts and the failure list | none |
 | `return` | paths copied back into the directory when the job ends; excluded from the sync | none |
+| `packs` | `{"zig": "0.17.0", "rig": "latest"}`: tool versions from the host's store, `~/cpuq/packs/NAME/VERSION`, installed by the first job that needs one (README, "Packs"). Each is on PATH and in `$NAME`. Versions: `latest`, `stable`, `X.Y.Z` (a tag) or a commit | none |
 | `git` | `true`: the copy gets the repo's git as `.git`, git's own parts only (objects, refs, packed-refs, config, info, shallow, and the worktree's HEAD and index). `.git` as it is here never syncs | `false` |
 
 - **Defaults:** the directory is the git top of the spec's repo, and its realpath must be under

@@ -40,6 +40,7 @@ const usage =
     \\       cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] -- PROGRAM [ARGS...]
     \\       cpuq note PID|LABEL TEXT [--all] [--host HOST]
     \\       cpuq submit SPEC [-- ARGS] [--env K=V]... [--replace | --again]
+    \\       cpuq packs [--host HOST] | cpuq packs install NAME@VERSION... [--host HOST]
     \\       cpuq jobs [--all]
     \\       cpuq job [ID|last] [--wait [--max-wait S]] [--tail N] [--json] [--cancel]
     \\       cpuq hook                (an agent harness's pre-command hook)
@@ -183,6 +184,8 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
         .{ "_peek", submit.cmdPeek },
         .{ "_synced", submit.cmdSynced },
         .{ "_cancel", submit.cmdHostCancel },
+        .{ "_pack", submit.cmdPack },
+        .{ "packs", submit.cmdPacks },
     }) |entry| {
         if (std.mem.eql(u8, cmd, entry[0])) {
             const self = std.process.executablePathAlloc(ctx.io, ctx.arena) catch fail("can't find this binary's path", .{});

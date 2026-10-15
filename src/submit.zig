@@ -19,6 +19,7 @@ const c = std.c;
 const policy = @import("policy.zig");
 const sys = @import("sys.zig");
 const gitship = @import("gitship.zig");
+const packs = @import("packs.zig");
 
 pub const Cx = struct {
     io: Io,
@@ -33,6 +34,8 @@ pub const Cx = struct {
 
 /// The oldest cpuq a host may run to take submitted jobs (it has _start, _job, _peek).
 const host_min = [3]u32{ 0, 18, 0 };
+/// The oldest that installs packs (_pack).
+const packs_min = [3]u32{ 0, 21, 0 };
 
 // --- Exit codes: verdicts, never the job's own ----------------------------------------------
 
@@ -105,6 +108,9 @@ const Spec = struct {
     /// The repo's git, git's own parts only (gitship.zig), as the copy's `.git`: for a job that
     /// runs `git ls-files` and the like. Never the `.git` here as it is.
     git: bool = false,
+    /// Tool versions the job runs with, from the host's store (packs.zig): NAME to a version,
+    /// `latest`, `stable` or a commit. Each is on the job's PATH and in NAME (capitals).
+    packs: ?Map = null,
 };
 
 /// What goes to the host: the spec as this job runs it, resolved.
@@ -128,6 +134,7 @@ const Payload = struct {
     generation: []const u8,
     digest: []const u8,
     attempt: u32 = 1,
+    packs: []const packs.Pack = &.{},
     /// The config's `spill_env.HOST`: shell assignments the job's shell exports first (a PATH to
     /// tools under ~/.local, which a command run over ssh doesn't otherwise get).
     host_env: []const u8 = "",
@@ -150,6 +157,7 @@ const Record = struct {
     @"return": []const []const u8 = &.{},
     deps: ?Map = null,
     git: bool = false,
+    packs: []const packs.Pack = &.{},
     on: []const []const u8 = &.{},
     payload: []const u8,
 };
@@ -458,7 +466,7 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
     const spec_abs = realpath(cx, sp) orelse return fail2("{s}: not found", .{sp});
     const text = readFile(cx, spec_abs) orelse return fail2("{s}: can't be read", .{sp});
     const spec = std.json.parseFromSliceLeaky(Spec, cx.a, text, .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err|
-        return fail2("spec {s}: {t} (fields: label, run, setup, cores, on, time, mem, tools, env, exclude, deps, caches, report, return, git)", .{ sp, err });
+        return fail2("spec {s}: {t} (fields: label, run, setup, cores, on, time, mem, tools, env, exclude, deps, caches, report, return, git, packs)", .{ sp, err });
     const top_run = run(cx, &.{ "git", "-C", std.fs.path.dirname(spec_abs) orelse ".", "rev-parse", "--show-toplevel" }, null);
     const dir = if (top_run.ok) std.mem.trim(u8, top_run.out, " \n") else (std.fs.path.dirname(spec_abs) orelse ".");
     if (std.mem.findScalar(u8, spec.label, ':') == null) return fail2("spec {s}: \"label\" must be project:task, not '{s}'", .{ sp, spec.label });
@@ -493,12 +501,16 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
             dep_digests.append(cx.a, cx.a.print("{s}={s}", .{ e.key_ptr.*, s.digest }) catch "") catch {};
         }
     }
+    const wanted = if (spec.packs) |want| packs.resolve(cx.a, cx.io, cx.env, want) else packs.Resolved{};
+    if (wanted.err) |e| return fail2("spec {s}: {s}", .{ sp, e });
+    var pack_ids: std.ArrayList([]const u8) = .empty;
+    for (wanted.packs) |pk| pack_ids.append(cx.a, cx.a.print("{s}@{s}", .{ pk.name, pk.version }) catch "") catch {};
     const snap = snapshot(cx, dir, excludes.items, false);
     if (snap.digest.len == 0) return fail2("{s}: can't read it", .{dir});
     if (snap.secret) |p| return fail2("{s} holds {s}, which looks like a credential: add it to \"exclude\" (cpuq never ships credentials)", .{ dir, p });
 
     const snapshot_digest = sha(cx, &.{ snap.digest, std.mem.join(cx.a, "\x01", dep_digests.items) catch "" });
-    const job_digest = sha(cx, &.{ snapshot_digest, text, std.mem.join(cx.a, "\x01", job_args) catch "", std.mem.join(cx.a, "\x01", extra_env.items) catch "" });
+    const job_digest = sha(cx, &.{ snapshot_digest, text, std.mem.join(cx.a, "\x01", job_args) catch "", std.mem.join(cx.a, "\x01", extra_env.items) catch "", std.mem.join(cx.a, "\x01", pack_ids.items) catch "" });
 
     // Attach, or not.
     const project = spec.label[0 .. std.mem.findScalar(u8, spec.label, ':') orelse spec.label.len];
@@ -552,6 +564,7 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
         .copy = copy,
         .generation = snapshot_digest,
         .digest = job_digest,
+        .packs = wanted.packs,
     };
     const rec: Record = .{
         .id = id,
@@ -567,6 +580,7 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
         .@"return" = spec.@"return",
         .deps = spec.deps,
         .git = spec.git,
+        .packs = wanted.packs,
         .on = spec.on,
         .payload = jsonString(cx, payload),
     };
@@ -831,7 +845,7 @@ fn placeDetail(cx: Cx) []const u8 {
 
 const Probe = struct { reachable: bool, room: bool, mem_total: u64, note: []const u8 };
 
-fn probe(cx: Cx, host: []const u8) Probe {
+fn probe(cx: Cx, host: []const u8, min: [3]u32) Probe {
     const r = onHost(cx, host, cx.a.print("{s} status --json --no-usage", .{cpuqOn(cx, host)}) catch "");
     if (!r.ok) return .{ .reachable = false, .room = false, .mem_total = 0, .note = cx.a.print("{s}: no answer", .{host}) catch "" };
     const St = struct {
@@ -844,7 +858,7 @@ fn probe(cx: Cx, host: []const u8) Probe {
     };
     const st = std.json.parseFromSliceLeaky(St, cx.a, r.out, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch
         return .{ .reachable = false, .room = false, .mem_total = 0, .note = cx.a.print("{s}: its cpuq answered in a form this one can't read", .{host}) catch "" };
-    if (!versionAtLeast(st.version, host_min)) return .{ .reachable = false, .room = false, .mem_total = 0, .note = cx.a.print("{s} runs cpuq {s}, and submit needs {d}.{d} (curl -fsSL https://raw.githubusercontent.com/shreeve/cpuq/main/install.sh | bash, on {s})", .{ host, st.version, host_min[0], host_min[1], host }) catch "" };
+    if (!versionAtLeast(st.version, min)) return .{ .reachable = false, .room = false, .mem_total = 0, .note = cx.a.print("{s} runs cpuq {s}, and this job needs {d}.{d} (curl -fsSL https://raw.githubusercontent.com/shreeve/cpuq/main/install.sh | bash, on {s})", .{ host, st.version, min[0], min[1], host }) catch "" };
     const room = st.waiters.len == 0 and st.load[0] < @as(f64, @floatFromInt(st.active_cores)) and std.mem.eql(u8, st.gate.state, "open");
     return .{ .reachable = true, .room = room, .mem_total = if (st.memory) |m| m.total else 0, .note = "" };
 }
@@ -866,7 +880,7 @@ fn place(cx: Cx, rec: *const Record) ?[]const u8 {
     const need: u64 = if (payload.mem) |m| policy.parseBytes(m) orelse 0 else 0;
     var first_up: ?[]const u8 = null;
     for (rec.on) |host| {
-        const p = probe(cx, host);
+        const p = probe(cx, host, if (rec.packs.len != 0) packs_min else host_min);
         if (!p.reachable) {
             place_notes.append(cx.a, p.note) catch {};
             continue;
@@ -887,7 +901,7 @@ fn place(cx: Cx, rec: *const Record) ?[]const u8 {
             place_notes.append(cx.a, cx.a.print("{s}: its start command failed", .{host}) catch "") catch {};
             continue;
         }
-        if (probe(cx, host).reachable) return host;
+        if (probe(cx, host, if (rec.packs.len != 0) packs_min else host_min).reachable) return host;
     }
     return null;
 }
@@ -927,6 +941,9 @@ fn startAndWatch(cx: Cx, rec: *Record, payload: *Payload, host: []const u8) u8 {
         sleepMs(cx.io, 1000);
     }
     setState(cx, id, "syncing", cx.a.print("to {s}", .{host}) catch "");
+    // Packs built from source: the source of each version the host lacks.
+    for (rec.packs) |pk| if (packs.ship(cx.a, cx.io, if (std.mem.eql(u8, host, "here")) null else host, pk)) |e|
+        return done(cx, id, rec.*, .cpuq_error, null, cx.a.print("{s}: not your code", .{e}) catch "", host);
     var tries: u32 = 0;
     while (true) : (tries += 1) {
         if (!sync(cx, rec, host)) return done(cx, id, rec.*, .cpuq_error, null, cx.a.print("rsync to {s} failed: not your code, report it", .{host}) catch "", host);
@@ -1030,7 +1047,7 @@ fn watch(cx: Cx, rec: *Record, payload: *Payload, host: []const u8) u8 {
 fn lostOrRetry(cx: Cx, rec: *Record, payload: *Payload, host: []const u8) u8 {
     const id = rec.id;
     if (rec.attempt >= 2) return done(cx, id, rec.*, .lost, null, cx.a.print("{s} went away twice: not your code, resubmit once", .{host}) catch "", host);
-    if (!probe(cx, host).reachable) {
+    if (!probe(cx, host, if (rec.packs.len != 0) packs_min else host_min).reachable) {
         const start = cx.cfg.spillStart(host) orelse return done(cx, id, rec.*, .lost, null, cx.a.print("{s} went away: not your code, resubmit once", .{host}) catch "", host);
         setState(cx, id, "starting", cx.a.print("{s} went away; starting it again", .{host}) catch "");
         if (!run(cx, &.{ "/bin/sh", "-c", cx.a.print("{s} 1>&2", .{start}) catch "" }, null).ok)
@@ -1189,6 +1206,23 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
             env.put(kv.key_ptr.*, dir) catch {};
         }
     }
+    // Packs: each on the job's PATH by its name (a link in a bin of the job's own, into the
+    // store) and as NAME, its binary; the job's first steps install any the store lacks, the
+    // packs a build needs first.
+    var prelude: std.ArrayList(u8) = .empty;
+    if (p.packs.len != 0) {
+        const bin_dir = jobFile(cx, id, "bin");
+        Io.Dir.cwd().deleteTree(cx.io, bin_dir) catch {};
+        Io.Dir.cwd().createDirPath(cx.io, bin_dir) catch {};
+        prelude.print(cx.a, "export PATH={s}:\"$PATH\"\n", .{quote(cx, bin_dir)}) catch {};
+        for (p.packs) |pk| {
+            if (!packs.validName(pk.name)) continue;
+            const binary = cx.a.print("{s}/{s}/{s}/{s}", .{ packs.storeRoot(cx.a, cx.env), pk.name, pk.version, pk.bin }) catch continue;
+            Io.Dir.cwd().symLink(cx.io, binary, cx.a.print("{s}/{s}", .{ bin_dir, std.fs.path.basename(pk.bin) }) catch continue, .{}) catch {};
+            env.put(packs.varName(cx.a, pk.name), binary) catch {};
+            prelude.print(cx.a, "{s} _pack {s} {s} {s} {s} {s} {s} || exit\n", .{ quote(cx, cx.self), quote(cx, pk.name), quote(cx, pk.version), quote(cx, if (pk.alias.len == 0) "-" else pk.alias), quote(cx, pk.kind), quote(cx, pk.bin), quote(cx, if (pk.build.len == 0) "-" else pk.build) }) catch {};
+        }
+    }
     const tmp = jobFile(cx, id, "tmp");
     Io.Dir.cwd().createDirPath(cx.io, tmp) catch {};
     env.put("TMPDIR", tmp) catch {};
@@ -1207,7 +1241,8 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
     if (p.time) |t| argv.appendSlice(cx.a, &.{ "--time", t }) catch {};
     if (p.mem) |m| argv.appendSlice(cx.a, &.{ "--mem", m }) catch {};
     const body = if (p.setup) |s| cx.a.print("{{ {s}\n}} && {{ {s}\n}}", .{ s, p.run }) catch p.run else p.run;
-    const script = if (p.host_env.len != 0) cx.a.print("export {s}\n{s}", .{ p.host_env, body }) catch body else body;
+    const with_packs = cx.a.print("{s}{s}", .{ prelude.items, body }) catch body;
+    const script = if (p.host_env.len != 0) cx.a.print("export {s}\n{s}", .{ p.host_env, with_packs }) catch with_packs else with_packs;
     argv.appendSlice(cx.a, &.{ "--", "/bin/sh", "-c", script, "cpuq" }) catch {};
     argv.appendSlice(cx.a, p.args) catch {};
     hostState(cx, id, "running");
@@ -1228,6 +1263,117 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
         return hostDone(cx, id, p, .fail, x, "", started);
     }
     return hostDone(cx, id, p, .fail, null, "killed by a signal", started);
+}
+
+/// `cpuq packs [--host HOST]`: the packs in a store, each version with the links naming it.
+/// `cpuq packs install NAME@REF... [--host HOST]`: installs them there now, under that cpuq's
+/// queue, as a job asking for them would.
+pub fn cmdPacks(cx: Cx, args: []const [:0]const u8) u8 {
+    var host: ?[]const u8 = null;
+    var installing = false;
+    var wanted: Map = .{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg: []const u8 = args[i];
+        if (std.mem.eql(u8, arg, "--host") and i + 1 < args.len) {
+            i += 1;
+            host = args[i];
+        } else if (i == 0 and std.mem.eql(u8, arg, "install")) {
+            installing = true;
+        } else if (installing and std.mem.findScalar(u8, arg, '@') != null) {
+            const at = std.mem.findScalar(u8, arg, '@').?;
+            wanted.map.put(cx.a, arg[0..at], arg[at + 1 ..]) catch {};
+        } else return fail2("usage: cpuq packs [--host HOST] | cpuq packs install NAME@VERSION... [--host HOST] (VERSION: latest, stable, 0.2.9, a commit)", .{});
+    }
+    const where: ?[]const u8 = if (host) |h| (if (std.mem.eql(u8, h, "here")) null else h) else null;
+    if (!installing) {
+        if (where) |h| {
+            const r = onHost(cx, h, cx.a.print("{s} packs", .{cpuqOn(cx, h)}) catch "");
+            cx.out.writeAll(r.out) catch {};
+            cx.out.flush() catch {};
+            std.debug.print("{s}", .{r.err});
+            return r.code;
+        }
+        listPacks(cx);
+        return 0;
+    }
+    if (wanted.map.count() == 0) return fail2("cpuq packs install: name the packs, NAME@VERSION", .{});
+    const r = packs.resolve(cx.a, cx.io, cx.env, wanted);
+    if (r.err) |e| return fail2("{s}", .{e});
+    for (r.packs) |pk| if (packs.ship(cx.a, cx.io, where, pk)) |e| return fail2("{s}", .{e});
+    // The installs, as a job's first steps: the packs a build needs on PATH, then each in turn.
+    var script: std.ArrayList(u8) = .empty;
+    script.appendSlice(cx.a, "b=$(mktemp -d) || exit 1; trap 'rm -rf \"$b\"' EXIT\n") catch {};
+    for (r.packs) |pk| {
+        const binary = cx.a.print("$HOME/cpuq/packs/{s}/{s}/{s}", .{ pk.name, pk.version, pk.bin }) catch continue;
+        script.print(cx.a, "ln -s \"{s}\" \"$b/{s}\"; export {s}=\"{s}\"\n", .{ binary, std.fs.path.basename(pk.bin), packs.varName(cx.a, pk.name), binary }) catch {};
+    }
+    script.appendSlice(cx.a, "export PATH=\"$b:$PATH\"\n") catch {};
+    const self = if (where) |h| cpuqOn(cx, h) else cx.self;
+    for (r.packs) |pk| {
+        script.print(cx.a, "{s} _pack {s} {s} {s} {s} {s} {s} || exit\n", .{ self, quote(cx, pk.name), quote(cx, pk.version), quote(cx, if (pk.alias.len == 0) "-" else pk.alias), quote(cx, pk.kind), quote(cx, pk.bin), quote(cx, if (pk.build.len == 0) "-" else pk.build) }) catch {};
+        cx.out.print("{s} {s}{s}{s}\n", .{ pk.name, pk.version, if (pk.alias.len != 0) "  " else "", pk.alias }) catch {};
+    }
+    cx.out.flush() catch {};
+    const line = cx.a.print("{s} run --label cpuq:packs --cores 2-8 -- /bin/sh -c {s}", .{ self, quote(cx, script.items) }) catch return 125;
+    const ran = if (where) |h| onHost(cx, h, line) else run(cx, &.{ "/bin/sh", "-c", line }, null);
+    std.debug.print("{s}{s}", .{ ran.out, ran.err });
+    return ran.code;
+}
+
+fn listPacks(cx: Cx) void {
+    const root = packs.storeRoot(cx.a, cx.env);
+    var top = Io.Dir.cwd().openDir(cx.io, root, .{ .iterate = true }) catch {
+        cx.out.print("no packs here ({s})\n", .{root}) catch {};
+        cx.out.flush() catch {};
+        return;
+    };
+    defer top.close(cx.io);
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = top.iterate();
+    while (it.next(cx.io) catch null) |e| if (e.kind == .directory and e.name[0] != '.') names.append(cx.a, cx.a.dupe(u8, e.name) catch continue) catch {};
+    std.mem.sortUnstable([]const u8, names.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    for (names.items) |name| {
+        var d = top.openDir(cx.io, name, .{ .iterate = true }) catch continue;
+        defer d.close(cx.io);
+        var versions: std.ArrayList([]const u8) = .empty;
+        var links: std.ArrayList([2][]const u8) = .empty;
+        var vi = d.iterate();
+        while (vi.next(cx.io) catch null) |e| {
+            if (e.name[0] == '.') continue;
+            if (e.kind == .sym_link) {
+                var buf: [256]u8 = undefined;
+                const n = d.readLink(cx.io, e.name, &buf) catch continue;
+                links.append(cx.a, .{ cx.a.dupe(u8, e.name) catch continue, cx.a.dupe(u8, buf[0..n]) catch continue }) catch {};
+            } else if (e.kind == .directory) {
+                d.access(cx.io, cx.a.print("{s}/.cpuq-installed", .{e.name}) catch continue, .{}) catch continue;
+                versions.append(cx.a, cx.a.dupe(u8, e.name) catch continue) catch {};
+            }
+        }
+        std.mem.sortUnstable([]const u8, versions.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        for (versions.items) |v| {
+            cx.out.print("{s:<10} {s:<14}", .{ name, v }) catch {};
+            for (links.items) |l| if (std.mem.eql(u8, l[1], v)) cx.out.print(" {s}", .{l[0]}) catch {};
+            cx.out.writeByte('\n') catch {};
+        }
+    }
+    cx.out.flush() catch {};
+}
+
+/// `cpuq _pack NAME VERSION ALIAS KIND BIN BUILD` (packs.install): a job's step installing a pack.
+pub fn cmdPack(cx: Cx, args: []const [:0]const u8) u8 {
+    var fixed: [6][:0]const u8 = undefined;
+    if (args.len != 6) return 2;
+    for (args, 0..) |x, k| fixed[k] = if (std.mem.eql(u8, x, "-")) "" else x;
+    return packs.install(cx.a, cx.io, cx.env, &fixed);
 }
 
 fn cancelled(cx: Cx, id: []const u8) bool {

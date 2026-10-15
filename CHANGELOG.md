@@ -2,6 +2,20 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.21.0 — 2026-10-15
+
+- **Packs: tool versions kept on each host**, as mise keeps them, in `~/cpuq/packs/NAME/VERSION`
+  (`zig/0.17.0`, `rig/0.2.9`, `nexus/c28bef1a4d28`, with `latest` and `stable` links). A submit
+  spec asks for them: `"packs": {"zig": "0.17.0", "rig": "latest"}`. Versions are `latest` (the
+  default branch's head), `stable` (the newest release tag), a tag's version, or a commit,
+  resolved at submit. The first job that needs a version installs it inside its own grant: zig
+  from ziglang.org with its sha256 checked, others built from their commit's source, shipped from
+  the checkout here when the host lacks it. Each pack is on the job's PATH and in `$NAME`.
+  Recipes live in `~/.config/cpuq/packs.json`.
+- `cpuq packs [--host HOST]` lists a store; `cpuq packs install NAME@VERSION... [--host HOST]`
+  installs ahead of a job, under that host's queue.
+- A job with packs needs cpuq 0.21 on its host.
+
 ## 0.20.0 — 2026-10-15
 
 - **`"git": true` in a submit spec** ships the repo's git to the copy, git's own parts only (a
