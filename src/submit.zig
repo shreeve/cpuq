@@ -290,6 +290,7 @@ fn quote(cx: Cx, s: []const u8) []const u8 {
 }
 
 fn rsyncPath(cx: Cx) []const u8 {
+    if (cx.env.get("CPUQ_RSYNC")) |p| return p;
     for ([_][]const u8{ "/opt/homebrew/bin/rsync", "/usr/local/bin/rsync", "/usr/bin/rsync" }) |p| {
         Io.Dir.cwd().access(cx.io, p, .{ .execute = true }) catch continue;
         return p;
@@ -1025,9 +1026,15 @@ fn finish(cx: Cx, rec: *const Record, host: []const u8) u8 {
     const res = onHost(cx, host, cx.a.print("cat {s}", .{quote(cx, hostJobFile(cx, host, id, "result.json"))}) catch "");
     const tail = onHost(cx, host, cx.a.print("tail -n 200 {s}", .{quote(cx, hostJobFile(cx, host, id, "output.log"))}) catch "");
     if (tail.ok) writeFile(cx, jobFile(cx, id, "tail.log"), tail.out);
+    // Each path to its own parent, without --relative (macOS's own rsync, openrsync, lacks the
+    // "/./" form): a directory as a directory, a file as a file.
     for (rec.@"return") |p| {
-        const src = cx.a.print("{s}/{s}/./{s}", .{ copyTarget(cx, host, rec.copy), "", p }) catch continue;
-        _ = run(cx, &.{ rsyncPath(cx), "-a", "--relative", "--safe-links", src, cx.a.print("{s}/", .{rec.dir}) catch continue }, null);
+        const src = cx.a.print("{s}/{s}", .{ copyTarget(cx, host, rec.copy), std.mem.trimEnd(u8, p, "/") }) catch continue;
+        const parent = std.fs.path.dirname(std.mem.trimEnd(u8, p, "/"));
+        const dest = if (parent) |d| cx.a.print("{s}/{s}/", .{ rec.dir, d }) catch continue else cx.a.print("{s}/", .{rec.dir}) catch continue;
+        Io.Dir.cwd().createDirPath(cx.io, dest) catch {};
+        const r = run(cx, &.{ rsyncPath(cx), "-a", "--safe-links", src, dest }, null);
+        if (!r.ok) std.debug.print("cpuq: couldn't bring {s} back from {s}: {s}\n", .{ p, host, std.mem.trim(u8, r.err, " \n") });
     }
     if (!res.ok) return done(cx, id, rec.*, .cpuq_error, null, cx.a.print("its result couldn't be read on {s}: not your code, report it", .{host}) catch "", host);
     // Here, the host's job directory is this one: result.json is already in place.
