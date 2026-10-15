@@ -2,6 +2,14 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.13.0 — 2026-10-15
+
+- `cpuq run --spill-to HOST`: runs the job on HOST whatever this machine's state, the repo copied
+  and the job tied to its caller as with `--spill`: at once when HOST has room, else in HOST's
+  queue; started first when it is stopped and has a `spill_start` command. A HOST that cannot be
+  reached or started fails the run (exit 125) rather than running it here. Lost mid-job (a Spot VM
+  reclaimed), HOST is started again and the job reruns there once, then here.
+
 ## 0.12.1 — 2026-10-15
 
 - `cpuq hook` reads a heredoc as data: an apostrophe in a heredoc's body no longer opens a quote

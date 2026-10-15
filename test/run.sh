@@ -1447,6 +1447,17 @@ t_spill() {
     "[[ '$here' == ran-here && $rc = 75 && '$full' == *'no spill host has room'*'unreachable'* && '$none' == *'no spill hosts configured'*ran-anyway* ]]"
 }
 
+t_spill_to() {
+  # --spill-to HOST runs there whatever this machine's state; a host that neither answers nor
+  # has a spill_start command is an error, not a quiet run here.
+  setup spill-to
+  local out rc
+  out=$("$CPUQ" run --spill-to cpuq-test-nohost.invalid --cores 1 -- echo ran-here 2>&1); rc=$?
+  "$CPUQ" run --spill --spill-to x --cores 1 -- true 2>/dev/null; local both=$?
+  check "--spill-to an unreachable host without spill_start fails (rc $rc: '$out'), never running here; --spill with --spill-to is refused (rc $both)" \
+    "[[ $rc = 125 && '$out' == *'does not answer'* && '$out' != *ran-here* && $both = 2 ]]"
+}
+
 t_tethered() {
   # --tethered (what --spill runs on the spill host): the command gets
   # /dev/null for stdin, which carries the caller's heartbeats, and is
@@ -1484,7 +1495,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill tethered status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to tethered status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

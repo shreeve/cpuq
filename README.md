@@ -331,6 +331,7 @@ window's work. It needs measured admission.
 ## Spilling to other machines
 
     cpuq run --spill [run options] [--return PATH]... -- CMD ARGS...
+    cpuq run --spill-to HOST [run options] [--return PATH]... -- CMD ARGS...
 
 `--spill` runs the job here while this machine has room. When it is full (anyone waiting, the
 1-minute load above its CPUs, or a gate shut), it tries the machines named by `spill` in the
@@ -358,6 +359,11 @@ afterwards, for a build's output; it repeats.
   the connection fails or the job dies by a signal and the machine then stops answering, the job
   runs again here.
 - **Only work that doesn't need this OS** belongs on `--spill`: the other machine may run Linux.
+- **`--spill-to HOST`** sends the job to HOST whatever this machine's state, copied and tied the
+  same way: at once when HOST has room, else into HOST's queue; started first when it is stopped
+  and has a `spill_start` command. A HOST that neither answers nor can be started is an error
+  (exit 125), never a quiet run here. Lost mid-job, HOST is started again and the job reruns there
+  once, then here.
 - The other machines need cpuq 0.12 or later, and ssh to them must work without a prompt.
 
 ## Named leases

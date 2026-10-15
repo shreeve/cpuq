@@ -49,7 +49,9 @@ const usage =
     \\  --spill               when this machine is full, run on a spill host with
     \\                        room (config `spill`), starting a stopped one if
     \\                        need be; the repo is copied there with rsync
-    \\  --return PATH         with --spill: copy PATH back here afterwards (repeats)
+    \\  --spill-to HOST       run on HOST, here full or not: queue there if it is busy,
+    \\                        start it if stopped (config `spill_start.HOST`)
+    \\  --return PATH         with --spill or --spill-to: copy PATH back here afterwards
     \\
     \\lease options (NAME: letters, digits, . _ -):
     \\  --slots N             let N hold NAME at once (default 1)
@@ -307,6 +309,8 @@ const RunOptions = struct {
     hidden: bool = false,
     /// `--spill`: when this machine is full, run on a spill host instead.
     spill: bool = false,
+    /// `--spill-to HOST`: run on HOST, whether this machine is full or not.
+    spill_to: ?[]const u8 = null,
     /// `--return PATH` (with --spill): copied back from the spill host after.
     returns: [max_returns][]const u8 = undefined,
     return_count: u8 = 0,
@@ -336,7 +340,7 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             name = kv[0];
             inline_value = kv[1];
         }
-        const takes_value = for ([_][]const u8{ "--cores", "--priority", "--label", "--max-wait", "--qos", "--host", "--slots", "--return" }) |v| {
+        const takes_value = for ([_][]const u8{ "--cores", "--priority", "--label", "--max-wait", "--qos", "--host", "--slots", "--return", "--spill-to" }) |v| {
             if (std.mem.eql(u8, name, v)) break true;
         } else false;
         var value: []const u8 = "";
@@ -353,7 +357,7 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             _ = usageError("{s} takes no value", .{name});
             return null;
         }
-        for ([_][]const u8{ "--cores", "--no-load-check", "--qos", "--opaque", "--spill", "--return", "--tethered" }) |r| {
+        for ([_][]const u8{ "--cores", "--no-load-check", "--qos", "--opaque", "--spill", "--return", "--tethered", "--spill-to" }) |r| {
             if (std.mem.eql(u8, name, r)) o.run_only = r;
         }
         if (std.mem.eql(u8, name, "--cores")) {
@@ -396,6 +400,12 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             o.hold = true;
         } else if (std.mem.eql(u8, name, "--spill")) {
             o.spill = true;
+        } else if (std.mem.eql(u8, name, "--spill-to")) {
+            if (value.len == 0) {
+                _ = usageError("--spill-to needs a host", .{});
+                return null;
+            }
+            o.spill_to = value;
         } else if (std.mem.eql(u8, name, "--tethered")) {
             o.tethered = true;
         } else if (std.mem.eql(u8, name, "--return")) {
@@ -485,10 +495,12 @@ fn cmdRun(ctx: *Ctx, args: []const [:0]const u8) u8 {
 
     loadConfig(ctx);
     if (o.exclusive and !ctx.cfg.exclusive) o.exclusive = exclusiveOff(o.label);
-    if (o.return_count != 0 and !o.spill) return usageError("--return goes with --spill", .{});
+    if (o.return_count != 0 and !o.spill and o.spill_to == null) return usageError("--return goes with --spill or --spill-to", .{});
+    if (o.spill and o.spill_to != null) return usageError("--spill and --spill-to: choose one", .{});
     if (o.tethered) tether();
-    if (o.spill) {
+    if (o.spill or o.spill_to != null) {
         if (o.exclusive) return usageError("--spill sends ordinary jobs, not --exclusive ones (time on the machine you mean)", .{});
+        if (o.spill_to) |h| return runSpillTo(ctx, o, h);
         return runSpill(ctx, o);
     }
     return runHere(ctx, o);
@@ -541,7 +553,7 @@ fn runSpill(ctx: *Ctx, o: RunOptions) u8 {
     while (hosts.next()) |h| {
         const p = probeHost(ctx, h);
         switch (p) {
-            .room => return spillTo(ctx, o, h, why),
+            .room => return spillTo(ctx, o, h, a2(ctx, "here {s}", why)),
             .full => |text| seen.print(ctx.arena, "{s}{s} {s}", .{ if (seen.items.len == 0) "" else ", ", h, text }) catch {},
             .gone => if (stopped == null and ctx.cfg.spillStart(h) != null) {
                 stopped = h;
@@ -552,12 +564,43 @@ fn runSpill(ctx: *Ctx, o: RunOptions) u8 {
     }
     if (stopped) |h| {
         std.debug.print("cpuq: here {s}{s}{s}; starting {s}\n", .{ why, if (seen.items.len == 0) "" else "; ", seen.items, h });
-        if (startHost(ctx, h)) return spillTo(ctx, o, h, why);
+        if (startHost(ctx, h)) return spillTo(ctx, o, h, a2(ctx, "here {s}", why));
         std.debug.print("cpuq: could not start {s}; queueing here\n", .{h});
         return runHere(ctx, o);
     }
     std.debug.print("cpuq: here {s}, and no spill host has room ({s}); queueing here\n", .{ why, seen.items });
     return runHere(ctx, o);
+}
+
+/// `cpuq run --spill-to HOST`: runs on HOST whatever this machine's state: there at once
+/// when it has room, else in its queue; started first if it is stopped and has a `spill_start`
+/// command. A host that cannot be reached or started is an error (exit 125), not a quiet run
+/// somewhere else: HOST was asked for by name.
+fn runSpillTo(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
+    switch (probeHost(ctx, host)) {
+        .room => return spillTo(ctx, o, host, a2(ctx, "--spill-to {s}", host)),
+        .full => |why| return spillTo(ctx, o, host, a2(ctx, "--spill-to: it {s}, so the job queues there", why)),
+        .gone => {
+            if (ctx.cfg.spillStart(host) == null) {
+                std.debug.print("cpuq: --spill-to {s}: it does not answer, and the config has no spill_start.{s} to start it\n", .{ host, host });
+                return exit_failure;
+            }
+            std.debug.print("cpuq: --spill-to {s}: it is stopped; starting it\n", .{host});
+            if (!startHost(ctx, host)) {
+                std.debug.print("cpuq: --spill-to {s}: could not start it\n", .{host});
+                return exit_failure;
+            }
+            return spillTo(ctx, o, host, a2(ctx, "--spill-to {s}", host));
+        },
+    }
+}
+
+/// A run sent to a host by name and lost there is started again and rerun only once.
+var spill_retried = false;
+
+/// A formatted line in the arena, for messages.
+fn a2(ctx: *Ctx, comptime fmt: []const u8, arg: []const u8) []const u8 {
+    return ctx.arena.print(fmt, .{arg}) catch arg;
 }
 
 /// Why this machine is full, for `--spill`; null when it has room.
@@ -624,7 +667,7 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     // The copy's place on the host mirrors the repo's path here, so each
     // repo (and worktree) keeps its own, and its build caches, between runs.
     const dir = a.print("cpuq-spill{s}", .{root}) catch fail("out of memory", .{});
-    std.debug.print("cpuq: here {s}; running {s} on {s}\n", .{ why, if (o.label.len != 0) o.label else o.cmd[0], host });
+    std.debug.print("cpuq: {s}; running {s} on {s}\n", .{ why, if (o.label.len != 0) o.label else o.cmd[0], host });
 
     const sync = [_][]const u8{
         "rsync",                                                                          "-a", "--delete", "--exclude=/.git", "--filter=:- .gitignore",
@@ -668,7 +711,15 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     // give a host that is going a moment to go, and if it has, run the job
     // here instead.
     if ((code == 255 or code > 128) and hostWentAway(ctx, host)) {
-        std.debug.print("cpuq: lost {s} while {s} ran there; running it here instead\n", .{ host, if (o.label.len != 0) o.label else o.cmd[0] });
+        const who = if (o.label.len != 0) o.label else o.cmd[0];
+        // Sent there by name (--spill-to): start it again and run there once more, as a Spot VM
+        // reclaimed is usually back a minute later; only then, here.
+        if (o.spill_to != null and !spill_retried and ctx.cfg.spillStart(host) != null) {
+            std.debug.print("cpuq: lost {s} while {s} ran there; starting it again\n", .{ host, who });
+            spill_retried = true;
+            if (startHost(ctx, host)) return spillTo(ctx, o, host, "running again");
+        }
+        std.debug.print("cpuq: lost {s} while {s} ran there; running it here instead\n", .{ host, who });
         return runHere(ctx, o);
     }
     for (o.returns[0..o.return_count]) |path| {
