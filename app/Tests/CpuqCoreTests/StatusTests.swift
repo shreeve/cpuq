@@ -162,3 +162,13 @@ import Testing
     #expect(s[0].cpu == [46, 35] && s[0].held == 2 && s[0].wait == 1)
     #expect(s[1].gate == "low_disk")
 }
+
+@Test func decodesMemory() throws {
+    let json = #"{"schema":1,"memory":{"total":137438953472,"used":104152956928,"swap_total":34359738368,"swap_used":25769803776}}"#
+    let s = try Status.decode(Data(json.utf8))
+    let m = try #require(s.memory)
+    #expect(Status.Memory.ofGB(m.used, m.total) == "97 of 128 GB")
+    #expect(Status.Memory.ofGB(m.swapUsed, m.swapTotal) == "24 of 32 GB")
+    #expect(Status.Memory.ofGB(1_395_864_371, 2_147_483_648) == "1.3 of 2.0 GB")
+    #expect(try Status.decode(Data(#"{"schema":1}"#.utf8)).memory == nil)
+}

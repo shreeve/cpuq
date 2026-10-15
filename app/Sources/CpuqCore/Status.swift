@@ -22,6 +22,9 @@ public struct Status: Decodable, Sendable, Equatable {
     /// When the machine booted, Unix seconds (`boot_time`, cpuq 0.14 and later): how long a cloud
     /// machine has been up.
     public var bootTime: Double?
+    /// Memory and swap in bytes (cpuq 0.16 and later): `used` is Activity Monitor's Memory Used on
+    /// macOS, the total less MemAvailable on Linux.
+    public var memory: Memory?
     public var gate = Gate()
     public var holders: [Holder] = []
     public var waiters: [Waiter] = []
@@ -88,10 +91,32 @@ public struct Status: Decodable, Sendable, Equatable {
     }
 }
 
+extension Status {
+    public struct Memory: Decodable, Sendable, Equatable {
+        public var total: UInt64
+        public var used: UInt64
+        public var swapTotal: UInt64
+        public var swapUsed: UInt64
+
+        public init(total: UInt64, used: UInt64, swapTotal: UInt64, swapUsed: UInt64) {
+            self.total = total
+            self.used = used
+            self.swapTotal = swapTotal
+            self.swapUsed = swapUsed
+        }
+
+        /// "97 of 128 GB": a decimal when the total is below 10 GB ("1.3 of 2.0 GB").
+        public static func ofGB(_ used: UInt64, _ total: UInt64) -> String {
+            let u = Double(used) / 1_073_741_824, t = Double(total) / 1_073_741_824
+            return t < 9.95 ? String(format: "%.1f of %.1f GB", u, t) : String(format: "%.0f of %.0f GB", u, t)
+        }
+    }
+}
+
 // Decoding with defaults: a missing key keeps the property's default.
 extension Status {
     private enum Keys: String, CodingKey {
-        case schema, version, budget, held, free, load, memoryPressure, gate, holders, waiters, leases, outside, admit, target, activeCores, cpuTicks, bootTime
+        case schema, version, budget, held, free, load, memoryPressure, gate, holders, waiters, leases, outside, admit, target, activeCores, cpuTicks, bootTime, memory
     }
 
     public init(from decoder: any Decoder) throws {
@@ -108,6 +133,7 @@ extension Status {
         activeCores = try c.decodeIfPresent(Int.self, forKey: .activeCores) ?? 0
         cpuTicks = try c.decodeIfPresent([[UInt64]].self, forKey: .cpuTicks)
         bootTime = try c.decodeIfPresent(Double.self, forKey: .bootTime)
+        memory = try c.decodeIfPresent(Memory.self, forKey: .memory)
         gate = try c.decodeIfPresent(Gate.self, forKey: .gate) ?? Gate()
         holders = try c.decodeIfPresent([Holder].self, forKey: .holders) ?? []
         waiters = try c.decodeIfPresent([Waiter].self, forKey: .waiters) ?? []

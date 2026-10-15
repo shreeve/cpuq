@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.17.0 — 2026-10-15
+
+- Each machine's page shows its memory and swap in use beside the gate and the demand: "RAM 97 of
+  128 GB • Swap 24 of 32 GB" (cpuq 0.16), RAM turning rose under memory pressure. With an older
+  cpuq it says the pressure, as before.
+
 ## 0.16.0 — 2026-10-15
 
 - The charts start full: on opening, each machine's page fills in the hour before from that

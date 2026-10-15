@@ -287,10 +287,28 @@ struct StatusChips: View {
                 Label(s.gate.state == "open" ? "Gate open" : "Gate shut", systemImage: s.gate.state == "open" ? "checkmark.circle" : "pause.circle.fill")
                     .foregroundStyle(s.gate.state == "open" ? Color.secondary : Color.orange)
                     .help(s.gate.text)
-                HStack(spacing: 4) {
-                    Text("Memory").foregroundStyle(Alive.ink2)
-                    Text(s.memoryPressure == "high" ? "high" : s.memoryPressure.isEmpty ? "–" : s.memoryPressure)
-                        .fontWeight(.medium).foregroundStyle(s.memoryPressure == "high" ? Alive.rose : Alive.ink)
+                if let m = s.memory {
+                    HStack(spacing: 4) {
+                        Text("RAM").foregroundStyle(Alive.ink2)
+                        Text(Status.Memory.ofGB(m.used, m.total))
+                            .fontWeight(.medium).monospacedDigit().foregroundStyle(s.memoryPressure == "high" ? Alive.rose : Alive.ink)
+                    }
+                    .help(s.memoryPressure == "high" ? "Memory in use, and the kernel reports memory pressure: cpuq's gate holds new work back." : "Memory in use: apps, the kernel's own, and compressed. The file cache counts as free.")
+                    if m.swapTotal > 0 {
+                        Text("•").foregroundStyle(Alive.ink2)
+                        HStack(spacing: 4) {
+                            Text("Swap").foregroundStyle(Alive.ink2)
+                            Text(Status.Memory.ofGB(m.swapUsed, m.swapTotal))
+                                .fontWeight(.medium).monospacedDigit().foregroundStyle(Alive.ink)
+                        }
+                        .help("Swap in use. Swap a machine filled earlier stays used until those pages are needed again, so a full swap with free RAM is history, not trouble; the pressure is what counts.")
+                    }
+                } else {
+                    HStack(spacing: 4) {
+                        Text("Memory").foregroundStyle(Alive.ink2)
+                        Text(s.memoryPressure == "high" ? "high" : s.memoryPressure.isEmpty ? "–" : s.memoryPressure)
+                            .fontWeight(.medium).foregroundStyle(s.memoryPressure == "high" ? Alive.rose : Alive.ink)
+                    }
                 }
                 if let load = s.load.first {
                     HStack(spacing: 4) {
