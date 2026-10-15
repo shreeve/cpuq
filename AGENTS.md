@@ -71,6 +71,12 @@ that machine's own cpuq:
 
 Never run it there outside cpuq: its queue can't share what it doesn't see.
 
+A big job sent to a cloud host keeps a fixed label, asks for at most a third of the host's CPUs
+(`--cores 8-32` on 96), puts its caches under `$HOME/cpuq-spill/c/PROJECT/` (outside the
+per-worktree copy, so every branch shares them), deletes its scratch at the end of the same
+command (`rc=$?; rm -rf SCRATCH; exit $rc`), and runs in the background. More: README's "Big jobs
+on a cloud host".
+
 ## Test runners
 
 A runner that starts many programs limits each with `cpuq cap` rather than watching them itself

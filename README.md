@@ -435,6 +435,46 @@ afterwards, for a build's output; it repeats.
   machine, since a job sized for HOST would swamp it.
 - The other machines need cpuq 0.12 or later, and ssh to them must work without a prompt.
 
+### Big jobs on a cloud host
+
+A test suite that takes an hour on a laptop takes minutes on a 96-CPU cloud machine, if each run
+goes there whole, keeps its caches warm, and cleans up after itself. This is how an agent sends
+one:
+
+    cpuq run --spill-to burst --label proj:matrix --cores 8-32 -- sh -c '
+      zig build -j"$CPUQ_CORES" &&
+      PROJ_RESULTS_CACHE=$HOME/cpuq-spill/c/proj/results ./test/run -j "$CPUQ_CORES" >.zig-cache/gate.log 2>&1
+      rc=$?
+      grep -E "^(fail|FAIL)" .zig-cache/gate.log | head -20; tail -2 .zig-cache/gate.log
+      rm -rf .zig-cache/proj-test
+      exit $rc'
+
+- **The same label every time** (`proj:matrix`, `proj:suite`): history sizes the request and
+  estimates waits by label. Never a branch name.
+- **A core range sized to share:** at most a third of the host's CPUs each, so three runs fit at
+  once and more queue on the host. Every tool inside takes `$CPUQ_CORES`.
+- **Caches outside the copy.** Each worktree gets its own copy on the host, so a cache inside it
+  is cold for every new branch. A path under `$HOME/cpuq-spill/c/PROJECT/`, outside every copy,
+  is shared by all of a project's runs there. A results cache keyed by content (one entry per
+  test and input) then carries a pass from one branch to the next.
+- **Scratch deleted at the end**, after the status is saved, in the same command. The copy
+  persists between runs, so whatever a run leaves stays on the host's disk.
+- **A short report:** the failures and the summary line on the terminal, and the full log in the
+  copy. The exit status is the run's own.
+- **Run it as a background command.** It waits in the host's queue, then runs as long as it
+  takes, often past an agent tool's timeout.
+- **Tools the host lacks** are fetched or built there by the command itself, beside the copy
+  (`../tool`), where later runs find them already built.
+- **Per-program limits** in a test runner come from `cpuq cap`, never from a watchdog listing
+  every process.
+- **Only work that doesn't need this OS** goes there.
+- **The first run of a branch is cold:** it copies the repo and builds from scratch. Later runs
+  move only what changed.
+
+The host itself (burst here) is a Spot VM that starts on demand and stops itself after 10 idle
+minutes. It has no cloud service account, so nothing running on it can act on the cloud
+project. Copies and caches sit on a ZFS dataset with lz4 compression and a size quota.
+
 ## Named leases
 
     cpuq lease NAME [--slots N] [--exclusive] [--priority P] [--label L] [--max-wait S] -- CMD...
