@@ -1177,7 +1177,8 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
     env.put("TMPDIR", tmp) catch {};
     // The job's progress (`DONE TOTAL FAILING`), where _peek finds it; cpuq run keeps it.
     Io.Dir.cwd().deleteFile(cx.io, jobFile(cx, id, "progress")) catch {};
-    env.put("CPUQ_PROGRESS", jobFile(cx, id, "progress")) catch {};
+    // The progress file `cpuq run` gives the job: this job's own, which _peek reads.
+    env.put("CPUQ_PROGRESS_AT", jobFile(cx, id, "progress")) catch {};
     if (p.report) |r| if (inside(r)) Io.Dir.cwd().deleteFile(cx.io, cx.a.print("{s}/{s}", .{ copy, r }) catch "") catch {};
 
     // cpuq run takes the cores and the job's cgroup; cap enforces time from admission, and memory.

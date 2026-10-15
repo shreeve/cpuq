@@ -58,10 +58,11 @@ It runs here while there's room; when this machine is full it runs on a spill ho
 starting a stopped cloud machine if need be, with the repo copied there by rsync. Its output and
 exit status come back as usual. The command must stay inside the repo: absolute paths here (a
 scratchpad file) don't exist there. `--return zig-out` copies a build's output back. Gitignored
-inputs the job needs (a vendored tree, `.git`) go in the repo's `.cpuq-spill`, a path a line, or
-`--ship PATH`; environment variables set here don't travel, so set them inside the command. To send a job
-to a given machine whatever the state here, use `--spill-to HOST` instead (it starts a stopped
-cloud machine): for work too big for this one, not to skip its queue.
+inputs the job needs (a vendored tree, `.git` for `git ls-files`) go in the repo's `.cpuq-spill`,
+a path a line, or `--ship PATH`. `.git` ships trimmed to git's own parts, a worktree's included.
+Environment variables set here don't travel, so set them inside the command. To send a job to a
+given machine whatever the state here, use `--spill-to HOST` instead (it starts a stopped cloud
+machine): for work too big for this one, not to skip its queue.
 
 Without `spill` configured, send work by hand when this machine is full (anyone waiting, or the
 1-minute load above its CPU count) and another has room (`cpuq status --host HOST`), through

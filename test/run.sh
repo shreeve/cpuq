@@ -1062,9 +1062,10 @@ t_progress() {
   "$CPUQ" run --cores 1 --label proj:matrix -- sh -c 'for d in 0 100 200 300 400; do echo "$d 1000 2" > "$CPUQ_PROGRESS.tmp"; mv "$CPUQ_PROGRESS.tmp" "$CPUQ_PROGRESS"; sleep 1; done; echo "$CPUQ_PROGRESS" > '"$T/path" & wait_held 1
   sleep 2.5
   local got; got=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; h = json.load(sys.stdin)["holders"][0]; p = h["progress"]; print(p["total"], p["failing"], h["left_from"], h["left"] > 0)')
+  local line; line=$("$CPUQ" status --no-usage | grep -c '/1000 .*% · 2 failing · ~')
   wait
   local gone=yes; [ -e "$(cat "$T/path")" ] && gone=no
-  check "status shows a job's reported progress and time left, and the file goes with it (got '$got', removed: $gone)" "[ '$got' = '1000 2 progress True' ] && [ $gone = yes ]"
+  check "status shows a job's reported progress and time left, and the file goes with it (got '$got', a line under it: $line, removed: $gone)" "[ '$got' = '1000 2 progress True' ] && [ '$line' = 1 ] && [ $gone = yes ]"
 }
 
 t_submit() {
@@ -1603,6 +1604,27 @@ t_spill_to() {
     "[[ $rc = 125 && '$out' == *'does not answer'* && '$out' != *ran-here* && $both = 2 ]]"
 }
 
+t_ship_git() {
+  # `.git` in .cpuq-spill ships a standalone git: a worktree's commit and index, git's own parts,
+  # and none of what else the repo keeps under .git.
+  setup ship-git
+  local bin=$T/bin far=$T/far
+  mkdir -p "$bin" "$far"
+  printf '#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done\nshift\ncd "%s" && exec sh -c "$*"\n' "$far" >"$bin/ssh"
+  chmod +x "$bin/ssh"
+  ln -sf "$CPUQ" "$bin/cpuq"
+  (
+    cd "$T" && git init -q repo && cd repo && git config user.email t@t && git config user.name t
+    echo a > a.txt && echo b > b.txt && git add -A && git commit -qm one
+    mkdir .git/big-cache && echo junk > .git/big-cache/x
+    git worktree add -q "$T/wt" -b wt && cd "$T/wt" && echo c > c.txt && git add c.txt && git commit -qm two
+    echo .git > .cpuq-spill
+  ) >/dev/null 2>&1
+  local want; want=$(git -C "$T/wt" rev-parse HEAD)
+  local got; got=$(cd "$T/wt" && PATH="$bin:$PATH" "$CPUQ" run --spill-to far --cores 1 -- sh -c 'test -d .git && echo dir; git rev-parse HEAD; git ls-files | tr "\n" " "; test -e .git/big-cache && echo junk || echo clean' 2>/dev/null | tr '\n' ' ')
+  check "a worktree's .git ships as a git of its own (got '$got')" "[ '$got' = 'dir $want a.txt b.txt c.txt clean ' ]"
+}
+
 t_tethered() {
   # --tethered (what --spill runs on the spill host): the command gets
   # /dev/null for stdin, which carries the caller's heartbeats, and is
@@ -1662,7 +1684,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to tethered record cap cgroups note progress submit status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git tethered record cap cgroups note progress submit status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

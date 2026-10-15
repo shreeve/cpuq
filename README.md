@@ -433,6 +433,12 @@ afterwards, for a build's output; it repeats.
   ship too when listed in `.cpuq-spill` at the repo's top, a path a line (`#` comments), or given
   with `--ship PATH`. A gitignored path not listed never ships, and never leaves the host's copy
   either: a build cache there (`.zig-cache`) stays warm from one run to the next.
+- **`.git` ships as a git of the copy's own:** a `.git` directory with only git's parts of the
+  repo's (objects, refs, packed-refs, config, info, shallow) and the worktree's own HEAD and index.
+  A worktree's `.git` file, a path on this machine, becomes a repo there, and whatever else a
+  repo keeps under `.git` (build stores, caches, notes) stays here. After the first copy rsync
+  sends only what changed. `git ls-files`, `diff` and `log` work there; the first `git status`
+  rehashes the files once, as their times differ.
 - **Tools under `~/.local`** are off the PATH of a command run over ssh, whose shell reads no login
   profile. `spill_env.HOST = PATH=$HOME/.local/go/bin:$PATH` in the config is exported on HOST
   before the job: shell assignments, expanded there.

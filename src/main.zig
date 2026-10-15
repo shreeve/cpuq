@@ -741,7 +741,13 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     // .gitignore names; rsync takes the first rule that matches.
     var sync: std.ArrayList([]const u8) = .empty;
     sync.appendSlice(a, &.{ "rsync", "-a", "--delete" }) catch fail("out of memory", .{});
+    var ship_git = false;
     for (shipList(ctx, root, o)) |path| {
+        // `.git` ships as a git of the copy's own (shipGit), never as it is here.
+        if (std.mem.eql(u8, path, ".git")) {
+            ship_git = true;
+            continue;
+        }
         var parts = std.mem.splitScalar(u8, path, '/');
         var above: std.ArrayList(u8) = .empty;
         while (parts.next()) |part| {
@@ -758,8 +764,8 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
         a.print("{s}:{s}/", .{ host, dir }) catch "",
     }) catch fail("out of memory", .{});
     const copied = std.process.run(a, io, .{ .argv = sync.items }) catch |err| fail("rsync: {t}", .{err});
-    if (!copied.term.success()) {
-        const err_text = std.mem.trim(u8, copied.stderr, " \n");
+    const failed: ?[]const u8 = if (!copied.term.success()) std.mem.trim(u8, copied.stderr, " \n") else if (ship_git) shipGit(ctx, root, host, dir) else null;
+    if (failed) |err_text| {
         // Sent there by name, a job never runs here: it was sized for that host.
         if (o.spill_to != null) {
             std.debug.print("cpuq: could not copy {s} to {s}: {s}; --spill-to runs it nowhere else\n", .{ root, host, err_text });
@@ -845,6 +851,41 @@ fn hostWentAway(ctx: *Ctx, host: []const u8) bool {
 /// A path inside the repo: relative, with no `..`.
 fn repoPath(p: []const u8) bool {
     return p.len != 0 and p[0] != '/' and std.mem.find(u8, p, "..") == null;
+}
+
+/// `.git` shipped (`--ship .git`, or a `.git` line in `.cpuq-spill`): the copy gets a
+/// standalone git, `.git` a directory with only git's own parts of the common dir (objects,
+/// refs, packed-refs, config, info, shallow) and the worktree's own HEAD and index. Whatever
+/// else a repo keeps under .git (build stores, caches, notes) stays here, and a worktree's
+/// `.git` file, a path on this machine, becomes a repo there. After the first copy rsync
+/// sends only what changed. The error text when it fails, else null.
+fn shipGit(ctx: *Ctx, root: []const u8, host: []const u8, dir: []const u8) ?[]const u8 {
+    const a = ctx.arena;
+    const r = std.process.run(a, ctx.io, .{ .argv = &.{ "git", "-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir", "--git-dir" } }) catch return "--ship .git: cannot run git";
+    if (!r.term.success()) return "--ship .git: not a git repository";
+    var lines = std.mem.tokenizeScalar(u8, r.stdout, '\n');
+    const common = lines.next() orelse return "--ship .git: git gave no git directory";
+    const own = lines.next() orelse common;
+    const in_worktree = !std.mem.eql(u8, common, own);
+    const dest = a.print("{s}:{s}/.git/", .{ host, dir }) catch return "out of memory";
+    // A `.git` file there (a worktree's, shipped as it was) gives way to the directory.
+    const make = a.print("--rsync-path=d={s}; [ -d \"$d\" ] || rm -f \"$d\"; mkdir -p \"$d\" && rsync", .{shellQuote(a, a.print("{s}/.git", .{dir}) catch "")}) catch return "out of memory";
+    var argv: std.ArrayList([]const u8) = .empty;
+    argv.appendSlice(a, &.{ "rsync", "-a", "--delete", make, "--include=/config", "--include=/packed-refs", "--include=/shallow", "--include=/objects/***", "--include=/refs/***", "--include=/info/***" }) catch return "out of memory";
+    if (!in_worktree) argv.appendSlice(a, &.{ "--include=/HEAD", "--include=/index" }) catch return "out of memory";
+    argv.appendSlice(a, &.{ "--exclude=*", a.print("{s}/", .{common}) catch "", dest }) catch return "out of memory";
+    const c = std.process.run(a, ctx.io, .{ .argv = argv.items }) catch return "--ship .git: cannot run rsync";
+    if (!c.term.success()) return a.print("--ship .git: {s}", .{std.mem.trim(u8, c.stderr, " \n")}) catch "--ship .git: rsync failed";
+    if (!in_worktree) return null;
+    // The worktree's own: which commit it's on, and its index.
+    var own_argv: std.ArrayList([]const u8) = .empty;
+    own_argv.appendSlice(a, &.{ "rsync", "-a", a.print("{s}/HEAD", .{own}) catch "" }) catch return "out of memory";
+    const index = a.print("{s}/index", .{own}) catch "";
+    if (Io.Dir.cwd().access(ctx.io, index, .{})) |_| own_argv.append(a, index) catch {} else |_| {}
+    own_argv.append(a, dest) catch return "out of memory";
+    const w = std.process.run(a, ctx.io, .{ .argv = own_argv.items }) catch return "--ship .git: cannot run rsync";
+    if (!w.term.success()) return a.print("--ship .git: {s}", .{std.mem.trim(u8, w.stderr, " \n")}) catch "--ship .git: rsync failed";
+    return null;
 }
 
 /// The paths a spilled job ships beyond the tracked files: its --ship paths, then the repo's
@@ -1808,10 +1849,13 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
         var num: [16]u8 = undefined;
         ctx.env.put("CPUQ_CORES", std.mem.print(&num, "{d}", .{k}) catch "1") catch fail("out of memory", .{});
         ctx.env.put("CPUQ_TOKEN", lease.name) catch fail("out of memory", .{});
-        // Where the job may report its progress (`DONE TOTAL FAILING`): one a caller set (cpuq
-        // submit's), else one of its own beside the queue, removed when it ends.
-        if (ctx.env.get("CPUQ_PROGRESS")) |p| {
+        // Where the job may report its progress (`DONE TOTAL FAILING`): one cpuq submit chose
+        // (CPUQ_PROGRESS_AT), else one of its own beside the queue, removed when it ends. A
+        // CPUQ_PROGRESS inherited from another job is that job's, never this one's.
+        if (ctx.env.get("CPUQ_PROGRESS_AT")) |p| {
             lease.record.progress = p;
+            ctx.env.put("CPUQ_PROGRESS", p) catch {};
+            _ = ctx.env.swapRemove("CPUQ_PROGRESS_AT");
         } else {
             const p = std.mem.concat(ctx.arena, u8, &.{ stateDir(ctx), "/progress-", lease.name }) catch "";
             Io.Dir.cwd().deleteFile(io, p) catch {};
@@ -3799,16 +3843,28 @@ const JsonLease = struct {
 /// "12m · 4210/12629 33% · ~9m left", or "12m · ~34m left" from its label's history.
 fn sinceText(a: std.mem.Allocator, h: JsonHolder, now: i64) []const u8 {
     var b: [16]u8 = undefined;
-    const ran = a.dupe(u8, age(&b, now - h.since)) catch "?";
+    const ran = age(&b, now - h.since);
+    const how = progressText(a, h);
+    if (how.len == 0) return a.dupe(u8, ran) catch "?";
+    return a.print("{s} · {s}", .{ ran, how }) catch "?";
+}
+
+/// How far a running job is, "4210/12629 33% · 3 failing · ~9m left" from its own
+/// count, "~9m left" from its label's history; "" when neither is known.
+fn progressText(a: std.mem.Allocator, h: JsonHolder) []const u8 {
     var lb: [16]u8 = undefined;
-    const left = if (h.left) |l| a.dupe(u8, age(&lb, @intFromFloat(l))) catch "?" else "";
+    const left = if (h.left) |l| a.print("~{s} left", .{age(&lb, @intFromFloat(l))}) catch "" else "";
     if (h.progress) |p| {
         const pct = p.done * 100 / @max(p.total, 1);
         const failing = if (p.failing != 0) a.print(" · {d} failing", .{p.failing}) catch "" else "";
-        return a.print("{s} · {d}/{d} {d}%{s}{s}{s}", .{ ran, p.done, p.total, pct, failing, if (left.len != 0) " · ~" else "", if (left.len != 0) a.print("{s} left", .{left}) catch "" else "" }) catch ran;
+        return a.print("{d}/{d} {d}%{s}{s}{s}", .{ p.done, p.total, pct, failing, if (left.len != 0) " · " else "", left }) catch "";
     }
-    if (left.len != 0) return a.print("{s} · ~{s} left", .{ ran, left }) catch ran;
-    return ran;
+    // From history alone: an estimate, so it says what it's from.
+    const typical = h.typical orelse return "";
+    var tb: [16]u8 = undefined;
+    const usual = age(&tb, @intFromFloat(typical));
+    if (h.left) |l| if (l >= 1) return a.print("{s} (usually {s})", .{ left, usual }) catch "";
+    return a.print("over its usual {s}", .{usual}) catch "";
 }
 
 /// A label with its note after it, when it has one: "rig:corpus  #224 markers".
@@ -4595,6 +4651,9 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
             pid_text,                child_text,                    h.cores,   using_text,                                                                   if (h.exclusive) "excl" else h.priority,
             age(&b1, now - h.since), pad(&lbuf, withNote(ctx.arena, h.label, h.note), lw), h.command, if (h.holder_alive) "" else "  (cpuq gone; the command still has the cores)",
         }) catch {};
+        // How far it is, on a line of its own under the job, so the columns keep their places.
+        const how = progressText(ctx.arena, h);
+        if (how.len != 0) w.print("  {s:<8} {s}\n", .{ "", how }) catch {};
     }
     w.print("\nwaiters ({d})\n", .{waiters.len}) catch {};
     if (waiters.len != 0) w.print("  #    PID      CORES  PRIO    WAITING  {s} COMMAND\n", .{pad(&lbuf, "LABEL", lw)}) catch {};
