@@ -2,12 +2,13 @@ import AppKit
 import CpuqCore
 import Sparkle
 import SwiftUI
+import UserNotifications
 
 /// Cpuq.app: a window with a page per machine, and a chip in the menu bar that stays calm while
 /// all is well. While the window is open it is an ordinary app (Dock icon, menu bar, ⌘Tab); closed,
 /// only the chip remains (Settings can keep the Dock icon, or drop the chip). It only reads
 /// `cpuq status --json`; cpuq itself needs no app.
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
     private var menuOpen = false
@@ -26,6 +27,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var viewMenu: NSMenu?
     /// Ticks of the 3-second timer, for the once-a-minute look at cloud machines.
     private var ticks = 0
+    /// What has gone wrong and since when, for the notifications: one each time a thing goes
+    /// wrong and stays so, none again until it has come right.
+    private var gateShut = Episode()
+    private var idleWait = Episode()
+    private var cloudIdle: [String: Episode] = [:]
     private let sizeGuard = MinimumSize()
     private var historyTimer: Timer?
     /// Sparkle, running only in a Cpuq.app bundle: a binary run from the build folder never offers
@@ -54,6 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.applyShape() }
         }
+        setUpNotifications()
         poll()
         pollClouds()
         // An update relaunched the app with the graphs window open: open it again. A menu-bar
@@ -337,6 +344,105 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var tip = s.map { "cpuq: \($0.held) of \($0.capacity) cores in use" + ($0.waiters.isEmpty ? "" : " · \($0.waiters.count) waiting") } ?? "cpuq: \(problem ?? "cannot read cpuq")"
         for line in alerts() { tip += "\n" + line }
         item.button?.toolTip = tip
+        checkAlerts()
+    }
+
+    // MARK: - Notifications
+
+    private struct Episode {
+        var since: Date?
+        var told = false
+    }
+
+    /// Asks once to notify; a Stop It button on the cloud notification.
+    private func setUpNotifications() {
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        let stop = UNNotificationAction(identifier: "stop", title: "Stop It", options: [.destructive])
+        center.setNotificationCategories([UNNotificationCategory(identifier: "cloud", actions: [stop], intentIdentifiers: [])])
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    /// Three things worth an interruption, each once it has lasted: cpuq's gate shut (30 s), jobs
+    /// waiting beside idle CPUs (a minute), and a cloud machine up with nothing to do for 15
+    /// minutes, which means its own 10-minute idle stop failed and it is still billing.
+    private func checkAlerts() {
+        guard Prefs.notify else { return }
+        let now = Date()
+        if let s = status {
+            track(&gateShut, s.gate.state != "open", after: 30, now) {
+                notify("gate", "cpuq's gate is shut", "\(s.gate.text.prefix(1).uppercased() + s.gate.text.dropFirst()). New jobs wait until it opens.")
+            }
+            let m = Moment.now(graphs)
+            track(&idleWait, m.needless, after: 60, now) {
+                notify("idle", "\(m.waiters.count) waiting beside idle CPUs",
+                       String(format: "%.1f CPUs free on %@, and nothing starts: a job may be stuck, or asking for more than there is.", m.free, graphs.machine.name))
+            }
+        }
+        for c in remotes where c.machine.start != nil {
+            let idle = c.isCloudRunning && (c.status.map { $0.holders.isEmpty && $0.waiters.isEmpty } ?? false)
+            var e = cloudIdle[c.machine.id] ?? Episode()
+            track(&e, idle, after: 15 * 60, now) {
+                notify("cloud-\(c.machine.id)", "\(c.machine.name) is running with nothing to do",
+                       "Idle 15 minutes and still billing; it should have stopped itself after 10.", stop: stopCommand(for: c.machine))
+            }
+            cloudIdle[c.machine.id] = e
+        }
+    }
+
+    private func track(_ e: inout Episode, _ wrong: Bool, after: TimeInterval, _ now: Date, tell: () -> Void) {
+        guard wrong else { e = Episode(); return }
+        if e.since == nil { e.since = now }
+        if !e.told, let since = e.since, now.timeIntervalSince(since) >= after {
+            e.told = true
+            tell()
+        }
+    }
+
+    /// The command that stops a cloud machine: its start command's `stop` beside it (the
+    /// runbook's start and stop scripts), if there is one.
+    private func stopCommand(for machine: Machine) -> String? {
+        guard let start = machine.start, start.hasSuffix("/start") else { return nil }
+        let stop = String(start.dropLast("start".count)) + "stop"
+        let path = (stop as NSString).expandingTildeInPath
+        return FileManager.default.isExecutableFile(atPath: path) ? stop : nil
+    }
+
+    private func notify(_ id: String, _ title: String, _ body: String, stop: String? = nil) {
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        if let stop {
+            content.categoryIdentifier = "cloud"
+            content.userInfo = ["stop": stop]
+        }
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
+    }
+
+    /// Shown even while Cpuq is in front.
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                            withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    /// Stop It runs the machine's stop command; clicking the notification opens the window.
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                            withCompletionHandler completionHandler: @escaping () -> Void) {
+        let action = response.actionIdentifier
+        let stop = response.notification.request.content.userInfo["stop"] as? String
+        Task { @MainActor in
+            if action == "stop", let stop {
+                Task.detached(priority: .userInitiated) {
+                    _ = Self.shell(stop)
+                    await MainActor.run { self.pollClouds() }
+                }
+            } else {
+                self.showGraphs()
+            }
+        }
+        completionHandler()
     }
 
     /// "Cpuq 0.14.3 · cpuq 0.13.0", in grey: the app's version and the cpuq it reads.

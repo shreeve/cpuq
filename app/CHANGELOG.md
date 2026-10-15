@@ -3,6 +3,14 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.15.1 — 2026-10-15
+
+- Notifications, each once when something goes wrong and stays so, never again until it has come
+  right: cpuq's gate shut for 30 seconds; jobs waiting beside idle CPUs for a minute; a cloud
+  machine up with nothing to do for 15 minutes (its own 10-minute idle stop failed, and it is
+  billing), with a Stop It button that runs the machine's stop script. Clicking one opens the
+  window. Settings turns them off.
+
 ## 0.15.0 — 2026-10-15
 
 - An ordinary app while its window is open: a Dock icon, ⌘Tab, and a menu bar of its own (Cpuq:
