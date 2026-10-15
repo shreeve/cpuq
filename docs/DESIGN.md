@@ -322,12 +322,24 @@ A job's record carries `opaque=1` when it was started with `--opaque`. `measured
 a job its whole grant instead of its measured use, and an opaque waiter does not start while a
 window lends the machine; `freezeBeside` skips it.
 
-With `cpu_weights`, `runAdmitted` starts a core job as `systemd-run --user --scope --quiet
---collect --property=CPUWeight=GRANT×100 --unit=cpuq-LEASE-PID -- CMD...`. systemd-run moves itself
-into the new scope and execs CMD, so the pid cpuq tracks stays the command's. Whether scopes work
-is probed with `systemd-run --user --scope true` and remembered in `weights-ok` for ten minutes;
-without them, or off Linux, the command starts as it is. Timing windows and named leases are not
-weighted.
+With `cgroups` or `cpu_weights`, `runAdmitted` starts a core job as:
+
+    systemd-run --user --scope --quiet --collect --expand-environment=no
+        [--property=CPUWeight=GRANT×100] [--property=Delegate=yes --property=OOMPolicy=continue]
+        --unit=cpuq-LEASE-PID -- [cpuq _job --] CMD...
+
+- **The pid:** systemd-run moves itself into the new scope and execs; `cpuq _job` then moves itself
+  into the scope's `job/`, enables `+memory +pids` for the scope's children (allowed only once the
+  scope's own cgroup holds no process), exports the scope as `CPUQ_CGROUP`, and execs CMD. So the
+  pid cpuq tracks stays the command's.
+- **`--expand-environment=no`:** systemd 254 and later expand `$VAR` and `${VAR}` in the command
+  line themselves, before CMD's shell sees it: `sh -c 'echo ${x%/job}'` failed with "Invalid
+  environment variable name". The flag stops that. Older systemd, which lacks it, didn't expand.
+- **Probing:** whether scopes work, and with which flag, is probed once and kept in `weights-ok`
+  for ten minutes. Without them, or off Linux, CMD starts as it is.
+- **What isn't scoped:** timing windows and named leases.
+- **`OOMPolicy=continue`:** a capped program's cgroup running out of memory is that program's end,
+  not the job's.
 
 ## Fair turns, peaks, doctor and the hook
 

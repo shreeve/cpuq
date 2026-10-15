@@ -121,8 +121,14 @@ job measures idle and its cores would be handed out again. Give such a job `--op
 timing window (it couldn't be frozen), and `cpuq pause`/`stop` say they reach only the command
 cpuq started.
 
-**CPU weights (Linux).** With `cpu_weights = on`, each job runs in a systemd user scope of its
-own whose CPU weight is its grant (`systemd-run --user --scope`). On a crowded machine CPU time
+**A cgroup per job (Linux).** With `cgroups` (on by default), each job runs in a systemd user
+scope of its own, delegated to the user, and its command in that scope's `job/`. `$CPUQ_CGROUP`
+names the scope, so `cpuq cap` can give each program a test runner starts a cgroup of its own
+beside `job/`, with limits the kernel enforces. Where `systemd-run --user` doesn't work, jobs run
+as they are, and `cpuq cap` watches the slow way.
+
+**CPU weights (Linux).** With `cpu_weights = on`, each job's scope also has a CPU weight equal to
+its grant. On a crowded machine CPU time
 then divides in proportion to grants, so a job that starts more threads than it was granted
 (`zig build` without `-j`) slows only itself; on a quiet one a job can still use every CPU.
 Where `systemd-run --user` doesn't work, jobs run as they are. Work in a container stays in the
@@ -264,6 +270,34 @@ it, and every other command works the same without it.
 lingering where `loginctl` allows, so it runs without a login), restarted if it stops. It exits
 when its binary is replaced, so an upgrade restarts it on the new one. Cpuq.app reads its
 samples to draw the hour before the app was opened, on each machine.
+
+### cpuq cap
+
+    cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] -- PROGRAM [ARGS...]
+
+For a test runner that starts thousands of programs: it runs one under limits, so the runner
+needn't watch each one itself. A runner that lists every process (`ps`) for each program it runs
+can spend a large part of a big machine doing nothing else: one did, about 17 of 96 CPUs.
+
+| limit | what happens |
+|---|---|
+| `--mem SIZE` | PROGRAM and everything it started are stopped above SIZE (`2G`, `512M`) |
+| `--time DURATION` | stopped after DURATION (`120`, `120s`, `2m`, `500ms`) |
+| `--output SIZE` | stopped once it has written more than SIZE to stdout and stderr, which must be files or `/dev/null`; a pipe is refused |
+| `--pids N` | at most N processes and threads at once (inside a job on Linux) |
+
+- **Exit status:** PROGRAM's own, or death by its signal. When cpuq stopped it, it's 122 for
+  memory, 124 for time and 121 for output, each with one line on stderr. 127 means PROGRAM
+  wasn't found.
+- **Inside a cpuq job on Linux:** PROGRAM is born in a cgroup of its own beside the job's
+  (`clone3` into it, with no write to `cgroup.procs`, which would stall every fork on the
+  machine). The cgroup has `memory.max`, no swap and `memory.oom.group`, so the kernel stops it
+  at the limit: within milliseconds, with nothing polling. Everything it started is stopped with
+  it, even what left its process group.
+- **Elsewhere** (macOS, or Linux outside a job): PROGRAM gets its own process group, and its
+  memory is read once a second from its own process tree, never from a list of every process.
+- **Either way:** PROGRAM's end wakes cpuq at once, and anything PROGRAM left running is stopped.
+  It costs about half a millisecond a call.
 
 ### Cpuq.app (macOS)
 
@@ -544,7 +578,8 @@ re-reads the file when it changes; an invalid edit keeps the settings in force a
 | `spill_env.HOST` | none | shell assignments a spilled job exports on HOST, e.g. `PATH=$HOME/.local/go/bin:$PATH` |
 | `exclusive` | on | grant `--exclusive`; off, it runs as an ordinary job |
 | `window_gap` | 0 | seconds after an exclusive run ends during which waiting ones go behind other work |
-| `cpu_weights` | off | Linux: run each job in a scope weighted by its grant |
+| `cgroups` | on | Linux: run each job in a delegated systemd scope, its command in `job/`, for `cpuq cap` |
+| `cpu_weights` | off | Linux: weight each job's scope by its grant |
 | `window_lend` | 0 | seconds a `--hold --exclusive` window's owner idles before it lends the machine (measured only; 0: never) |
 | `budget` | active CPUs - 2 | cores an exclusive run takes; under `admit = cores`, the cores to hand out |
 | `active_cap` | on | cap the budget by the CPUs active now |

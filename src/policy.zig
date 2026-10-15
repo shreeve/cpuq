@@ -131,6 +131,11 @@ pub const Config = struct {
     /// on a crowded machine CPU time divides by grant, however many threads
     /// a job starts; on a quiet one it limits nothing (`cpu_weights`).
     cpu_weights: bool = false,
+    /// Linux: run each job in a delegated cgroup of its own (a systemd user
+    /// scope), its command in the scope's `job/`, so `cpuq cap` can give each
+    /// program a test runner starts a cgroup beside it, with limits the
+    /// kernel enforces (`cgroups`).
+    cgroups: bool = true,
     /// The machines `cpuq run --spill` may send a job to when this one is
     /// full, in the order tried: ssh names, separated by commas or spaces
     /// (`spill`).
@@ -230,6 +235,8 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             cfg.lend_after_s = parseCount(value) orelse return bad(diag, "lend_after must be a whole number of seconds, at least 1");
         } else if (std.mem.eql(u8, key, "window_gap")) {
             cfg.window_gap_s = std.fmt.parseInt(u32, value, 10) catch return bad(diag, "window_gap must be a whole number of seconds");
+        } else if (std.mem.eql(u8, key, "cgroups")) {
+            cfg.cgroups = parseBool(value) orelse return bad(diag, "cgroups must be on or off");
         } else if (std.mem.eql(u8, key, "cpu_weights")) {
             cfg.cpu_weights = parseBool(value) orelse return bad(diag, "cpu_weights must be on or off");
         } else if (std.mem.eql(u8, key, "window_lend")) {

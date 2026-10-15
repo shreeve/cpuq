@@ -10,8 +10,10 @@ const sys = @import("sys.zig");
 const history = @import("history.zig");
 const hook = @import("hook.zig");
 const table = @import("table.zig");
+const cap = @import("cap.zig");
 
 test {
+    _ = cap;
     _ = hook;
     _ = policy;
     _ = state;
@@ -32,6 +34,7 @@ const usage =
     \\       cpuq doctor [--host HOST]
     \\       cpuq record [--interval SECONDS] | --install | --uninstall
     \\       cpuq samples [--since UNIX-SECONDS]
+    \\       cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] -- PROGRAM [ARGS...]
     \\       cpuq hook                (an agent harness's pre-command hook)
     \\       cpuq budget | qos | --version | --help
     \\
@@ -81,6 +84,10 @@ const usage =
     \\                        waiting, gate) into a day of samples beside the history;
     \\                        --install keeps it running (launchd / systemd --user)
     \\  samples               the recorded samples since a time, one JSON line each
+    \\  cap                   run one program under limits on its memory, time and output:
+    \\                        for a test runner, around each program it starts (exit 122
+    \\                        memory, 124 time, 121 output); a cgroup of its own inside a job
+    \\                        on Linux, its own process tree read once a second elsewhere
     \\  hook                  Claude Code PreToolUse hook: refuses heavy commands
     \\                        outside cpuq or misusing it (exit 2, fix on stderr)
     \\  budget | qos          print the budget | this process's scheduling class
@@ -149,6 +156,8 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
         return 0;
     }
     if (std.mem.eql(u8, cmd, "hook")) return cmdHook(ctx);
+    if (std.mem.eql(u8, cmd, "_job")) return cmdJob(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "cap")) return cap.main(ctx.arena, args[1..], ctx.env.get("CPUQ_CGROUP"), ctx.env.get("PATH"));
     if (std.mem.eql(u8, cmd, "run")) return cmdRun(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "lease")) return cmdLease(ctx, args[1..]);
     loadConfig(ctx);
@@ -1779,10 +1788,12 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
     if (o.lease == null and !lease.record.exclusive) own_lease = .{ .st = st, .name = lease.name };
     const qos_enabled = ctx.cfg.qos and o.qos and o.lease == null;
     const qos: policy.Qos = if (lease.borrowed > 0 and qos_enabled and policy.borrowersYield()) .background else policy.qosFor(o.priority, o.exclusive, qos_enabled);
-    // Linux, `cpu_weights`: the job runs in a cgroup of its own weighted by
-    // its grant (a systemd user scope), so a crowded machine's CPU time
-    // divides by grant however many threads a job starts.
-    const weighted: ?[*:null]const ?[*:0]const u8 = if (o.lease == null and !lease.record.exclusive and ctx.cfg.cpu_weights) weightedArgv(ctx, exe, argv, k, lease.name) else null;
+    // Linux: the job runs in a systemd user scope of its own. With `cgroups`
+    // the scope is delegated, and the command runs in its `job/`, so
+    // `cpuq cap` can make cgroups beside it (CPUQ_CGROUP); with `cpu_weights`
+    // it is weighted by its grant, so a crowded machine's CPU time divides by
+    // grant however many threads a job starts.
+    const weighted: ?[*:null]const ?[*:0]const u8 = if (o.lease == null and !lease.record.exclusive and (ctx.cfg.cpu_weights or ctx.cfg.cgroups)) weightedArgv(ctx, exe, argv, k, lease.name) else null;
     const spawned = if (weighted) |wv| sys.spawn(wv[0].?, wv, @ptrCast(envp.slice.ptr), qos) else sys.spawn(exe, argv.ptr, @ptrCast(envp.slice.ptr), qos);
     if (pipe[0] >= 0) sys.closeFd(pipe[0]);
     if (pipe[1] >= 0) sys.closeFd(pipe[1]);
@@ -1812,47 +1823,133 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
     }
 }
 
-/// `systemd-run --user --scope -p CPUWeight=W -- EXE ARGS...` for a job of
-/// `cores`, when this is Linux with a user systemd that can make scopes;
-/// else null, and the job runs as it is. systemd-run execs the command in
-/// place, so its pid stays the job's. Whether scopes work is probed once and
-/// remembered for ten minutes ("weights-ok" in the state directory), so a
-/// job never fails for want of one.
+/// `systemd-run --user --scope [-p CPUWeight=W] [-p Delegate=yes ...] --
+/// [cpuq _job --] EXE ARGS...` for a job of `cores`, when this is Linux with
+/// a user systemd that can make scopes; else null, and the job runs as it is.
+/// systemd-run and `cpuq _job` exec the command in place, so its pid stays
+/// the job's. Whether scopes work is probed once and remembered for ten
+/// minutes ("weights-ok" in the state directory), so a job never fails for
+/// want of one.
 fn weightedArgv(ctx: *Ctx, exe: [:0]const u8, argv: [:null]?[*:0]const u8, cores: u32, lease_name: []const u8) ?[*:null]const ?[*:0]const u8 {
     if (@import("builtin").os.tag != .linux) return null;
     const run = findExecutable(ctx, "systemd-run") orelse return null;
-    if (!scopesWork(ctx, run)) return null;
+    const scopes = scopesWork(ctx, run);
+    if (scopes == .none) return null;
     const a = ctx.arena;
-    const weight = std.math.clamp(@as(u64, cores) * 100, 1, 10000);
-    const head = [_][]const u8{
-        run,                                                              "--user",                                                                        "--scope", "--quiet", "--collect",
-        a.print("--property=CPUWeight={d}", .{weight}) catch return null, a.print("--unit=cpuq-{s}-{d}", .{ lease_name, sys.getpid() }) catch return null, "--",
-    };
-    const out = a.allocSentinel(?[*:0]const u8, head.len + 1 + argv.len - 1, null) catch return null;
-    for (head, 0..) |h, i| out[i] = (a.dupeSentinel(u8, h, 0) catch return null).ptr;
-    out[head.len] = exe.ptr;
-    for (argv[1..], 0..) |v, i| out[head.len + 1 + i] = v;
+    var head: std.ArrayList([]const u8) = .empty;
+    head.appendSlice(a, &.{ run, "--user", "--scope", "--quiet", "--collect" }) catch return null;
+    // systemd 254 and later expand $VAR and ${VAR} in the command line themselves, before
+    // the command's shell sees it: `sh -c 'echo ${x%/job}'` would fail, or quietly change.
+    if (scopes == .literal) head.append(a, "--expand-environment=no") catch return null;
+    if (ctx.cfg.cpu_weights) {
+        const weight = std.math.clamp(@as(u64, cores) * 100, 1, 10000);
+        head.append(a, a.print("--property=CPUWeight={d}", .{weight}) catch return null) catch return null;
+    }
+    // A cgroup OOM inside the job (a capped program's) is the program's
+    // business: the job goes on.
+    const self: ?[]const u8 = if (ctx.cfg.cgroups) selfExe(a) else null;
+    if (self != null) head.appendSlice(a, &.{ "--property=Delegate=yes", "--property=OOMPolicy=continue" }) catch return null;
+    head.append(a, a.print("--unit=cpuq-{s}-{d}", .{ lease_name, sys.getpid() }) catch return null) catch return null;
+    head.append(a, "--") catch return null;
+    if (self) |s| head.appendSlice(a, &.{ s, "_job", "--" }) catch return null;
+    const out = a.allocSentinel(?[*:0]const u8, head.items.len + 1 + argv.len - 1, null) catch return null;
+    for (head.items, 0..) |h, i| out[i] = (a.dupeSentinel(u8, h, 0) catch return null).ptr;
+    out[head.items.len] = exe.ptr;
+    for (argv[1..], 0..) |v, i| out[head.items.len + 1 + i] = v;
     return out.ptr;
 }
 
-/// Whether `systemd-run --user --scope` works here: tried once, the answer
-/// kept ten minutes.
-fn scopesWork(ctx: *Ctx, run: [:0]const u8) bool {
+/// This binary's own path (Linux: /proc/self/exe), for `cpuq _job`.
+fn selfExe(a: std.mem.Allocator) ?[]const u8 {
+    var buf: [4096]u8 = undefined;
+    const n = std.c.readlink("/proc/self/exe", &buf, buf.len);
+    if (n <= 0) return null;
+    return a.dupe(u8, buf[0..@intCast(n)]) catch null;
+}
+
+/// `cpuq _job -- EXE ARGS...`, run by systemd-run inside a job's delegated
+/// scope: moves itself into the scope's `job/`, enables the memory and pids
+/// controllers for the scope's children (which needs the scope's own cgroup
+/// empty of processes, hence the move), exports the scope as CPUQ_CGROUP for
+/// `cpuq cap`, and execs the command in place. If any of that fails, the
+/// command runs anyway, without CPUQ_CGROUP: caps then watch the slow way.
+fn cmdJob(ctx: *Ctx, args: []const [:0]const u8) u8 {
+    var i: usize = 0;
+    if (i < args.len and std.mem.eql(u8, args[i], "--")) i += 1;
+    if (i >= args.len) return usageError("_job needs -- EXE [ARGS...]", .{});
+    const a = ctx.arena;
+    if (@import("builtin").os.tag == .linux) delegate: {
+        var buf: [1024]u8 = undefined;
+        const fd = std.c.open("/proc/self/cgroup", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+        if (fd < 0) break :delegate;
+        const n = std.c.read(fd, &buf, buf.len);
+        _ = std.c.close(fd);
+        if (n <= 0) break :delegate;
+        const text: []const u8 = buf[0..@intCast(n)];
+        const line = std.mem.sliceTo(text[(std.mem.find(u8, text, "0::") orelse break :delegate) + 3 ..], '\n');
+        const scope = a.print("/sys/fs/cgroup{s}", .{line}) catch break :delegate;
+        const job = a.printSentinel("{s}/job", .{scope}, 0) catch break :delegate;
+        if (std.c.mkdir(job, 0o755) != 0 and std.c.errno(-1) != .EXIST) break :delegate;
+        if (!writeSmall(a.printSentinel("{s}/job/cgroup.procs", .{scope}, 0) catch break :delegate, "0")) break :delegate;
+        if (!writeSmall(a.printSentinel("{s}/cgroup.subtree_control", .{scope}, 0) catch break :delegate, "+memory +pids")) break :delegate;
+        ctx.env.put("CPUQ_CGROUP", scope) catch break :delegate;
+    }
+    const argv = a.allocSentinel(?[*:0]const u8, args.len - i, null) catch fail("out of memory", .{});
+    for (args[i..], 0..) |v, k| argv[k] = v.ptr;
+    const envp = ctx.env.createPosixBlock(a, .{}) catch fail("out of memory", .{});
+    _ = std.c.execve(args[i].ptr, argv.ptr, @ptrCast(envp.slice.ptr));
+    std.debug.print("cpuq: {s}: can't be run\n", .{args[i]});
+    return if (std.c.errno(-1) == .NOENT) exit_notfound else exit_noexec;
+}
+
+fn writeSmall(path: [:0]const u8, value: []const u8) bool {
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+    if (fd < 0) return false;
+    defer _ = std.c.close(fd);
+    return std.c.write(fd, value.ptr, value.len) == @as(isize, @intCast(value.len));
+}
+
+const Scopes = enum {
+    none,
+    /// Scopes work, and systemd-run passes the command line as it is.
+    plain,
+    /// Scopes work, with `--expand-environment=no` (systemd 254 and later, which expand
+    /// variables in the command line otherwise).
+    literal,
+};
+
+/// Whether `systemd-run --user --scope` works here, and how to keep it from
+/// expanding variables in a command line: tried once, the answer kept ten
+/// minutes ("weights-ok" in the state directory, holding "literal" or
+/// "plain").
+fn scopesWork(ctx: *Ctx, run: [:0]const u8) Scopes {
     const io = ctx.io;
-    const path = std.mem.concat(ctx.arena, u8, &.{ stateDir(ctx), "/weights-ok" }) catch return false;
+    const path = std.mem.concat(ctx.arena, u8, &.{ stateDir(ctx), "/weights-ok" }) catch return .none;
     const cwd = Io.Dir.cwd();
     if (cwd.statFile(io, path, .{})) |st| {
         const age_ns = Io.Clock.real.now(io).toNanoseconds() - st.mtime.toNanoseconds();
-        if (age_ns >= 0 and age_ns < 600 * std.time.ns_per_s) return true;
+        if (age_ns >= 0 and age_ns < 600 * std.time.ns_per_s) {
+            var buf: [16]u8 = undefined;
+            const kept = cwd.readFile(io, path, &buf) catch "";
+            return if (std.mem.startsWith(u8, kept, "plain")) .plain else .literal;
+        }
     } else |_| {}
-    var child = std.process.spawn(io, .{ .argv = &.{ run, "--user", "--scope", "--quiet", "--collect", "true" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
-    const term = child.wait(io) catch return false;
-    const ok = switch (term) {
-        .exited => |code| code == 0,
-        else => false,
+    const tries = [_]struct { scopes: Scopes, argv: []const []const u8 }{
+        .{ .scopes = .literal, .argv = &.{ run, "--user", "--scope", "--quiet", "--collect", "--expand-environment=no", "true" } },
+        .{ .scopes = .plain, .argv = &.{ run, "--user", "--scope", "--quiet", "--collect", "true" } },
     };
-    if (ok) cwd.writeFile(io, .{ .sub_path = path, .data = "" }) catch {};
-    return ok;
+    for (tries) |t| {
+        var child = std.process.spawn(io, .{ .argv = t.argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return .none;
+        const term = child.wait(io) catch return .none;
+        const ok = switch (term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+        if (!ok) continue;
+        cwd.writeFile(io, .{ .sub_path = path, .data = @tagName(t.scopes) }) catch {};
+        return t.scopes;
+    }
+    return .none;
 }
 
 /// Gives a lease back. LOCK_UN releases each lock for every holder of the

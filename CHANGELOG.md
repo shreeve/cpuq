@@ -2,6 +2,21 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.17.0 — 2026-10-15
+
+- `cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] -- PROGRAM`: one program under
+  limits, for a test runner that starts thousands. Exit 122, 124 or 121 when stopped for memory,
+  time or output; PROGRAM's own status otherwise. Inside a cpuq job on Linux, the kernel enforces
+  the memory limit on a cgroup of PROGRAM's own: born there by `clone3`, stopped within
+  milliseconds, everything it started with it. Elsewhere, memory is read once a second from
+  PROGRAM's own process tree. About half a millisecond a call.
+- Each Linux job runs in a delegated systemd scope of its own, its command in `job/`, with
+  `CPUQ_CGROUP` naming the scope (`cgroups`, on by default; `cpu_weights` still only adds the
+  weight).
+- A job's command line is no longer changed by systemd-run: systemd 254 and later expanded `$VAR`
+  and `${VAR}` in it before the command's shell saw it, so `${x%/job}` failed under
+  `cpu_weights`.
+
 ## 0.16.3 — 2026-10-15
 
 - `--spill-to HOST` exits 125 when the repo can't be copied to HOST, rather than running the job

@@ -71,6 +71,16 @@ that machine's own cpuq:
 
 Never run it there outside cpuq: its queue can't share what it doesn't see.
 
+## Test runners
+
+A runner that starts many programs limits each with `cpuq cap` rather than watching them itself
+(never a `ps` of the whole machine per program):
+
+    cpuq cap --mem 2G --time 120s --output 1M -- PROGRAM ARGS...
+
+It exits with PROGRAM's status, or 122 (memory), 124 (time) or 121 (output) when it stopped it.
+stdout and stderr must be files for `--output`.
+
 ## Exit status
 
 - CMD's own status passes through; 128+N: CMD was killed by signal N.

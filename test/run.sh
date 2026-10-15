@@ -968,12 +968,54 @@ t_cpu_weights() {
   # cpu_weights (Linux with a user systemd): each job runs in a scope of its
   # own weighted by its grant; elsewhere, or off, jobs run as they are.
   setup cpu-weights "cpu_weights = on"
-  local got; got=$({ "$CPUQ" run --cores 3 --label weighed -- sh -c 'g=$(cut -d: -f3 /proc/self/cgroup 2>/dev/null); echo "$g $(cat /sys/fs/cgroup$g/cpu.weight 2>/dev/null)"'; echo "rc=$?"; } | tr '\n' ' ')
+  # The command runs in the scope's job/ (cgroups is on by default); the weight is the scope's.
+  local got; got=$({ "$CPUQ" run --cores 3 --label weighed -- sh -c 'g=$(cut -d: -f3 /proc/self/cgroup 2>/dev/null | sed "s|/job\$||"); echo "$g $(cat /sys/fs/cgroup$g/cpu.weight 2>/dev/null)"'; echo "rc=$?"; } | tr '\n' ' ')
   if [ "$(uname)" = Linux ] && systemd-run --user --scope --quiet true 2>/dev/null; then
     check "with cpu_weights a job runs in a scope weighted by its grant (got $got)" "[[ '$got' == *'/cpuq-'*'.scope 300 rc=0 ' ]]"
   else
     check "without a user systemd, cpu_weights leaves the job as it is (got $got)" "[[ '$got' == *'rc=0 ' ]]"
   fi
+}
+
+t_cap() {
+  # cpuq cap: one program under limits; its own exit otherwise.
+  setup cap
+  "$CPUQ" cap -- sh -c 'exit 7'; local rc_exit=$?
+  "$CPUQ" cap -- cpuq-test-no-such-program 2>/dev/null; local rc_missing=$?
+  local t0; t0=$(now)
+  "$CPUQ" cap --time 1s -- sleep 30 2>/dev/null; local rc_time=$?
+  local dt; dt=$(python3 -c "print('%.1f' % ($(now) - $t0))")
+  "$CPUQ" cap --mem 64M -- python3 -c 'import time; x = bytearray(256 << 20); time.sleep(10)' 2>/dev/null; local rc_mem=$?
+  # A grandchild that leaves the group (": " keeps sh as its parent, not a group leader it became).
+  "$CPUQ" cap --mem 64M -- sh -c 'python3 -c "import os, time; os.setsid(); x = bytearray(256 << 20); time.sleep(10)"; :' 2>/dev/null; local rc_escaped=$?
+  "$CPUQ" cap --output 1K -- sh -c 'head -c 100000 /dev/zero; sleep 10' >"$T/out" 2>"$T/err"; local rc_out=$?
+  "$CPUQ" cap --output 1K -- true 2>/dev/null | cat; local rc_pipe=${PIPESTATUS[0]}
+  "$CPUQ" cap -- sh -c 'kill -TERM $$'; local rc_sig=$?
+  "$CPUQ" cap --mem 1G -- sh -c 'sleep 77 & exit 0'; sleep 0.3
+  local left=0; pgrep -f '^sleep 77$' >/dev/null && left=1
+  check "cap passes the exit on (7: $rc_exit), not found 127 ($rc_missing), time 124 ($rc_time after ${dt}s), memory 122 ($rc_mem; escaped the group: $rc_escaped), output 121 ($rc_out), a pipe refused 2 ($rc_pipe), a signal as itself 143 ($rc_sig), nothing left behind ($left)" "[ $rc_exit = 7 ] && [ $rc_missing = 127 ] && [ $rc_time = 124 ] && python3 -c 'import sys; sys.exit(0 if $dt < 3 else 1)' && [ $rc_mem = 122 ] && [ $rc_escaped = 122 ] && [ $rc_out = 121 ] && [ $rc_pipe = 2 ] && [ $rc_sig = 143 ] && [ $left = 0 ]"
+}
+
+t_cgroups() {
+  # Linux with a user systemd: a job runs in a delegated scope, its command in job/, with
+  # CPUQ_CGROUP naming the scope, and a cap inside it gets a cgroup of its own the kernel stops
+  # at the limit (far sooner than the once-a-second read elsewhere).
+  setup cgroups
+  if [ "$(uname)" != Linux ] || ! systemd-run --user --scope --quiet true 2>/dev/null; then
+    local got; got=$("$CPUQ" run --cores 1 --label plain -- sh -c 'echo "cg=${CPUQ_CGROUP:-none}"')
+    check "without a user systemd a job runs as it is (got $got)" "[ '$got' = 'cg=none' ]"
+    return
+  fi
+  local got; got=$("$CPUQ" run --cores 1 --label delegated -- sh -c 'echo "$(cut -d: -f3 /proc/self/cgroup) $CPUQ_CGROUP $(cat "$CPUQ_CGROUP/cgroup.subtree_control")"')
+  local t0; t0=$(now)
+  "$CPUQ" run --cores 1 --label capped -- "$CPUQ" cap --mem 64M -- python3 -c 'import time; x = bytearray(256 << 20); time.sleep(10)' 2>/dev/null; local rc=$?
+  local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
+  check "a job runs in its scope's job/ with CPUQ_CGROUP and memory for its children (got $got); a cap there is stopped by the kernel ($rc after ${dt}s)" "[[ '$got' == *'.scope/job /sys/fs/cgroup/'*'.scope '*memory* ]] && [ $rc = 122 ] && python3 -c 'import sys; sys.exit(0 if $dt < 0.9 else 1)'"
+  # A command's own ${...} reaches its shell untouched: systemd-run (254 and later) would expand it.
+  local lit; lit=$("$CPUQ" run --cores 1 --label literal -- sh -c 'x=abc/job; echo "${x%/job}"' 2>&1)
+  check "a job's \${x%/job} reaches its shell (got '$lit')" "[ '$lit' = abc ]"
+  local off; off=$(sed 's/^cgroups.*//' "$CPUQ_CONFIG" > "$T/c" && echo "cgroups = off" >> "$T/c" && CPUQ_CONFIG="$T/c" "$CPUQ" run --cores 1 --label plain -- sh -c 'echo "cg=${CPUQ_CGROUP:-none}"')
+  check "cgroups = off leaves a job as it is (got $off)" "[ '$off' = 'cg=none' ]"
 }
 
 t_hook() {
@@ -1532,7 +1574,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to tethered record status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to tethered record cap cgroups status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"
