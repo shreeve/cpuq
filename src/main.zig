@@ -39,7 +39,7 @@ const usage =
     \\       cpuq samples [--since UNIX-SECONDS]
     \\       cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] -- PROGRAM [ARGS...]
     \\       cpuq note PID|LABEL TEXT [--all] [--host HOST]
-    \\       cpuq submit SPEC [-- ARGS] [--env K=V]... [--replace | --again]
+    \\       cpuq submit SPEC [--note TEXT] [--env K=V]... [--replace | --again] [-- ARGS]
     \\       cpuq packs [--host HOST] | cpuq packs install NAME@VERSION... [--host HOST]
     \\       cpuq jobs [--all]
     \\       cpuq job [ID|last] [--wait [--max-wait S]] [--tail N] [--json] [--cancel]

@@ -95,9 +95,11 @@ More: README's "Big jobs on a cloud host".
 
 Where a repo keeps specs in `cpuq/*.json`, heavy work goes through them:
 
-    cpuq submit cpuq/suite.json [-- TEST FILTER]
+    cpuq submit cpuq/suite.json [--note "#PR branch"] [-- TEST FILTER]
 
 - **Run it in the background.** You're notified when it ends.
+- **The spec comes from your own worktree** (`cpuq/*.json` there): it ships the repo it sits in.
+- **`--note "#PR branch"`** shows beside the label everywhere; without it, the branch.
 - **The last line is the verdict, and the exit status matches it:**
   - PASS 0 and FAIL 1 are your code; the failures are printed above the verdict.
   - TIMEOUT and OOM are limits, often a hang or a leak in your change: `cpuq job ID --tail 100`.
