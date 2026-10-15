@@ -487,6 +487,7 @@ rest:
 - **Supervised:** killing `cpuq submit` never stops the job. `cpuq job ID --wait` follows it
   again.
 - **The note:** `--note`, or else the worktree's branch, shows beside the label everywhere.
+  `cpuq note PID|LABEL TEXT [--host HOST]` changes a running job's note.
 - **What travels:**
   - everything in the repo but `exclude`;
   - a directory holding something like a credential (`.env`, `*.pem`, `id_*`) is refused;

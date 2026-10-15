@@ -1036,6 +1036,12 @@ t_note() {
   wait
   local hist; hist=$("$CPUQ" history --json | python3 -c 'import json, sys; j = json.load(sys.stdin)[0]; print(j["label"], "|", j["note"])')
   check "--note travels beside the label (status: $got; history: $hist)" "[ '$got' = 'proj:build | #224 markers' ] && [ '$hist' = 'proj:build | #224 markers' ]"
+  # A running job's note can be set afterwards (its PR opened later).
+  "$CPUQ" run --cores 1 --label proj:test -- sleep 2 & wait_held 1
+  "$CPUQ" note proj:test "#229 inline" >/dev/null
+  local later; later=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print(json.load(sys.stdin)["holders"][0]["note"])')
+  wait
+  check "cpuq note sets a running job's note (got '$later')" "[ '$later' = '#229 inline' ]"
 }
 
 t_submit() {

@@ -2,6 +2,12 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.18.2 — 2026-10-15
+
+- `cpuq note PID|LABEL TEXT [--all] [--host HOST]`: sets a running or waiting job's note after it
+  started (its PR opened later). `--host` sets it through that machine's cpuq, for a job sent
+  there. History keeps the note a job started with.
+
 ## 0.18.1 — 2026-10-15
 
 - A job sent to another machine (`--spill`, `--spill-to`) without `--note` is noted with the

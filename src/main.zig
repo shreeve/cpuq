@@ -37,6 +37,7 @@ const usage =
     \\       cpuq record [--interval SECONDS] | --install | --uninstall
     \\       cpuq samples [--since UNIX-SECONDS]
     \\       cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] -- PROGRAM [ARGS...]
+    \\       cpuq note PID|LABEL TEXT [--all] [--host HOST]
     \\       cpuq submit SPEC [-- ARGS] [--env K=V]... [--replace | --again]
     \\       cpuq jobs [--all]
     \\       cpuq job [ID|last] [--wait [--max-wait S]] [--tail N] [--json] [--cancel]
@@ -189,6 +190,7 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
         }
     }
     if (std.mem.eql(u8, cmd, "samples")) return cmdSamples(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "note")) return cmdNote(ctx, args[1..]);
     inline for (.{ "first", "start", "cancel", "pause", "resume", "stop" }) |action| {
         if (std.mem.eql(u8, cmd, action)) return cmdControl(ctx, action, args[1..]);
     }
@@ -2765,6 +2767,69 @@ fn namedLeases(ctx: *Ctx, a: std.mem.Allocator) []const []const u8 {
 /// to the command's whole process tree, or SIGTERM to its cpuq, which passes
 /// it on. A paused job's cores count as idle, so they are lent at once.
 /// Nothing touches an exclusive run. Several matches need --all.
+/// `cpuq note PID|LABEL TEXT [--all] [--host HOST]`: sets what a running or waiting job is for,
+/// after it started (its PR opened later, say). Only the note changes: not its label, nor how
+/// it's sized or timed.
+fn cmdNote(ctx: *Ctx, args: []const [:0]const u8) u8 {
+    var target: ?[]const u8 = null;
+    var text: ?[]const u8 = null;
+    var all = false;
+    var host: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg: []const u8 = args[i];
+        if (std.mem.eql(u8, arg, "--all")) {
+            all = true;
+        } else if (std.mem.eql(u8, arg, "--host") and i + 1 < args.len) {
+            i += 1;
+            host = args[i];
+        } else if (target == null) target = arg else if (text == null) text = arg else return usageError("note takes a job (pid or label) and the text", .{});
+    }
+    const t = target orelse return usageError("note needs a job: a cpuq pid or a label (PATTERN* for a prefix), then the text", .{});
+    const note_text = text orelse return usageError("note needs the text: cpuq note {s} \"#229 inline\"", .{t});
+    if (host) |h| {
+        const remote = ctx.arena.print("cpuq note {s} {s}{s}", .{ shellQuote(ctx.arena, t), shellQuote(ctx.arena, note_text), if (all) " --all" else "" }) catch return exit_failure;
+        const r = std.process.run(ctx.arena, ctx.io, .{ .argv = &.{ "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", h, remote } }) catch return exit_failure;
+        ctx.out.writeAll(r.stdout) catch {};
+        std.debug.print("{s}", .{r.stderr});
+        return switch (r.term) {
+            .exited => |c| c,
+            else => exit_failure,
+        };
+    }
+    const pid: ?i32 = std.fmt.parseInt(i32, t, 10) catch null;
+    var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var st = openState(ctx);
+    lockOrFail(&st);
+    defer st.unlock();
+    const Hit = struct { dir: Io.Dir, e: state.Entry };
+    var hits: std.ArrayList(Hit) = .empty;
+    const leases = state.scanLeases(&st, a, false) catch @as([]state.Entry, &.{});
+    const queue = state.scanQueue(&st, a, null, .{}, nowSeconds(ctx.io), ctx.cfg.aging_s) catch @as([]state.Entry, &.{});
+    for (leases) |e| if (if (pid) |p| e.record.pid == p else labelMatches(t, e.record.label)) hits.append(a, .{ .dir = st.leases, .e = e }) catch {};
+    for (queue) |e| if (if (pid) |p| e.record.pid == p else labelMatches(t, e.record.label)) hits.append(a, .{ .dir = st.queue, .e = e }) catch {};
+    if (hits.items.len == 0) {
+        std.debug.print("cpuq: no running or waiting job matches '{s}'\n", .{t});
+        return exit_failure;
+    }
+    if (hits.items.len > 1 and !all) {
+        std.debug.print("cpuq: '{s}' matches {d} jobs; name one by pid, or add --all:\n", .{ t, hits.items.len });
+        for (hits.items) |h| std.debug.print("  {d}  {s}  {s}\n", .{ h.e.record.pid, h.e.record.label, h.e.record.note });
+        return exit_usage;
+    }
+    for (hits.items) |h| {
+        var r = h.e.record;
+        r.note = note_text;
+        const f = h.dir.openFile(ctx.io, h.e.name, .{ .mode = .read_write }) catch continue;
+        defer f.close(ctx.io);
+        rewriteRecord(ctx.io, f, r);
+        ctx.out.print("note: {s} (pid {d}): {s}\n", .{ if (r.label.len != 0) r.label else r.cmd, r.pid, note_text }) catch {};
+    }
+    return 0;
+}
+
 fn cmdControl(ctx: *Ctx, comptime action: []const u8, args: []const [:0]const u8) u8 {
     var target: ?[]const u8 = null;
     var all = false;
