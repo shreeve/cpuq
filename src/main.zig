@@ -32,7 +32,7 @@ const usage =
     \\       cpuq wait --label PATTERN [--max-wait SECONDS]
     \\       cpuq status [--host HOST]... [--json] [--no-usage] [--watch[=SECONDS]]
     \\       cpuq history [--label PATTERN] [--limit N] [--json]
-    \\       cpuq first|start|cancel|pause|resume|stop LABEL|PID [--all]
+    \\       cpuq first|start|cancel|pause|resume|stop LABEL|PID [--all] [--host HOST]
     \\       cpuq doctor [--host HOST]
     \\       cpuq record [--interval SECONDS] | --install | --uninstall
     \\       cpuq samples [--since UNIX-SECONDS]
@@ -2774,7 +2774,7 @@ fn namedLeases(ctx: *Ctx, a: std.mem.Allocator) []const []const u8 {
 
 /// `cpuq wait --label PATTERN [--max-wait S]`: blocks until no job whose
 /// label matches holds cores or a lease, or waits for either.
-/// `cpuq first|start|cancel|pause|resume|stop TARGET [--all]`: a hand at the
+/// `cpuq first|start|cancel|pause|resume|stop TARGET [--all] [--host HOST]`: a hand at the
 /// queue. TARGET is a label (`PATTERN*` for a prefix) or a cpuq pid. first,
 /// start and cancel act on waiters: each leaves an order its waiter takes at
 /// its next look (the head looks every `poll`, the next waiters every 2
@@ -2802,16 +2802,7 @@ fn cmdNote(ctx: *Ctx, args: []const [:0]const u8) u8 {
     }
     const t = target orelse return usageError("note needs a job: a cpuq pid or a label (PATTERN* for a prefix), then the text", .{});
     const note_text = text orelse return usageError("note needs the text: cpuq note {s} \"#229 inline\"", .{t});
-    if (host) |h| {
-        const remote = ctx.arena.print("cpuq note {s} {s}{s}", .{ shellQuote(ctx.arena, t), shellQuote(ctx.arena, note_text), if (all) " --all" else "" }) catch return exit_failure;
-        const r = std.process.run(ctx.arena, ctx.io, .{ .argv = &.{ "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", h, remote } }) catch return exit_failure;
-        ctx.out.writeAll(r.stdout) catch {};
-        std.debug.print("{s}", .{r.stderr});
-        return switch (r.term) {
-            .exited => |c| c,
-            else => exit_failure,
-        };
-    }
+    if (host) |h| return onHost(ctx, h, ctx.arena.print("cpuq note {s} {s}{s}", .{ shellQuote(ctx.arena, t), shellQuote(ctx.arena, note_text), if (all) " --all" else "" }) catch return exit_failure);
     const pid: ?i32 = std.fmt.parseInt(i32, t, 10) catch null;
     var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer scratch.deinit();
@@ -2845,13 +2836,35 @@ fn cmdNote(ctx: *Ctx, args: []const [:0]const u8) u8 {
     return 0;
 }
 
+/// Runs a cpuq command line on HOST through ssh, for a job sent there: its output and
+/// exit status come back as its own.
+fn onHost(ctx: *Ctx, host: []const u8, remote: []const u8) u8 {
+    const r = std.process.run(ctx.arena, ctx.io, .{ .argv = &.{ "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, remote } }) catch return exit_failure;
+    ctx.out.writeAll(r.stdout) catch {};
+    ctx.out.flush() catch {};
+    std.debug.print("{s}", .{r.stderr});
+    return switch (r.term) {
+        .exited => |c| c,
+        else => exit_failure,
+    };
+}
+
 fn cmdControl(ctx: *Ctx, comptime action: []const u8, args: []const [:0]const u8) u8 {
     var target: ?[]const u8 = null;
     var all = false;
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--all")) all = true else if (target == null) target = arg else return usageError("{s} takes one label or pid", .{action});
+    var host: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg: []const u8 = args[i];
+        if (std.mem.eql(u8, arg, "--all")) {
+            all = true;
+        } else if (std.mem.eql(u8, arg, "--host") and i + 1 < args.len) {
+            i += 1;
+            host = args[i];
+        } else if (target == null) target = arg else return usageError("{s} takes one label or pid", .{action});
     }
     const t = target orelse return usageError("{s} needs a label (PATTERN* for a prefix) or a cpuq pid", .{action});
+    if (host) |h| return onHost(ctx, h, ctx.arena.print("cpuq {s} {s}{s}", .{ action, shellQuote(ctx.arena, t), if (all) " --all" else "" }) catch return exit_failure);
     const pid: ?i32 = std.fmt.parseInt(i32, t, 10) catch null;
     var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer scratch.deinit();

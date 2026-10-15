@@ -640,7 +640,8 @@ can wait for another session's work without polling `cpuq status`. `--max-wait` 
 These act on anyone's jobs in the queue, not only the caller's, so use them on jobs you did not
 start only when you mean to. They act on jobs for cores, not on named leases. PID is the job's
 cpuq; LABEL may end in `*` for a prefix. A target that matches several jobs needs `--all` (else
-exit 2); one that matches nothing exits 125.
+exit 2); one that matches nothing exits 125. `--host HOST` acts through that machine's cpuq, on a
+job sent there (`cpuq stop 1751518 --host burst`).
 
 A waiter takes its order at its next look: the first eight within 2 seconds, the rest within a
 minute. `start` never starts a job into a running exclusive run, and pause, resume and stop leave

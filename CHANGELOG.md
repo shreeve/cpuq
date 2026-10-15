@@ -2,6 +2,11 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.19.1 — 2026-10-15
+
+- `cpuq first|start|cancel|pause|resume|stop ... --host HOST` acts through that machine's cpuq,
+  on a job sent there, as `cpuq note --host` does.
+
 ## 0.19.0 — 2026-10-15
 
 - **Progress.** Every job gets `CPUQ_PROGRESS`, a file it may write `DONE TOTAL FAILING` to
