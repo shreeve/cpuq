@@ -59,6 +59,16 @@ wait_held() {
   done
 }
 
+# wait_holder LABEL [seconds]: until a job labelled LABEL holds cores.
+wait_holder() {
+  local i=0
+  until "$CPUQ" status --json --no-usage | python3 -c 'import json, sys
+sys.exit(0 if any(h["label"] == sys.argv[1] for h in json.load(sys.stdin)["holders"]) else 1)' "$1"; do
+    i=$((i + 1)); [ $i -gt $((${2:-10} * 10)) ] && return 1
+    sleep 0.1
+  done
+}
+
 # wait_lease_holder NAME: until the named lease is held.
 wait_lease_holder() {
   local i=0
@@ -622,10 +632,9 @@ t_wait() {
   "$CPUQ" wait --label 'job:*'; local rc=$?
   local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
   check "cpuq wait --label 'job:*' returns when the last matching job ends (exit $rc after ${dt}s)" "[ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if 0.8 < $dt < 6 else 1)'"
-  # job:a's cores can show as held for a moment after it ends: see them go first, so the 2 held
-  # below are long's.
-  wait_held 0
-  "$CPUQ" run --label long -- sleep 3 & wait_held 2
+  # Wait for what the check needs, a holder labelled long, not a count of held cores, which on a
+  # slow runner can belong to the job before it.
+  "$CPUQ" run --label long -- sleep 3 & wait_holder long
   "$CPUQ" wait --label long --max-wait 1; rc=$?
   check "cpuq wait --max-wait gives up with 75 (got $rc)" "[ $rc = 75 ]"
   wait
