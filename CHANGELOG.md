@@ -2,6 +2,12 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.22.0 — 2026-10-15
+
+- **go and bun packs**, beside zig: `"packs": {"go": "1.27.1", "bun": "1.4.3"}`, downloaded from
+  go.dev and Bun's GitHub releases and checked against their published sha256s. No recipe needed.
+- A pack's whole bin directory is on the job's PATH (go's has gofmt too), not a link to one binary.
+
 ## 0.21.1 — 2026-10-15
 
 - A job on Linux keeps its caller's stack limit (`ulimit -s`). cpuq raised its own to 16 MB at

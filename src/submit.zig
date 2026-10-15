@@ -1212,20 +1212,20 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
             env.put(kv.key_ptr.*, dir) catch {};
         }
     }
-    // Packs: each on the job's PATH by its name (a link in a bin of the job's own, into the
-    // store) and as NAME, its binary; the job's first steps install any the store lacks, the
-    // packs a build needs first.
+    // Packs: each one's bin directory on the job's PATH (go's has gofmt beside go), and NAME, its
+    // binary; the job's first steps install any the store lacks, the packs a build needs first.
     var prelude: std.ArrayList(u8) = .empty;
     if (p.packs.len != 0) {
-        const bin_dir = jobFile(cx, id, "bin");
-        Io.Dir.cwd().deleteTree(cx.io, bin_dir) catch {};
-        Io.Dir.cwd().createDirPath(cx.io, bin_dir) catch {};
-        prelude.print(cx.a, "export PATH={s}:\"$PATH\"\n", .{quote(cx, bin_dir)}) catch {};
+        var dirs: std.ArrayList(u8) = .empty;
         for (p.packs) |pk| {
             if (!packs.validName(pk.name)) continue;
             const binary = cx.a.print("{s}/{s}/{s}/{s}", .{ packs.storeRoot(cx.a, cx.env), pk.name, pk.version, pk.bin }) catch continue;
-            Io.Dir.cwd().symLink(cx.io, binary, cx.a.print("{s}/{s}", .{ bin_dir, std.fs.path.basename(pk.bin) }) catch continue, .{}) catch {};
+            dirs.print(cx.a, "{s}:", .{std.fs.path.dirname(binary) orelse binary}) catch {};
             env.put(packs.varName(cx.a, pk.name), binary) catch {};
+        }
+        prelude.print(cx.a, "export PATH={s}\"$PATH\"\n", .{quote(cx, dirs.items)}) catch {};
+        for (p.packs) |pk| {
+            if (!packs.validName(pk.name)) continue;
             prelude.print(cx.a, "{s} _pack {s} {s} {s} {s} {s} {s} || exit\n", .{ quote(cx, cx.self), quote(cx, pk.name), quote(cx, pk.version), quote(cx, if (pk.alias.len == 0) "-" else pk.alias), quote(cx, pk.kind), quote(cx, pk.bin), quote(cx, if (pk.build.len == 0) "-" else pk.build) }) catch {};
         }
     }
@@ -1309,12 +1309,11 @@ pub fn cmdPacks(cx: Cx, args: []const [:0]const u8) u8 {
     for (r.packs) |pk| if (packs.ship(cx.a, cx.io, where, pk)) |e| return fail2("{s}", .{e});
     // The installs, as a job's first steps: the packs a build needs on PATH, then each in turn.
     var script: std.ArrayList(u8) = .empty;
-    script.appendSlice(cx.a, "b=$(mktemp -d) || exit 1; trap 'rm -rf \"$b\"' EXIT\n") catch {};
     for (r.packs) |pk| {
         const binary = cx.a.print("$HOME/cpuq/packs/{s}/{s}/{s}", .{ pk.name, pk.version, pk.bin }) catch continue;
-        script.print(cx.a, "ln -s \"{s}\" \"$b/{s}\"; export {s}=\"{s}\"\n", .{ binary, std.fs.path.basename(pk.bin), packs.varName(cx.a, pk.name), binary }) catch {};
+        script.print(cx.a, "PATH=\"{s}:$PATH\"; export {s}=\"{s}\"\n", .{ std.fs.path.dirname(binary) orelse binary, packs.varName(cx.a, pk.name), binary }) catch {};
     }
-    script.appendSlice(cx.a, "export PATH=\"$b:$PATH\"\n") catch {};
+    script.appendSlice(cx.a, "export PATH\n") catch {};
     const self = if (where) |h| cpuqOn(cx, h) else cx.self;
     for (r.packs) |pk| {
         script.print(cx.a, "{s} _pack {s} {s} {s} {s} {s} {s} || exit\n", .{ self, quote(cx, pk.name), quote(cx, pk.version), quote(cx, if (pk.alias.len == 0) "-" else pk.alias), quote(cx, pk.kind), quote(cx, pk.bin), quote(cx, if (pk.build.len == 0) "-" else pk.build) }) catch {};

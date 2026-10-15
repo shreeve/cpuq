@@ -538,7 +538,7 @@ mise does:
 - **Versions:** `latest` is the default branch's head, `stable` the newest release tag
   (vX.Y.Z), `0.2.9` that tag, and a hash that commit, pushed or not. Each is resolved when the job
   is submitted, so the job's identity holds the exact version and `latest` moves as main does.
-- **In the job:** each pack is on `PATH` by its binary's name and in `$NAME` (`$RIG`, `$ZIG`).
+- **In the job:** each pack is on `PATH` and in `$NAME`, its binary (`$RIG`, `$ZIG`, `$GO`).
 - **Installed once, by the first job that needs it,** inside that job's grant and under a lock
   per version: zig downloaded from ziglang.org, any other built from the source of its commit,
   which cpuq ships from its checkout here (`git archive`) when the host lacks it. A version never
@@ -556,8 +556,11 @@ mise does:
   }
   ```
 
-  A recipe's `packs` are installed first and are on its build's PATH. zig needs no recipe. One
-  version of each pack per job: the job's own request wins over a recipe's.
+  A recipe's `packs` are installed first and are on its build's PATH. zig, go and bun need no
+  recipe: their releases are downloaded (ziglang.org, go.dev, Bun's GitHub releases) and checked
+  against the sha256 each publishes. One version of each pack per job: the job's own request wins
+  over a recipe's.
+- **On PATH** goes each pack's bin directory, so go brings gofmt.
 - **`cpuq packs [--host HOST]`** lists a store; **`cpuq packs install rig@stable --host burst`**
   installs ahead of a job, under that host's queue. Hosts need cpuq 0.21 for packs.
 

@@ -112,13 +112,21 @@ fn visit(a: std.mem.Allocator, name: []const u8, recipes: *const std.json.ArrayH
 
 const One = union(enum) { ok: Pack, err: []const u8 };
 
+/// Packs that need no recipe: their releases, downloaded.
+const builtins = [_]struct { name: []const u8, bin: []const u8, example: []const u8 }{
+    .{ .name = "zig", .bin = "zig", .example = "0.17.0" },
+    .{ .name = "go", .bin = "bin/go", .example = "1.27.1" },
+    .{ .name = "bun", .bin = "bun", .example = "1.4.3" },
+};
+
 fn resolveOne(a: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, name: []const u8, ref: []const u8, recipe: ?Recipe) One {
     if (!validName(name)) return .{ .err = a.print("packs: a pack's name is lowercase letters, digits, - and _, not '{s}'", .{name}) catch "" };
     const r = recipe orelse {
-        if (std.mem.eql(u8, name, "zig")) {
-            if (!isVersion(ref)) return .{ .err = a.print("packs: zig is asked for by its version (0.17.0), not '{s}'", .{ref}) catch "" };
-            return .{ .ok = .{ .name = "zig", .version = ref, .kind = "zig", .bin = "zig" } };
-        }
+        // Released tools cpuq downloads itself, each checked against its published sha256.
+        for (builtins) |b| if (std.mem.eql(u8, name, b.name)) {
+            if (!isVersion(ref)) return .{ .err = a.print("packs: {s} is asked for by its version ({s}), not '{s}'", .{ name, b.example, ref }) catch "" };
+            return .{ .ok = .{ .name = b.name, .version = ref, .kind = b.name, .bin = b.bin } };
+        };
         return .{ .err = a.print("packs: no recipe for {s} in {s}", .{ name, recipesPath(a, env) }) catch "" };
     };
     const url = r.git orelse return .{ .err = a.print("packs: {s}'s recipe has no \"git\"", .{name}) catch "" };
@@ -314,10 +322,12 @@ pub fn install(a: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map
     const marker = a.print("{s}/.cpuq-installed", .{dir}) catch return 125;
     const there = if (Io.Dir.cwd().access(io, marker, .{})) |_| (if (Io.Dir.cwd().access(io, binary, .{})) |_| true else |_| false) else |_| false;
     if (!there) {
-        if (std.mem.eql(u8, kind, "zig")) {
-            std.debug.print("cpuq: pack zig {s}: downloading\n", .{version});
-            if (installZig(a, io, root, version)) |e| {
-                std.debug.print("cpuq: pack zig {s}: {s}\n", .{ version, e });
+        const download: ?*const fn (std.mem.Allocator, Io, []const u8, []const u8) ?[]const u8 =
+            if (std.mem.eql(u8, kind, "zig")) &installZig else if (std.mem.eql(u8, kind, "go")) &installGo else if (std.mem.eql(u8, kind, "bun")) &installBun else null;
+        if (download) |get| {
+            std.debug.print("cpuq: pack {s} {s}: downloading\n", .{ name, version });
+            if (get(a, io, root, version)) |e| {
+                std.debug.print("cpuq: pack {s} {s}: {s}\n", .{ name, version, e });
                 return 1;
             }
         } else {
@@ -357,33 +367,117 @@ fn setAlias(a: std.mem.Allocator, io: Io, root: []const u8, alias: []const u8, v
     cwd.rename(tmp, cwd, a.print("{s}/{s}", .{ root, alias }) catch return, io) catch {};
 }
 
-/// zig's release VERSION for this machine, from ziglang.org's index, its sha256 checked, unpacked
-/// beside the store and renamed into it.
+/// zig's release VERSION for this machine, from ziglang.org's index.
 fn installZig(a: std.mem.Allocator, io: Io, root: []const u8, version: []const u8) ?[]const u8 {
-    const index = std.process.run(a, io, .{ .argv = &.{ "curl", "-fsSL", "--max-time", "60", "https://ziglang.org/download/index.json" } }) catch return "curl couldn't run";
-    if (!index.term.success()) return "ziglang.org's index couldn't be fetched";
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, index.stdout, .{}) catch return "ziglang.org's index isn't JSON";
+    const index = fetch(a, io, "https://ziglang.org/download/index.json") orelse return "ziglang.org's index couldn't be fetched";
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, index, .{}) catch return "ziglang.org's index isn't JSON";
     const platform = a.print("{t}-{s}", .{ builtin.cpu.arch, if (builtin.os.tag == .macos) "macos" else @tagName(builtin.os.tag) }) catch return "out of memory";
     const release = (if (parsed == .object) parsed.object.get(version) else null) orelse return "no such release on ziglang.org";
     const build = (if (release == .object) release.object.get(platform) else null) orelse return a.print("no build for {s}", .{platform}) catch "no build for this machine";
     if (build != .object) return "a strange index entry";
     const url = (build.object.get("tarball") orelse return "no tarball").string;
     const want = (build.object.get("shasum") orelse return "no shasum").string;
-    const tarball = a.print("{s}/.zig-{s}.tar.xz", .{ root, version }) catch return "out of memory";
-    defer Io.Dir.cwd().deleteFile(io, tarball) catch {};
-    const got = std.process.run(a, io, .{ .argv = &.{ "curl", "-fsSL", "--max-time", "600", "-o", tarball, url } }) catch return "curl couldn't run";
+    return unpack(a, io, root, version, url, want, .tar_xz);
+}
+
+/// Go's release VERSION for this machine, from go.dev's list.
+fn installGo(a: std.mem.Allocator, io: Io, root: []const u8, version: []const u8) ?[]const u8 {
+    const list = fetch(a, io, "https://go.dev/dl/?mode=json&include=all") orelse return "go.dev's list couldn't be fetched";
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, list, .{}) catch return "go.dev's list isn't JSON";
+    if (parsed != .array) return "go.dev's list isn't a list";
+    const os = if (builtin.os.tag == .macos) "darwin" else @tagName(builtin.os.tag);
+    const arch = switch (builtin.cpu.arch) {
+        .x86_64 => "amd64",
+        .aarch64 => "arm64",
+        else => @tagName(builtin.cpu.arch),
+    };
+    const want_version = a.print("go{s}", .{version}) catch return "out of memory";
+    for (parsed.array.items) |rel| {
+        if (rel != .object) continue;
+        const v = rel.object.get("version") orelse continue;
+        if (v != .string or !std.mem.eql(u8, v.string, want_version)) continue;
+        const files = rel.object.get("files") orelse continue;
+        if (files != .array) continue;
+        for (files.array.items) |f| {
+            if (f != .object) continue;
+            const fo = f.object;
+            if (!eqlField(fo, "os", os) or !eqlField(fo, "arch", arch) or !eqlField(fo, "kind", "archive")) continue;
+            const filename = (fo.get("filename") orelse continue).string;
+            const sum = (fo.get("sha256") orelse continue).string;
+            return unpack(a, io, root, version, a.print("https://go.dev/dl/{s}", .{filename}) catch return "out of memory", sum, .tar_gz);
+        }
+        return a.print("no Go {s} archive for {s}-{s}", .{ version, os, arch }) catch "no archive for this machine";
+    }
+    return "no such release on go.dev";
+}
+
+/// Bun's release VERSION for this machine, from its GitHub release and that release's SHASUMS256.txt.
+fn installBun(a: std.mem.Allocator, io: Io, root: []const u8, version: []const u8) ?[]const u8 {
+    const os = if (builtin.os.tag == .macos) "darwin" else @tagName(builtin.os.tag);
+    const arch = switch (builtin.cpu.arch) {
+        .x86_64 => "x64",
+        .aarch64 => "aarch64",
+        else => @tagName(builtin.cpu.arch),
+    };
+    const zip = a.print("bun-{s}-{s}.zip", .{ os, arch }) catch return "out of memory";
+    const base = a.print("https://github.com/oven-sh/bun/releases/download/bun-v{s}", .{version}) catch return "out of memory";
+    const sums = fetch(a, io, a.print("{s}/SHASUMS256.txt", .{base}) catch return "out of memory") orelse return "no such release on GitHub (SHASUMS256.txt)";
+    var lines = std.mem.tokenizeScalar(u8, sums, '\n');
+    while (lines.next()) |line| {
+        var parts = std.mem.tokenizeAny(u8, line, " \t*");
+        const sum = parts.next() orelse continue;
+        const file = parts.next() orelse continue;
+        if (!std.mem.eql(u8, file, zip)) continue;
+        return unpack(a, io, root, version, a.print("{s}/{s}", .{ base, zip }) catch return "out of memory", sum, .zip);
+    }
+    return a.print("no {s} in the release", .{zip}) catch "no build for this machine";
+}
+
+fn eqlField(o: std.json.ObjectMap, key: []const u8, want: []const u8) bool {
+    const v = o.get(key) orelse return false;
+    return v == .string and std.mem.eql(u8, v.string, want);
+}
+
+fn fetch(a: std.mem.Allocator, io: Io, url: []const u8) ?[]const u8 {
+    const r = std.process.run(a, io, .{ .argv = &.{ "curl", "-fsSL", "--max-time", "60", url } }) catch return null;
+    return if (r.term.success()) r.stdout else null;
+}
+
+const Archive = enum { tar_xz, tar_gz, zip };
+
+/// Downloads `url` beside the store, checks its sha256 against `want`, unpacks it (its one top
+/// directory dropped) and renames it into ROOT/VERSION.
+fn unpack(a: std.mem.Allocator, io: Io, root: []const u8, version: []const u8, url: []const u8, want: []const u8, kind: Archive) ?[]const u8 {
+    const file = a.print("{s}/.{s}.download", .{ root, version }) catch return "out of memory";
+    defer Io.Dir.cwd().deleteFile(io, file) catch {};
+    const got = std.process.run(a, io, .{ .argv = &.{ "curl", "-fsSL", "--max-time", "900", "-o", file, url } }) catch return "curl couldn't run";
     if (!got.term.success()) return a.print("{s} couldn't be downloaded", .{url}) catch "the download failed";
-    const sum = sha256File(a, io, tarball) orelse return "the download couldn't be read";
-    if (!std.mem.eql(u8, sum, want)) return a.print("its sha256 is {s}, the index says {s}: not installed", .{ sum, want }) catch "a bad sha256";
+    const sum = sha256File(a, io, file) orelse return "the download couldn't be read";
+    if (!std.ascii.eqlIgnoreCase(sum, want)) return a.print("its sha256 is {s}, the release says {s}: not installed", .{ sum, want }) catch "a bad sha256";
     const tmp = a.print("{s}/.{s}.unpack", .{ root, version }) catch return "out of memory";
     Io.Dir.cwd().deleteTree(io, tmp) catch {};
     Io.Dir.cwd().createDirPath(io, tmp) catch return "couldn't make a directory";
-    const x = std.process.run(a, io, .{ .argv = &.{ "tar", "-xJf", tarball, "-C", tmp, "--strip-components=1" } }) catch return "tar couldn't run";
-    if (!x.term.success()) return "the tarball couldn't be unpacked";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    const x = switch (kind) {
+        .tar_xz => std.process.run(a, io, .{ .argv = &.{ "tar", "-xJf", file, "-C", tmp } }),
+        .tar_gz => std.process.run(a, io, .{ .argv = &.{ "tar", "-xzf", file, "-C", tmp } }),
+        // No unzip on a minimal Linux; python3 is everywhere cpuq runs jobs. Modes are lost: the
+        // files are made executable below.
+        .zip => std.process.run(a, io, .{ .argv = &.{ "python3", "-m", "zipfile", "-e", file, tmp } }),
+    } catch return "couldn't unpack it";
+    if (!x.term.success()) return "the download couldn't be unpacked";
+    // Its one top directory (zig-x86_64-linux-0.17.0/, go/, bun-linux-x64/) becomes VERSION.
+    var d = Io.Dir.cwd().openDir(io, tmp, .{ .iterate = true }) catch return "couldn't read what was unpacked";
+    defer d.close(io);
+    var it = d.iterate();
+    const top = (it.next(io) catch null) orelse return "the download was empty";
+    if (top.kind != .directory or (it.next(io) catch null) != null) return "the download isn't one directory";
+    const from = a.print("{s}/{s}", .{ tmp, top.name }) catch return "out of memory";
+    if (kind == .zip) _ = std.process.run(a, io, .{ .argv = &.{ "chmod", "-R", "a+rX,u+x", from } }) catch {};
     const dir = a.print("{s}/{s}", .{ root, version }) catch return "out of memory";
     Io.Dir.cwd().deleteTree(io, dir) catch {};
     const cwd = Io.Dir.cwd();
-    cwd.rename(tmp, cwd, dir, io) catch return "couldn't move it into place";
+    cwd.rename(from, cwd, dir, io) catch return "couldn't move it into place";
     return null;
 }
 
