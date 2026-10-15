@@ -1206,7 +1206,7 @@ struct JobsCard: View {
                 Text("· \(holders.count) running · \(waiters.count) waiting").font(.system(size: 13, weight: .medium)).foregroundStyle(Alive.ink)
                 Spacer()
                 ViewThatFits(in: .horizontal) {
-                    Text("bar = how far a job is, when it says; else CPU used (0–\(Int(scale))) · CPU used of the cores reserved")
+                    Text("bar = how far a job is: its count, else (lighter) its usual time; else CPU used (0–\(Int(scale))) · CPU used of the cores reserved")
                     Text("bar = CPU used (0–\(Int(scale)))")
                     Color.clear.frame(width: 0, height: 0)
                 }
@@ -1248,8 +1248,12 @@ struct JobsCard: View {
     private func running(_ h: Status.Holder, scale: Double) -> some View {
         let project = GraphModel.group(h.label, h.note)
         let use = h.using ?? 0
-        // How far it is, when it says (DONE of TOTAL); else the bar is its CPU.
+        // How far it is, when it says (DONE of TOTAL); else an estimate, its time so far against
+        // its label's usual time (a lighter bar); else the bar is its CPU.
         let done: Double? = h.progress.flatMap { $0.total > 0 ? min(Double($0.done) / Double($0.total), 1) : nil }
+        let ran = max(Date().timeIntervalSince1970 - Double(h.since), 0)
+        let usual: Double? = done == nil ? h.typical.flatMap { $0 > 0 ? $0 : nil } : nil
+        let estimated: Double? = usual.map { min(ran / $0, 1) }
         return HStack(spacing: 10) {
             Circle().fill(model.color(project)).frame(width: 8, height: 8)
             // The note after the label, quieter: "rig:corpus  #224 markers".
@@ -1260,7 +1264,8 @@ struct JobsCard: View {
                 GeometryReader { g in
                     ZStack(alignment: .leading) {
                         Capsule().fill(Alive.track)
-                        Capsule().fill(model.color(project)).frame(width: g.size.width * (done ?? min(use / scale, 1)))
+                        Capsule().fill(model.color(project).opacity(done == nil && estimated != nil ? 0.45 : 1))
+                            .frame(width: g.size.width * (done ?? estimated ?? min(use / scale, 1)))
                     }
                 }
                 .frame(maxWidth: 300).frame(height: 8)
@@ -1268,6 +1273,10 @@ struct JobsCard: View {
                     Text("paused").foregroundStyle(.orange).frame(width: 52, alignment: .leading)
                 } else if let done {
                     Text("\(Int((done * 100).rounded(.down)))%").fontWeight(.medium).foregroundStyle(Alive.ink).frame(width: 52, alignment: .leading)
+                } else if let usual {
+                    // Minutes left by its usual time; "over" once past it.
+                    Text(ran < usual ? "~\(roughly(usual - ran))" : "over").fontWeight(.medium)
+                        .foregroundStyle(ran < usual ? Alive.ink : .orange).frame(width: 52, alignment: .leading)
                 } else if h.using == nil {
                     Text("starting").foregroundStyle(Alive.ink2).frame(width: 52, alignment: .leading)
                 } else {

@@ -1141,6 +1141,33 @@ t_submit_moved() {
   unset XDG_STATE_HOME
 }
 
+t_submit_progress() {
+  # A submitted job's progress (CPUQ_PROGRESS) shows in cpuq status, as a cpuq run's does.
+  setup submit-progress
+  local was_home=$HOME
+  export HOME=$T/home XDG_STATE_HOME=$T/xdg
+  mkdir -p "$HOME" "$T/roots/repo/cpuq"
+  echo "submit_roots = $T/roots" >> "$CPUQ_CONFIG"
+  (
+    cd "$T/roots/repo" || exit 1
+    git init -q && git config user.email t@t && git config user.name t
+    printf '%s\n' '{ "label": "t:count", "run": "echo \"7 40 1\" > \"$CPUQ_PROGRESS.tmp\" && mv \"$CPUQ_PROGRESS.tmp\" \"$CPUQ_PROGRESS\" && sleep 4", "cores": "1" }' > cpuq/c.json
+    git add -A && git commit -qm init
+    "$CPUQ" submit cpuq/c.json >/dev/null 2>&1
+  ) & local s=$!
+  local got="" i=0
+  while [ -z "$got" ] && [ $i -lt 40 ]; do
+    got=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys
+h = [h for h in json.load(sys.stdin)["holders"] if h["label"] == "t:count" and h.get("progress")]
+print("%d %d %d" % (h[0]["progress"]["done"], h[0]["progress"]["total"], h[0]["progress"]["failing"]) if h else "")')
+    i=$((i + 1)); [ -n "$got" ] || sleep 0.25
+  done
+  wait $s
+  check "a submitted job's progress shows in status (got '$got')" "[ '$got' = '7 40 1' ]"
+  export HOME=$was_home
+  unset XDG_STATE_HOME
+}
+
 t_packs() {
   # Packs: a spec asks for a tool by version; the first job builds it into the store
   # (~/cpuq/packs/NAME/VERSION), later ones reuse it, `latest` links to it, and the job finds it
@@ -1187,6 +1214,22 @@ t_stack_limit() {
   setup stack-limit
   local got; got=$( (ulimit -s 4096 && "$CPUQ" run --cores 1 -- sh -c 'ulimit -s') 2>/dev/null)
   check "a job keeps its caller's stack limit (4096, got $got)" "[ '$got' = 4096 ]"
+}
+
+t_exclusive_off_waiting() {
+  # An exclusive run waiting to drain the machine, when its config turns exclusive runs off,
+  # waits on as an ordinary job: it starts beside the running one.
+  setup exclusive-off-waiting
+  "$CPUQ" run --cores 2 --label busy -- sleep 6 & local b=$!
+  wait_held 2
+  local t0; t0=$(now)
+  "$CPUQ" run --exclusive --cores 1 --label late -- true 2>"$T/err" & local x=$!
+  wait_waiters 1
+  echo "exclusive = off" >> "$CPUQ_CONFIG"
+  wait $x; local rc=$?
+  local dt; dt=$(python3 -c "print('%.1f' % ($(now) - $t0))")
+  wait $b
+  check "an exclusive run turned ordinary while it waits starts beside a running job (rc $rc, ${dt}s)" "[ $rc = 0 ] && grep -q 'exclusive is off' '$T/err' && python3 -c 'import sys; sys.exit(0 if $dt < 4 else 1)'"
 }
 
 t_hook() {
@@ -1766,7 +1809,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git tethered record cap cgroups note progress submit submit_moved packs stack_limit status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git tethered record cap cgroups note progress submit submit_moved submit_progress packs stack_limit exclusive_off_waiting status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

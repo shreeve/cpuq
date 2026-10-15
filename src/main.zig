@@ -1128,6 +1128,16 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
     while (true) {
         reloadConfig(ctx);
         cfg = ctx.cfg;
+        // `exclusive = off` set while it waits: it waits on as an ordinary job, no longer
+        // draining the machine for a window it won't get.
+        if (o.exclusive and !cfg.exclusive) {
+            o.exclusive = exclusiveOff(o.label);
+            lockOrFail(st);
+            rec.exclusive = false;
+            keepNote(ctx.arena, io, ticket, &rec);
+            rewriteRecord(io, ticket, rec);
+            st.unlock();
+        }
         const now_ticks = sys.cpuTicks(io);
         var mach = machine(ctx);
         if (ticks) |t0| if (now_ticks) |t1| {
@@ -1857,7 +1867,9 @@ fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8, le
         // Where the job may report its progress (`DONE TOTAL FAILING`): one cpuq submit chose
         // (CPUQ_PROGRESS_AT), else one of its own beside the queue, removed when it ends. A
         // CPUQ_PROGRESS inherited from another job is that job's, never this one's.
-        if (ctx.env.get("CPUQ_PROGRESS_AT")) |p| {
+        if (ctx.env.get("CPUQ_PROGRESS_AT")) |at| {
+            // A copy: removing the variable frees the string the map held.
+            const p = ctx.arena.dupe(u8, at) catch "";
             lease.record.progress = p;
             ctx.env.put("CPUQ_PROGRESS", p) catch {};
             _ = ctx.env.swapRemove("CPUQ_PROGRESS_AT");

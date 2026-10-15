@@ -3,6 +3,13 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.19.3 — 2026-10-15
+
+- A running job that reports no count but has run before shows an estimate in the Jobs card: a
+  lighter bar of its time so far against its usual time, and the minutes left beside it ("~25m",
+  or "over" once past it). Its CPU stays at the right ("29.7 of 32"). A job with neither keeps its
+  CPU bar.
+
 ## 0.19.2 — 2026-10-15
 
 - The menu's version line ("App 0.19.2 · CLI 0.19.3") is readable: it was drawn as a disabled

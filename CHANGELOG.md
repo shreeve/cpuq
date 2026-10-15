@@ -2,6 +2,15 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.22.1 — 2026-10-15
+
+- A submitted job's progress shows in `cpuq status` and Cpuq.app again. Since 0.19.3 its record
+  held a freed string where the progress file's path belonged, so only the supervisor saw it.
+
+- An `--exclusive` run already waiting when its machine's config turns exclusive runs off
+  (`exclusive = off`) waits on as an ordinary job, and says so: it no longer drains the machine
+  for a window it won't get, holding everyone queued behind it.
+
 ## 0.22.0 — 2026-10-15
 
 - **go and bun packs**, beside zig: `"packs": {"go": "1.27.1", "bun": "1.4.3"}`, downloaded from
