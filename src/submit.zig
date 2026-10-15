@@ -124,6 +124,9 @@ const Payload = struct {
     generation: []const u8,
     digest: []const u8,
     attempt: u32 = 1,
+    /// The config's `spill_env.HOST`: shell assignments the job's shell exports first (a PATH to
+    /// tools under ~/.local, which a command run over ssh doesn't otherwise get).
+    host_env: []const u8 = "",
 };
 
 /// The job as the submitting machine keeps it (job.json).
@@ -585,10 +588,12 @@ fn realpath(cx: Cx, p: []const u8) ?[]const u8 {
     return cx.a.dupe(u8, std.mem.sliceTo(r, 0)) catch null;
 }
 
+/// This machine's name, short ("burst", not burst.us-west3-a.c.….internal).
 fn hostname(cx: Cx) []const u8 {
     var buf: [256]u8 = undefined;
     if (c.gethostname(&buf, buf.len) != 0) return "here";
-    return cx.a.dupe(u8, std.mem.sliceTo(&buf, 0)) catch "here";
+    const full = std.mem.sliceTo(&buf, 0);
+    return cx.a.dupe(u8, full[0 .. std.mem.findScalar(u8, full, '.') orelse full.len]) catch "here";
 }
 
 fn roots(cx: Cx) []const u8 {
@@ -895,6 +900,7 @@ fn startAndWatch(cx: Cx, rec: *Record, payload: *Payload, host: []const u8) u8 {
     const id = rec.id;
     if (host_has_time_rule(cx, host) and payload.time == null) payload.time = "2h";
     payload.attempt = rec.attempt;
+    payload.host_env = cx.cfg.spillEnv(host) orelse "";
     setState(cx, id, "starting", cx.a.print("on {s}", .{host}) catch "");
     const b64 = base64(cx, jsonString(cx, payload.*));
     const started = onHost(cx, host, cx.a.print("{s} _start {s} {s}", .{ cpuqOn(cx, host), id, b64 }) catch "");
@@ -1176,7 +1182,8 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
     argv.appendSlice(cx.a, &.{ "--", cx.self, "cap" }) catch {};
     if (p.time) |t| argv.appendSlice(cx.a, &.{ "--time", t }) catch {};
     if (p.mem) |m| argv.appendSlice(cx.a, &.{ "--mem", m }) catch {};
-    const script = if (p.setup) |s| cx.a.print("{{ {s}\n}} && {{ {s}\n}}", .{ s, p.run }) catch p.run else p.run;
+    const body = if (p.setup) |s| cx.a.print("{{ {s}\n}} && {{ {s}\n}}", .{ s, p.run }) catch p.run else p.run;
+    const script = if (p.host_env.len != 0) cx.a.print("export {s}\n{s}", .{ p.host_env, body }) catch body else body;
     argv.appendSlice(cx.a, &.{ "--", "/bin/sh", "-c", script, "cpuq" }) catch {};
     argv.appendSlice(cx.a, p.args) catch {};
     hostState(cx, id, "running");

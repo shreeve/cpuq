@@ -776,7 +776,9 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     if (ctx.cfg.spillEnv(host)) |env| remote.print(a, "export {s} && ", .{env}) catch {};
     remote.print(a, "exec cpuq run --tethered --priority {t}", .{o.priority}) catch fail("out of memory", .{});
     if (o.label.len != 0) remote.print(a, " --label {s}", .{shellQuote(a, o.label)}) catch {};
-    if (o.note.len != 0) remote.print(a, " --note {s}", .{shellQuote(a, o.note)}) catch {};
+    // Without --note, the worktree it came from: every job on another machine says what it's for.
+    const job_note = if (o.note.len != 0) o.note else std.fs.path.basename(root);
+    if (job_note.len != 0) remote.print(a, " --note {s}", .{shellQuote(a, job_note)}) catch {};
     if (o.cores_given) remote.print(a, " --cores {d}-{d}", .{ o.request.min, o.request.max }) catch {};
     if (o.max_wait) |mw| remote.print(a, " --max-wait {d}", .{mw}) catch {};
     if (!o.load_check) remote.appendSlice(a, " --no-load-check") catch {};

@@ -2,6 +2,14 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.18.1 — 2026-10-15
+
+- A job sent to another machine (`--spill`, `--spill-to`) without `--note` is noted with the
+  worktree it came from (`rig-inline`), so every job there says what it's for.
+- A submitted job exports the host's `spill_env` first, as a spilled job does, so tools under
+  `~/.local` (pup's zig) are on its PATH.
+- Verdicts name a host by its short name (`burst`, not its full domain name).
+
 ## 0.18.0 — 2026-10-15
 
 - `cpuq submit SPEC`: a job described by a spec kept in the repo (`cpuq/*.json`), placed on a
