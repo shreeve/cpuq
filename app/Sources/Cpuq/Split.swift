@@ -57,7 +57,7 @@ struct SplitColumn: View {
             VStack(spacing: 0) {
                 ForEach(sections.indices, id: \.self) { i in
                     sections[i].frame(height: heights[i]).clipShape(Rectangle().inset(by: -bleed))
-                    if i < sections.count - 1 { handle(i, room: room) }
+                    if i < sections.count - 1 { handle(i, room: room, heights: heights) }
                 }
             }
         }
@@ -80,7 +80,7 @@ struct SplitColumn: View {
         return h
     }
 
-    private func handle(_ i: Int, room: CGFloat) -> some View {
+    private func handle(_ i: Int, room: CGFloat, heights: [CGFloat]) -> some View {
         Rectangle().fill(.clear).frame(height: gap).frame(maxWidth: .infinity).contentShape(Rectangle())
             .overlay {
                 // Always faintly there, so the gap reads as something to drag; plain on hover.
@@ -97,7 +97,11 @@ struct SplitColumn: View {
                 // sections shook.
                 DragGesture(minimumDistance: 1, coordinateSpace: .global)
                     .onChanged { v in
-                        let start = dragStart ?? shares
+                        // From the heights on screen, not the shares kept: a share below its
+                        // section's minimum shows at the minimum, and starting from the share
+                        // made the first part of every drag move nothing (the top handle, with
+                        // the hero at its least height, seemed not to work at all).
+                        let start = dragStart ?? heights.map { Double($0 / max(room, 1)) }
                         if dragStart == nil {
                             dragStart = start
                             SplitDrag.shared.active = true

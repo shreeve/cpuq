@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.17.5 — 2026-10-15
+
+- A section handle moves from the first step of a drag. A drag started from the sizes kept, and
+  when a section showed at its least height (the "right now" card, most often), the first part
+  of the drag moved nothing, so the top handle seemed not to work.
+
 ## 0.17.4 — 2026-10-15
 
 - When more jobs run or wait than the Jobs card shows, its bottom edge says "+1 more ↓" (or
