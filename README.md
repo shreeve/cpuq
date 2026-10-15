@@ -423,7 +423,8 @@ job waits its turn here. It says on stderr which it chose and why.
     spill_start.burst = ~/Data/Code/runbooks/host-gcp-burst/start
 
 Before the job runs there, the repo (git's top level, else the working directory) is copied to
-`HOST:cpuq-spill/<its path here>` with rsync, honoring `.gitignore` and leaving `.git` behind.
+`HOST:cpuq-spill/s/NAME-HASH` (NAME the repo's directory, one copy per repo or worktree here)
+with rsync, honoring `.gitignore` and leaving `.git` behind.
 Each repo and worktree keeps its own copy there, so build caches stay warm between runs. The job
 starts in the same subdirectory, with the same options; its output streams back, and its exit
 status is cpuq's. `--return PATH` copies a path (relative to the working directory) back
@@ -623,6 +624,25 @@ The host itself (burst here) is a Spot VM that starts on demand and stops itself
 minutes. It has no cloud service account, so nothing running on it can act on the cloud
 project. Copies and caches sit on a ZFS dataset with lz4 compression and a size quota.
 
+## Cleaning up: cpuq clean
+
+    cpuq clean [--dry-run] [--older AGE] [--host HOST]
+
+A machine that takes spilled and submitted jobs keeps their copies, so the next run of the same
+worktree syncs only what changed, and keeps pack versions. Left alone they pile up: every agent
+worktree that ever spilled leaves a copy of up to tens of GB. `cpuq clean` removes them once
+unused for `clean_after` (3 days); `cpuq record`, where it's installed, runs it every hour.
+
+- **Spilled jobs' copies** (`~/cpuq-spill/s/…`) go by when a job last ran in one.
+- **Submitted jobs' copies** (`~/cpuq-spill/w/PROJECT/…`) go by their last sync, never while a
+  job holds the copy's lock.
+- **Pack versions** go by when a job last used one, never one `latest` or `stable` names.
+- **Submitted jobs' records** go a week after they ended.
+- **Never anything a process is working in**, and never the caches (`~/cpuq-spill/c`), which are
+  the jobs' own to bound.
+
+`--dry-run` lists what would go and how much; `--older 1d` overrides the age.
+
 ## Named leases
 
     cpuq lease NAME [--slots N] [--exclusive] [--priority P] [--label L] [--max-wait S] -- CMD...
@@ -760,6 +780,7 @@ re-reads the file when it changes; an invalid edit keeps the settings in force a
 | `pressure_check` | on | admit nothing under memory pressure |
 | `pressure_psi` | 10 | Linux: the `some avg10` percentage that counts as pressure |
 | `min_available` | off | admit nothing while available memory is under this (e.g. `6G`) |
+| `clean_after` | 3d | what jobs left on this machine (spilled and submitted jobs' copies, pack versions no link names, job records after a week) is removed once unused this long, by `cpuq record` hourly and `cpuq clean`; off keeps everything |
 | `min_disk` | 5G | admit nothing while `$HOME`'s, the temp directory's or `~/cpuq-spill`'s filesystem has less free than this; off turns it off |
 | `max_memory` | off | stop a job whose processes together use more memory than this (e.g. `16G`) |
 | `spill` | none | ssh hosts `--spill` may send a job to, in order (commas or spaces) |

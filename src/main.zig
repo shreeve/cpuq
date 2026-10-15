@@ -7,6 +7,7 @@ const policy = @import("policy.zig");
 const state = @import("state.zig");
 const sys = @import("sys.zig");
 const gitship = @import("gitship.zig");
+const clean = @import("clean.zig");
 
 const history = @import("history.zig");
 const hook = @import("hook.zig");
@@ -35,6 +36,7 @@ const usage =
     \\       cpuq history [--label PATTERN] [--limit N] [--json]
     \\       cpuq first|start|cancel|pause|resume|stop LABEL|PID [--all] [--host HOST]
     \\       cpuq doctor [--host HOST]
+    \\       cpuq clean [--dry-run] [--older AGE] [--host HOST]
     \\       cpuq record [--interval SECONDS] | --install | --uninstall
     \\       cpuq samples [--since UNIX-SECONDS]
     \\       cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] -- PROGRAM [ARGS...]
@@ -195,6 +197,7 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
     }
     if (std.mem.eql(u8, cmd, "samples")) return cmdSamples(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "note")) return cmdNote(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "clean")) return cmdClean(ctx, args[1..]);
     inline for (.{ "first", "start", "cancel", "pause", "resume", "stop" }) |action| {
         if (std.mem.eql(u8, cmd, action)) return cmdControl(ctx, action, args[1..]);
     }
@@ -608,7 +611,7 @@ fn tether() void {
 /// failing that, it queues here. Full means anyone waiting, the 1-minute
 /// load above the CPUs, or a gate shut, here and on each host alike. The
 /// repo (git's top level, else the working directory) is copied to
-/// HOST:cpuq-spill/<its path here> with rsync, honoring .gitignore and
+/// HOST:cpuq-spill/s/NAME-HASH with rsync, honoring .gitignore and
 /// leaving .git behind, and the job runs there through HOST's cpuq,
 /// tethered to this one, which streams its output and returns its status.
 fn runSpill(ctx: *Ctx, o: RunOptions) u8 {
@@ -735,9 +738,9 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     const cwd = std.process.currentPathAlloc(io, a) catch fail("current directory: cannot read it", .{});
     const root = gitTop(ctx) orelse cwd;
     const rel = if (std.mem.startsWith(u8, cwd, root)) cwd[root.len..] else "";
-    // The copy's place on the host mirrors the repo's path here, so each
-    // repo (and worktree) keeps its own, and its build caches, between runs.
-    const dir = a.print("cpuq-spill{s}", .{root}) catch fail("out of memory", .{});
+    // The copy's place on the host: one per repo (and worktree) here, named by it, so each keeps
+    // its own build caches between runs, and `cpuq clean` finds them all in one directory.
+    const dir = a.print("cpuq-spill/s/{s}-{x:0>8}", .{ std.fs.path.basename(root), @as(u32, @truncate(std.hash.Wyhash.hash(0, a.print("{s}\x00{s}", .{ shortHost(a), root }) catch root))) }) catch fail("out of memory", .{});
     std.debug.print("cpuq: {s}; running {s} on {s}\n", .{ why, if (o.label.len != 0) o.label else o.cmd[0], host });
 
     // What ships beyond the tracked files: --ship paths and the repo's .cpuq-spill list, each
@@ -763,7 +766,7 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
         sync.append(a, a.print("--include=/{s}{s}", .{ path, if (is_dir) "/***" else "" }) catch "") catch {};
     }
     sync.appendSlice(a, &.{
-        "--exclude=/.git",                                                                "--filter=:- .gitignore",
+        "--exclude=/.git", "--exclude=/.cpuq-used",                                        "--filter=:- .gitignore",
         a.print("--rsync-path=mkdir -p {s} && rsync", .{shellQuote(a, dir)}) catch "", a.print("{s}/", .{root}) catch "",
         a.print("{s}:{s}/", .{ host, dir }) catch "",
     }) catch fail("out of memory", .{});
@@ -782,7 +785,9 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     // ssh joins its arguments into one line for the remote shell, so
     // everything is quoted for it.
     var remote: std.ArrayList(u8) = .empty;
-    remote.print(a, "cd {s} && ", .{shellQuote(a, a.print("{s}{s}", .{ dir, rel }) catch dir)}) catch fail("out of memory", .{});
+    // `.cpuq-used`: when a job last ran in the copy, which `cpuq clean` goes by.
+    remote.print(a, "cd {s} && touch .cpuq-used && ", .{shellQuote(a, dir)}) catch fail("out of memory", .{});
+    if (rel.len != 0) remote.print(a, "cd {s} && ", .{shellQuote(a, a.print(".{s}", .{rel}) catch ".")}) catch {};
     // `spill_env.HOST`: the user's own shell assignments, expanded there (an ssh command's
     // shell reads no login profile, so ~/.local tools are off its PATH).
     if (ctx.cfg.spillEnv(host)) |env| remote.print(a, "export {s} && ", .{env}) catch {};
@@ -2851,6 +2856,44 @@ fn namedLeases(ctx: *Ctx, a: std.mem.Allocator) []const []const u8 {
 /// to the command's whole process tree, or SIGTERM to its cpuq, which passes
 /// it on. A paused job's cores count as idle, so they are lent at once.
 /// Nothing touches an exclusive run. Several matches need --all.
+/// This machine's name, short (`pop`, not pop.local).
+fn shortHost(a: std.mem.Allocator) []const u8 {
+    var buf: [256]u8 = undefined;
+    if (std.c.gethostname(&buf, buf.len) != 0) return "here";
+    const full = std.mem.sliceTo(&buf, 0);
+    return a.dupe(u8, full[0 .. std.mem.findScalar(u8, full, '.') orelse full.len]) catch "here";
+}
+
+/// `cpuq clean [--dry-run] [--older AGE] [--host HOST]`: removes what jobs left here (copies,
+/// pack versions, job records) once unused for AGE (the config's `clean_after`, 3d).
+fn cmdClean(ctx: *Ctx, args: []const [:0]const u8) u8 {
+    var dry = false;
+    var older: ?u32 = null;
+    var host: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg: []const u8 = args[i];
+        if (std.mem.eql(u8, arg, "--dry-run")) {
+            dry = true;
+        } else if (std.mem.eql(u8, arg, "--older") and i + 1 < args.len) {
+            i += 1;
+            older = policy.parseAge(args[i]) orelse return usageError("--older takes a time such as 3d, 36h or 90m, not '{s}'", .{args[i]});
+        } else if (std.mem.eql(u8, arg, "--host") and i + 1 < args.len) {
+            i += 1;
+            host = args[i];
+        } else return usageError("clean takes --dry-run, --older AGE and --host HOST", .{});
+    }
+    if (host) |h| return onHost(ctx, h, ctx.arena.print("cpuq clean{s}{s}", .{ if (dry) " --dry-run" else "", if (older) |o| ctx.arena.print(" --older {d}", .{o}) catch "" else "" }) catch return exit_failure);
+    const after = older orelse ctx.cfg.clean_after_s;
+    if (after == 0) {
+        ctx.out.writeAll("cpuq clean: clean_after is off here; --older AGE to clean anyway\n") catch {};
+        ctx.out.flush() catch {};
+        return 0;
+    }
+    _ = clean.run(ctx.arena, ctx.io, ctx.env, nowSeconds(ctx.io), .{ .older_s = after, .dry_run = dry }, ctx.out);
+    return 0;
+}
+
 /// `cpuq note PID|LABEL TEXT [--all] [--host HOST]`: sets what a running or waiting job is for,
 /// after it started (its PR opened later, say). Only the note changes: not its label, nor how
 /// it's sized or timed.
@@ -3280,12 +3323,17 @@ fn cmdRecord(ctx: *Ctx, args: []const [:0]const u8) u8 {
     var prev = sys.perCpuTicks(io, ctx.arena);
     var n: u64 = 0;
     std.debug.print("cpuq: recording this machine every {d:.1} s into {s}\n", .{ @as(f64, @floatFromInt(interval_ms)) / 1000, path });
+    // `cpuq clean` once an hour, the first a minute in.
+    const clean_every: u64 = @max(3600 * 1000 / @max(interval_ms, 1), 1);
+    const clean_first: u64 = @max(60 * 1000 / @max(interval_ms, 1), 1);
     while (true) : (n += 1) {
         io.sleep(.fromMilliseconds(@intCast(interval_ms)), .awake) catch {};
         var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena_state.deinit();
         const a = arena_state.allocator();
         const now = nowSeconds(io);
+        if (n % clean_every == clean_first % clean_every and ctx.cfg.clean_after_s != 0)
+            _ = clean.run(a, io, ctx.env, now, .{ .older_s = ctx.cfg.clean_after_s }, ctx.out);
         const ticks = sys.perCpuTicks(io, a);
         var line: std.ArrayList(u8) = .empty;
         line.print(a, "{{\"t\":{d},\"cpu\":[", .{now}) catch continue;

@@ -355,6 +355,8 @@ pub fn install(a: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map
         f.close(io);
     }
     if (alias.len != 0 and validName(alias)) setAlias(a, io, root, alias, version);
+    // Used now: `cpuq clean` keeps a version jobs still use.
+    if (Io.Dir.cwd().createFile(io, a.print("{s}/.cpuq-used", .{dir}) catch return 0, .{})) |f| f.close(io) else |_| {}
     return 0;
 }
 

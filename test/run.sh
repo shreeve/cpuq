@@ -1232,6 +1232,33 @@ t_exclusive_off_waiting() {
   check "an exclusive run turned ordinary while it waits starts beside a running job (rc $rc, ${dt}s)" "[ $rc = 0 ] && grep -q 'exclusive is off' '$T/err' && python3 -c 'import sys; sys.exit(0 if $dt < 4 else 1)'"
 }
 
+t_clean() {
+  # cpuq clean: copies, pack versions and job records unused for its age go; fresh ones, a
+  # version a link names, and a copy a job holds the lock of stay; --dry-run removes nothing.
+  setup clean
+  local was_home=$HOME
+  export HOME=$T/home
+  local sp=$HOME/cpuq-spill pk=$HOME/cpuq/packs
+  mkdir -p "$sp/s/old-1" "$sp/s/new-2" "$sp/w/p/oldcopy" "$sp/w/p/heldcopy" "$sp/w/p/newcopy" "$pk/tool/aaa" "$pk/tool/bbb" "$pk/tool/ccc"
+  touch -t 202601010000 "$sp/s/old-1/.cpuq-used" "$sp/w/p/oldcopy/.cpuq-generation" "$sp/w/p/heldcopy/.cpuq-generation" "$pk/tool/aaa/.cpuq-used" "$pk/tool/bbb/.cpuq-used"
+  touch "$sp/s/new-2/.cpuq-used" "$sp/w/p/newcopy/.cpuq-generation" "$pk/tool/ccc/.cpuq-used"
+  ln -s bbb "$pk/tool/latest"
+  touch "$sp/w/p/heldcopy.lock"
+  # A job holding its copy's lock.
+  python3 -c 'import fcntl, sys, time
+f = open(sys.argv[1]); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$sp/w/p/heldcopy.lock" & local holder=$!
+  sleep 0.5
+  "$CPUQ" clean --dry-run --older 1h >"$T/dry"
+  local after_dry; after_dry=$(ls "$sp/s" "$sp/w/p" "$pk/tool" | tr '\n' ' ')
+  "$CPUQ" clean --older 1h >"$T/out"
+  wait $holder
+  local left; left=$(cd "$HOME" && find cpuq-spill cpuq -mindepth 2 -maxdepth 3 -type d | sort | tr '\n' ' ')
+  echo "  left: $left"
+  check "clean: old copies and an unnamed old pack version go, fresh ones, a named one and a locked copy stay; --dry-run removes nothing ($(tail -1 "$T/dry"))" \
+    "[[ '$after_dry' == *old-1* && '$left' != *old-1* && '$left' != *oldcopy* && '$left' != *tool/aaa* && '$left' == *new-2* && '$left' == *newcopy* && '$left' == *heldcopy* && '$left' == *tool/bbb* && '$left' == *tool/ccc* ]] && grep -q 'removed 3' '$T/out'"
+  export HOME=$was_home
+}
+
 t_hook() {
   # cpuq hook: Claude Code's PreToolUse hook refuses heavy commands outside
   # cpuq (exit 2, the fix on stderr) and passes everything else.
@@ -1809,7 +1836,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git tethered record cap cgroups note progress submit submit_moved submit_progress packs stack_limit exclusive_off_waiting status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git tethered record cap cgroups note progress submit submit_moved submit_progress packs stack_limit exclusive_off_waiting clean status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

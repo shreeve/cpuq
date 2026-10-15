@@ -139,6 +139,9 @@ pub const Config = struct {
     /// Directories `cpuq submit` may ship, and take `deps` from, separated by commas or spaces
     /// (`submit_roots`; empty: ~/Data/Code).
     submit_roots: []const u8 = "",
+    /// What jobs left (copies, pack versions, job records) goes once unused this long
+    /// (`clean_after`, e.g. 3d; off: never), by `cpuq record` hourly and `cpuq clean`.
+    clean_after_s: u32 = 3 * 86400,
     /// The machines `cpuq run --spill` may send a job to when this one is
     /// full, in the order tried: ssh names, separated by commas or spaces
     /// (`spill`).
@@ -272,6 +275,8 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             if (cfg.spill_env_count == max_spill_starts) return bad(diag, "at most 8 spill_env lines");
             cfg.spill_envs[cfg.spill_env_count] = .{ .host = host, .cmd = value };
             cfg.spill_env_count += 1;
+        } else if (std.mem.eql(u8, key, "clean_after")) {
+            cfg.clean_after_s = parseAge(value) orelse return bad(diag, "clean_after must be off or a time such as 3d, 36h or 90m");
         } else if (std.mem.eql(u8, key, "min_disk")) {
             cfg.min_disk = parseBytes(value) orelse return bad(diag, "min_disk must be off or a size such as 5G or 512M");
         } else if (std.mem.eql(u8, key, "min_available")) {
@@ -315,6 +320,34 @@ test "sizes for max_memory" {
 fn bad(diag: *Diagnostic, message: []const u8) error{ConfigInvalid} {
     diag.message = message;
     return error.ConfigInvalid;
+}
+
+/// `3d`, `36h`, `90m`, `600s` (or `600`), in seconds; `off` is 0.
+pub fn parseAge(s: []const u8) ?u32 {
+    if (std.mem.eql(u8, s, "off")) return 0;
+    if (s.len == 0) return null;
+    const unit: u32 = switch (s[s.len - 1]) {
+        'd' => 86400,
+        'h' => 3600,
+        'm' => 60,
+        's' => 1,
+        '0'...'9' => 1,
+        else => return null,
+    };
+    const digits = if (std.ascii.isDigit(s[s.len - 1])) s else s[0 .. s.len - 1];
+    const n = std.fmt.parseInt(u32, digits, 10) catch return null;
+    if (n == 0) return null;
+    return std.math.mul(u32, n, unit) catch null;
+}
+
+test "parseAge" {
+    try std.testing.expectEqual(@as(?u32, 3 * 86400), parseAge("3d"));
+    try std.testing.expectEqual(@as(?u32, 36 * 3600), parseAge("36h"));
+    try std.testing.expectEqual(@as(?u32, 5400), parseAge("90m"));
+    try std.testing.expectEqual(@as(?u32, 600), parseAge("600"));
+    try std.testing.expectEqual(@as(?u32, 0), parseAge("off"));
+    try std.testing.expectEqual(@as(?u32, null), parseAge("3x"));
+    try std.testing.expectEqual(@as(?u32, null), parseAge("0d"));
 }
 
 pub fn parseCount(s: []const u8) ?u32 {

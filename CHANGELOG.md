@@ -2,6 +2,19 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.23.0 — 2026-10-15
+
+- **`cpuq clean [--dry-run] [--older AGE] [--host HOST]`** removes what jobs left on a machine once
+  unused for `clean_after` (default 3d, off to keep everything): spilled and submitted jobs'
+  copies, pack versions no link names, and submitted jobs' records a week after they ended. Never
+  anything a process works in, nor a copy a job holds the lock of, nor the caches. `cpuq record`
+  runs it hourly.
+- **A spilled job's copy is now `cpuq-spill/s/NAME-HASH`**, one directory per repo or worktree,
+  not a mirror of its path here: an agent's worktree inside another repo's (`.claude/worktrees/…`)
+  had its copy nested inside that repo's copy. Each spill marks the copy used (`.cpuq-used`).
+  Copies in the old layout are cleaned like the rest once unused.
+- Each job using a pack marks the version used, so `cpuq clean` keeps versions in use.
+
 ## 0.22.1 — 2026-10-15
 
 - A submitted job's progress shows in `cpuq status` and Cpuq.app again. Since 0.19.3 its record
