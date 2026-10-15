@@ -1042,6 +1042,9 @@ struct HourCard: View {
         .chartBackground { yLabels($0, [(0, "0"), (cpus / 2, "\(Int(cpus / 2))"), (cpus, "\(Int(cpus))")], font: .caption) }
         .chartOverlay { scrubber($0) }
         .padding(.leading, labelColumn)
+        // The top and bottom labels, and "quiet · nothing queued", are centred on the plot's
+        // edges: room for their other half, or the section's edge cuts them through.
+        .padding(.vertical, 8)
     }
 
     private func value(_ c: HourCache.Column, _ layer: String) -> Double {

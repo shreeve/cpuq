@@ -3,6 +3,11 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.17.2 — 2026-10-15
+
+- The stacked chart's top and bottom labels ("96", "0") and its "quiet · nothing queued" note are
+  whole again: they sat half outside the plot, where the section's edge cut them.
+
 ## 0.17.1 — 2026-10-15
 
 - The menu's version line says which is which: "App 0.17.1 · CLI 0.16.3", for this app and the
