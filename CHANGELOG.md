@@ -2,6 +2,11 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.16.3 — 2026-10-15
+
+- `--spill-to HOST` exits 125 when the repo can't be copied to HOST, rather than running the job
+  here: 0.16.2 closed the same fallback for a host lost mid-job, but not this one.
+
 ## 0.16.2 — 2026-10-15
 
 - `--spill-to HOST` never runs a job here. Lost mid-job, HOST is started again and the job reruns

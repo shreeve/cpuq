@@ -722,7 +722,13 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     }) catch fail("out of memory", .{});
     const copied = std.process.run(a, io, .{ .argv = sync.items }) catch |err| fail("rsync: {t}", .{err});
     if (!copied.term.success()) {
-        std.debug.print("cpuq: could not copy {s} to {s}: {s}; running here\n", .{ root, host, std.mem.trim(u8, copied.stderr, " \n") });
+        const why = std.mem.trim(u8, copied.stderr, " \n");
+        // Sent there by name, a job never runs here: it was sized for that host.
+        if (o.spill_to != null) {
+            std.debug.print("cpuq: could not copy {s} to {s}: {s}; --spill-to runs it nowhere else\n", .{ root, host, why });
+            return exit_failure;
+        }
+        std.debug.print("cpuq: could not copy {s} to {s}: {s}; running here\n", .{ root, host, why });
         return runHere(ctx, o);
     }
 
