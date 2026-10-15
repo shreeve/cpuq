@@ -862,6 +862,8 @@ fn sleepMs(ms: u32) void {
 /// the lease, waiting or held, would outlive its holder.
 pub const StdinWatch = struct {
     var started = false;
+    /// What it reads: stdin, or the copy `startAside` moved it to.
+    var fd: c.fd_t = 0;
     var eof = std.atomic.Value(bool).init(false);
     /// Written when stdin closes, so a waiter wakes at once.
     var wake: [2]c.fd_t = .{ -1, -1 };
@@ -879,10 +881,25 @@ pub const StdinWatch = struct {
         t.detach();
     }
 
+    /// Watches stdin from a copy of it, and gives fd 0 /dev/null in its
+    /// place: for `cpuq run --tethered`, whose stdin carries the caller's
+    /// heartbeats and must not reach the command, which would read them.
+    pub fn startAside() void {
+        const copy = c.fcntl(0, c.F.DUPFD_CLOEXEC, @as(c_int, 3));
+        if (copy < 0) return start();
+        const null_fd = c.open("/dev/null", .{ .ACCMODE = .RDONLY });
+        if (null_fd >= 0) {
+            _ = c.dup2(null_fd, 0);
+            _ = c.close(null_fd);
+        }
+        fd = copy;
+        start();
+    }
+
     fn run() void {
         var buf: [64]u8 = undefined;
         while (true) {
-            const n = c.read(0, &buf, buf.len);
+            const n = c.read(fd, &buf, buf.len);
             if (n > 0) {
                 beat.store(monoMs(), .release);
                 continue;

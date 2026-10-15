@@ -1433,6 +1433,33 @@ t_min_available() {
   check "under min_available nothing starts (rc $rc, gate $state); above it, it does (rc $rc2)" "[ $rc = 75 ] && [ '$state' = 'low_memory with-available' ] && [ $rc2 = 0 ]"
 }
 
+t_spill() {
+  # A machine with room runs a --spill job itself; a full one tries each
+  # spill host, and with none answering it queues here, saying so.
+  setup spill "spill = cpuq-test-nohost.invalid"
+  local here; here=$("$CPUQ" run --spill --cores 1 -- echo ran-here 2>&1)
+  setup spill-full "spill = cpuq-test-nohost.invalid" "min_available = 1000000G"
+  local full rc
+  full=$("$CPUQ" run --spill --max-wait 1 --cores 1 -- echo ran 2>&1); rc=$?
+  setup spill-none
+  local none; none=$("$CPUQ" run --spill --cores 1 -- echo ran-anyway 2>&1)
+  check "--spill runs here with room ('$here'); full with no host answering, it queues here (rc $rc: '$full'); with no spill hosts, it says so and runs ('$none')" \
+    "[[ '$here' == ran-here && $rc = 75 && '$full' == *'no spill host has room'*'unreachable'* && '$none' == *'no spill hosts configured'*ran-anyway* ]]"
+}
+
+t_tethered() {
+  # --tethered (what --spill runs on the spill host): the command gets
+  # /dev/null for stdin, which carries the caller's heartbeats, and is
+  # stopped when the caller goes (stdin closes).
+  setup tethered
+  local out; out=$( (echo heartbeat; sleep 3) | "$CPUQ" run --tethered --cores 1 -- sh -c 'cat; echo done' 2>/dev/null)
+  local t0 rc; t0=$(date +%s)
+  (sleep 1) | "$CPUQ" run --tethered --cores 1 -- sleep 30 2>/dev/null; rc=$?
+  local took=$(( $(date +%s) - t0 ))
+  check "a tethered command reads /dev/null, not the heartbeats ('$out'), and stops once the caller goes (rc $rc after ${took}s)" \
+    "[[ '$out' == done && $rc = 143 && $took -lt 10 ]]"
+}
+
 t_min_disk() {
   setup min-disk "min_disk = 1000000G"
   "$CPUQ" run --cores 1 --max-wait 1 -- true 2>/dev/null; local rc=$?
@@ -1457,7 +1484,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status --json has schema 1, the version, a structured gate, and pressure off when unchecked (got '$j')" "[ '$j' = '1 True open None off' ]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill tethered status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

@@ -46,6 +46,10 @@ const usage =
     \\                        a VM): counted at its whole grant; give --cores
     \\  --no-load-check       ignore the load valve
     \\  --qos none|auto       none: leave the command's scheduling class alone
+    \\  --spill               when this machine is full, run on a spill host with
+    \\                        room (config `spill`), starting a stopped one if
+    \\                        need be; the repo is copied there with rsync
+    \\  --return PATH         with --spill: copy PATH back here afterwards (repeats)
     \\
     \\lease options (NAME: letters, digits, . _ -):
     \\  --slots N             let N hold NAME at once (default 1)
@@ -301,7 +305,17 @@ const RunOptions = struct {
     /// stop it (inside a container or a VM): counted at its whole grant,
     /// never lent a timing window it could not be frozen out of.
     hidden: bool = false,
+    /// `--spill`: when this machine is full, run on a spill host instead.
+    spill: bool = false,
+    /// `--return PATH` (with --spill): copied back from the spill host after.
+    returns: [max_returns][]const u8 = undefined,
+    return_count: u8 = 0,
+    /// `--tethered` (internal, what --spill runs on the spill host): stdin
+    /// carries the caller's heartbeats; when they stop, the job stops.
+    tethered: bool = false,
 };
+
+const max_returns = 8;
 
 fn parseRun(args: []const [:0]const u8) ?RunOptions {
     var o: RunOptions = .{};
@@ -322,7 +336,7 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             name = kv[0];
             inline_value = kv[1];
         }
-        const takes_value = for ([_][]const u8{ "--cores", "--priority", "--label", "--max-wait", "--qos", "--host", "--slots" }) |v| {
+        const takes_value = for ([_][]const u8{ "--cores", "--priority", "--label", "--max-wait", "--qos", "--host", "--slots", "--return" }) |v| {
             if (std.mem.eql(u8, name, v)) break true;
         } else false;
         var value: []const u8 = "";
@@ -339,7 +353,7 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             _ = usageError("{s} takes no value", .{name});
             return null;
         }
-        for ([_][]const u8{ "--cores", "--no-load-check", "--qos", "--opaque" }) |r| {
+        for ([_][]const u8{ "--cores", "--no-load-check", "--qos", "--opaque", "--spill", "--return", "--tethered" }) |r| {
             if (std.mem.eql(u8, name, r)) o.run_only = r;
         }
         if (std.mem.eql(u8, name, "--cores")) {
@@ -380,6 +394,21 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             };
         } else if (std.mem.eql(u8, name, "--hold")) {
             o.hold = true;
+        } else if (std.mem.eql(u8, name, "--spill")) {
+            o.spill = true;
+        } else if (std.mem.eql(u8, name, "--tethered")) {
+            o.tethered = true;
+        } else if (std.mem.eql(u8, name, "--return")) {
+            if (value.len == 0 or value[0] == '/' or std.mem.find(u8, value, "..") != null) {
+                _ = usageError("--return needs a path inside the repo, not '{s}'", .{value});
+                return null;
+            }
+            if (o.return_count == max_returns) {
+                _ = usageError("at most {d} --return paths", .{max_returns});
+                return null;
+            }
+            o.returns[o.return_count] = value;
+            o.return_count += 1;
         } else {
             _ = usageError("unknown option '{s}'", .{a});
             return null;
@@ -456,6 +485,17 @@ fn cmdRun(ctx: *Ctx, args: []const [:0]const u8) u8 {
 
     loadConfig(ctx);
     if (o.exclusive and !ctx.cfg.exclusive) o.exclusive = exclusiveOff(o.label);
+    if (o.return_count != 0 and !o.spill) return usageError("--return goes with --spill", .{});
+    if (o.tethered) tether();
+    if (o.spill) {
+        if (o.exclusive) return usageError("--spill sends ordinary jobs, not --exclusive ones (time on the machine you mean)", .{});
+        return runSpill(ctx, o);
+    }
+    return runHere(ctx, o);
+}
+
+/// Waits its turn on this machine and runs the command.
+fn runHere(ctx: *Ctx, o: RunOptions) u8 {
     const exe = findExecutable(ctx, o.cmd[0]) orelse {
         std.debug.print("cpuq: {s}: command not found\n", .{o.cmd[0]});
         return exit_notfound;
@@ -463,6 +503,198 @@ fn cmdRun(ctx: *Ctx, args: []const [:0]const u8) u8 {
     var st = openState(ctx);
     const lease = waitTurn(ctx, &st, o);
     return runAdmitted(ctx, &st, o, exe, lease);
+}
+
+/// Whether this run is tethered to a caller over ssh (`--tethered`).
+var tethered = false;
+
+/// `--tethered`: the caller (a `cpuq run --spill` on another machine)
+/// sends heartbeats down stdin. A waiting run gives up once they stop, and a
+/// running one stops its command, as when the caller is killed or loses the
+/// connection. The command gets /dev/null for stdin.
+fn tether() void {
+    tethered = true;
+    // Heartbeats come every 10 s; three missed is gone.
+    hold_quiet_ms = 35_000;
+    sys.StdinWatch.startAside();
+}
+
+/// `cpuq run --spill`: runs here unless this machine is full; else on the
+/// first spill host (config `spill`) with room; failing that, it starts the
+/// first stopped one that has a `spill_start` command and runs there;
+/// failing that, it queues here. Full means anyone waiting, the 1-minute
+/// load above the CPUs, or a gate shut, here and on each host alike. The
+/// repo (git's top level, else the working directory) is copied to
+/// HOST:cpuq-spill/<its path here> with rsync, honoring .gitignore and
+/// leaving .git behind, and the job runs there through HOST's cpuq,
+/// tethered to this one, which streams its output and returns its status.
+fn runSpill(ctx: *Ctx, o: RunOptions) u8 {
+    var hosts = ctx.cfg.spillHosts();
+    if (hosts.peek() == null) {
+        std.debug.print("cpuq: --spill: no spill hosts configured (`spill = HOST, ...` in {s}); running here\n", .{ctx.cfg_path});
+        return runHere(ctx, o);
+    }
+    var why_buf: [96]u8 = undefined;
+    const why = localFull(ctx, &why_buf) orelse return runHere(ctx, o);
+    var stopped: ?[]const u8 = null;
+    var seen: std.ArrayList(u8) = .empty;
+    while (hosts.next()) |h| {
+        const p = probeHost(ctx, h);
+        switch (p) {
+            .room => return spillTo(ctx, o, h, why),
+            .full => |text| seen.print(ctx.arena, "{s}{s} {s}", .{ if (seen.items.len == 0) "" else ", ", h, text }) catch {},
+            .gone => if (stopped == null and ctx.cfg.spillStart(h) != null) {
+                stopped = h;
+            } else {
+                seen.print(ctx.arena, "{s}{s} unreachable", .{ if (seen.items.len == 0) "" else ", ", h }) catch {};
+            },
+        }
+    }
+    if (stopped) |h| {
+        std.debug.print("cpuq: here {s}{s}{s}; starting {s}\n", .{ why, if (seen.items.len == 0) "" else "; ", seen.items, h });
+        if (startHost(ctx, h)) return spillTo(ctx, o, h, why);
+        std.debug.print("cpuq: could not start {s}; queueing here\n", .{h});
+        return runHere(ctx, o);
+    }
+    std.debug.print("cpuq: here {s}, and no spill host has room ({s}); queueing here\n", .{ why, seen.items });
+    return runHere(ctx, o);
+}
+
+/// Why this machine is full, for `--spill`; null when it has room.
+fn localFull(ctx: *Ctx, buf: []u8) ?[]const u8 {
+    var st = openState(ctx);
+    lockOrFail(&st);
+    const now = nowSeconds(ctx.io);
+    const queue = state.scanQueue(&st, ctx.arena, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{});
+    st.unlock();
+    if (queue.len != 0) return std.mem.print(buf, "has {d} waiting", .{queue.len}) catch "is full";
+    const m = machine(ctx);
+    const load = sys.loadAverage()[0];
+    if (load > @as(f64, @floatFromInt(m.active))) return std.mem.print(buf, "is at load {d:.1} on {d} CPUs", .{ load, m.active }) catch "is full";
+    if (policy.gate(ctx.cfg, m, budgetNow(ctx, m), null, now) != .open) return "has its gate shut";
+    return null;
+}
+
+/// A spill host as `cpuq status` there describes it.
+const Probe = union(enum) {
+    room,
+    /// Why not: someone waiting, its load, its gate.
+    full: []const u8,
+    /// No answer: down, stopped, or an older cpuq.
+    gone,
+};
+
+fn probeHost(ctx: *Ctx, host: []const u8) Probe {
+    const a = ctx.arena;
+    const argv = [_][]const u8{ "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, "cpuq status --json --no-usage" };
+    const result = std.process.run(a, ctx.io, .{ .argv = &argv }) catch return .gone;
+    if (!result.term.success()) return .gone;
+    const st = std.json.parseFromSliceLeaky(JsonStatus, a, result.stdout, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return .gone;
+    if (st.waiters.len != 0) return .{ .full = a.print("has {d} waiting", .{st.waiters.len}) catch "is full" };
+    if (st.load[0] > @as(f64, @floatFromInt(st.active_cores))) return .{ .full = a.print("is at load {d:.1} on {d} CPUs", .{ st.load[0], st.active_cores }) catch "is full" };
+    if (!std.mem.eql(u8, st.gate.state, "open")) return .{ .full = "has its gate shut" };
+    return .room;
+}
+
+/// Runs `host`'s `spill_start` command, one start at a time: a second
+/// --spill waits for the first's start and finds the host up.
+fn startHost(ctx: *Ctx, host: []const u8) bool {
+    const io = ctx.io;
+    const a = ctx.arena;
+    const cmd = ctx.cfg.spillStart(host) orelse return false;
+    const lock_path = a.print("{s}/spill-start-{s}", .{ stateDir(ctx), host }) catch return false;
+    const lock = Io.Dir.cwd().createFile(io, lock_path, .{ .lock = .exclusive, .truncate = false }) catch null;
+    defer if (lock) |f| f.close(io);
+    if (probeHost(ctx, host) != .gone) return true;
+    // Its output is about the start, not the job: to stderr.
+    const script = a.print("{s} 1>&2", .{cmd}) catch return false;
+    var child = std.process.spawn(io, .{ .argv = &.{ "sh", "-c", script }, .stdin = .ignore, .stdout = .inherit, .stderr = .inherit }) catch return false;
+    const term = child.wait(io) catch return false;
+    return term.success();
+}
+
+/// Copies the repo to `host` and runs the job there through its cpuq.
+fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
+    const io = ctx.io;
+    const a = ctx.arena;
+    const cwd = std.process.currentPathAlloc(io, a) catch fail("current directory: cannot read it", .{});
+    const root = gitTop(ctx) orelse cwd;
+    const rel = if (std.mem.startsWith(u8, cwd, root)) cwd[root.len..] else "";
+    // The copy's place on the host mirrors the repo's path here, so each
+    // repo (and worktree) keeps its own, and its build caches, between runs.
+    const dir = a.print("cpuq-spill{s}", .{root}) catch fail("out of memory", .{});
+    std.debug.print("cpuq: here {s}; running {s} on {s}\n", .{ why, if (o.label.len != 0) o.label else o.cmd[0], host });
+
+    const sync = [_][]const u8{
+        "rsync",                                                                          "-a", "--delete", "--exclude=/.git", "--filter=:- .gitignore",
+        a.print("--rsync-path=mkdir -p {s} && rsync", .{shellQuote(a, dir)}) catch "", a.print("{s}/", .{root}) catch "",
+        a.print("{s}:{s}/", .{ host, dir }) catch "",
+    };
+    const copied = std.process.run(a, io, .{ .argv = &sync }) catch |err| fail("rsync: {t}", .{err});
+    if (!copied.term.success()) {
+        std.debug.print("cpuq: could not copy {s} to {s}: {s}; running here\n", .{ root, host, std.mem.trim(u8, copied.stderr, " \n") });
+        return runHere(ctx, o);
+    }
+
+    // ssh joins its arguments into one line for the remote shell, so
+    // everything is quoted for it.
+    var remote: std.ArrayList(u8) = .empty;
+    remote.print(a, "cd {s} && exec cpuq run --tethered --priority {t}", .{ shellQuote(a, a.print("{s}{s}", .{ dir, rel }) catch dir), o.priority }) catch fail("out of memory", .{});
+    if (o.label.len != 0) remote.print(a, " --label {s}", .{shellQuote(a, o.label)}) catch {};
+    if (o.cores_given) remote.print(a, " --cores {d}-{d}", .{ o.request.min, o.request.max }) catch {};
+    if (o.max_wait) |mw| remote.print(a, " --max-wait {d}", .{mw}) catch {};
+    if (!o.load_check) remote.appendSlice(a, " --no-load-check") catch {};
+    if (!o.qos) remote.appendSlice(a, " --qos none") catch {};
+    if (o.hidden) remote.appendSlice(a, " --opaque") catch {};
+    remote.appendSlice(a, " --") catch {};
+    for (o.cmd) |arg| remote.print(a, " {s}", .{shellQuote(a, arg)}) catch {};
+    const argv = [_][]const u8{ "ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4", host, remote.items };
+    var child = std.process.spawn(io, .{ .argv = &argv, .stdin = .pipe, .stdout = .inherit, .stderr = .inherit }) catch |err|
+        fail("ssh {s}: {t}", .{ host, err });
+    // Heartbeats down the connection: the run on the host stops its job
+    // when they stop, as when this cpuq is killed or the connection dies.
+    var heart: sys.Heartbeat = .{ .fd = child.stdin.?.handle };
+    heart.start();
+    const term = child.wait(io) catch std.process.Child.Term{ .unknown = 0 };
+    heart.stop();
+    const code: u8 = switch (term) {
+        .exited => |c| c,
+        else => exit_failure,
+    };
+    // 255 is ssh's own failure; a death by signal can be the host shutting
+    // down under the job (a Spot reclaim powers the VM off gracefully, and
+    // the shutdown kills the job before the connection drops). Either way,
+    // give a host that is going a moment to go, and if it has, run the job
+    // here instead.
+    if ((code == 255 or code > 128) and hostWentAway(ctx, host)) {
+        std.debug.print("cpuq: lost {s} while {s} ran there; running it here instead\n", .{ host, if (o.label.len != 0) o.label else o.cmd[0] });
+        return runHere(ctx, o);
+    }
+    for (o.returns[0..o.return_count]) |path| {
+        const back = [_][]const u8{ "rsync", "-a", "--relative", a.print("{s}:{s}{s}/./{s}", .{ host, dir, rel, path }) catch "", "./" };
+        const r = std.process.run(a, io, .{ .argv = &back }) catch null;
+        if (r == null or !r.?.term.success()) std.debug.print("cpuq: could not copy {s} back from {s}\n", .{ path, host });
+    }
+    return code;
+}
+
+/// Whether `host` stopped answering after a job there ended badly: looked
+/// at twice, 5 seconds apart, since a host shutting down can still answer
+/// at first.
+fn hostWentAway(ctx: *Ctx, host: []const u8) bool {
+    for (0..2) |_| {
+        ctx.io.sleep(.fromSeconds(5), .awake) catch {};
+        if (probeHost(ctx, host) == .gone) return true;
+    }
+    return false;
+}
+
+/// The top of the git work tree holding the working directory, if any.
+fn gitTop(ctx: *Ctx) ?[]const u8 {
+    const r = std.process.run(ctx.arena, ctx.io, .{ .argv = &.{ "git", "rev-parse", "--show-toplevel" } }) catch return null;
+    if (!r.term.success()) return null;
+    const top = std.mem.trim(u8, r.stdout, " \n");
+    return if (top.len == 0) null else top;
 }
 
 const Lease = struct {
@@ -705,7 +937,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
         // Waiting to hold a lease for someone who has gone (their
         // connection dropped): give up rather than hold it for nobody.
         if (sys.StdinWatch.gone(hold_quiet_ms)) {
-            std.debug.print("cpuq: whoever this hold was for has gone; giving up\n", .{});
+            std.debug.print("cpuq: whoever this {s} was for has gone; giving up\n", .{if (tethered) "run" else "hold"});
             giveUp(ctx, st, ticket_name, now - start, job);
         }
 
@@ -1238,6 +1470,8 @@ fn watchChild(ctx: *Ctx, pid: std.c.pid_t, label: []const u8) sys.Waited {
     defer arena_state.deinit();
     var stopped: ?u64 = null;
     var stopped_at: f64 = 0;
+    // A tethered run whose caller has gone: when its command was stopped.
+    var abandoned_at: ?f64 = null;
     var peak: u64 = 0;
     var last_cpu: u64 = 0;
     var last_ms: i64 = 0;
@@ -1265,6 +1499,13 @@ fn watchChild(ctx: *Ctx, pid: std.c.pid_t, label: []const u8) sys.Waited {
             n.observe(procs, own, true, label);
         }
         keepFrozen(ctx, a, procs, pid);
+        if (abandoned_at) |t| {
+            if (nowFloat(ctx.io) - t >= 10) signalTree(a, procs, pid, .KILL);
+        } else if (tethered and sys.StdinWatch.gone(hold_quiet_ms)) {
+            std.debug.print("cpuq: whoever ran {s} here has gone (killed, or the connection lost); stopping it\n", .{if (label.len != 0) label else "this job"});
+            abandoned_at = nowFloat(ctx.io);
+            signalTree(a, procs, pid, .TERM);
+        }
         if (stopped != null) {
             if (nowFloat(ctx.io) - stopped_at >= 10) signalTree(a, procs, pid, .KILL);
             continue;

@@ -49,10 +49,19 @@ branch names: history sizes jobs and estimates waits by label.
 
 ## Another machine
 
-When this machine is full (anyone waiting in `cpuq status`, or the 1-minute load above its CPU
-count) and another machine you can use has room (`cpuq status --host HOST`: nobody waiting, load
-under its CPU count), run work that doesn't need this OS there, through that machine's own cpuq.
-Don't wait for a long queue: a job sent at the first wait spares everyone behind it. For example:
+Where `spill` is configured (`grep spill ~/.config/cpuq/config`), add `--spill` to any job
+that doesn't need this OS (builds, test suites of portable code):
+
+    cpuq run --spill --label app:build --cores 2-6 -- sh -c 'zig build -j"$CPUQ_CORES" test'
+
+It runs here while there's room; when this machine is full it runs on a spill host with room,
+starting a stopped cloud machine if need be, with the repo copied there by rsync. Its output and
+exit status come back as usual. The command must stay inside the repo: absolute paths here (a
+scratchpad file) don't exist there. `--return zig-out` copies a build's output back.
+
+Without `spill` configured, send work by hand when this machine is full (anyone waiting, or the
+1-minute load above its CPU count) and another has room (`cpuq status --host HOST`), through
+that machine's own cpuq:
 
     ssh HOST 'cd repo && cpuq run --label app:build --cores 2-8 -- sh -c "make -j\"\$CPUQ_CORES\""'
 

@@ -131,6 +131,33 @@ pub const Config = struct {
     /// on a crowded machine CPU time divides by grant, however many threads
     /// a job starts; on a quiet one it limits nothing (`cpu_weights`).
     cpu_weights: bool = false,
+    /// The machines `cpuq run --spill` may send a job to when this one is
+    /// full, in the order tried: ssh names, separated by commas or spaces
+    /// (`spill`).
+    spill: []const u8 = "",
+    /// How to start a spill host that is stopped, such as a cloud machine:
+    /// `spill_start.HOST = COMMAND`, run with sh; it should return once
+    /// `ssh HOST` works.
+    spill_starts: [max_spill_starts]SpillStart = @splat(.{}),
+    spill_start_count: u8 = 0,
+
+    /// The spill hosts, in order.
+    pub fn spillHosts(self: *const Config) std.mem.TokenIterator(u8, .any) {
+        return std.mem.tokenizeAny(u8, self.spill, ", \t");
+    }
+
+    /// The command that starts `host`, if one is configured.
+    pub fn spillStart(self: *const Config, host: []const u8) ?[]const u8 {
+        for (self.spill_starts[0..self.spill_start_count]) |s| if (std.mem.eql(u8, s.host, host)) return s.cmd;
+        return null;
+    }
+};
+
+pub const max_spill_starts = 8;
+
+pub const SpillStart = struct {
+    host: []const u8 = "",
+    cmd: []const u8 = "",
 };
 
 pub const Diagnostic = struct {
@@ -205,6 +232,15 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             cfg.target = t;
         } else if (std.mem.eql(u8, key, "settle")) {
             cfg.settle_s = parseCount(value) orelse return bad(diag, "settle must be a whole number of seconds, at least 1");
+        } else if (std.mem.eql(u8, key, "spill")) {
+            cfg.spill = value;
+        } else if (std.mem.startsWith(u8, key, "spill_start.")) {
+            const host = key["spill_start.".len..];
+            if (host.len == 0) return bad(diag, "spill_start needs a host: spill_start.HOST = COMMAND");
+            if (value.len == 0) return bad(diag, "spill_start needs a command to start the host");
+            if (cfg.spill_start_count == max_spill_starts) return bad(diag, "at most 8 spill_start commands");
+            cfg.spill_starts[cfg.spill_start_count] = .{ .host = host, .cmd = value };
+            cfg.spill_start_count += 1;
         } else if (std.mem.eql(u8, key, "min_disk")) {
             cfg.min_disk = parseBytes(value) orelse return bad(diag, "min_disk must be off or a size such as 5G or 512M");
         } else if (std.mem.eql(u8, key, "min_available")) {
@@ -812,6 +848,23 @@ test "memory pressure gate" {
     try testing.expectEqual(Gate.pressure, gate(cfg, squeezed, 8, null, 0));
     try testing.expectEqual(Gate.open, gate(.{ .pressure_check = false }, squeezed, 8, null, 0));
     try testing.expectEqual(Gate.open, gate(cfg, .{ .active = 10, .load1 = 3, .pressure = .unknown }, 8, null, 0));
+}
+
+test "spill hosts and their start commands" {
+    var cfg: Config = .{};
+    var diag: Diagnostic = .{};
+    try parseConfig(
+        \\spill = pup, burst
+        \\spill_start.burst = ~/runbooks/host-gcp-burst/start  # a cloud machine
+        \\
+    , &cfg, &diag);
+    var it = cfg.spillHosts();
+    try testing.expectEqualStrings("pup", it.next().?);
+    try testing.expectEqualStrings("burst", it.next().?);
+    try testing.expectEqual(@as(?[]const u8, null), it.next());
+    try testing.expectEqualStrings("~/runbooks/host-gcp-burst/start", cfg.spillStart("burst").?);
+    try testing.expectEqual(@as(?[]const u8, null), cfg.spillStart("pup"));
+    try testing.expectError(error.ConfigInvalid, parseConfig("spill_start. = x\n", &cfg, &diag));
 }
 
 test "disk gate" {

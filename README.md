@@ -328,6 +328,38 @@ them, and frozen jobs keep their memory. `cpuq status` notes a lending window an
 jobs as paused. This suits a dedicated build or benchmark machine where those processes are the
 window's work. It needs measured admission.
 
+## Spilling to other machines
+
+    cpuq run --spill [run options] [--return PATH]... -- CMD ARGS...
+
+`--spill` runs the job here while this machine has room. When it is full (anyone waiting, the
+1-minute load above its CPUs, or a gate shut), it tries the machines named by `spill` in the
+config, in order, and runs the job on the first one with room by the same test, through that
+machine's own cpuq. If none has room but one is stopped and has a `spill_start` command (a cloud
+machine that bills only while it runs), it starts that one and runs there. Failing all that, the
+job waits its turn here. It says on stderr which it chose and why.
+
+    spill = pup, burst
+    spill_start.burst = ~/Data/Code/runbooks/host-gcp-burst/start
+
+Before the job runs there, the repo (git's top level, else the working directory) is copied to
+`HOST:cpuq-spill/<its path here>` with rsync, honoring `.gitignore` and leaving `.git` behind.
+Each repo and worktree keeps its own copy there, so build caches stay warm between runs. The job
+starts in the same subdirectory, with the same options; its output streams back, and its exit
+status is cpuq's. `--return PATH` copies a path (relative to the working directory) back
+afterwards, for a build's output; it repeats.
+
+- **The command must not reach outside the repo.** Absolute paths here (a scratch directory, a
+  file in another checkout) do not exist on the other machine, and nothing writes back except
+  `--return`.
+- **The job stays tied to this cpuq.** It sends heartbeats down the connection, and the job on the
+  other machine stops when they stop: when this cpuq is killed, or the connection is lost.
+- **A machine that goes away mid-job** (a Spot VM reclaimed, the network down) is noticed: when
+  the connection fails or the job dies by a signal and the machine then stops answering, the job
+  runs again here.
+- **Only work that doesn't need this OS** belongs on `--spill`: the other machine may run Linux.
+- The other machines need cpuq 0.12 or later, and ssh to them must work without a prompt.
+
 ## Named leases
 
     cpuq lease NAME [--slots N] [--exclusive] [--priority P] [--label L] [--max-wait S] -- CMD...
@@ -466,6 +498,8 @@ re-reads the file when it changes; an invalid edit keeps the settings in force a
 | `min_available` | off | admit nothing while available memory is under this (e.g. `6G`) |
 | `min_disk` | 5G | admit nothing while `$HOME`'s or the temp directory's filesystem has less free than this; off turns it off |
 | `max_memory` | off | stop a job whose processes together use more memory than this (e.g. `16G`) |
+| `spill` | none | ssh hosts `--spill` may send a job to, in order (commas or spaces) |
+| `spill_start.HOST` | none | a command (run with sh) that starts HOST when it is stopped; it returns once ssh works |
 | `exclusive` | on | grant `--exclusive`; off, it runs as an ordinary job |
 | `window_gap` | 0 | seconds after an exclusive run ends during which waiting ones go behind other work |
 | `cpu_weights` | off | Linux: run each job in a scope weighted by its grant |

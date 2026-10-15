@@ -2,6 +2,19 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.12.0 — 2026-10-14
+
+- `cpuq run --spill`: when this machine is full (anyone waiting, the load above its CPUs, or a
+  gate shut), the job runs on the first machine named by `spill` in the config that has room,
+  through that machine's own cpuq; failing that, it starts a stopped one that has a
+  `spill_start.HOST` command (a cloud machine billed only while it runs) and runs there; failing
+  that, it waits here. The repo is copied there with rsync (honoring `.gitignore`, without
+  `.git`), into a place of its own that keeps build caches warm; output and exit status come
+  back; `--return PATH` copies results back.
+- A spilled job is tied to the cpuq that sent it: when that cpuq is killed or the connection is
+  lost, the job on the other machine stops. When the other machine goes away mid-job (a Spot VM
+  reclaimed), the job runs again here.
+
 ## 0.11.1 — 2026-10-12
 
 - `cpuq status` on a terminal counts the cores handed out against the CPUs online under measured
