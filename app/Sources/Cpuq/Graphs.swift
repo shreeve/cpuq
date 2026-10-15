@@ -235,10 +235,10 @@ final class GraphModel {
                 if let u = h.using { blocks[i].active.append(Reading(at: now, cores: u)) }
             } else {
                 let from = Date(timeIntervalSince1970: Double(h.since))
-                blocks.append(Block(id: id, project: Self.project(h.label), label: Self.label(h.label, h.command),
+                blocks.append(Block(id: id, project: Self.group(h.label, h.note), label: Self.label(h.label, h.command),
                                     lanes: h.slots.isEmpty ? fit(h.cores, from: from) : h.slots, from: from,
                                     active: h.using.map { [Reading(at: now, cores: $0)] } ?? [], exclusive: h.exclusive))
-                remember(Self.project(h.label))
+                remember(Self.group(h.label, h.note))
             }
         }
         for i in blocks.indices where blocks[i].to == nil && !running.contains(blocks[i].id) { blocks[i].to = now }
@@ -248,9 +248,9 @@ final class GraphModel {
             let id = "\(w.since)-\(w.label)-\(w.command)"
             queued.insert(id)
             if !waits.contains(where: { $0.id == id }) {
-                waits.append(Wait(id: id, project: Self.project(w.label), label: Self.label(w.label, w.command), cores: Self.wants(w),
+                waits.append(Wait(id: id, project: Self.group(w.label, w.note), label: Self.label(w.label, w.command), cores: Self.wants(w),
                                   need: w.exclusive ? budget : max(w.cores, 1), from: Date(timeIntervalSince1970: Double(w.since)), exclusive: w.exclusive))
-                remember(Self.project(w.label))
+                remember(Self.group(w.label, w.note))
             }
         }
         for i in waits.indices where waits[i].to == nil && !queued.contains(waits[i].id) { waits[i].to = now }
@@ -315,13 +315,13 @@ final class GraphModel {
             if blocks.contains(where: { $0.id.hasPrefix("\(j.pid ?? -1)-") && abs($0.from.timeIntervalSince1970 - start) < 2 }) { continue }
             let from = Date(timeIntervalSince1970: max(start, since))
             let to = Date(timeIntervalSince1970: j.ended ?? start)
-            blocks.append(Block(id: "\(j.pid ?? 0)-\(Int(start))", project: Self.project(j.label), label: j.label.isEmpty ? "-" : j.label,
+            blocks.append(Block(id: "\(j.pid ?? 0)-\(Int(start))", project: Self.group(j.label, j.note), label: j.label.isEmpty ? "-" : j.label,
                                 lanes: j.slots ?? fit(cores, from: from, to: to), from: from, to: to, average: j.used, exclusive: j.exclusive))
             if let w = j.waited, w >= 1, start > since {
-                waits.append(Wait(id: "h\(j.id)", project: Self.project(j.label), label: j.label, cores: "\(cores) cores",
+                waits.append(Wait(id: "h\(j.id)", project: Self.group(j.label, j.note), label: j.label, cores: "\(cores) cores",
                                   need: cores, from: Date(timeIntervalSince1970: start - w), to: from, exclusive: j.exclusive))
             }
-            remember(Self.project(j.label))
+            remember(Self.group(j.label, j.note))
         }
         blocks.sort { $0.from < $1.from }
     }
@@ -419,8 +419,8 @@ final class GraphModel {
         var held: [String: Int] = [:]
         var used: [String: Double] = [:]
         for h in s.holders {
-            held[Self.project(h.label), default: 0] += h.cores
-            used[Self.project(h.label), default: 0] += h.using ?? 0
+            held[Self.group(h.label, h.note), default: 0] += h.cores
+            used[Self.group(h.label, h.note), default: 0] += h.using ?? 0
         }
         return held.map { Row(project: $0.key, held: $0.value, used: used[$0.key] ?? 0) }
             .sorted { $0.held != $1.held ? $0.held > $1.held : $0.project < $1.project }
@@ -436,6 +436,12 @@ final class GraphModel {
 
     static func wants(_ w: Status.Waiter) -> String {
         w.exclusive ? "every core" : (w.max > w.cores ? "\(w.cores)–\(w.max) cores" : w.cores == 1 ? "1 core" : "\(w.cores) cores")
+    }
+
+    /// What the charts split CPU by: the project, and with a note ("#881 markers") the project
+    /// and the note, so one project's PRs show as bands of their own.
+    static func group(_ label: String, _ note: String) -> String {
+        note.isEmpty ? project(label) : "\(project(label)) \(note)"
     }
 
     static func project(_ label: String) -> String {

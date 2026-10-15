@@ -54,6 +54,8 @@ public struct Status: Decodable, Sendable, Equatable {
         public var priority = ""
         public var exclusive = false
         public var label = ""
+        /// What the job is for (`--note`): shown beside the label, a band of its own in the charts.
+        public var note = ""
         public var command = ""
         public var since = 0
     }
@@ -65,6 +67,8 @@ public struct Status: Decodable, Sendable, Equatable {
         public var max = 0
         public var exclusive = false
         public var label = ""
+        /// What the job is for (`--note`): shown beside the label, a band of its own in the charts.
+        public var note = ""
         public var command = ""
         public var since = 0
         public var eta: Double?
@@ -156,7 +160,7 @@ extension Status.Gate {
 }
 
 extension Status.Holder {
-    private enum Keys: String, CodingKey { case pid, cores, slots, paused, using, priority, exclusive, label, command, since }
+    private enum Keys: String, CodingKey { case pid, cores, slots, paused, using, priority, exclusive, label, note, command, since }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         pid = try c.decodeIfPresent(Int.self, forKey: .pid) ?? 0
@@ -167,13 +171,14 @@ extension Status.Holder {
         priority = try c.decodeIfPresent(String.self, forKey: .priority) ?? ""
         exclusive = try c.decodeIfPresent(Bool.self, forKey: .exclusive) ?? false
         label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
+        note = try c.decodeIfPresent(String.self, forKey: .note) ?? ""
         command = try c.decodeIfPresent(String.self, forKey: .command) ?? ""
         since = try c.decodeIfPresent(Int.self, forKey: .since) ?? 0
     }
 }
 
 extension Status.Waiter {
-    private enum Keys: String, CodingKey { case order, pid, cores, max, exclusive, label, command, since, eta }
+    private enum Keys: String, CodingKey { case order, pid, cores, max, exclusive, label, note, command, since, eta }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         order = try c.decodeIfPresent(Int.self, forKey: .order) ?? 0
@@ -182,6 +187,7 @@ extension Status.Waiter {
         max = try c.decodeIfPresent(Int.self, forKey: .max) ?? cores
         exclusive = try c.decodeIfPresent(Bool.self, forKey: .exclusive) ?? false
         label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
+        note = try c.decodeIfPresent(String.self, forKey: .note) ?? ""
         command = try c.decodeIfPresent(String.self, forKey: .command) ?? ""
         since = try c.decodeIfPresent(Int.self, forKey: .since) ?? 0
         eta = try c.decodeIfPresent(Double.self, forKey: .eta)
@@ -266,6 +272,8 @@ public struct Job: Decodable, Sendable, Equatable {
     public var state = ""
     public var pool = ""
     public var label = ""
+        /// What the job is for (`--note`): shown beside the label, a band of its own in the charts.
+        public var note = ""
     /// The job's cpuq pid and the moment it queued, as "PID-TIME".
     public var id = ""
     public var cores: Int?
@@ -279,13 +287,14 @@ public struct Job: Decodable, Sendable, Equatable {
     /// It held the machine alone (`--exclusive`).
     public var exclusive = false
 
-    private enum Keys: String, CodingKey { case state, pool, label, id, cores, slots, queued, started, ended, waited, ran, used, exclusive }
+    private enum Keys: String, CodingKey { case state, pool, label, note, id, cores, slots, queued, started, ended, waited, ran, used, exclusive }
 
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         state = try c.decodeIfPresent(String.self, forKey: .state) ?? ""
         pool = try c.decodeIfPresent(String.self, forKey: .pool) ?? ""
         label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
+        note = try c.decodeIfPresent(String.self, forKey: .note) ?? ""
         id = try c.decodeIfPresent(String.self, forKey: .id) ?? ""
         cores = try c.decodeIfPresent(Int.self, forKey: .cores)
         slots = try c.decodeIfPresent([Int].self, forKey: .slots)

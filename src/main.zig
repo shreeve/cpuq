@@ -11,9 +11,11 @@ const history = @import("history.zig");
 const hook = @import("hook.zig");
 const table = @import("table.zig");
 const cap = @import("cap.zig");
+const submit = @import("submit.zig");
 
 test {
     _ = cap;
+    _ = submit;
     _ = hook;
     _ = policy;
     _ = state;
@@ -35,6 +37,9 @@ const usage =
     \\       cpuq record [--interval SECONDS] | --install | --uninstall
     \\       cpuq samples [--since UNIX-SECONDS]
     \\       cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] -- PROGRAM [ARGS...]
+    \\       cpuq submit SPEC [-- ARGS] [--env K=V]... [--replace | --again]
+    \\       cpuq jobs [--all]
+    \\       cpuq job [ID|last] [--wait [--max-wait S]] [--tail N] [--json] [--cancel]
     \\       cpuq hook                (an agent harness's pre-command hook)
     \\       cpuq budget | qos | --version | --help
     \\
@@ -166,6 +171,23 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
     if (std.mem.eql(u8, cmd, "history")) return cmdHistory(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "doctor")) return cmdDoctor(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "record")) return cmdRecord(ctx, args[1..]);
+    inline for (.{
+        .{ "submit", submit.cmdSubmit },
+        .{ "jobs", submit.cmdJobs },
+        .{ "job", submit.cmdJob },
+        .{ "_supervise", submit.cmdSupervise },
+        .{ "_start", submit.cmdStart },
+        .{ "_runjob", submit.cmdHostJob },
+        .{ "_peek", submit.cmdPeek },
+        .{ "_synced", submit.cmdSynced },
+        .{ "_cancel", submit.cmdHostCancel },
+    }) |entry| {
+        if (std.mem.eql(u8, cmd, entry[0])) {
+            const self = std.process.executablePathAlloc(ctx.io, ctx.arena) catch fail("can't find this binary's path", .{});
+            const cx: submit.Cx = .{ .io = ctx.io, .a = ctx.arena, .env = ctx.env, .out = ctx.out, .version = version, .cfg = &ctx.cfg, .self = self };
+            return entry[1](cx, args[1..]);
+        }
+    }
     if (std.mem.eql(u8, cmd, "samples")) return cmdSamples(ctx, args[1..]);
     inline for (.{ "first", "start", "cancel", "pause", "resume", "stop" }) |action| {
         if (std.mem.eql(u8, cmd, action)) return cmdControl(ctx, action, args[1..]);
@@ -309,6 +331,8 @@ const RunOptions = struct {
     priority: policy.Priority = .normal,
     exclusive: bool = false,
     label: []const u8 = "",
+    /// What the job is for (`--note "#224 markers"`), shown beside the label; never sized by.
+    note: []const u8 = "",
     max_wait: ?i64 = null,
     load_check: bool = true,
     qos: bool = true,
@@ -368,7 +392,7 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             name = kv[0];
             inline_value = kv[1];
         }
-        const takes_value = for ([_][]const u8{ "--cores", "--priority", "--label", "--max-wait", "--qos", "--host", "--slots", "--return", "--spill-to", "--ship" }) |v| {
+        const takes_value = for ([_][]const u8{ "--cores", "--priority", "--label", "--note", "--max-wait", "--qos", "--host", "--slots", "--return", "--spill-to", "--ship" }) |v| {
             if (std.mem.eql(u8, name, v)) break true;
         } else false;
         var value: []const u8 = "";
@@ -401,6 +425,8 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             };
         } else if (std.mem.eql(u8, name, "--label")) {
             o.label = value;
+        } else if (std.mem.eql(u8, name, "--note")) {
+            o.note = value;
         } else if (std.mem.eql(u8, name, "--max-wait")) {
             o.max_wait = std.fmt.parseInt(i64, value, 10) catch {
                 _ = usageError("--max-wait needs whole seconds, not '{s}'", .{value});
@@ -750,6 +776,7 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     if (ctx.cfg.spillEnv(host)) |env| remote.print(a, "export {s} && ", .{env}) catch {};
     remote.print(a, "exec cpuq run --tethered --priority {t}", .{o.priority}) catch fail("out of memory", .{});
     if (o.label.len != 0) remote.print(a, " --label {s}", .{shellQuote(a, o.label)}) catch {};
+    if (o.note.len != 0) remote.print(a, " --note {s}", .{shellQuote(a, o.note)}) catch {};
     if (o.cores_given) remote.print(a, " --cores {d}-{d}", .{ o.request.min, o.request.max }) catch {};
     if (o.max_wait) |mw| remote.print(a, " --max-wait {d}", .{mw}) catch {};
     if (!o.load_check) remote.appendSlice(a, " --no-load-check") catch {};
@@ -902,6 +929,7 @@ fn newJobLog(ctx: *Ctx, o: RunOptions) JobLog {
             .pool = o.lease orelse "cores",
             .host = o.host,
             .label = o.label,
+            .note = o.note,
             .cmd = joinCommand(ctx, o.cmd),
             .priority = @tagName(o.priority),
             .exclusive = o.exclusive,
@@ -1061,6 +1089,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
         .exclusive = o.exclusive,
         .since = start,
         .label = o.label,
+        .note = o.note,
         .cmd = joinCommand(ctx, o.cmd),
         .first = o.first,
         .hidden = o.hidden,
@@ -2995,6 +3024,7 @@ const JsonJob = struct {
     pool: []const u8,
     host: ?[]const u8,
     label: []const u8,
+    note: []const u8,
     command: []const u8,
     priority: []const u8,
     exclusive: bool,
@@ -3304,6 +3334,7 @@ fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
             .pool = j.pool,
             .host = j.host,
             .label = j.label,
+            .note = j.note,
             .command = j.cmd,
             .priority = j.priority,
             .exclusive = j.exclusive,
@@ -3466,6 +3497,8 @@ const JsonHolder = struct {
     priority: []const u8 = "",
     exclusive: bool = false,
     label: []const u8 = "",
+    /// What the job is for, as `--note` gave it.
+    note: []const u8 = "",
     command: []const u8 = "",
     since: i64 = 0,
 };
@@ -3484,6 +3517,8 @@ const JsonWaiter = struct {
     class: []const u8 = "",
     exclusive: bool = false,
     label: []const u8 = "",
+    /// What the job is for, as `--note` gave it.
+    note: []const u8 = "",
     command: []const u8 = "",
     since: i64 = 0,
 };
@@ -3632,6 +3667,12 @@ const JsonLease = struct {
     waiters: []const JsonWaiter = &.{},
 };
 
+/// A label with its note after it, when it has one: "rig:corpus  #224 markers".
+fn withNote(a: std.mem.Allocator, label: []const u8, why: []const u8) []const u8 {
+    if (why.len == 0) return dash(label);
+    return a.print("{s}  {s}", .{ dash(label), why }) catch dash(label);
+}
+
 fn toHolders(a: std.mem.Allocator, leases: []const state.Entry, busy: []const ?f64) []JsonHolder {
     var out: std.ArrayList(JsonHolder) = .empty;
     for (leases, 0..) |l, i| {
@@ -3647,6 +3688,7 @@ fn toHolders(a: std.mem.Allocator, leases: []const state.Entry, busy: []const ?f
             .priority = @tagName(r.priority),
             .exclusive = r.exclusive,
             .label = r.label,
+            .note = r.note,
             .command = r.cmd,
             .since = r.since,
         }) catch {};
@@ -3668,6 +3710,7 @@ fn toWaiters(a: std.mem.Allocator, queue: []const state.Entry) []JsonWaiter {
             .class = className(e.class),
             .exclusive = r.exclusive,
             .label = r.label,
+            .note = r.note,
             .command = r.cmd,
             .since = r.since,
         }) catch {};
@@ -3840,7 +3883,7 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
             } else .{ .text = "-", .tint = .dim };
             var b: [16]u8 = undefined;
             rows.append(a, a.dupe(C, &.{
-                .{ .text = dash(h.label), .tint = .accent },
+                .{ .text = withNote(a, h.label, h.note), .tint = .accent },
                 .{ .text = a.print("{d}", .{h.cores}) catch "?" },
                 using,
                 .{ .text = if (h.exclusive) "exclusive" else h.priority, .tint = if (h.exclusive) .warn else null },
@@ -3873,7 +3916,7 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
             const prio = if (q.exclusive) "exclusive" else if (std.mem.eql(u8, q.class, q.priority)) q.priority else a.print("{s}>{s}", .{ q.priority, q.class }) catch q.priority;
             rows.append(a, a.dupe(C, &.{
                 .{ .text = a.print("{d}", .{q.order}) catch "?", .tint = .dim },
-                .{ .text = dash(q.label), .tint = .accent },
+                .{ .text = withNote(a, q.label, q.note), .tint = .accent },
                 .{ .text = if (q.max > q.cores) a.print("{d}-{d}", .{ q.cores, q.max }) catch "?" else a.print("{d}", .{q.cores}) catch "?" },
                 .{ .text = prio },
                 .{ .text = a.dupe(u8, age(&b, v.now - q.since)) catch "?" },
@@ -4376,8 +4419,8 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
     }
     // The label column fits the longest label, within reason.
     var lw: usize = 5;
-    for (holders) |h| lw = @max(lw, @min(dash(h.label).len, 32));
-    for (waiters) |q| lw = @max(lw, @min(dash(q.label).len, 32));
+    for (holders) |h| lw = @max(lw, @min(withNote(ctx.arena, h.label, h.note).len, 40));
+    for (waiters) |q| lw = @max(lw, @min(withNote(ctx.arena, q.label, q.note).len, 40));
     var b1: [16]u8 = undefined;
     w.print("\nholders ({d})\n", .{holders.len}) catch {};
     var lbuf: [40]u8 = undefined;
@@ -4391,7 +4434,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
         const using_text = if (h.using) |u| std.mem.print(&using_buf, "{d:.1}", .{u}) catch "?" else "-";
         w.print("  {s:<8} {s:<8} {d:<6} {s:<6} {s:<7} {s:<8} {s} {s}{s}\n", .{
             pid_text,                child_text,                    h.cores,   using_text,                                                                   if (h.exclusive) "excl" else h.priority,
-            age(&b1, now - h.since), pad(&lbuf, dash(h.label), lw), h.command, if (h.holder_alive) "" else "  (cpuq gone; the command still has the cores)",
+            age(&b1, now - h.since), pad(&lbuf, withNote(ctx.arena, h.label, h.note), lw), h.command, if (h.holder_alive) "" else "  (cpuq gone; the command still has the cores)",
         }) catch {};
     }
     w.print("\nwaiters ({d})\n", .{waiters.len}) catch {};
@@ -4403,7 +4446,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
         const pid_text = std.mem.print(&pid_buf, "{d}", .{q.pid}) catch "?";
         var cores_buf: [24]u8 = undefined;
         const cores_text = if (q.max > q.cores) std.mem.print(&cores_buf, "{d}-{d}", .{ q.cores, q.max }) catch "?" else std.mem.print(&cores_buf, "{d}", .{q.cores}) catch "?";
-        w.print("  {d:<4} {s:<8} {s:<6} {s:<7} {s:<8} {s} {s}\n", .{ q.order, pid_text, cores_text, prio, age(&b1, now - q.since), pad(&lbuf, dash(q.label), lw), q.command }) catch {};
+        w.print("  {d:<4} {s:<8} {s:<6} {s:<7} {s:<8} {s} {s}\n", .{ q.order, pid_text, cores_text, prio, age(&b1, now - q.since), pad(&lbuf, withNote(ctx.arena, q.label, q.note), lw), q.command }) catch {};
     }
     if (named.items.len != 0) {
         w.print("\nleases ({d})\n", .{named.items.len}) catch {};

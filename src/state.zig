@@ -283,6 +283,9 @@ pub const Record = struct {
     /// `--opaque`: its work runs where cpuq cannot see or stop it (a
     /// container, a VM), so it counts at its whole grant.
     hidden: bool = false,
+    /// `--note`: what the job is for (a PR, a branch), shown beside its label but never
+    /// matched, sized or timed by.
+    note: []const u8 = "",
 
     pub fn write(r: Record, w: *Io.Writer) Io.Writer.Error!void {
         try w.print("ticket={d}\npid={d}\nchild={d}\ncores={d}\nmax={d}\npriority={t}\nexclusive={d}\nsince={d}\n", .{
@@ -295,6 +298,10 @@ pub const Record = struct {
         if (r.slots.len != 0) try w.print("slots={s}\n", .{r.slots});
         if (r.first) try w.writeAll("first=1\n");
         if (r.hidden) try w.writeAll("opaque=1\n");
+        if (r.note.len != 0) {
+            try w.writeAll("note=");
+            try writeLine(w, r.note);
+        }
     }
 
     fn writeLine(w: *Io.Writer, text: []const u8) Io.Writer.Error!void {
@@ -320,6 +327,7 @@ pub const Record = struct {
             if (std.mem.eql(u8, k, "slots")) r.slots = v;
             if (std.mem.eql(u8, k, "first")) r.first = std.mem.eql(u8, v, "1");
             if (std.mem.eql(u8, k, "opaque")) r.hidden = std.mem.eql(u8, v, "1");
+            if (std.mem.eql(u8, k, "note")) r.note = v;
         }
         return r;
     }

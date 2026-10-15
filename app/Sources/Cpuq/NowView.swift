@@ -99,7 +99,7 @@ struct Moment {
     static func now(_ m: GraphModel) -> Moment {
         guard let s = m.status else { return Moment() }
         var by: [String: Double] = [:]
-        for h in s.holders { by[GraphModel.project(h.label), default: 0] += h.using ?? 0 }
+        for h in s.holders { by[GraphModel.group(h.label, h.note), default: 0] += h.using ?? 0 }
         var out = Moment()
         out.cpus = m.cpus
         out.shares = by.keys.sorted { (m.slot($0), $0) < (m.slot($1), $1) }.map { Share(project: $0, cpu: by[$0] ?? 0) }
@@ -107,7 +107,7 @@ struct Moment {
         // The rest of what the Mac measured busy, beyond cpuq's jobs, is other work.
         if let busy = m.samples.last?.busy { out.outside = max(busy * m.cpus - jobs, 0) } else { out.outside = s.outside.reduce(0) { $0 + $1.using } }
         out.waiters = s.waiters.map {
-            Waiter(id: "\($0.pid)-\($0.since)", pid: $0.pid, label: GraphModel.label($0.label, $0.command), project: GraphModel.project($0.label),
+            Waiter(id: "\($0.pid)-\($0.since)", pid: $0.pid, label: GraphModel.label($0.label, $0.command), project: GraphModel.group($0.label, $0.note),
                    asks: GraphModel.wants($0), need: $0.exclusive ? Int(m.cpus) : max($0.cores, 1), since: Date(timeIntervalSince1970: Double($0.since)))
         }
         out.gateShut = s.gate.state == "open" ? nil : s.gate.text
@@ -1225,11 +1225,14 @@ struct JobsCard: View {
     }
 
     private func running(_ h: Status.Holder, scale: Double) -> some View {
-        let project = GraphModel.project(h.label)
+        let project = GraphModel.group(h.label, h.note)
         let use = h.using ?? 0
         return HStack(spacing: 10) {
             Circle().fill(model.color(project)).frame(width: 8, height: 8)
-            Text(GraphModel.label(h.label, h.command)).lineLimit(1).truncationMode(.middle).fontWeight(.medium).foregroundStyle(Alive.ink).frame(width: 170, alignment: .leading)
+            // The note after the label, quieter: "rig:corpus  #224 markers".
+            (Text(GraphModel.label(h.label, h.command)).fontWeight(.medium).foregroundStyle(Alive.ink)
+                + Text(h.note.isEmpty ? "" : "  \(h.note)").foregroundStyle(Alive.ink2))
+                .lineLimit(1).truncationMode(.middle).frame(width: 230, alignment: .leading)
             HStack(spacing: 8) {
                 GeometryReader { g in
                     ZStack(alignment: .leading) {
@@ -1265,7 +1268,7 @@ struct JobsCard: View {
     }
 
     private func waiting(_ w: Status.Waiter, free: Double) -> some View {
-        let project = GraphModel.project(w.label)
+        let project = GraphModel.group(w.label, w.note)
         let name = GraphModel.label(w.label, w.command)
         let need = w.exclusive ? cpus : Double(max(w.cores, 1))
         let gate = model.status?.gate.state ?? "open"
@@ -1274,7 +1277,9 @@ struct JobsCard: View {
         let why = w.exclusive ? "timing window: waits for the Mac to empty" : window != nil ? "waits for the timing window" : gate != "open" ? "the gate is shut" : needless ? "CPUs idle" : free >= need ? "starting" : "\(String(format: "%.1f", free)) free, so it holds"
         return HStack(spacing: 10) {
             Circle().strokeBorder(model.color(project), lineWidth: 2).frame(width: 8, height: 8)
-            Text(name).lineLimit(1).truncationMode(.middle).fontWeight(.medium).foregroundStyle(Alive.ink).frame(width: 170, alignment: .leading)
+            (Text(name).fontWeight(.medium).foregroundStyle(Alive.ink)
+                + Text(w.note.isEmpty ? "" : "  \(w.note)").foregroundStyle(Alive.ink2))
+                .lineLimit(1).truncationMode(.middle).frame(width: 230, alignment: .leading)
             Text("waiting · asks \(GraphModel.wants(w)) · \(why)").foregroundStyle(needless ? Alive.rose : Alive.ink2)
                 .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
             Text(duration(Date().timeIntervalSince1970 - Double(w.since))).foregroundStyle(needless ? Alive.rose : Alive.ink2)

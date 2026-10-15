@@ -26,6 +26,8 @@ pub const Event = struct {
     /// The host a `--host` lease is held on.
     host: ?[]const u8 = null,
     label: []const u8 = "",
+    /// What the job was for (`--note`), shown, never matched or sized by.
+    note: []const u8 = "",
     cmd: []const u8 = "",
     priority: []const u8 = "normal",
     exclusive: bool = false,
@@ -108,6 +110,7 @@ pub const Job = struct {
     pool: []const u8,
     host: ?[]const u8,
     label: []const u8,
+    note: []const u8 = "",
     cmd: []const u8,
     priority: []const u8,
     exclusive: bool,
@@ -180,6 +183,7 @@ pub fn load(io: Io, a: std.mem.Allocator, path: []const u8, boot: f64, alive: *c
                     .pool = ev.pool,
                     .host = ev.host,
                     .label = ev.label,
+                    .note = ev.note,
                     .cmd = ev.cmd,
                     .priority = ev.priority,
                     .exclusive = ev.exclusive,

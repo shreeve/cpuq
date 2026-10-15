@@ -435,6 +435,66 @@ afterwards, for a build's output; it repeats.
   machine, since a job sized for HOST would swamp it.
 - The other machines need cpuq 0.12 or later, and ssh to them must work without a prompt.
 
+### cpuq submit: a spec, and cpuq does the rest
+
+    cpuq submit SPEC [-- ARGS] [--env K=V]... [--note TEXT] [--replace | --again] [--max-wait S]
+    cpuq jobs [--all]
+    cpuq job [ID | last] [--wait [--max-wait S]] [--tail N] [--json] [--cancel]
+
+A spec in the repo (`cpuq/matrix.json`) says what a job runs and where it may go. cpuq does the
+rest:
+
+- **places it:** on the first host in `on` that has room, else queues it there, starting a
+  stopped cloud host if need be;
+- **syncs a snapshot** of the work there with rsync, moving only what changed;
+- **runs it, owned by that host,** so the agent's session, or this machine sleeping, doesn't stop
+  it;
+- **reports:** progress while it runs, then a verdict that names the code it tested.
+
+```json
+{
+  "label": "proj:suite",
+  "run": "./test/run -j $CPUQ_CORES \"$@\"",
+  "setup": "zig build -j$CPUQ_CORES",
+  "cores": "8-32",
+  "on": ["burst", "here"],
+  "time": "60m",
+  "exclude": [".git", ".zig-cache", "zig-out"],
+  "caches": { "PROJ_RESULTS_CACHE": "results" },
+  "report": "test/results.jsonl",
+  "return": ["test/results.jsonl"]
+}
+```
+
+- **The last line is always a verdict,** with an exit code that is never the job's own:
+
+  | verdict | exit | meaning |
+  |---|---|---|
+  | PASS | 0 | |
+  | FAIL | 1 | the job's own code is in the line |
+  | NOT STARTED | 2 | another snapshot of this worktree is running: `--replace` or `--again` |
+  | RUNNING | 3 | `--max-wait` passed and the job still runs |
+  | LOST | 69 | its host went away twice |
+  | NOT RUN | 75 | no host could take it |
+  | CANCELLED | 76 | |
+  | OOM | 122 | |
+  | TIMEOUT | 124 | |
+  | CPUQ ERROR | 125 | |
+
+  A FAIL lists the report's first failures (or the output's last lines) above the verdict.
+- **Identity:** a resubmit of the same code, spec and arguments attaches to the job already
+  running.
+- **Supervised:** killing `cpuq submit` never stops the job. `cpuq job ID --wait` follows it
+  again.
+- **The note:** `--note`, or else the worktree's branch, shows beside the label everywhere.
+- **What travels:**
+  - everything in the repo but `exclude`;
+  - a directory holding something like a credential (`.env`, `*.pem`, `id_*`) is refused;
+  - `caches` live on the host, outside the copy, shared by all of a project's runs;
+  - `deps` ship a sibling repo's tracked files.
+
+The full design, fields and rules are in [docs/SUBMIT.md](docs/SUBMIT.md). Hosts need cpuq 0.18.
+
 ### Big jobs on a cloud host
 
 A test suite that takes an hour on a laptop takes minutes on a 96-CPU cloud machine, if each run

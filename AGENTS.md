@@ -90,6 +90,24 @@ A big job for a cloud host, run in the background:
 
 More: README's "Big jobs on a cloud host".
 
+## Submitting a spec
+
+Where a repo keeps specs in `cpuq/*.json`, heavy work goes through them:
+
+    cpuq submit cpuq/suite.json [-- TEST FILTER]
+
+- **Run it in the background.** You're notified when it ends.
+- **The last line is the verdict, and the exit status matches it:**
+  - PASS 0 and FAIL 1 are your code; the failures are printed above the verdict.
+  - TIMEOUT and OOM are limits, often a hang or a leak in your change: `cpuq job ID --tail 100`.
+  - NOT RUN, LOST, CANCELLED and CPUQ ERROR aren't your code: follow the hint on the line.
+- **Read a log** with `cpuq job ID --tail N`, never by cat.
+- **After compaction:** `cpuq jobs`, then `cpuq job ID --wait` in the background.
+- **Resubmitting:** the same code attaches to the job already running. After edits use
+  `--replace`. For a repro beside a full run, use `--again`.
+- **Never** edit or write specs, add -j, --cores, hosts or rm -rf to them, loop on a verdict
+  that isn't about your code, or cancel another worktree's job.
+
 ## Test runners
 
 A runner that starts many programs limits each with `cpuq cap`, never with a watchdog that lists

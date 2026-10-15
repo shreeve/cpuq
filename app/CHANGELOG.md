@@ -3,6 +3,13 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.18.0 — 2026-10-15
+
+- A job's note (cpuq 0.18's `--note`, such as "#224 markers") shows beside its label in the Jobs
+  card. The charts split CPU by project and note, so one project's PRs are bands of their own in
+  the stacked chart, the CPU grid and its legend. The History card still sums by project.
+- The app's version now goes with cpuq's: Cpuq.app 0.18 is for cpuq 0.18.
+
 ## 0.17.5 — 2026-10-15
 
 - A section handle moves from the first step of a drag. A drag started from the sizes kept, and

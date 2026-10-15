@@ -2,6 +2,26 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.18.0 — 2026-10-15
+
+- `cpuq submit SPEC`: a job described by a spec kept in the repo (`cpuq/*.json`), placed on a
+  host cpuq picks (`on`), synced there as a snapshot by rsync, run there under `cpuq run` and
+  `cpuq cap` (time from admission, memory as the kernel's limit), owned by that host, and followed
+  from here.
+  - Its last line is a verdict, with an exit code that is never the job's own: PASS 0, FAIL 1,
+    NOT STARTED 2, RUNNING 3, LOST 69, NOT RUN 75, CANCELLED 76, OOM 122, TIMEOUT 124,
+    CPUQ ERROR 125.
+  - Jobs are identified by a digest of their code, spec and arguments. The same submitted again
+    attaches; another snapshot of the same worktree and label waits for `--replace` or
+    `--again`.
+  - `cpuq jobs` and `cpuq job ID` (`--wait`, `--tail`, `--json`, `--cancel`) follow and manage
+    them.
+  - docs/SUBMIT.md is the design.
+- `--note TEXT` on `cpuq run` (and `cpuq submit`, where it defaults to the branch): what a job
+  is for, such as a PR, shown beside its label in `cpuq status`, history and Cpuq.app, and
+  carried to a spill host. History still sizes and times jobs by the label alone.
+- `submit_roots` in the config: the directories `cpuq submit` may ship (default `~/Data/Code`).
+
 ## 0.17.2 — 2026-10-15
 
 - When a Linux job's command ends, whatever it left running in its scope is stopped

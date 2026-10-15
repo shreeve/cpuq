@@ -1028,6 +1028,55 @@ t_cgroups() {
   check "cgroups = off leaves a job as it is (got $off)" "[ '$off' = 'cg=none' ]"
 }
 
+t_note() {
+  # --note shows beside the label in status and history, and history still sizes by the label.
+  setup note
+  "$CPUQ" run --cores 1 --label proj:build --note "#224 markers" -- sleep 2 & wait_held 1
+  local got; got=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; h = json.load(sys.stdin)["holders"][0]; print(h["label"], "|", h["note"])')
+  wait
+  local hist; hist=$("$CPUQ" history --json | python3 -c 'import json, sys; j = json.load(sys.stdin)[0]; print(j["label"], "|", j["note"])')
+  check "--note travels beside the label (status: $got; history: $hist)" "[ '$got' = 'proj:build | #224 markers' ] && [ '$hist' = 'proj:build | #224 markers' ]"
+}
+
+t_submit() {
+  # cpuq submit, on "here": verdicts and their exits, report failures, return, attach, NOT STARTED
+  # and --replace, and a credential refused.
+  setup submit
+  local was_home=$HOME
+  export HOME=$T/home XDG_STATE_HOME=$T/xdg
+  mkdir -p "$HOME" "$T/roots/repo/cpuq"
+  echo "submit_roots = $T/roots" >> "$CPUQ_CONFIG"
+  (
+    cd "$T/roots/repo" || exit 1
+    git init -q && git config user.email t@t && git config user.name t
+    echo hello > a.txt
+    printf '%s\n' '{ "label": "t:pass", "run": "cat a.txt; echo \"args=$*\"", "cores": "1" }' > cpuq/pass.json
+    printf '%s\n' '{ "label": "t:fail", "run": "printf %s\\\\n \"{\\\"id\\\":\\\"t2\\\",\\\"ok\\\":false,\\\"reason\\\":\\\"boom\\\"}\" > r.jsonl; exit 3", "report": "r.jsonl", "cores": "1" }' > cpuq/fail.json
+    printf '%s\n' '{ "label": "t:slow", "run": "sleep 30", "time": "1s", "cores": "1" }' > cpuq/slow.json
+    printf '%s\n' '{ "label": "t:ret", "run": "mkdir -p out && echo made > out/x", "return": ["out"], "cores": "1" }' > cpuq/ret.json
+    printf '%s\n' '{ "label": "t:long", "run": "sleep 6", "cores": "1" }' > cpuq/long.json
+    git add -A && git commit -qm init
+    "$CPUQ" submit cpuq/pass.json -- one two >"$T/pass" 2>/dev/null; echo "pass=$?"
+    "$CPUQ" submit cpuq/fail.json >"$T/fail" 2>/dev/null; echo "fail=$?"
+    "$CPUQ" submit cpuq/slow.json >/dev/null 2>&1; echo "slow=$?"
+    "$CPUQ" submit cpuq/ret.json >/dev/null 2>&1; echo "ret=$?"; cat out/x 2>/dev/null
+    "$CPUQ" submit cpuq/long.json >"$T/first" 2>/dev/null & local first=$!
+    sleep 2
+    "$CPUQ" submit cpuq/long.json --max-wait 1 2>/dev/null | head -1 | sed 's/^job [0-9a-f]* (attached.*/attached/'
+    echo b > b.txt
+    "$CPUQ" submit cpuq/long.json >/dev/null 2>&1; echo "changed=$?"
+    "$CPUQ" submit cpuq/long.json --replace >/dev/null 2>&1; echo "replace=$?"
+    wait $first; echo "replaced=$?"
+    echo x > .env; "$CPUQ" submit cpuq/pass.json >/dev/null 2>&1; echo "secret=$?"
+  ) >"$T/out" 2>&1
+  local got; got=$(tr '\n' ' ' < "$T/out")
+  local tail_ok=0; grep -q 'args=one two' "$HOME/.local/state/cpuq/jobs/"*/tail.log 2>/dev/null || grep -rq 'args=one two' "$T/xdg" && tail_ok=1
+  check "submit: pass 0, fail 1, timeout 124, return copied, attach, changed code 2, --replace 0 and the old CANCELLED 76, a credential 2 (got: $got)" "[[ '$got' == 'pass=0 fail=1 slow=124 ret=0 made attached changed=2 replace=0 replaced=76 secret=2 ' ]]"
+  check "submit: the report's failure is listed, and the job got its arguments" "grep -q 'fail  t2  boom' '$T/fail' && [ $tail_ok = 1 ]"
+  export HOME=$was_home
+  unset XDG_STATE_HOME
+}
+
 t_hook() {
   # cpuq hook: Claude Code's PreToolUse hook refuses heavy commands outside
   # cpuq (exit 2, the fix on stderr) and passes everything else.
@@ -1584,7 +1633,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to tethered record cap cgroups status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to tethered record cap cgroups note submit status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"
