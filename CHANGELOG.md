@@ -2,6 +2,15 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.12.1 — 2026-10-15
+
+- `cpuq hook` reads a heredoc as data: an apostrophe in a heredoc's body no longer opens a quote
+  that hides the rest of the command, and text in it (documentation, code being edited) is not
+  checked as commands. A body a shell or ssh reads as its script (`sh <<EOF`, `ssh HOST <<EOF`,
+  `cat <<EOF | bash`) is checked. Three of one day's refusals were these.
+- `cpuq hook` lets `swift build --show-bin-path` (and `--show-codecov-path`) through: they print a
+  path and build nothing.
+
 ## 0.12.0 — 2026-10-14
 
 - `cpuq run --spill`: when this machine is full (anyone waiting, the load above its CPUs, or a

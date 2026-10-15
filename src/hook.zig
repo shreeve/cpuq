@@ -26,6 +26,9 @@ pub fn check(a: std.mem.Allocator, command: []const u8, cpus: u32, project: []co
 const Simple = struct {
     words: []const []const u8,
     text: []const u8,
+    /// The body of a heredoc (`<<EOF` … `EOF`) on its line: data, checked only when a shell or
+    /// ssh reads it as a script (`sh <<EOF`, `ssh host <<EOF`).
+    heredoc: ?[]const u8 = null,
 };
 
 fn checkScript(a: std.mem.Allocator, script: []const u8, cpus: u32, project: []const u8, host: ?[]const u8, depth: u32) ?Refusal {
@@ -42,9 +45,14 @@ fn checkSimple(a: std.mem.Allocator, cmd: Simple, cpus: u32, project: []const u8
     if (std.mem.eql(u8, prog, "cpuq")) return checkCpuq(a, cmd, w, cpus, project, depth);
     if (std.mem.eql(u8, prog, "ssh")) {
         const remote = sshRemote(a, w) orelse return null;
-        return checkScript(a, remote.command, cpus, project, remote.host, depth + 1);
+        // `ssh HOST <<EOF`: the heredoc is the script HOST runs.
+        const script = if (remote.command.len == 0) cmd.heredoc orelse return null else remote.command;
+        return checkScript(a, script, cpus, project, remote.host, depth + 1);
     }
-    if (isShell(prog)) if (shellScript(w)) |s| return checkScript(a, s, cpus, project, host, depth + 1);
+    if (isShell(prog)) {
+        if (shellScript(w)) |s| return checkScript(a, s, cpus, project, host, depth + 1);
+        if (cmd.heredoc) |body| return checkScript(a, body, cpus, project, host, depth + 1);
+    }
     const heavy_prog = heavyName(w) orelse return null;
     // "zig build", "cargo test": the program and its subcommand.
     const heavy = if (std.mem.eql(u8, heavy_prog, prog) and w.len > 1 and w[1].len > 0 and w[1][0] != '-' and isSubTool(prog))
@@ -191,6 +199,8 @@ fn heavyName(w: []const []const u8) ?[]const u8 {
         &.{ "-n", "-t" }
     else if (std.mem.eql(u8, prog, "xcodebuild"))
         &.{ "-list", "-showsdks", "-showBuildSettings", "-showdestinations", "-version", "-showTestPlans" }
+    else if (std.mem.eql(u8, prog, "swift"))
+        &.{ "--show-bin-path", "--show-codecov-path" }
     else
         &.{};
     for (w[1..]) |x| {
@@ -296,7 +306,8 @@ fn sshRemote(a: std.mem.Allocator, w: []const []const u8) ?Remote {
             if (x.len == 2 and std.mem.findScalar(u8, "bcDEeFIiJLlmOoPpQRSWw", x[1]) != null) i += 1;
             continue;
         }
-        if (i + 1 >= w.len) return null;
+        // No command: a login, or a script on stdin (a heredoc).
+        if (i + 1 >= w.len) return .{ .host = x, .command = "" };
         return .{ .host = x, .command = std.mem.join(a, " ", w[i + 1 ..]) catch return null };
     }
     return null;
@@ -320,10 +331,41 @@ fn suggest(a: std.mem.Allocator, w: []const []const u8, project: []const u8, hos
     return if (host) |h| a.print("ssh {s} 'cd … && {s}' (the inner quotes as needed)", .{ h, run }) catch run else run;
 }
 
+/// A heredoc opened on a line (`<<EOF`, `<<-EOF`, `<<'EOF'`, `<<"EOF"`): where its delimiter
+/// word ends, and the line that closes it.
+const Heredoc = struct { end: usize, delim: []const u8, strip_tabs: bool };
+
+/// The heredoc whose `<<` is at `i`, if it is one: not a here-string (`<<<`), and a delimiter
+/// that is a word (letters, digits, _ . -, not starting with a digit, not followed by `)`), so
+/// an arithmetic shift such as `$((1<<2))` is not taken for one.
+fn heredocAt(script: []const u8, i: usize) ?Heredoc {
+    var j = i + 2;
+    if (j < script.len and script[j] == '<') return null;
+    const strip = j < script.len and script[j] == '-';
+    if (strip) j += 1;
+    while (j < script.len and (script[j] == ' ' or script[j] == '\t')) : (j += 1) {}
+    if (j >= script.len) return null;
+    const quote: ?u8 = if (script[j] == '\'' or script[j] == '"') script[j] else null;
+    if (quote != null) j += 1;
+    const from = j;
+    while (j < script.len and (std.ascii.isAlphanumeric(script[j]) or script[j] == '_' or script[j] == '.' or script[j] == '-')) : (j += 1) {}
+    const delim = script[from..j];
+    if (delim.len == 0 or std.ascii.isDigit(delim[0])) return null;
+    if (quote) |q| {
+        if (j >= script.len or script[j] != q) return null;
+        j += 1;
+    }
+    if (j < script.len and script[j] == ')') return null;
+    return .{ .end = j, .delim = delim, .strip_tabs = strip };
+}
+
 /// Splits a script into simple commands: at unquoted ; & | && || newlines,
-/// ( ) and the edges of $( … ) and backquotes, with each word unquoted.
+/// ( ) and the edges of $( … ) and backquotes, with each word unquoted. A
+/// heredoc's body is set aside, never split: it is data (`python3 - <<EOF`),
+/// unless the command that reads it is a shell (checkSimple).
 fn split(a: std.mem.Allocator, script: []const u8) ![]Simple {
     var out: std.ArrayList(Simple) = .empty;
+    var pending: std.ArrayList(Heredoc) = .empty;
     var words: std.ArrayList([]const u8) = .empty;
     var word: std.ArrayList(u8) = .empty;
     var in_word = false;
@@ -370,7 +412,48 @@ fn split(a: std.mem.Allocator, script: []const u8) ![]Simple {
                 start = i + 1;
             } else try word.append(a, ch),
             ' ', '\t' => try flushWord(a, &words, &word, &in_word),
-            ';', '&', '|', '\n', '(', ')', '`' => {
+            '<' => if (if (i + 1 < script.len and script[i + 1] == '<') heredocAt(script, i) else null) |h| {
+                // The redirection ends the word before it (`cat<<EOF`) and is no word itself.
+                try flushWord(a, &words, &word, &in_word);
+                try pending.append(a, h);
+                i = h.end - 1;
+            } else {
+                in_word = true;
+                try word.append(a, ch);
+            },
+            '\n' => {
+                try flushWord(a, &words, &word, &in_word);
+                const had = out.items.len;
+                try flushCmd(a, &out, &words, script[start..i]);
+                // The bodies of the line's heredocs follow it, each up to its delimiter line.
+                var p = i + 1;
+                var bodies: std.ArrayList(u8) = .empty;
+                for (pending.items) |h| {
+                    const from = p;
+                    var body_end = script.len;
+                    var next = script.len;
+                    while (p < script.len) {
+                        const eol = std.mem.findScalarPos(u8, script, p, '\n') orelse script.len;
+                        const line = if (h.strip_tabs) std.mem.trimStart(u8, script[p..eol], "\t") else script[p..eol];
+                        if (std.mem.eql(u8, line, h.delim)) {
+                            body_end = p;
+                            next = @min(eol + 1, script.len);
+                            break;
+                        }
+                        p = eol + 1;
+                    }
+                    try bodies.appendSlice(a, script[from..@min(body_end, script.len)]);
+                    p = next;
+                }
+                if (pending.items.len != 0) {
+                    // The line's last command reads them (`cat <<EOF | sh`: sh).
+                    if (out.items.len > had) out.items[out.items.len - 1].heredoc = bodies.items;
+                    pending.clearRetainingCapacity();
+                    i = p - 1;
+                }
+                start = i + 1;
+            },
+            ';', '&', '|', '(', ')', '`' => {
                 try flushWord(a, &words, &word, &in_word);
                 try flushCmd(a, &out, &words, script[start..i]);
                 start = i + 1;
@@ -424,6 +507,7 @@ test "light and wrapped commands pass" {
     try std.testing.expect(!refused("zig build --help"));
     try std.testing.expect(!refused("make -n"));
     try std.testing.expect(!refused("xcodebuild -list"));
+    try std.testing.expect(!refused("swift build --show-bin-path"));
     try std.testing.expect(!refused("cargo fmt"));
     try std.testing.expect(refused("pytest -n 4"));
     try std.testing.expect(!refused("cpuq lease pup-bench --host pup --exclusive --label kit -- ./bench.sh"));
@@ -435,6 +519,33 @@ test "light and wrapped commands pass" {
     try std.testing.expect(!refused("cpuq run --label app:build -- make"));
     try std.testing.expect(!refused("ssh pup 'cd repo && cpuq run --label app:build -- make'"));
     try std.testing.expect(!refused("cpuq run --label lede:test --cores 4 --opaque -- nice xcodebuild test -destination 'platform=iOS Simulator,id=X' -jobs 4"));
+}
+
+test "a heredoc's body is data unless a shell reads it" {
+    // An apostrophe in a heredoc once opened a quote that swallowed the rest of the command.
+    try std.testing.expect(!refused(
+        \\python3 - <<'EOF'
+        \\s = "the machine's load"
+        \\EOF
+        \\cpuq run --label cpuq:build --cores 2-6 -- sh -c 'zig build -j"$CPUQ_CORES" && zig build test -j"$CPUQ_CORES"'
+    ));
+    // Documentation in a body is not a command.
+    try std.testing.expect(!refused(
+        \\python3 - <<'EOF'
+        \\doc = "cpuq run --cores 2-6 -- make -j$CPUQ_CORES; zig build"
+        \\EOF
+    ));
+    try std.testing.expect(!refused("cat <<-EOF\n\tzig build\n\tEOF\necho ok"));
+    // What follows the closing line is checked as ever.
+    try std.testing.expect(refused("cat <<EOF\nhi there's\nEOF\nzig build"));
+    // A body a shell or ssh reads is a script, and checked.
+    try std.testing.expect(refused("sh <<'EOF'\ncd x && zig build\nEOF"));
+    try std.testing.expect(refused("cat <<EOF | bash\nmake -j8\nEOF"));
+    try std.testing.expect(refused("ssh pup <<'EOF'\ncd repo && zig build\nEOF"));
+    try std.testing.expect(!refused("ssh pup <<'EOF'\ncd repo && cpuq run --label a:b -- make\nEOF"));
+    // Not heredocs: a here-string, and an arithmetic shift.
+    try std.testing.expect(!refused("cat <<< 'zig build'"));
+    try std.testing.expect(refused("echo $((1<<2)); zig build"));
 }
 
 test "misused cpuq runs are refused" {
