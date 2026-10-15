@@ -397,7 +397,8 @@ afterwards, for a build's output; it repeats.
   same way: at once when HOST has room, else into HOST's queue; started first when it is stopped
   and has a `spill_start` command. A HOST that neither answers nor can be started is an error
   (exit 125), never a quiet run here. Lost mid-job, HOST is started again and the job reruns there
-  once, then here.
+  once; if HOST can't be brought back, the run ends with exit 125, and never falls back to this
+  machine, since a job sized for HOST would swamp it.
 - The other machines need cpuq 0.12 or later, and ssh to them must work without a prompt.
 
 ## Named leases

@@ -2,6 +2,12 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.16.2 — 2026-10-15
+
+- `--spill-to HOST` never runs a job here. Lost mid-job, HOST is started again and the job reruns
+  there once; failing that, the run ends with exit 125. It used to fall back to this machine, where
+  a job sized for a 96-CPU host swamped a 10-CPU Mac.
+
 ## 0.16.1 — 2026-10-15
 
 - The disk gate also watches `~/cpuq-spill`, where jobs spilled to this machine land, when it is a

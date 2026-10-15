@@ -759,18 +759,23 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     // down under the job (a Spot reclaim powers the VM off gracefully, and
     // the shutdown kills the job before the connection drops). Either way,
     // give a host that is going a moment to go, and if it has, run the job
-    // here instead.
+    // again: under --spill here, under --spill-to on that host or nowhere.
     if ((code == 255 or code > 128) and hostWentAway(ctx, host)) {
         const who = if (o.label.len != 0) o.label else o.cmd[0];
-        // Sent there by name (--spill-to): start it again and run there once more, as a Spot VM
-        // reclaimed is usually back a minute later; only then, here.
-        if (o.spill_to != null and !spill_retried and ctx.cfg.spillStart(host) != null) {
+        if (o.spill_to == null) {
+            std.debug.print("cpuq: lost {s} while {s} ran there; running it here instead\n", .{ host, who });
+            return runHere(ctx, o);
+        }
+        // Sent there by name: start it again and run there once more, as a Spot VM reclaimed is
+        // usually back a minute later. Never here: a job sized for that host (--cores 8-48 for 96
+        // CPUs) would swamp this machine.
+        if (!spill_retried and ctx.cfg.spillStart(host) != null) {
             std.debug.print("cpuq: lost {s} while {s} ran there; starting it again\n", .{ host, who });
             spill_retried = true;
             if (startHost(ctx, host)) return spillTo(ctx, o, host, "running again");
         }
-        std.debug.print("cpuq: lost {s} while {s} ran there; running it here instead\n", .{ host, who });
-        return runHere(ctx, o);
+        std.debug.print("cpuq: lost {s} while {s} ran there, and --spill-to runs it nowhere else: run it again when {s} is back\n", .{ host, who, host });
+        return exit_failure;
     }
     for (o.returns[0..o.return_count]) |path| {
         const back = [_][]const u8{ "rsync", "-a", "--relative", a.print("{s}:{s}{s}/./{s}", .{ host, dir, rel, path }) catch "", "./" };
