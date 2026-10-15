@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.19.4 — 2026-10-15
+
+- The Jobs card orders running jobs as you pick, with a control beside its title: Started (the
+  default, oldest first: a row moves only when a job ends), Name, CPU in use, or time Left. It no
+  longer reorders by CPU every few seconds. The choice is kept.
+
 ## 0.19.3 — 2026-10-15
 
 - A running job that reports no count but has run before shows an estimate in the Jobs card: a

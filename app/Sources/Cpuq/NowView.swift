@@ -1185,6 +1185,33 @@ private struct JobsScrollKey: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
 
+/// How the Jobs card orders running jobs: by when each started (steady: a row only moves when a
+/// job ends), by name, by CPU in use, or by time left.
+enum JobOrder: String, CaseIterable, Identifiable {
+    case started = "Started", name = "Name", cpu = "CPU", left = "Left"
+    var id: String { rawValue }
+
+    func sorted(_ hs: [Status.Holder]) -> [Status.Holder] {
+        hs.sorted { a, b in
+            switch self {
+            case .started: return (a.since, a.pid) < (b.since, b.pid)
+            case .name:
+                let x = (a.label + " " + a.note).lowercased(), y = (b.label + " " + b.note).lowercased()
+                return x == y ? (a.since, a.pid) < (b.since, b.pid) : x < y
+            case .cpu: return (a.using ?? 0, b.since) > (b.using ?? 0, a.since)
+            case .left:
+                // A job with no estimate goes last.
+                switch (a.left, b.left) {
+                case let (x?, y?): return x == y ? a.since < b.since : x < y
+                case (.some, nil): return true
+                case (nil, .some): return false
+                default: return (a.since, a.pid) < (b.since, b.pid)
+                }
+            }
+        }
+    }
+}
+
 struct JobsCard: View {
     let model: GraphModel
     private var cpus: Double { model.cpus }
@@ -1192,11 +1219,12 @@ struct JobsCard: View {
     /// The list's visible height and how far it is scrolled: what's below the card's edge.
     @State private var listHeight: CGFloat = 0
     @State private var scrolled: CGFloat = 0
+    @AppStorage("jobOrder") private var order: JobOrder = .started
     private let rowHeight: CGFloat = 21
 
     var body: some View {
         let s = model.status
-        let holders = (s?.holders ?? []).sorted { ($0.using ?? 0) > ($1.using ?? 0) }
+        let holders = order.sorted(s?.holders ?? [])
         let waiters = s?.waiters ?? []
         let free = Moment.now(model).free
         let scale = max(4, holders.map { $0.using ?? 0 }.max() ?? 0).rounded(.up)
@@ -1204,6 +1232,12 @@ struct JobsCard: View {
             HStack(alignment: .firstTextBaseline) {
                 Text("JOBS").eyebrow()
                 Text("· \(holders.count) running · \(waiters.count) waiting").font(.system(size: 13, weight: .medium)).foregroundStyle(Alive.ink)
+                Picker("Order", selection: $order) {
+                    ForEach(JobOrder.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented).labelsHidden().controlSize(.small).fixedSize()
+                .help("Order running jobs by when they started, name, CPU in use, or time left")
+                .padding(.leading, 8)
                 Spacer()
                 ViewThatFits(in: .horizontal) {
                     Text("bar = how far a job is: its count, else (lighter) its usual time; else CPU used (0–\(Int(scale))) · CPU used of the cores reserved")
