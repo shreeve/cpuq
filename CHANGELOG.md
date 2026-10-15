@@ -2,6 +2,15 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.21.1 — 2026-10-15
+
+- A job on Linux keeps its caller's stack limit (`ulimit -s`). cpuq raised its own to 16 MB at
+  startup, as Zig programs do, and every job inherited that: deep recursion that crashes in a
+  shell at 8 MB passed under cpuq.
+- A submitted job whose worktree changed while it waited for its copy (a commit made after
+  `cpuq submit`) runs the worktree as it is when copied, and says so, instead of ending in CPUQ
+  ERROR. Its host checked the copy against the code at submit.
+
 ## 0.21.0 — 2026-10-15
 
 - **Packs: tool versions kept on each host**, as mise keeps them, in `~/cpuq/packs/NAME/VERSION`

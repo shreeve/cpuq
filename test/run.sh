@@ -1112,6 +1112,35 @@ t_submit() {
   unset XDG_STATE_HOME
 }
 
+t_submit_moved() {
+  # A job waiting for its copy (another of the worktree's jobs on it) when the worktree changes
+  # runs the worktree as it is when its copy syncs, not CPUQ ERROR.
+  setup submit-moved
+  local was_home=$HOME
+  export HOME=$T/home XDG_STATE_HOME=$T/xdg
+  mkdir -p "$HOME" "$T/roots/repo/cpuq"
+  echo "submit_roots = $T/roots" >> "$CPUQ_CONFIG"
+  (
+    cd "$T/roots/repo" || exit 1
+    git init -q && git config user.email t@t && git config user.name t
+    echo one > v.txt
+    printf '%s\n' '{ "label": "t:hold", "run": "sleep 4", "cores": "1" }' > cpuq/hold.json
+    printf '%s\n' '{ "label": "t:read", "run": "cat v.txt", "cores": "1" }' > cpuq/read.json
+    git add -A && git commit -qm init
+    "$CPUQ" submit cpuq/hold.json >/dev/null 2>&1 & local h=$!
+    sleep 1.5
+    "$CPUQ" submit cpuq/read.json >"$T/read" 2>&1 & local r=$!
+    sleep 1.5
+    echo two > v.txt && git commit -qam two
+    wait $r; echo "read=$?"; wait $h
+  ) >"$T/out" 2>&1
+  local got; got=$(tr '\n' ' ' < "$T/out")
+  local saw; saw=$(cat "$HOME"/.local/state/cpuq/jobs/*/tail.log "$T"/xdg/cpuq/jobs/*/tail.log 2>/dev/null | grep -x 'one\|two' | tr '\n' ' ')
+  check "submit: a job whose worktree moved while it waited for its copy runs it as it is then ($got, it read: $saw)" "[ '$got' = 'read=0 ' ] && [ '$saw' = 'two ' ]"
+  export HOME=$was_home
+  unset XDG_STATE_HOME
+}
+
 t_packs() {
   # Packs: a spec asks for a tool by version; the first job builds it into the store
   # (~/cpuq/packs/NAME/VERSION), later ones reuse it, `latest` links to it, and the job finds it
@@ -1150,6 +1179,14 @@ t_packs() {
     "[ '$got' = 'first=0 second=0 third=0 ' ] && [ '$saw' = 6 ] && [ '$two' = 2 ] && [ '$builds' = 2 ] && [ '$versions' = 2 ] && [ '$latest' = '$head' ]"
   export HOME=$was_home
   unset XDG_STATE_HOME
+}
+
+t_stack_limit() {
+  # A job gets its caller's stack limit as it was: a Zig program raises its own to the stack it was
+  # built with, which every job would inherit.
+  setup stack-limit
+  local got; got=$( (ulimit -s 4096 && "$CPUQ" run --cores 1 -- sh -c 'ulimit -s') 2>/dev/null)
+  check "a job keeps its caller's stack limit (4096, got $got)" "[ '$got' = 4096 ]"
 }
 
 t_hook() {
@@ -1729,7 +1766,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git tethered record cap cgroups note progress submit packs status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git tethered record cap cgroups note progress submit submit_moved packs stack_limit status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

@@ -26,6 +26,10 @@ pub fn build(b: *std.Build) void {
     mod.addOptions("build_options", options);
 
     const exe = b.addExecutable(.{ .name = "cpuq", .root_module = mod });
+    // On Linux a Zig program raises its own stack limit to the stack it was built with (16 MB by
+    // default) at startup, and every job cpuq runs would inherit that, not the caller's 8 MB: a
+    // job's deep recursion then passes under cpuq and crashes outside it. cpuq needs little.
+    exe.stack_size = 1 << 20;
     b.installArtifact(exe); // `zig build install -p PREFIX` puts it in PREFIX/bin
 
     // `zig build` (the default step) writes bin/cpuq in the checkout.

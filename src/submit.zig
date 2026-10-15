@@ -950,6 +950,8 @@ fn startAndWatch(cx: Cx, rec: *Record, payload: *Payload, host: []const u8) u8 {
         // The worktree must not have changed while it was copied.
         const again = resnapshot(cx, rec);
         if (std.mem.eql(u8, again, rec.snapshot)) break;
+        // Changed since submit (or during the copy): it runs as it is now, copied again.
+        setState(cx, id, "syncing", cx.a.print("to {s}: the worktree changed since submit, so it runs as it is now", .{host}) catch "");
         if (tries == 2) return done(cx, id, rec.*, .cpuq_error, null, "the worktree kept changing while it was copied: resubmit when it's still", host);
         rec.snapshot = again;
         payload.generation = again;
@@ -1178,8 +1180,12 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
         if (waited > 3600 * 5) return hostDone(cx, id, p, .cpuq_error, null, "its copy was never synced: not your code, report it", started);
         sleepMs(cx.io, 200);
     }
+    // The generation the supervisor synced: the worktree as it was then, which can be newer than
+    // at submit (a commit while the job waited for its copy).
     const gen = std.mem.trim(u8, readFile(cx, cx.a.print("{s}/.cpuq-generation", .{copy}) catch "") orelse "", " \n");
-    if (!std.mem.eql(u8, gen, p.generation)) return hostDone(cx, id, p, .cpuq_error, null, "the copy doesn't hold the code this job was for: not your code, report it", started);
+    const synced = std.mem.trim(u8, readFile(cx, jobFile(cx, id, "synced")) orelse "", " \n");
+    const want = if (synced.len != 0) synced else p.generation;
+    if (!std.mem.eql(u8, gen, want)) return hostDone(cx, id, p, .cpuq_error, null, "the copy doesn't hold the code this job was for: not your code, report it", started);
 
     // Tools, before anything runs.
     if (p.tools) |tools| {
