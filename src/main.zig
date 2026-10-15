@@ -570,7 +570,8 @@ fn localFull(ctx: *Ctx, buf: []u8) ?[]const u8 {
     if (queue.len != 0) return std.mem.print(buf, "has {d} waiting", .{queue.len}) catch "is full";
     const m = machine(ctx);
     const load = sys.loadAverage()[0];
-    if (load > @as(f64, @floatFromInt(m.active))) return std.mem.print(buf, "is at load {d:.1} on {d} CPUs", .{ load, m.active }) catch "is full";
+    // `load_check = off` ignores the machine load, here as everywhere.
+    if (ctx.cfg.load_check and load > @as(f64, @floatFromInt(m.active))) return std.mem.print(buf, "is at load {d:.1} on {d} CPUs", .{ load, m.active }) catch "is full";
     if (policy.gate(ctx.cfg, m, budgetNow(ctx, m), null, now) != .open) return "has its gate shut";
     return null;
 }
@@ -3202,6 +3203,10 @@ const JsonStatus = struct {
     leases: []const JsonLease = &.{},
     /// The busiest processes outside every cpuq job (empty with --no-usage).
     outside: []const JsonOutside = &.{},
+    /// Each CPU's time so far, `[busy, total]` in clock ticks, in the
+    /// kernel's order: cumulative, so a reader takes the difference between
+    /// two statuses. Cpuq.app draws another machine's CPUs from it.
+    cpu_ticks: ?[]const [2]u64 = null,
 };
 
 const StatusView = struct {
@@ -3599,6 +3604,13 @@ fn statusHosts(ctx: *Ctx, hosts: []const []const u8, json: bool, measure: bool) 
     return rc;
 }
 
+fn cpuTicksJson(io: Io, a: std.mem.Allocator) ?[]const [2]u64 {
+    const ticks = sys.perCpuTicks(io, a) orelse return null;
+    const out = a.alloc([2]u64, ticks.len) catch return null;
+    for (ticks, out) |t, *o| o.* = .{ t.busy, t.total };
+    return out;
+}
+
 /// HOST's status over ssh: drawn here in boxes on a terminal, else HOST's
 /// own output passed through.
 fn statusRemote(ctx: *Ctx, host: []const u8, json: bool, measure: bool) u8 {
@@ -3781,6 +3793,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
             .waiters = waiters,
             .leases = named.items,
             .outside = smp.outside,
+            .cpu_ticks = cpuTicksJson(ctx.io, a),
         };
         std.json.Stringify.value(s, .{ .whitespace = .indent_2 }, w) catch {};
         w.writeAll("\n") catch {};

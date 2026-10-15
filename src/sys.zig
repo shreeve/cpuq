@@ -134,6 +134,62 @@ pub fn cpuTicks(io: Io) ?Ticks {
     return .{ .busy = total - idle, .total = total };
 }
 
+extern "c" fn host_processor_info(host: c_uint, flavor: c_int, out_count: *c_uint, info: *?[*]c_int, info_count: *c_uint) c_int;
+extern "c" fn vm_deallocate(task: c_uint, address: usize, size: usize) c_int;
+extern "c" var mach_task_self_: c_uint;
+
+/// Each CPU's time so far, busy and in all, in the kernel's order: macOS
+/// host_processor_info (on Apple silicon, efficiency cores first); Linux the
+/// cpuN lines of /proc/stat. Cumulative, so a reader takes the difference
+/// between two readings (`cpu_ticks` in `cpuq status --json`, from which
+/// Cpuq.app draws another machine's CPUs as it draws the Mac's own).
+pub fn perCpuTicks(io: Io, a: std.mem.Allocator) ?[]Ticks {
+    if (is_darwin) {
+        var count: c_uint = 0;
+        var info: ?[*]c_int = null;
+        var n: c_uint = 0;
+        // PROCESSOR_CPU_LOAD_INFO: user, system, idle, nice per CPU.
+        if (host_processor_info(mach_host_self(), 2, &count, &info, &n) != 0) return null;
+        const p = info orelse return null;
+        defer _ = vm_deallocate(mach_task_self_, @intFromPtr(p), @as(usize, n) * @sizeOf(c_int));
+        const out = a.alloc(Ticks, count) catch return null;
+        for (out, 0..) |*t, i| {
+            const at = i * 4;
+            const tick = struct {
+                fn of(v: c_int) u64 {
+                    return @as(u32, @bitCast(v));
+                }
+            }.of;
+            const busy = tick(p[at]) + tick(p[at + 1]) + tick(p[at + 3]);
+            t.* = .{ .busy = busy, .total = busy + tick(p[at + 2]) };
+        }
+        return out;
+    }
+    // /proc reports a size of 0, so read into a fixed buffer rather than one sized from it; the
+    // cpuN lines come first, before the long interrupt counts a buffer may cut short.
+    const buf = a.alloc(u8, 64 << 10) catch return null;
+    const text = Io.Dir.cwd().readFile(io, "/proc/stat", buf) catch return null;
+    var list: std.ArrayList(Ticks) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        // cpu0, cpu1, …; the plain `cpu` line is all of them.
+        if (line.len < 4 or !std.mem.startsWith(u8, line, "cpu") or !std.ascii.isDigit(line[3])) continue;
+        var f = std.mem.tokenizeScalar(u8, line, ' ');
+        _ = f.next();
+        var total: u64 = 0;
+        var idle: u64 = 0;
+        var i: usize = 0;
+        while (f.next()) |v| : (i += 1) {
+            if (i >= 8) break;
+            const n = std.fmt.parseInt(u64, v, 10) catch 0;
+            total += n;
+            if (i == 3 or i == 4) idle += n;
+        }
+        list.append(a, .{ .busy = total - idle, .total = total }) catch return null;
+    }
+    return if (list.items.len == 0) null else list.items;
+}
+
 /// The share of all CPUs busy between two readings, 0 to 1.
 pub fn busyBetween(a: Ticks, b: Ticks) ?f64 {
     if (b.total <= a.total) return null;

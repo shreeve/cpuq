@@ -11,6 +11,8 @@ User-visible changes to cpuq. Each version's section is its release notes.
   that, it waits here. The repo is copied there with rsync (honoring `.gitignore`, without
   `.git`), into a place of its own that keeps build caches warm; output and exit status come
   back; `--return PATH` copies results back.
+- `cpuq status --json` gives `cpu_ticks`: each CPU busy and total time so far, from which a
+  reader (Cpuq.app) draws another machine CPUs from the difference between two statuses.
 - A spilled job is tied to the cpuq that sent it: when that cpuq is killed or the connection is
   lost, the job on the other machine stops. When the other machine goes away mid-job (a Spot VM
   reclaimed), the job runs again here.
