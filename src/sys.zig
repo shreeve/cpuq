@@ -702,10 +702,14 @@ pub fn bootTime(io: Io) f64 {
 /// Ends this process the way the command ended: by the same signal, so the
 /// caller's shell reports it (128 + N), without a core dump.
 pub fn dieBySignal(sig: c.SIG) noreturn {
-    const no_core: c.rlimit = .{ .cur = 0, .max = 0 };
-    _ = c.setrlimit(.CORE, &no_core);
-    // Its command's death, mirrored: not a crash of cpuq's, so no crash report filed for it.
+    // Its command's death, mirrored: not a crash of cpuq's, so no core and
+    // no crash report for it (on Linux, noCrashReport's core limit of 1
+    // writes no core either).
     noCrashReport();
+    if (is_darwin) {
+        const no_core: c.rlimit = .{ .cur = 0, .max = 0 };
+        _ = c.setrlimit(.CORE, &no_core);
+    }
     var sa: c.Sigaction = .{ .handler = .{ .handler = c.SIG.DFL }, .mask = undefined, .flags = 0 };
     _ = c.sigemptyset(&sa.mask);
     _ = c.sigaction(sig, &sa, null);
@@ -1225,12 +1229,20 @@ pub fn procCwd(arena: std.mem.Allocator, io: Io, pid: i32) []const u8 {
 
 extern "c" fn task_set_exception_ports(task: c_uint, mask: c_uint, port: c_uint, behavior: c_int, flavor: c_int) c_int;
 
-/// macOS: no crash report (ReportCrash's .ips in ~/Library/Logs/DiagnosticReports) for this process,
-/// nor for what it execs or starts, which inherit it: its crash exception ports (EXC_CRASH,
-/// EXC_CORPSE_NOTIFY) cleared. For a death on purpose: a test's expected abort, or cpuq mirroring
-/// its command's signal. The process still dies by its signal. Nothing elsewhere.
+/// No crash report for this process, nor for what it execs or starts, which inherit it. macOS:
+/// no ReportCrash .ips (~/Library/Logs/DiagnosticReports), its crash exception ports (EXC_CRASH,
+/// EXC_CORPSE_NOTIFY) cleared. Linux: no core_pattern handler (apport), by a core limit of
+/// exactly 1. For a death on purpose: a test's expected abort, or cpuq mirroring its command's
+/// signal. The process still dies by its signal.
 pub fn noCrashReport() void {
-    if (!is_darwin) return;
+    if (!is_darwin) {
+        // Linux: at a core limit of exactly 1 the kernel starts no
+        // core_pattern pipe (Ubuntu's apport, seconds per crash) and writes
+        // no core file (smaller than a page).
+        const one: c.rlimit = .{ .cur = 1, .max = 1 };
+        _ = c.setrlimit(.CORE, &one);
+        return;
+    }
     const exc_mask_crash: c_uint = 1 << 10;
     const exc_mask_corpse_notify: c_uint = 1 << 13;
     const exception_default: c_int = 1;

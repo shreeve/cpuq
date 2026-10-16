@@ -2,6 +2,15 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.25.2 — 2026-10-16
+
+- Linux: `cpuq cap --no-crash-report` now works there too. PROGRAM gets a core limit of exactly 1,
+  at which the kernel passes its crash to no `core_pattern` handler. On Ubuntu that handler is
+  apport, which held each crashing process about 8 seconds (measured on burst; 3 ms without it).
+- Linux: cpuq mirroring its command's death (`cpuq run`, `cpuq cap`) no longer goes through apport
+  itself: before, a capped test's abort went through apport twice, once for the test and once for
+  cpuq.
+
 ## 0.25.1 — 2026-10-16
 
 - macOS: a job's CPU no longer leaps for one look when one of its processes reaps a child while

@@ -37,8 +37,9 @@ pub const usage =
     \\  --output SIZE     stop it when it has written more than this to stdout and stderr, which
     \\                    must be files or /dev/null (1M)
     \\  --pids N          at most N processes and threads at once (inside a cpuq job on Linux)
-    \\  --no-crash-report macOS: no crash report (.ips) when PROGRAM, or anything it starts,
-    \\                    crashes on purpose (a test that panics); it still dies by its signal
+    \\  --no-crash-report no crash report when PROGRAM, or anything it starts, crashes on
+    \\                    purpose (a test that panics): no .ips on macOS, no apport on Linux;
+    \\                    it still dies by its signal
     \\exit: PROGRAM's own (death by a signal passed on as one); stopped by cpuq: 122 memory,
     \\124 time, 121 output, each with a line on stderr; 125 cpuq failed; 127 PROGRAM not found
     \\

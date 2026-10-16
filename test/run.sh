@@ -1016,6 +1016,15 @@ t_cap_quiet_crash() {
   setup cap-quiet-crash
   local got; got=$(sh -c "\"$CPUQ\" cap --no-crash-report -- sh -c 'echo panic: on purpose >&2; kill -ABRT \$\$' 2>\"$T/err\"; echo \$?")
   check "cap --no-crash-report: PROGRAM still dies by its signal (status $got) with its stderr ($(cat "$T/err" | tr -d '\n'))" "[ '$got' = 134 ] && grep -q 'panic: on purpose' '$T/err'"
+  # Linux: PROGRAM's core limit is exactly 1, at which the kernel starts no core_pattern handler
+  # (apport); without the flag it keeps the limit it was given.
+  [ "$(uname)" = Linux ] || return 0
+  local core='/^Max core file size/ { print $5, $6 }'
+  local quiet plain want
+  quiet=$("$CPUQ" cap --no-crash-report -- awk "$core" /proc/self/limits)
+  plain=$("$CPUQ" cap -- awk "$core" /proc/self/limits)
+  want=$(awk "$core" /proc/$$/limits)
+  check "cap --no-crash-report on Linux: a core limit of 1 1 (got $quiet), and $want without it (got $plain)" "[ '$quiet' = '1 1' ] && [ '$plain' = '$want' ]"
 }
 
 t_cgroups() {

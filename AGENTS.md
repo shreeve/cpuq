@@ -133,9 +133,10 @@ every process (`ps`):
   2: don't count that as a test failure.
 - **`--mem` on Linux inside a job** counts page cache and tmpfs too, so a limit tuned on the Mac
   can trip on Linux.
-- **A test that panics on purpose:** add `--no-crash-report`, so macOS files no crash report for
-  it. Only on the program meant to crash: what it starts inherits it, and a real crash there
-  (a compiler's) must still be reported.
+- **A test that panics on purpose:** add `--no-crash-report`, so no crash report is made for it
+  (macOS's .ips, Linux's apport, which takes seconds a crash). Only on the program meant to
+  crash: what it starts inherits it, and a real crash there (a compiler's) must still be
+  reported.
 
 A runner that knows its test count reports progress, so status shows how far it is and the time
 left (`4210/12629 33% · 3 failing · ~9m left`): one line, `DONE TOTAL FAILING`, written whole at
