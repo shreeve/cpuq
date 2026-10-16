@@ -1240,12 +1240,13 @@ struct JobsCard: View {
                 .padding(.leading, 8)
                 Spacer()
                 ViewThatFits(in: .horizontal) {
-                    Text("bar = how far a job is: its count, else (lighter) its usual time; else CPU used (0–\(Int(scale))) · CPU used of the cores reserved")
+                    Text("bar = how far a job is: its count, else (lighter) its usual time; else CPU used (0–\(Int(scale)))")
                     Text("bar = CPU used (0–\(Int(scale)))")
                     Color.clear.frame(width: 0, height: 0)
                 }
                 .font(.system(size: 11)).foregroundStyle(Alive.ink3).lineLimit(1)
             }
+            if !holders.isEmpty { columnHeads }
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(holders, id: \.pid) { h in running(h, scale: scale) }
@@ -1277,6 +1278,20 @@ struct JobsCard: View {
         }
         .padding(.horizontal, 18).padding(.vertical, 10)
         .card()
+    }
+
+    /// What each column of a running job's row is, laid out as the rows are.
+    private var columnHeads: some View {
+        HStack(spacing: 10) {
+            Color.clear.frame(width: 8, height: 1)
+            Text("JOB").frame(width: 230, alignment: .leading)
+            Text("PROGRESS").frame(maxWidth: 362, alignment: .leading)
+            Text("").frame(minWidth: 0, maxWidth: .infinity)
+            Text("CPU OF RESERVED").frame(width: 100, alignment: .trailing)
+            Text("RUNNING").frame(width: 64, alignment: .trailing)
+        }
+        .font(.system(size: 9.5, weight: .semibold)).tracking(0.6).foregroundStyle(Alive.ink3)
+        .lineLimit(1).frame(height: 14)
     }
 
     private func running(_ h: Status.Holder, scale: Double) -> some View {

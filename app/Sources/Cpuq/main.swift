@@ -33,6 +33,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var idleWait = Episode()
     private var cloudIdle: [String: Episode] = [:]
     private var outsideHeavy: [String: Episode] = [:]
+    /// Running jobs being watched for a hang, by machine, pid and start.
+    private var hung: [String: Hang] = [:]
+
+    /// A running job's count when it last moved, and since when it has done almost nothing.
+    struct Hang {
+        var done: Int?
+        var moved: Date
+        var still: Date?
+        var told = false
+    }
     private let sizeGuard = MinimumSize()
     private var historyTimer: Timer?
     /// Sparkle, running only in a Cpuq.app bundle: a binary run from the build folder never offers
@@ -406,10 +416,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    /// Four things worth an interruption, each once it has lasted: cpuq's gate shut (30 s), jobs
-    /// waiting beside idle CPUs (a minute), heavy work outside cpuq on any machine (3 minutes), and
-    /// a cloud machine up with nothing to do for 15 minutes, which means its own 10-minute idle
-    /// stop failed and it is still billing.
+    /// Five things worth an interruption, each once it has lasted: cpuq's gate shut (30 s), jobs
+    /// waiting beside idle CPUs (a minute), heavy work outside cpuq on any machine (3 minutes), a
+    /// job that looks stuck (10 minutes of almost no CPU and no count), and a cloud machine up
+    /// with nothing to do for 15 minutes, which means its own 10-minute idle stop failed and it
+    /// is still billing.
     private func checkAlerts() {
         guard Prefs.notify else { return }
         let now = Date()
@@ -438,6 +449,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
             outsideHeavy[id] = e
         }
+        // A job that looks stuck: almost no CPU (under 0.2) for 10 minutes, and its count (when it
+        // reports one) unmoved as long. A slow tail that still counts, or a paused job, isn't.
+        var seen: Set<String> = []
+        for (id, name, s) in machines {
+            for h in s.holders where !h.exclusive {
+                let key = "\(id)-\(h.pid)-\(h.since)"
+                seen.insert(key)
+                var t = hung[key] ?? Hang(done: h.progress?.done, moved: now)
+                if h.progress?.done != t.done {
+                    t.done = h.progress?.done
+                    t.moved = now
+                }
+                let idle = !h.paused && (h.using ?? 1) < 0.2
+                let stalled = now.timeIntervalSince(t.moved) >= 600
+                if idle && stalled {
+                    if t.still == nil { t.still = now }
+                    if !t.told, let still = t.still, now.timeIntervalSince(still) >= 600 {
+                        t.told = true
+                        let what = h.label + (h.note.isEmpty ? "" : " " + h.note)
+                        let count = h.progress.map { " Its count has stood at \($0.done) of \($0.total) for 10 minutes." } ?? ""
+                        notify("hung-\(key)", "\(name): \(what) looks stuck",
+                               String(format: "Almost no CPU (%.1f of %d reserved) for 10 minutes.%@ Running %@; its owner can stop it with cpuq stop %d.", h.using ?? 0, h.cores, count, duration(now.timeIntervalSince1970 - Double(h.since)), h.pid))
+                    }
+                } else {
+                    t.still = nil
+                    t.told = false
+                }
+                hung[key] = t
+            }
+        }
+        hung = hung.filter { seen.contains($0.key) }
         for c in remotes where c.machine.start != nil {
             let idle = c.isCloudRunning && (c.status.map { $0.holders.isEmpty && $0.waiters.isEmpty } ?? false)
             var e = cloudIdle[c.machine.id] ?? Episode()

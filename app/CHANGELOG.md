@@ -3,6 +3,14 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.19.6 — 2026-10-15
+
+- The Jobs card labels its columns: Job, Progress, CPU of reserved, and Running (how long it has
+  run).
+- A notification when a running job looks stuck, on this Mac or a machine it watches: almost no
+  CPU (under 0.2) for 10 minutes, and its count, when it reports one, unmoved as long. A slow tail
+  that still counts and a paused job don't; it names the job and how to stop it.
+
 ## 0.19.5 — 2026-10-15
 
 - A notification when work outside cpuq holds a machine: at least 40% of its CPUs (and at least
