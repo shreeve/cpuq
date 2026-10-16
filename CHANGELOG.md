@@ -2,6 +2,14 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.25.1 — 2026-10-16
+
+- macOS: a job's CPU no longer leaps for one look when one of its processes reaps a child while
+  cpuq reads the process list (the child missed, or counted twice: once on its own and once in its
+  parent's reaped-children time). A one-second child read as 2.9 CPUs for a job using one, and the
+  leap could raise the label's `cpu_peak`. cpuq reads the kernel's list at once, parents before
+  children, and reads again the parent of a child reaped meanwhile.
+
 ## 0.25.0 — 2026-10-16
 
 - **`cpuq cap --no-crash-report`**: on macOS, no crash report (an `.ips` in

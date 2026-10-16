@@ -717,7 +717,6 @@ pub fn dieBySignal(sig: c.SIG) noreturn {
     c._exit(128 + @as(u8, @intCast(@backingInt(sig))));
 }
 
-extern "c" fn proc_listallpids(buffer: ?*anyopaque, size: c_int) c_int;
 extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, size: c_int) c_int;
 extern "c" fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: ?*anyopaque) c_int;
 extern "c" fn mach_timebase_info(info: *MachTimebase) c_int;
@@ -760,25 +759,25 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
     var list: std.ArrayList(Proc) = .empty;
     if (is_darwin) {
         // struct proc_bsdinfo (PROC_PIDTBSDINFO, 136 bytes): pbi_ppid at 16.
-        // struct rusage_info_v1 (144 bytes): ri_user_time at 16,
-        // ri_system_time at 24, ri_child_user_time at 96,
-        // ri_child_system_time at 104, in Mach absolute time units.
         var tb: MachTimebase = .{ .numer = 1, .denom = 1 };
         _ = mach_timebase_info(&tb);
-        const count = proc_listallpids(null, 0);
-        if (count <= 0) return &.{};
-        const pids = arena.alloc(c_int, @as(usize, @intCast(count)) + 64) catch return &.{};
-        const n = proc_listallpids(pids.ptr, @intCast(pids.len * @sizeOf(c_int)));
-        if (n <= 0) return &.{};
-        for (pids[0..@min(@as(usize, @intCast(n)), pids.len)]) |pid| {
-            var ru: [144]u8 align(8) = undefined;
-            if (proc_pid_rusage(pid, 1, &ru) != 0) continue;
-            var ticks: u64 = 0;
-            for ([_]usize{ 16, 24, 96, 104 }) |at| ticks +%= std.mem.readInt(u64, ru[at..][0..8], .little);
-            var own: u64 = 0;
-            for ([_]usize{ 16, 24 }) |at| own +%= std.mem.readInt(u64, ru[at..][0..8], .little);
-            // ri_phys_footprint, at 72.
-            const mem = std.mem.readInt(u64, ru[72..80], .little);
+        // Every process with its parent, as the kernel lists them at once
+        // (KERN_PROC_ALL): struct kinfo_proc, 648 bytes, p_pid at 40,
+        // e_ppid at 560. A zombie's parent comes from here too: it is
+        // invisible to proc_pidinfo. The list runs newest first, zombies
+        // last; read from its end, a parent comes before its children.
+        const all = kinfoAll(arena) orelse return &.{};
+        // The parents of processes reaped since the list was taken.
+        var reaped: std.ArrayList(i32) = .empty;
+        var end: usize = all.len - all.len % 648;
+        while (end >= 648) : (end -= 648) {
+            const at = end - 648;
+            const pid: c_int = std.mem.readInt(i32, all[at + 40 ..][0..4], .little);
+            const listed_ppid: i32 = std.mem.readInt(i32, all[at + 560 ..][0..4], .little);
+            const ru = rusage(pid, tb) orelse {
+                if (c.errno(-1) == .SRCH) reaped.append(arena, listed_ppid) catch {};
+                continue;
+            };
             // struct proc_taskinfo (PROC_PIDTASKINFO, 96 bytes): pti_numrunning at 88.
             var task: [96]u8 align(8) = undefined;
             const running: u32 = if (proc_pidinfo(pid, 4, 0, &task, task.len) == task.len)
@@ -786,7 +785,7 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
             else
                 0;
             var bsd: [136]u8 align(8) = undefined;
-            var ppid: i32 = undefined;
+            var ppid: i32 = listed_ppid;
             var name: []const u8 = "";
             var stopped = true;
             var uid: u32 = 0;
@@ -799,24 +798,49 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
                 // pbi_name (32 bytes at 64) when set, else pbi_comm (16 at 48).
                 const long = std.mem.sliceTo(bsd[64..96], 0);
                 name = if (long.len != 0) long else std.mem.sliceTo(bsd[48..64], 0);
-            } else {
-                // A zombie: exited, not yet reaped, and invisible to
-                // proc_pidinfo. Its CPU still counts until its parent reaps
-                // it and takes it over as child time; left out, a job's
-                // CPU would leap by the zombie's whole lifetime at the reap.
-                ppid = zombieParent(pid) orelse continue;
             }
+            // Else a zombie: exited, not yet reaped. Its CPU still counts
+            // until its parent reaps it and takes it over as child time;
+            // left out, a job's CPU would leap by the zombie's whole
+            // lifetime at the reap.
             list.append(arena, .{
                 .pid = pid,
                 .ppid = ppid,
                 .name = arena.dupe(u8, name) catch "",
-                .cpu_ns = @intCast(@as(u128, ticks) * tb.numer / tb.denom),
-                .own_ns = @intCast(@as(u128, own) * tb.numer / tb.denom),
-                .mem = mem,
+                .cpu_ns = ru.cpu_ns,
+                .own_ns = ru.own_ns,
+                .mem = ru.mem,
                 .running = running,
                 .stopped = stopped,
                 .uid = uid,
             }) catch break;
+        }
+        // A process reaped while this ran, after its parent was read, is in
+        // neither: its CPU would leap into its parent's at the next look.
+        // One read before its parent, as a zombie is, and reaped in between,
+        // is in both. Read each such parent again, holding it now, and drop
+        // the children it has reaped since, which that read holds too.
+        var read_at: std.AutoHashMapUnmanaged(i32, usize) = .empty;
+        for (list.items, 0..) |p, i| read_at.put(arena, p.pid, i) catch {};
+        for (list.items, 0..) |p, i| {
+            const parent_at = read_at.get(p.ppid) orelse continue;
+            if (parent_at > i and rusage(p.pid, tb) == null and c.errno(-1) == .SRCH) reaped.append(arena, p.ppid) catch {};
+        }
+        for (reaped.items, 0..) |parent, k| {
+            if (std.mem.indexOfScalar(i32, reaped.items[0..k], parent) != null) continue;
+            const i = for (list.items, 0..) |p, i| {
+                if (p.pid == parent) break i;
+            } else continue;
+            const ru = rusage(parent, tb) orelse continue;
+            list.items[i].cpu_ns = ru.cpu_ns;
+            list.items[i].own_ns = ru.own_ns;
+            var j: usize = 0;
+            while (j < list.items.len) {
+                const p = list.items[j];
+                if (p.ppid == parent and p.pid != parent and rusage(p.pid, tb) == null and c.errno(-1) == .SRCH) {
+                    _ = list.swapRemove(j);
+                } else j += 1;
+            }
         }
         return list.items;
     }
@@ -899,14 +923,43 @@ pub fn markTree(procs: []const Proc, root: i32, in_tree: []bool) void {
 }
 
 /// The CPU time of `root` and all its descendants in a snapshot.
-/// The parent of a macOS process, zombies included, from sysctl's
-/// kern.proc.pid: struct kinfo_proc (648 bytes), e_ppid at 560.
-fn zombieParent(pid: c_int) ?i32 {
-    var mib = [4]c_int{ 1, 14, 1, pid }; // CTL_KERN, KERN_PROC, KERN_PROC_PID
-    var info: [648]u8 align(8) = undefined;
-    var len: usize = info.len;
-    if (sysctl(&mib, mib.len, &info, &len, null, 0) != 0 or len != info.len) return null;
-    return @bitCast(std.mem.readInt(u32, info[560..564], .little));
+/// Every process, as the kernel lists them at once: an array of struct
+/// kinfo_proc (sysctl CTL_KERN, KERN_PROC, KERN_PROC_ALL).
+fn kinfoAll(arena: std.mem.Allocator) ?[]u8 {
+    var mib = [3]c_int{ 1, 14, 0 }; // CTL_KERN, KERN_PROC, KERN_PROC_ALL
+    var tries: u32 = 0;
+    while (tries < 4) : (tries += 1) {
+        var len: usize = 0;
+        if (sysctl(&mib, mib.len, null, &len, null, 0) != 0) return null;
+        // Room for processes started since the size was asked.
+        len += 64 * 648;
+        const buf = arena.alignedAlloc(u8, .@"8", len) catch return null;
+        if (sysctl(&mib, mib.len, buf.ptr, &len, null, 0) == 0) return buf[0..len];
+        if (c.errno(-1) != .NOMEM) return null;
+    }
+    return null;
+}
+
+const Rusage = struct { cpu_ns: u64, own_ns: u64, mem: u64 };
+
+/// A macOS process's CPU time, its own and with its reaped children's, and
+/// its memory (proc_pid_rusage); null when it cannot be read, as when it is
+/// gone (errno ESRCH).
+fn rusage(pid: c_int, tb: MachTimebase) ?Rusage {
+    // struct rusage_info_v1 (144 bytes): ri_user_time at 16,
+    // ri_system_time at 24, ri_phys_footprint at 72, ri_child_user_time at
+    // 96, ri_child_system_time at 104, in Mach absolute time units.
+    var ru: [144]u8 align(8) = undefined;
+    if (proc_pid_rusage(pid, 1, &ru) != 0) return null;
+    var own: u64 = 0;
+    for ([_]usize{ 16, 24 }) |at| own +%= std.mem.readInt(u64, ru[at..][0..8], .little);
+    var ticks = own;
+    for ([_]usize{ 96, 104 }) |at| ticks +%= std.mem.readInt(u64, ru[at..][0..8], .little);
+    return .{
+        .cpu_ns = @intCast(@as(u128, ticks) * tb.numer / tb.denom),
+        .own_ns = @intCast(@as(u128, own) * tb.numer / tb.denom),
+        .mem = std.mem.readInt(u64, ru[72..80], .little),
+    };
 }
 
 /// Threads ready to run in a process and its descendants.
