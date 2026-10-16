@@ -429,7 +429,7 @@ struct HeroCard: View {
     @ViewBuilder private var capacityVerdict: some View {
         let free = String(format: "%.1f", moment.free)
         if let w = moment.window {
-            verdict("lock.fill", "Timing window", moment.windowHolds ? "\(w) has the Mac alone" : "\(w) waits for the Mac to empty",
+            verdict("lock.fill", "Timing window", moment.windowHolds ? "\(w) has \(model.machine.name) alone" : "\(w) waits for \(model.machine.name) to empty",
                     tint: Alive.windowTint)
         } else if !moment.watched {
             verdict("eye.slash", "Not watched", "The app wasn't running then: how busy the CPUs were is unknown")
@@ -1358,7 +1358,7 @@ struct JobsCard: View {
         let gate = model.status?.gate.state ?? "open"
         let window = Moment.now(model).window
         let needless = free >= max(2, need) && gate == "open" && window == nil
-        let why = w.exclusive ? "timing window: waits for the Mac to empty" : window != nil ? "waits for the timing window" : gate != "open" ? "the gate is shut" : needless ? "CPUs idle" : free >= need ? "starting" : "\(String(format: "%.1f", free)) free, so it holds"
+        let why = w.exclusive ? "timing window: waits for \(model.machine.name) to empty" : window != nil ? "waits for the timing window" : gate != "open" ? "the gate is shut" : needless ? "CPUs idle" : free >= need ? "starting" : "\(String(format: "%.1f", free)) free, so it holds"
         return HStack(spacing: 10) {
             Circle().strokeBorder(model.color(project), lineWidth: 2).frame(width: 8, height: 8)
             (Text(name).fontWeight(.medium).foregroundStyle(Alive.ink)

@@ -3,6 +3,11 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.19.7 — 2026-10-15
+
+- A timing window says which machine it waits for or holds ("waits for pup to empty"), not
+  "the Mac" on every machine's page.
+
 ## 0.19.6 — 2026-10-15
 
 - The Jobs card labels its columns: Job, Progress, CPU of reserved, and Running (how long it has
