@@ -769,8 +769,14 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
         const is_dir = if (Io.Dir.cwd().statFile(io, a.print("{s}/{s}", .{ root, path }) catch "", .{})) |st| st.kind == .directory else |_| true;
         sync.append(a, a.print("--include=/{s}{s}", .{ path, if (is_dir) "/***" else "" }) catch "") catch {};
     }
+    sync.appendSlice(a, &.{ "--exclude=/.git", "--exclude=/.cpuq-used" }) catch fail("out of memory", .{});
+    // What .gitignore leaves out: in a git repo, as git itself reads it (its `!` lines, nested
+    // .gitignore files, the global excludes; a tracked file ships whatever matches it), which
+    // rsync's own .gitignore filter gets wrong; elsewhere, that filter.
+    const excludes = if (gitTop(ctx) != null) gitIgnored(ctx, root) else null;
+    defer if (excludes) |f| Io.Dir.cwd().deleteFile(io, f) catch {};
+    sync.append(a, if (excludes) |f| a.print("--exclude-from={s}", .{f}) catch "" else "--filter=:- .gitignore") catch fail("out of memory", .{});
     sync.appendSlice(a, &.{
-        "--exclude=/.git", "--exclude=/.cpuq-used",                                        "--filter=:- .gitignore",
         a.print("--rsync-path=mkdir -p {s} && rsync", .{shellQuote(a, dir)}) catch "", a.print("{s}/", .{root}) catch "",
         a.print("{s}:{s}/", .{ host, dir }) catch "",
     }) catch fail("out of memory", .{});
@@ -897,6 +903,32 @@ fn shipList(ctx: *Ctx, root: []const u8, o: RunOptions) []const []const u8 {
 }
 
 /// The top of the git work tree holding the working directory, if any.
+/// The untracked files git ignores in the repo at `root`, as an rsync exclude file of anchored
+/// patterns (an ignored folder whole, as `dir/`), written to a temporary file the caller deletes;
+/// null when git can't say.
+fn gitIgnored(ctx: *Ctx, root: []const u8) ?[]const u8 {
+    const a = ctx.arena;
+    const r = std.process.run(a, ctx.io, .{ .argv = &.{ "git", "-C", root, "ls-files", "-o", "-i", "--exclude-standard", "--directory", "-z" } }) catch return null;
+    if (!r.term.success()) return null;
+    var out: std.ArrayList(u8) = .empty;
+    var paths = std.mem.splitScalar(u8, r.stdout, 0);
+    while (paths.next()) |path| {
+        if (path.len == 0 or std.mem.findScalar(u8, path, '\n') != null) continue;
+        out.append(a, '/') catch return null;
+        // A wildcard in a name is matched as itself: rsync reads `\` before one as a plain char.
+        const wild = std.mem.findAny(u8, path, "*?[\\") != null;
+        for (path) |ch| {
+            if (wild and std.mem.findScalar(u8, "*?[\\", ch) != null) out.append(a, '\\') catch return null;
+            out.append(a, ch) catch return null;
+        }
+        out.append(a, '\n') catch return null;
+    }
+    const tmp = ctx.env.get("TMPDIR") orelse "/tmp";
+    const file = a.print("{s}/cpuq-spill-{d}.exclude", .{ std.mem.trimEnd(u8, tmp, "/"), sys.getpid() }) catch return null;
+    Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = file, .data = out.items }) catch return null;
+    return file;
+}
+
 fn gitTop(ctx: *Ctx) ?[]const u8 {
     const r = std.process.run(ctx.arena, ctx.io, .{ .argv = &.{ "git", "rev-parse", "--show-toplevel" } }) catch return null;
     if (!r.term.success()) return null;

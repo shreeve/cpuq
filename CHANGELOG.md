@@ -2,6 +2,13 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.25.5 — 2026-10-16
+
+- `--spill` and `--spill-to` copy what git ships: in a git repo the copy leaves out the untracked
+  files git ignores, as git reads .gitignore. rsync's own .gitignore filter, used before, ignores a
+  `!` line, so a file brought back by one (emdb's test/data/dump-100.txt) never arrived, and it
+  left out tracked files a pattern happens to match. Outside git, that filter stays.
+
 ## 0.25.4 — 2026-10-16
 
 - Measured admission: an `--opaque` job counts at its whole grant while it settles, then no

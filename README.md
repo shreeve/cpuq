@@ -441,7 +441,9 @@ afterwards, for a build's output; it repeats.
 - **Gitignored paths a job needs** (a vendored tree its tests read, or `.git` for `git ls-files`)
   ship too when listed in `.cpuq-spill` at the repo's top, a path a line (`#` comments), or given
   with `--ship PATH`. A gitignored path not listed never ships, and never leaves the host's copy
-  either: a build cache there (`.zig-cache`) stays warm from one run to the next.
+  either: a build cache there (`.zig-cache`) stays warm from one run to the next. "Gitignored" is
+  as git reads it (in a git repo, cpuq asks git): a file a `!` line brings back ships, and so does
+  a tracked file a pattern happens to match.
 - **`.git` ships as a git of the copy's own:** a `.git` directory with only git's parts of the
   repo's (objects, refs, packed-refs, config, info, shallow) and the worktree's own HEAD and index.
   A worktree's `.git` file, a path on this machine, becomes a repo there, and whatever else a

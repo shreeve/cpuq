@@ -1912,6 +1912,27 @@ t_ship_git() {
   check "a worktree's .git ships as a git of its own (got '$got')" "[ '$got' = 'dir $want a.txt b.txt c.txt clean ' ]"
 }
 
+t_spill_gitignore() {
+  # A spilled copy leaves out what git ignores, as git reads .gitignore: a file its `!` line
+  # brings back ships (rsync's own .gitignore filter dropped it), and a tracked file ships though
+  # a pattern matches it; ignored files and folders stay behind.
+  setup spill-gitignore
+  local bin=$T/bin far=$T/far
+  mkdir -p "$bin" "$far"
+  printf '#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done\nshift\ncd "%s" && exec sh -c "$*"\n' "$far" >"$bin/ssh"
+  chmod +x "$bin/ssh"
+  ln -sf "$CPUQ" "$bin/cpuq"
+  (
+    cd "$T" && git init -q repo && cd repo && git config user.email t@t && git config user.name t
+    printf 'data/*\n!data/keep.txt\nbuild/\n*.log\n' > .gitignore
+    mkdir -p data build && echo k > data/keep.txt && echo d > data/drop.txt && echo x > build/x
+    echo p > plain.txt && echo t > tracked.log && echo n > notes.log
+    git add .gitignore plain.txt && git add -f tracked.log && git commit -qm one
+  ) >/dev/null 2>&1
+  local got; got=$(cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --spill-to far --cores 1 -- sh -c 'find . -type f ! -path "./.git*" ! -name .cpuq-used | sort | tr "\n" " "' 2>/dev/null)
+  check "a spilled copy ships what git ships: a \`!\` re-included file and a tracked one, none of the ignored (got '$got')" "[ '$got' = './data/keep.txt ./plain.txt ./tracked.log ' ]"
+}
+
 t_tethered() {
   # --tethered (what --spill runs on the spill host): the command gets
   # /dev/null for stdin, which carries the caller's heartbeats, and is
@@ -1971,7 +1992,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git spill_gitignore tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"
