@@ -2,6 +2,15 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.25.4 — 2026-10-16
+
+- Measured admission: an `--opaque` job counts at its whole grant while it settles, then no
+  longer blindly. The settled `--opaque` jobs together count for the machine's busy CPUs that
+  nothing measured explains (where a container's work still shows), shared by their grants: each
+  at least what its own processes use, at most its grant. On pup six 4-core `--opaque` jobs using
+  0.02–0.97 CPUs each counted 24 cores, and jobs waited minutes with 20 of 22 CPUs idle; the same
+  idle 20-core `--opaque` job now lets a 4-core job start at once.
+
 ## 0.25.3 — 2026-10-16
 
 - `cpuq job ID --cancel` stops a submitted job whose command is running, at once, its whole

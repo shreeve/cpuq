@@ -957,22 +957,44 @@ sys.exit(0 if 0 <= a <= 1.5 and 0.8 <= b - a <= 1.5 else 1)'"
 }
 
 t_opaque() {
-  # --opaque: a job whose work cpuq cannot see (a container) counts at its
-  # whole grant, measured idle or not; without it, an idle job settles to
-  # nearly nothing and leaves room.
-  local mode rc out=""
-  for mode in opaque plain; do
-    setup "opaque-$mode" "admit = measured" "target = 2" "settle = 1"
-    local flag=""; [ $mode = opaque ] && flag=--opaque
+  # --opaque: a job whose work cpuq cannot see (a container) counts at its whole grant while it
+  # settles; then for the busy CPUs nothing measured explains, which its hidden work would show
+  # as. So busy hidden work (two spinners outside its tree, as a container's) keeps it whole and
+  # the next waits; an idle one leaves room, as a plain idle job does. (That case needs a quiet
+  # machine: other work outside cpuq counts as the hidden work's, erring toward waiting.)
+  local mode rc out="" quiet=1
+  for mode in settling busy idle plain; do
+    local settle=1; [ $mode = settling ] && settle=60
+    setup "opaque-$mode" "admit = measured" "target = 2" "settle = $settle"
+    local flag="--opaque"; [ $mode = plain ] && flag=""
+    local spin="opaque-spin.$$"
+    if [ $mode = busy ]; then
+      for _ in 1 2; do python3 -c 'import time; e = time.time() + 9
+while time.time() < e: pass' "$spin" & done
+    fi
     "$CPUQ" run --cores 2 $flag --label box -- sleep 8 & local b=$!
     wait_held 2
-    sleep 2
+    sleep 2.5
+    if [ $mode = idle ]; then
+      # The machine's busy CPUs over a second (status's per-CPU busy and total ticks), the sleeping
+      # job aside: any other work counts as its hidden work's.
+      local t0 t1; t0=$("$CPUQ" status --json --no-usage); sleep 1; t1=$("$CPUQ" status --json --no-usage)
+      python3 -c 'import json, sys
+a = json.loads(sys.argv[1])["cpu_ticks"]; b = json.loads(sys.argv[2])["cpu_ticks"]
+busy = sum((y[0] - x[0]) / max(y[1] - x[1], 1) for x, y in zip(a, b))
+sys.exit(0 if busy < 0.5 else 1)' "$t0" "$t1" || quiet=0
+    fi
     "$CPUQ" run --cores 1 --max-wait 2 --label next -- true 2>/dev/null; rc=$?
     out="$out$mode:$rc "
-    [ $mode = opaque ] && local shown; [ $mode = opaque ] && shown=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print([h["opaque"] for h in json.load(sys.stdin)["holders"]])')
+    [ $mode = settling ] && local shown; [ $mode = settling ] && shown=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print([h["opaque"] for h in json.load(sys.stdin)["holders"]])')
     wait $b
+    wait
   done
-  check "an --opaque job counts whole (status $shown), so the next waits; a plain idle one leaves room (got $out)" "[ '$out' = 'opaque:75 plain:0 ' ] && [ '$shown' = '[True]' ]"
+  if [ $quiet = 1 ]; then
+    check "an --opaque job counts whole while settling (status $shown) and while its hidden work is busy, and leaves room when idle, as a plain one does (got $out)" "[ '$out' = 'settling:75 busy:75 idle:0 plain:0 ' ] && [ '$shown' = '[True]' ]"
+  else
+    check "an --opaque job counts whole while settling (status $shown) and while its hidden work is busy; a plain idle one leaves room (got $out; the machine too busy to judge the idle case)" "[[ '$out' == 'settling:75 busy:75 idle:'* ]] && [[ '$out' == *' plain:0 ' ]] && [ '$shown' = '[True]' ]"
+  fi
 }
 
 t_cpu_weights() {

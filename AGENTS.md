@@ -23,7 +23,9 @@ nothing after it has no limit):
 A bare `zig build` uses every CPU: always give it `-j"$CPUQ_CORES"`.
 
 Work that runs inside a container or VM (`incus exec`, `docker exec`) is invisible to cpuq's
-measurements: add `--opaque` and a fixed `--cores`, so it counts at its whole grant.
+measurements: add `--opaque` and a fixed `--cores`, so it counts at its whole grant until the
+machine's own busy time says otherwise. Only for those: a VM or program the command starts itself
+(`qemu`, a local server) is in its process tree, and `--opaque` there holds cores it never uses.
 
 ## Cores
 

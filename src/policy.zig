@@ -744,6 +744,39 @@ pub fn charge(expected: ?f64, measured: ?f64, age_s: i64, settle_s: u32, held: u
     return @max(@min(expected orelse h, h), 0.05);
 }
 
+/// What settled `--opaque` jobs count for under measured admission. Their work runs where cpuq
+/// cannot see it (a container, a VM), but on this machine it still shows in the CPUs' own busy
+/// time: so together they count for the busy CPUs nothing else measured explains (`unexplained`,
+/// outside work included, which errs toward counting them more), shared by their grants. Each
+/// counts at least what its own command tree is seen to use and at most its grant. A job whose
+/// work runs on another machine (ssh) holds cores it never uses here, and counts for little.
+pub fn hiddenCharge(grants: []const u32, seen: []const f64, unexplained: f64) f64 {
+    var total: f64 = 0;
+    for (grants) |g| total += @floatFromInt(g);
+    if (total == 0) return 0;
+    var charged: f64 = 0;
+    for (grants, seen) |g, v| {
+        const grant: f64 = @floatFromInt(g);
+        const share = @max(unexplained, 0) * grant / total;
+        charged += std.math.clamp(@max(share, v), 0.05, grant);
+    }
+    return charged;
+}
+
+test "settled opaque jobs count for the busy CPUs nothing else explains" {
+    // Six 4-core opaque jobs on a machine busy 1 CPU beyond what was measured: ~1, not 24.
+    const g6 = [_]u32{ 4, 4, 4, 4, 4, 4 };
+    const quiet = [_]f64{ 0, 0.04, 0, 0.02, 0.97, 0.02 };
+    const unseen = [_]f64{ 0, 0, 0, 0, 0, 0 };
+    try std.testing.expect(hiddenCharge(&g6, &quiet, 1.0) < 2.0);
+    // Their containers busy (14 CPUs unexplained): they count for those 14.
+    try std.testing.expectApproxEqAbs(@as(f64, 14), hiddenCharge(&g6, &unseen, 14), 1e-9);
+    // Never past their grants, however busy the machine.
+    try std.testing.expectEqual(@as(f64, 24), hiddenCharge(&g6, &unseen, 40));
+    // What a job's own tree is seen to use stands, if more than its share.
+    try std.testing.expectApproxEqAbs(@as(f64, 3.05), hiddenCharge(&[_]u32{ 4, 4 }, &[_]f64{ 3, 0 }, 0), 1e-9);
+}
+
 /// The cores to hand a job under measured admission, as a range for the
 /// tokens: a fixed count asked for stands; a range is capped near the label's
 /// use (as `rightSize`); with no count asked for, the label's use decides

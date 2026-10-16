@@ -117,9 +117,15 @@ CMD's environment gets `CPUQ_CORES` (its grant), a GNU make jobserver of that si
 **Work cpuq can't see.** cpuq measures a job by its command's process tree. Work that runs in a
 container or a VM (`incus exec`, `docker exec`) belongs to the container's own processes, so the
 job measures idle and its cores would be handed out again. Give such a job `--opaque` and a
-`--cores` count: it counts at its whole grant the whole time, is never started inside a lending
-timing window (it couldn't be frozen), and `cpuq pause`/`stop` say they reach only the command
-cpuq started.
+`--cores` count: it counts at its whole grant while it settles; after that (measured admission),
+the `--opaque` jobs together count for the machine's busy CPUs that nothing measured explains,
+where a container's work on this machine still shows, shared by their grants: each at least what
+its own processes are seen to use and at most its grant. Work outside cpuq counts there too, so it
+errs toward counting them whole; an idle container, or a job marked `--opaque` whose work cpuq
+can see anyway (a qemu it starts itself), no longer holds the queue behind idle CPUs. It is never
+started inside a lending timing window (it couldn't be frozen), and `cpuq pause`/`stop` say they
+reach only the command cpuq started. A VM or program cpuq starts as a child is no container: leave
+`--opaque` off, and it is measured as it is.
 
 **A cgroup per job (Linux).** With `cgroups` (on by default), each job runs in a systemd user
 scope of its own, delegated to the user, and its command in that scope's `job/`. `$CPUQ_CGROUP`

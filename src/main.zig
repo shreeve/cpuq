@@ -1237,7 +1237,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             const machine_open = policy.gate(cfg, mach, 0, null, now) == .open and !saturated;
             if (!named and !o.exclusive and cfg.admit == .measured and cfg.backfill and !queue[0].record.exclusive and machine_open) {
                 if (run_times == null) run_times = RunTimes.load(ctx, ctx.arena);
-                const m = measuredLoad(ctx, st, a, &run_times.?, mach.busy);
+                const m = measuredLoad(ctx, st, a, &run_times.?, mach.busy, mach.active);
                 // Work cpuq cannot freeze never starts in a lending window.
                 if (!m.exclusive and !(o.hidden and m.lent)) {
                     const room = targetCpus(ctx) - m.charged;
@@ -1291,7 +1291,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             // its expected use while it settles) and start while that leaves
             // room for this one, unless the CPUs are measured all but full.
             if (run_times == null) run_times = RunTimes.load(ctx, ctx.arena);
-            const m = measuredLoad(ctx, st, a, &run_times.?, mach.busy);
+            const m = measuredLoad(ctx, st, a, &run_times.?, mach.busy, mach.active);
             const target = targetCpus(ctx);
             const room = target - m.charged;
             const req = policy.measuredGrant(o.request, o.cores_given, if (o.hidden) &.{} else labelUses(run_times.?, o.label), room, cores);
@@ -1389,7 +1389,7 @@ fn useOf(rt: RunTimes, label: []const u8) ?f64 {
 /// CPU, averaged over about half of `settle`), the measurements kept in the
 /// state directory so the next head carries on from them. Call with the
 /// admission lock held.
-fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const RunTimes, busy: ?f64) struct { charged: f64, exclusive: bool, lent: bool = false } {
+fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const RunTimes, busy: ?f64, cpus: u32) struct { charged: f64, exclusive: bool, lent: bool = false } {
     // Threads ready to run mean a job is short of CPU only when the CPUs are
     // full; with CPUs idle they are waiting on something else (a pool of
     // workers, a burst of short processes), and counting them held the
@@ -1416,10 +1416,16 @@ fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const Ru
     const now_ms: i64 = @intFromFloat(nowFloat(ctx.io) * 1000);
     const now_s = @divFloor(now_ms, 1000);
     var charged: f64 = 0;
+    // Settled --opaque jobs, counted together after the rest (policy.hiddenCharge), and what the
+    // other jobs are measured to use, which the machine's busy CPUs hold too.
+    var hidden_grants: std.ArrayList(u32) = .empty;
+    var hidden_seen: std.ArrayList(f64) = .empty;
+    var seen_total: f64 = 0;
     for (leases) |l| {
         if (l.record.exclusive or st.isPaused(l.name)) continue;
-        // Work cpuq cannot see counts at its whole grant.
-        if (l.record.hidden) {
+        // Work cpuq cannot see counts at its whole grant while it settles, or with the CPUs'
+        // busy time unmeasured.
+        if (l.record.hidden and (busy == null or l.record.child <= 0 or now_s - l.record.since < ctx.cfg.settle_s)) {
             charged += @floatFromInt(l.record.cores);
             continue;
         }
@@ -1433,12 +1439,22 @@ fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const Ru
         u.observe(sys.treeCpu(procs, l.record.child), now_ms, l.record.cores, ctx.cfg.settle_s);
         u.observeRunnable(sys.treeRunning(procs, l.record.child), if (before_ms == 0) 0 else @as(f64, @floatFromInt(now_ms - before_ms)) / 1000, ctx.cfg.settle_s);
         fresh.put(a, l.name, u) catch {};
+        if (l.record.hidden) {
+            hidden_grants.append(a, l.record.cores) catch {};
+            hidden_seen.append(a, if (u.at_ms != 0) u.avg else 0) catch {};
+            continue;
+        }
+        if (u.at_ms != 0) seen_total += u.avg;
         // What it asks of the CPUs: what it gets, or on a contended machine
         // the threads it has ready to run, whichever is more (at most twice
         // what it holds, so a burst of short processes cannot swamp it).
         const asks = if (contended) @max(u.avg, @min(u.runnable, 2 * @as(f64, @floatFromInt(l.record.cores)))) else u.avg;
         const measured: ?f64 = if (u.at_ms != 0) asks else null;
         charged += policy.charge(expected, measured, now_s - l.record.since, ctx.cfg.settle_s, l.record.cores);
+    }
+    if (hidden_grants.items.len != 0) {
+        const unexplained = (busy orelse 1) * @as(f64, @floatFromInt(cpus)) - seen_total;
+        charged += policy.hiddenCharge(hidden_grants.items, hidden_seen.items, unexplained);
     }
     st.writeUsage(a, fresh);
     return .{ .charged = charged, .exclusive = false, .lent = lent };
