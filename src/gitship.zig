@@ -44,8 +44,18 @@ pub fn ship(a: std.mem.Allocator, io: Io, rsync: []const u8, root: []const u8, h
 
 fn failed(a: std.mem.Allocator, io: Io, argv: []const []const u8) ?[]const u8 {
     const c = std.process.run(a, io, .{ .argv = argv }) catch return "git: cannot run rsync";
-    if (c.term.success()) return null;
+    if (copied(c.term)) return null;
     return a.print("git: {s}", .{std.mem.trim(u8, c.stderr, " \n")}) catch "git: rsync failed";
+}
+
+/// Whether an rsync did its job: it exited 0, or 24, "some files vanished before they could be
+/// transferred", a file deleted while it copied (a branch removed once merged, a build's scratch).
+/// What vanished is gone here too, so the copy is no less right.
+pub fn copied(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .exited => |code| code == 0 or code == 24,
+        else => false,
+    };
 }
 
 /// `s` in single quotes for a POSIX shell.
@@ -57,4 +67,11 @@ fn quote(a: std.mem.Allocator, s: []const u8) []const u8 {
     }
     out.append(a, '\'') catch return s;
     return out.items;
+}
+
+test "an rsync whose files vanished as it copied still copied" {
+    try std.testing.expect(copied(.{ .exited = 0 }));
+    try std.testing.expect(copied(.{ .exited = 24 }));
+    try std.testing.expect(!copied(.{ .exited = 23 }));
+    try std.testing.expect(!copied(.{ .exited = 255 }));
 }

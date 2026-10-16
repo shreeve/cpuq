@@ -2,6 +2,13 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.24.2 — 2026-10-16
+
+- A spilled or submitted job's copy no longer fails when a file vanishes while rsync copies it: a
+  branch deleted once merged (its ref, in a shipped `.git`), a build's scratch. rsync's exit 24
+  ("some files vanished") counts as copied, since what vanished is gone here too. A submitted job
+  had ended CPUQ ERROR before it ran ("rsync to burst failed").
+
 ## 0.24.1 — 2026-10-15
 
 - A running job's usual time (`typical` in `status --json`, and the time left from it) comes from

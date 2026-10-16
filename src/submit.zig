@@ -305,6 +305,11 @@ fn quote(cx: Cx, s: []const u8) []const u8 {
     return out.items;
 }
 
+/// An rsync that did its job: exit 0, or 24 (files vanished while it copied: gone here too).
+fn rsynced(r: Ran) bool {
+    return r.ok or r.code == 24;
+}
+
 fn rsyncPath(cx: Cx) []const u8 {
     if (cx.env.get("CPUQ_RSYNC")) |p| return p;
     for ([_][]const u8{ "/opt/homebrew/bin/rsync", "/usr/local/bin/rsync", "/usr/bin/rsync" }) |p| {
@@ -988,7 +993,7 @@ fn sync(cx: Cx, rec: *const Record, host: []const u8) bool {
     argv.append(cx.a, cx.a.print("{s}/", .{rec.dir}) catch return false) catch return false;
     argv.append(cx.a, cx.a.print("{s}/", .{dest}) catch return false) catch return false;
     if (std.mem.eql(u8, host, "here")) Io.Dir.cwd().createDirPath(cx.io, cx.a.print("{s}/{s}", .{ home(cx), rec.copy }) catch "") catch {};
-    if (!run(cx, argv.items, null).ok) return false;
+    if (!rsynced(run(cx, argv.items, null))) return false;
     if (rec.git) {
         const here = std.mem.eql(u8, host, "here");
         const git_dir = cx.a.print("{s}{s}{s}/.git", .{ if (here) home(cx) else "", if (here) "/" else "", rec.copy }) catch return false;
@@ -1014,7 +1019,7 @@ fn sync(cx: Cx, rec: *const Record, host: []const u8) bool {
             if (list.ok) dargv.append(cx.a, cx.a.print("--files-from={s}", .{files}) catch "") catch {};
             dargv.append(cx.a, cx.a.print("{s}/", .{src}) catch "") catch {};
             dargv.append(cx.a, target) catch {};
-            if (!run(cx, dargv.items, null).ok) return false;
+            if (!rsynced(run(cx, dargv.items, null))) return false;
         }
     }
     return true;
@@ -1079,7 +1084,7 @@ fn finish(cx: Cx, rec: *const Record, host: []const u8) u8 {
         const dest = if (parent) |d| cx.a.print("{s}/{s}/", .{ rec.dir, d }) catch continue else cx.a.print("{s}/", .{rec.dir}) catch continue;
         Io.Dir.cwd().createDirPath(cx.io, dest) catch {};
         const r = run(cx, &.{ rsyncPath(cx), "-a", "--safe-links", src, dest }, null);
-        if (!r.ok) std.debug.print("cpuq: couldn't bring {s} back from {s}: {s}\n", .{ p, host, std.mem.trim(u8, r.err, " \n") });
+        if (!rsynced(r)) std.debug.print("cpuq: couldn't bring {s} back from {s}: {s}\n", .{ p, host, std.mem.trim(u8, r.err, " \n") });
     }
     if (!res.ok) return done(cx, id, rec.*, .cpuq_error, null, cx.a.print("its result couldn't be read on {s}: not your code, report it", .{host}) catch "", host);
     // Here, the host's job directory is this one: result.json is already in place.

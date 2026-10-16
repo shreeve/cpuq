@@ -8,6 +8,7 @@ const state = @import("state.zig");
 const sys = @import("sys.zig");
 const gitship = @import("gitship.zig");
 const clean = @import("clean.zig");
+const packs_mod = @import("packs.zig");
 
 const history = @import("history.zig");
 const hook = @import("hook.zig");
@@ -23,6 +24,9 @@ test {
     _ = state;
     _ = history;
     _ = table;
+    _ = gitship;
+    _ = packs_mod;
+    _ = clean;
 }
 
 const version = @import("build_options").version;
@@ -771,7 +775,7 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
         a.print("{s}:{s}/", .{ host, dir }) catch "",
     }) catch fail("out of memory", .{});
     const copied = std.process.run(a, io, .{ .argv = sync.items }) catch |err| fail("rsync: {t}", .{err});
-    const failed: ?[]const u8 = if (!copied.term.success()) std.mem.trim(u8, copied.stderr, " \n") else if (ship_git) shipGit(ctx, root, host, dir) else null;
+    const failed: ?[]const u8 = if (!gitship.copied(copied.term)) std.mem.trim(u8, copied.stderr, " \n") else if (ship_git) shipGit(ctx, root, host, dir) else null;
     if (failed) |err_text| {
         // Sent there by name, a job never runs here: it was sized for that host.
         if (o.spill_to != null) {
@@ -841,7 +845,7 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     for (o.returns[0..o.return_count]) |path| {
         const back = [_][]const u8{ "rsync", "-a", "--relative", a.print("{s}:{s}{s}/./{s}", .{ host, dir, rel, path }) catch "", "./" };
         const r = std.process.run(a, io, .{ .argv = &back }) catch null;
-        if (r == null or !r.?.term.success()) std.debug.print("cpuq: could not copy {s} back from {s}\n", .{ path, host });
+        if (r == null or !gitship.copied(r.?.term)) std.debug.print("cpuq: could not copy {s} back from {s}\n", .{ path, host });
     }
     return code;
 }
