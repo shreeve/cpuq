@@ -2,6 +2,15 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.24.3 — 2026-10-16
+
+- A submitted job given up before its copy was synced (a failed rsync, a worktree that kept
+  changing) is cancelled on its host too. Its host side had waited up to an hour for the sync,
+  holding the worktree's copy, so the worktree's next job queued "waiting for its copy" all that
+  time.
+- A submitted job waiting for its copy can be cancelled (`cpuq job ID --cancel`): it waited in a
+  blocking lock and never saw the cancel.
+
 ## 0.24.2 — 2026-10-16
 
 - A spilled or submitted job's copy no longer fails when a file vanishes while rsync copies it: a

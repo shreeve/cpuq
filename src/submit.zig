@@ -948,23 +948,31 @@ fn startAndWatch(cx: Cx, rec: *Record, payload: *Payload, host: []const u8) u8 {
     setState(cx, id, "syncing", cx.a.print("to {s}", .{host}) catch "");
     // Packs built from source: the source of each version the host lacks.
     for (rec.packs) |pk| if (packs.ship(cx.a, cx.io, if (std.mem.eql(u8, host, "here")) null else host, pk)) |e|
-        return done(cx, id, rec.*, .cpuq_error, null, cx.a.print("{s}: not your code", .{e}) catch "", host);
+        return abandon(cx, id, rec.*, .cpuq_error, null, cx.a.print("{s}: not your code", .{e}) catch "", host);
     var tries: u32 = 0;
     while (true) : (tries += 1) {
-        if (!sync(cx, rec, host)) return done(cx, id, rec.*, .cpuq_error, null, cx.a.print("rsync to {s} failed: not your code, report it", .{host}) catch "", host);
+        if (!sync(cx, rec, host)) return abandon(cx, id, rec.*, .cpuq_error, null, cx.a.print("rsync to {s} failed: not your code, report it", .{host}) catch "", host);
         // The worktree must not have changed while it was copied.
         const again = resnapshot(cx, rec);
         if (std.mem.eql(u8, again, rec.snapshot)) break;
         // Changed since submit (or during the copy): it runs as it is now, copied again.
         setState(cx, id, "syncing", cx.a.print("to {s}: the worktree changed since submit, so it runs as it is now", .{host}) catch "");
-        if (tries == 2) return done(cx, id, rec.*, .cpuq_error, null, "the worktree kept changing while it was copied: resubmit when it's still", host);
+        if (tries == 2) return abandon(cx, id, rec.*, .cpuq_error, null, "the worktree kept changing while it was copied: resubmit when it's still", host);
         rec.snapshot = again;
         payload.generation = again;
     }
     const marked = onHost(cx, host, cx.a.print("{s} _synced {s} {s}", .{ cpuqOn(cx, host), id, rec.snapshot }) catch "");
-    if (!marked.ok) return done(cx, id, rec.*, .cpuq_error, null, cx.a.print("couldn't mark the copy on {s}: not your code, report it", .{host}) catch "", host);
+    if (!marked.ok) return abandon(cx, id, rec.*, .cpuq_error, null, cx.a.print("couldn't mark the copy on {s}: not your code, report it", .{host}) catch "", host);
     writeFile(cx, jobFile(cx, id, "job.json"), jsonString(cx, rec.*));
     return watch(cx, rec, payload, host);
+}
+
+/// Gives a job up before its copy was synced: its verdict here, and its _job on the host cancelled,
+/// which otherwise waits an hour for the sync, holding the copy's lock against the worktree's next
+/// job.
+fn abandon(cx: Cx, id: []const u8, rec: Record, v: Verdict, code: ?i64, detail: []const u8, host: []const u8) u8 {
+    _ = onHost(cx, host, cx.a.print("{s} _cancel {s}", .{ cpuqOn(cx, host), id }) catch "");
+    return done(cx, id, rec, v, code, detail, host);
 }
 
 fn host_has_time_rule(cx: Cx, host: []const u8) bool {
@@ -1173,9 +1181,14 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
     // One job at a time on a copy.
     const copy = cx.a.print("{s}/{s}", .{ home(cx), p.copy }) catch return 125;
     Io.Dir.cwd().createDirPath(cx.io, copy) catch {};
-    const copy_lock = Io.Dir.cwd().createFile(cx.io, cx.a.print("{s}.lock", .{copy}) catch "", .{ .lock = .exclusive, .truncate = false }) catch
-        return hostDone(cx, id, p, .cpuq_error, null, "the copy's lock couldn't be taken: not your code, report it", started);
+    // Waits its turn for the copy's lock without blocking in it, so a cancel is seen while queued.
+    const copy_lock = Io.Dir.cwd().createFile(cx.io, cx.a.print("{s}.lock", .{copy}) catch "", .{ .truncate = false }) catch
+        return hostDone(cx, id, p, .cpuq_error, null, "the copy's lock couldn't be opened: not your code, report it", started);
     defer copy_lock.close(cx.io);
+    while (!(copy_lock.tryLock(cx.io, .exclusive) catch false)) {
+        if (cancelled(cx, id)) return hostDone(cx, id, p, .cancelled, null, "by cpuq job --cancel: not your code", started);
+        sleepMs(cx.io, 500);
+    }
     hostState(cx, id, "ready");
 
     // The supervisor syncs, then marks it: wait for that, up to an hour.
@@ -1440,6 +1453,12 @@ fn runLogged(cx: Cx, argv: []const []const u8, env: *std.process.Environ.Map, cw
 
 /// The job's end on the host: its result, from its exit and its report.
 fn hostDone(cx: Cx, id: []const u8, p: Payload, v: Verdict, code: ?i64, detail: []const u8, started: i64) u8 {
+    // A verdict already there stands: on `here` the supervisor shares this directory, and one it
+    // gave up on before the sync (abandon) has written its own.
+    if (readFile(cx, jobFile(cx, id, "result.json")) != null) {
+        hostState(cx, id, "done");
+        return v.exit();
+    }
     var r: Result = .{
         .verdict = @tagName(v),
         .label = p.label,

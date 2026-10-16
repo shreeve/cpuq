@@ -1141,6 +1141,41 @@ t_submit_moved() {
   unset XDG_STATE_HOME
 }
 
+t_submit_abandon() {
+  # A submitted job given up before its copy was synced (here, an rsync that fails) is cancelled on
+  # its host too, so it holds the worktree's copy no longer: the next job runs at once. And a job
+  # queued behind another on the copy ends when cancelled, while it waits.
+  setup submit-abandon
+  local was_home=$HOME
+  export HOME=$T/home XDG_STATE_HOME=$T/xdg
+  mkdir -p "$HOME" "$T/roots/repo/cpuq"
+  echo "submit_roots = $T/roots" >> "$CPUQ_CONFIG"
+  (
+    cd "$T/roots/repo" || exit 1
+    git init -q && git config user.email t@t && git config user.name t
+    printf '%s\n' '{ "label": "t:quick", "run": "echo ran", "cores": "1" }' > cpuq/quick.json
+    printf '%s\n' '{ "label": "t:hold", "run": "sleep 6", "cores": "1" }' > cpuq/hold.json
+    git add -A && git commit -qm init
+    CPUQ_RSYNC=/usr/bin/false "$CPUQ" submit cpuq/quick.json --max-wait 20 >/dev/null 2>&1; echo "broken=$?"
+    local t0; t0=$(python3 -c 'import time; print(time.time())')
+    "$CPUQ" submit cpuq/quick.json --again --max-wait 20 >/dev/null 2>&1; echo "next=$?"
+    python3 -c "import time; print('next_s=%d' % (time.time() - $t0))"
+    "$CPUQ" submit cpuq/hold.json >/dev/null 2>&1 & local h=$!
+    sleep 2
+    "$CPUQ" submit cpuq/quick.json --again >"$T/queued" 2>&1 & local q=$!
+    sleep 2
+    local id; id=$("$CPUQ" jobs | awk '/t:quick/ && /queued/ {print $1; exit}')
+    "$CPUQ" job "$id" --cancel >/dev/null 2>&1
+    wait $q; echo "queued=$?"
+    wait $h
+  ) >"$T/out" 2>&1
+  local got; got=$(tr '\n' ' ' < "$T/out")
+  check "submit: a job given up before its sync frees its copy (the next runs at once), and a queued job ends when cancelled ($got)" \
+    "[[ '$got' == 'broken=125 next=0 next_s='[0-9]' queued=76 ' || '$got' == 'broken=125 next=0 next_s=1'[0-9]' queued=76 ' ]]"
+  export HOME=$was_home
+  unset XDG_STATE_HOME
+}
+
 t_submit_progress() {
   # A submitted job's progress (CPUQ_PROGRESS) shows in cpuq status, as a cpuq run's does.
   setup submit-progress
@@ -1863,7 +1898,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git tethered record cap cgroups note progress submit submit_moved submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git tethered record cap cgroups note progress submit submit_moved submit_abandon submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"
