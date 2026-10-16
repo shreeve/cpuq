@@ -67,7 +67,7 @@ pub const Event = struct {
 };
 
 /// The longest command kept in a line, so a line stays well under 4 KB.
-const max_cmd = 1024;
+pub const max_cmd = 1024;
 /// The file is rotated to `.1` when it passes this size.
 const rotate_bytes = 4 << 20;
 

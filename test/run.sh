@@ -1259,6 +1259,22 @@ f = open(sys.argv[1]); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$sp/w/p/he
   export HOME=$was_home
 }
 
+t_usual_by_command() {
+  # A running job's usual time comes from earlier runs of its own command (numbers aside), not
+  # from anything else under its label: a quick check doesn't make a long run look overdue.
+  setup usual-by-command
+  "$CPUQ" run --cores 1 --label t:work -- sh -c 'sleep 1; echo quick'
+  "$CPUQ" run --cores 1 --label t:work -- sh -c 'sleep 2; echo quick' & local same=$!
+  wait_holder t:work
+  local a; a=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; h = json.load(sys.stdin)["holders"][0]; print(h.get("typical") is not None)')
+  wait $same
+  "$CPUQ" run --cores 1 --label t:work -- sh -c 'sleep 2; echo long' & local other=$!
+  wait_holder t:work
+  local b; b=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; h = json.load(sys.stdin)["holders"][0]; print(h.get("typical") is not None)')
+  wait $other
+  check "a job's usual time is its own command's, numbers aside (same: $a), and a new command under the label has none (new: $b)" "[ '$a' = True ] && [ '$b' = False ]"
+}
+
 t_hook() {
   # cpuq hook: Claude Code's PreToolUse hook refuses heavy commands outside
   # cpuq (exit 2, the fix on stderr) and passes everything else.
@@ -1836,7 +1852,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git tethered record cap cgroups note progress submit submit_moved submit_progress packs stack_limit exclusive_off_waiting clean status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git tethered record cap cgroups note progress submit submit_moved submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

@@ -2,6 +2,14 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.24.1 — 2026-10-15
+
+- A running job's usual time (`typical` in `status --json`, and the time left from it) comes from
+  earlier runs of its own command, numbers aside (a different seed, count or limit is the same
+  work), not from everything under its label: a one-minute check no longer makes a three-hour
+  run under the same label look hours overdue. A command not run before has none. Waiters' ETAs
+  still fall back to the label's runs.
+
 ## 0.24.0 — 2026-10-15
 
 - `cpuq status --json` names work outside cpuq better: each process listed under `outside` has its

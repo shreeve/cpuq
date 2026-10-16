@@ -3802,15 +3802,23 @@ const RunTimes = struct {
     /// Sizing from peaks counts a build that fans out briefly at what it
     /// fans out to, not at its average.
     uses: std.StringHashMapUnmanaged(std.ArrayList(f64)) = .empty,
+    /// Each command's median run time, by label and the command's shape (`shape`).
+    by_command: std.StringHashMapUnmanaged(f64) = .empty,
 
     fn load(ctx: *Ctx, a: std.mem.Allocator) RunTimes {
         var rt: RunTimes = .{};
         const jobs = history.load(ctx.io, a, historyPath(ctx), sys.bootTime(ctx.io), &aliveForHistory);
         var label_runs: std.StringHashMapUnmanaged(std.ArrayList(f64)) = .empty;
         var project_runs: std.StringHashMapUnmanaged(std.ArrayList(f64)) = .empty;
+        var command_runs: std.StringHashMapUnmanaged(std.ArrayList(f64)) = .empty;
         for (jobs) |j| {
             const r = j.ran() orelse continue;
             if (j.label.len == 0 or !std.mem.eql(u8, j.pool, "cores")) continue;
+            {
+                const gop = command_runs.getOrPut(a, shape(a, j.label, j.cmd)) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                gop.value_ptr.append(a, r) catch {};
+            }
             if (j.cpu_peak orelse j.used()) |u| {
                 const gop = rt.uses.getOrPut(a, j.label) catch continue;
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -3829,7 +3837,36 @@ const RunTimes = struct {
         while (it.next()) |e| rt.by_label.put(a, e.key_ptr.*, history.median(e.value_ptr.items)) catch {};
         var it2 = project_runs.iterator();
         while (it2.next()) |e| rt.by_project.put(a, e.key_ptr.*, history.median(e.value_ptr.items)) catch {};
+        var it3 = command_runs.iterator();
+        while (it3.next()) |e| rt.by_command.put(a, e.key_ptr.*, history.median(e.value_ptr.items)) catch {};
         return rt;
+    }
+
+    /// A job's usual run time by earlier runs of its own command: what a running job's time is
+    /// judged by. A label can cover different work (a one-minute check and a three-hour model),
+    /// so a command not run before has none.
+    fn typicalFor(rt: RunTimes, a: std.mem.Allocator, label: []const u8, cmd: []const u8) ?f64 {
+        if (label.len == 0) return null;
+        return rt.by_command.get(shape(a, label, cmd));
+    }
+
+    /// A label and a command, its numbers as `#`: runs differing only in a count, a seed or a
+    /// limit (`-- 20 --seed 100`) are the same work.
+    fn shape(a: std.mem.Allocator, label: []const u8, cmd: []const u8) []const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        out.appendSlice(a, label) catch return label;
+        out.append(a, 0) catch return label;
+        var in_number = false;
+        for (cmd[0..@min(cmd.len, history.max_cmd)]) |ch| {
+            if (std.ascii.isDigit(ch)) {
+                if (!in_number) out.append(a, '#') catch return label;
+                in_number = true;
+            } else {
+                in_number = false;
+                out.append(a, ch) catch return label;
+            }
+        }
+        return out.items;
     }
 
     fn typical(rt: RunTimes, label: []const u8) ?f64 {
@@ -4609,7 +4646,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
     const rt_all: ?RunTimes = if (holders.len + waiters.len != 0) RunTimes.load(ctx, a) else null;
     for (holders, leases) |*h, l| {
         h.progress = readProgress(ctx.io, l.record.progress);
-        h.typical = if (rt_all) |rt| rt.typical(l.record.label) else null;
+        h.typical = if (rt_all) |rt| rt.typicalFor(a, l.record.label, l.record.cmd) else null;
         const ran: f64 = @floatFromInt(@max(now - l.record.since, 0));
         // The rate since it began counting (its build before that is no guide), or, from a
         // cpuq that doesn't note when that was, since it started.

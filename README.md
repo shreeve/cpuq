@@ -311,8 +311,9 @@ cpuq gives every job a file, `$CPUQ_PROGRESS`, to write one line to, `DONE TOTAL
 - **What it shows:** `cpuq status` puts it under the job, with the time left from its rate so
   far: `12m · 4210/12629 33% · 3 failing · ~9m left`. The `--json` holder has `progress`
   (`done`, `total`, `failing`), `left` in seconds, `left_from` (`progress`) and `typical`.
-- **A job that writes nothing** shows its label's usual time instead, from history, with
-  `left_from` `history`.
+- **A job that writes nothing** shows its usual time instead, from earlier runs of the same
+  command (numbers aside: a different seed or count is the same work), with `left_from` `history`.
+  A command not run before has none, whatever else ran under its label.
 - **Inside another machine's job** (`--spill`, `cpuq submit`) the file is that machine's, and
   `cpuq status --host HOST` (and Cpuq.app) shows it there. `cpuq submit` prints it as it follows.
 - The file is removed when the job ends.
