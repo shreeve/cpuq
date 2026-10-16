@@ -1193,6 +1193,40 @@ t_submit_abandon() {
   unset XDG_STATE_HOME
 }
 
+t_submit_cancel_running() {
+  # A submitted job cancelled while its command runs stops at once (its whole tree), as CANCELLED,
+  # not after the command ends of itself.
+  setup submit-cancel-running
+  local was_home=$HOME
+  export HOME=$T/home XDG_STATE_HOME=$T/xdg
+  mkdir -p "$HOME" "$T/roots/repo/cpuq"
+  echo "submit_roots = $T/roots" >> "$CPUQ_CONFIG"
+  local nap="61.$$"
+  (
+    cd "$T/roots/repo" || exit 1
+    git init -q && git config user.email t@t && git config user.name t
+    printf '%s\n' "{ \"label\": \"t:long\", \"run\": \"sleep $nap\", \"cores\": \"1\" }" > cpuq/long.json
+    git add -A && git commit -qm init
+    "$CPUQ" submit cpuq/long.json >/dev/null 2>&1 & local j=$!
+    local id="" i
+    for i in $(seq 1 100); do
+      id=$("$CPUQ" jobs | awk '/t:long/ && /running/ {print $1; exit}')
+      [ -n "$id" ] && pgrep -f "^sleep $nap\$" >/dev/null && break
+      sleep 0.1
+    done
+    local t0; t0=$(python3 -c 'import time; print(time.time())')
+    "$CPUQ" job "$id" --cancel >/dev/null 2>&1
+    wait $j; echo "rc=$?"
+    python3 -c "import time; print('s=%d' % (time.time() - $t0))"
+    sleep 0.5
+    pgrep -f "^sleep $nap\$" >/dev/null && echo left || echo gone
+  ) >"$T/out" 2>&1
+  local got; got=$(tr '\n' ' ' < "$T/out")
+  check "submit: a job cancelled while it runs stops at once, its command gone ($got)" "[[ '$got' == 'rc=76 s='[0-9]' gone ' ]]"
+  export HOME=$was_home
+  unset XDG_STATE_HOME
+}
+
 t_submit_progress() {
   # A submitted job's progress (CPUQ_PROGRESS) shows in cpuq status, as a cpuq run's does.
   setup submit-progress
@@ -1915,7 +1949,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

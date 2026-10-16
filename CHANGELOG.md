@@ -2,6 +2,13 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.25.3 — 2026-10-16
+
+- `cpuq job ID --cancel` stops a submitted job whose command is running, at once, its whole
+  tree. Before, it only marked the job: its host signalled a pid file nothing wrote, so the
+  command ran on (up to its time limit, an hour once) and was called CANCELLED only when it
+  ended. A cancel that lands as the command starts stops it too.
+
 ## 0.25.2 — 2026-10-16
 
 - Linux: `cpuq cap --no-crash-report` now works there too. PROGRAM gets a core limit of exactly 1,

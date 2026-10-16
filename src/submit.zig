@@ -1173,6 +1173,15 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
     const id: []const u8 = args[0];
     const me = Io.Dir.cwd().createFile(cx.io, jobFile(cx, id, "running.lock"), .{ .lock = .exclusive, .lock_nonblocking = true, .truncate = false }) catch return 0;
     defer me.close(cx.io);
+    // _cancel signals the pid in job.pid. A signal while the command runs goes on to it (cpuq run
+    // stops its whole tree); before, it is caught and does nothing: the cancel marker, written
+    // first, is seen at the next check.
+    var sa: c.Sigaction = .{ .handler = .{ .sigaction = onTerm }, .mask = undefined, .flags = c.SA.SIGINFO | c.SA.RESTART };
+    _ = c.sigemptyset(&sa.mask);
+    for ([_]c.SIG{ .TERM, .INT, .HUP }) |sig| _ = c.sigaction(sig, &sa, null);
+    writeFile(cx, jobFile(cx, id, "job.pid"), cx.a.print("{d}\n", .{c.getpid()}) catch "");
+    // Gone when it ends, so a later cancel can't signal a process that took the pid since.
+    defer Io.Dir.cwd().deleteFile(cx.io, jobFile(cx, id, "job.pid")) catch {};
     const text = readFile(cx, jobFile(cx, id, "payload.json")) orelse return 2;
     const p = std.json.parseFromSliceLeaky(Payload, cx.a, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return 2;
     const started = now(cx.io);
@@ -1272,7 +1281,7 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
     hostState(cx, id, "running");
 
     const log = jobFile(cx, id, "output.log");
-    const code = runLogged(cx, argv.items, &env, copy, log);
+    const code = runLogged(cx, id, argv.items, &env, copy, log);
     Io.Dir.cwd().deleteTree(cx.io, tmp) catch {};
 
     // The verdict: cap's own last line says when it stopped the job; the exit code says the rest.
@@ -1421,15 +1430,12 @@ fn lastLine(cx: Cx, path: []const u8) []const u8 {
 
 /// Runs the job with its output in `log`, passing cpuq's termination on to it; its exit code,
 /// or null when a signal ended it.
-fn runLogged(cx: Cx, argv: []const []const u8, env: *std.process.Environ.Map, cwd: []const u8, log: []const u8) ?i64 {
+fn runLogged(cx: Cx, id: []const u8, argv: []const []const u8, env: *std.process.Environ.Map, cwd: []const u8, log: []const u8) ?i64 {
     const argz = cx.a.allocSentinel(?[*:0]const u8, argv.len, null) catch return null;
     for (argv, 0..) |x, k| argz[k] = (cx.a.dupeSentinel(u8, x, 0) catch return null).ptr;
     const envp = env.createPosixBlock(cx.a, .{}) catch return null;
     const cwdz = cx.a.dupeSentinel(u8, cwd, 0) catch return null;
     const logz = cx.a.dupeSentinel(u8, log, 0) catch return null;
-    var sa: c.Sigaction = .{ .handler = .{ .sigaction = onTerm }, .mask = undefined, .flags = c.SA.SIGINFO | c.SA.RESTART };
-    _ = c.sigemptyset(&sa.mask);
-    for ([_]c.SIG{ .TERM, .INT, .HUP }) |s| _ = c.sigaction(s, &sa, null);
     const pid = c.fork();
     if (pid < 0) return null;
     if (pid == 0) {
@@ -1443,6 +1449,8 @@ fn runLogged(cx: Cx, argv: []const []const u8, env: *std.process.Environ.Map, cw
         c._exit(127);
     }
     job_child.store(pid, .release);
+    // A cancel that came before the child was known to onTerm: it is marked, and stops it now.
+    if (cancelled(cx, id)) _ = c.kill(pid, .TERM);
     var status: c_int = 0;
     while (c.waitpid(pid, &status, 0) < 0) {}
     job_child.store(0, .release);
