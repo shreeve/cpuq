@@ -68,6 +68,7 @@ const usage =
     \\  --spill               when this machine is full, run on a spill host with
     \\                        room (config `spill`), starting a stopped one if
     \\                        need be; the repo is copied there with rsync
+    \\  --local               run here only, whatever config `spill_default` says
     \\  --spill-to HOST       run on HOST, here full or not: queue there if it is busy,
     \\                        start it if stopped (config `spill_start.HOST`)
     \\  --return PATH         with --spill or --spill-to: copy PATH back here afterwards
@@ -371,6 +372,8 @@ const RunOptions = struct {
     hidden: bool = false,
     /// `--spill`: when this machine is full, run on a spill host instead.
     spill: bool = false,
+    /// `--local`: run on this machine only, whatever `spill_default` says.
+    local: bool = false,
     /// `--spill-to HOST`: run on HOST, whether this machine is full or not.
     spill_to: ?[]const u8 = null,
     /// `--return PATH` (with --spill): copied back from the spill host after.
@@ -422,7 +425,7 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             _ = usageError("{s} takes no value", .{name});
             return null;
         }
-        for ([_][]const u8{ "--cores", "--no-load-check", "--qos", "--opaque", "--spill", "--return", "--tethered", "--spill-to", "--ship" }) |r| {
+        for ([_][]const u8{ "--cores", "--no-load-check", "--qos", "--opaque", "--spill", "--local", "--return", "--tethered", "--spill-to", "--ship" }) |r| {
             if (std.mem.eql(u8, name, r)) o.run_only = r;
         }
         if (std.mem.eql(u8, name, "--cores")) {
@@ -467,6 +470,8 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             o.hold = true;
         } else if (std.mem.eql(u8, name, "--spill")) {
             o.spill = true;
+        } else if (std.mem.eql(u8, name, "--local")) {
+            o.local = true;
         } else if (std.mem.eql(u8, name, "--spill-to")) {
             if (value.len == 0) {
                 _ = usageError("--spill-to needs a host", .{});
@@ -575,6 +580,9 @@ fn cmdRun(ctx: *Ctx, args: []const [:0]const u8) u8 {
     if (o.exclusive and !ctx.cfg.exclusive) o.exclusive = exclusiveOff(o.label);
     if ((o.return_count != 0 or o.ship_count != 0) and !o.spill and o.spill_to == null) return usageError("--return and --ship go with --spill or --spill-to", .{});
     if (o.spill and o.spill_to != null) return usageError("--spill and --spill-to: choose one", .{});
+    if (o.local and (o.spill or o.spill_to != null)) return usageError("--local runs here: not with --spill or --spill-to", .{});
+    // `spill_default`: a job that can go elsewhere spills unless it says --local.
+    if (ctx.cfg.spill_default and !o.local and !o.spill and o.spill_to == null and notPortable(ctx, o) == null) o.spill = true;
     if (o.tethered) tether();
     if (o.spill or o.spill_to != null) {
         if (o.exclusive) return usageError("--spill sends ordinary jobs, not --exclusive ones (time on the machine you mean)", .{});
@@ -582,6 +590,35 @@ fn cmdRun(ctx: *Ctx, args: []const [:0]const u8) u8 {
         return runSpill(ctx, o);
     }
     return runHere(ctx, o);
+}
+
+/// Why a job can't run on another machine as it is (for `spill_default`), or null when it can:
+/// it isn't in a git repo, names a path that exists only here (absolute or under ~, outside the
+/// system's own directories), uses a macOS-only tool, or is a kind --spill doesn't send.
+fn notPortable(ctx: *Ctx, o: RunOptions) ?[]const u8 {
+    if (o.exclusive) return "--exclusive";
+    if (o.hidden) return "--opaque";
+    if (o.hold) return "a hold";
+    if (o.tethered or o.host != null) return "run for another machine";
+    if (gitTop(ctx) == null) return "not in a git repo";
+    const system = [_][]const u8{ "/usr/", "/bin/", "/sbin/", "/etc/", "/dev/", "/proc/", "/opt/homebrew/" };
+    const mac_only = [_][]const u8{ "xcodebuild", "xcrun", "swift", "swiftc", "codesign", "osascript", "launchctl", "sw_vers", "hdiutil", "plutil", "simctl", "instruments", "notarytool", "lipo", "install_name_tool", "otool", "dtrace", "pkgbuild", "productbuild" };
+    for (o.cmd) |arg| {
+        var words = std.mem.tokenizeAny(u8, arg, " \t\n'\";=:|&()<>`");
+        while (words.next()) |word| {
+            const base = std.fs.path.basename(word);
+            for (mac_only) |m| if (std.mem.eql(u8, base, m)) return ctx.arena.print("it uses {s}, a macOS tool", .{m}) catch "a macOS tool";
+            const path = word[0..@min(word.len, 200)];
+            if (std.mem.startsWith(u8, word, "~/") or std.mem.startsWith(u8, word, "$HOME") or std.mem.startsWith(u8, word, "${HOME}"))
+                return ctx.arena.print("it names {s}, under this machine's home", .{path}) catch "a path here";
+            if (word.len < 2 or word[0] != '/') continue;
+            const ok = for (system) |prefix| {
+                if (std.mem.startsWith(u8, word, prefix)) break true;
+            } else false;
+            if (!ok) return ctx.arena.print("it names {s}, which exists only here", .{path}) catch "a path here";
+        }
+    }
+    return null;
 }
 
 /// Waits its turn on this machine and runs the command.
@@ -3158,7 +3195,18 @@ fn cmdHook(ctx: *Ctx) u8 {
     const call = std.json.parseFromSliceLeaky(Call, a, input.items, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return 0;
     if (!std.mem.eql(u8, call.tool_name, "Bash") or call.tool_input.command.len == 0) return 0;
     const project = std.fs.path.basename(call.cwd);
-    const r = hook.check(a, call.tool_input.command, sys.totalCpus(ctx.io), project) orelse return 0;
+    // Whether this machine is full, for a `cpuq run` that says neither --spill nor --local: only
+    // when the command has one and there's somewhere else to send it.
+    var full: ?[]const u8 = null;
+    if (std.mem.find(u8, call.tool_input.command, "cpuq") != null and std.mem.find(u8, call.tool_input.command, "run") != null) {
+        loadConfig(ctx);
+        var hosts = ctx.cfg.spillHosts();
+        if (hosts.peek() != null) {
+            var why_buf: [96]u8 = undefined;
+            if (localFull(ctx, &why_buf)) |why| full = a.dupe(u8, why) catch null;
+        }
+    }
+    const r = hook.check(a, call.tool_input.command, sys.totalCpus(ctx.io), project, full) orelse return 0;
     std.debug.print("cpuq: {s}.\nRun instead: {s}\n(See AGENTS.md in the cpuq repo. A command that must run as it is can end with `# cpuq: skip`.)\n", .{ r.reason, r.instead });
     return 2;
 }

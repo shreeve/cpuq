@@ -2,6 +2,18 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.26.0 — 2026-10-16
+
+- **`spill_default = on`**: a `cpuq run` with neither `--spill` nor `--local` acts as `--spill`
+  when nothing ties it to this machine: in a git repo, naming no path outside the system's own
+  directories, using no macOS-only tool, not `--opaque`, `--exclusive` or a hold. So portable work
+  goes to pup or burst when the Mac is full without each session remembering `--spill`.
+- **`--local`**: run here only, whatever `spill_default` says.
+- **The hook asks where a job may run while the machine is full**: with spill hosts configured
+  and this machine full (anyone waiting, load over its CPUs, a gate shut), `cpuq hook` refuses a
+  `cpuq run` that says neither `--spill` nor `--local`, so an agent chooses rather than its job
+  waiting here beside idle machines, or drifting to another OS.
+
 ## 0.25.5 — 2026-10-16
 
 - `--spill` and `--spill-to` copy what git ships: in a git repo the copy leaves out the untracked

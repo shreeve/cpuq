@@ -429,6 +429,16 @@ job waits its turn here. It says on stderr which it chose and why.
 
     spill = pup, burst
     spill_start.burst = ~/Data/Code/runbooks/host-gcp-burst/start
+    spill_default = on
+
+`--local` keeps a job here. With `spill_default = on`, a `cpuq run` with neither `--spill` nor
+`--local` acts as `--spill` when nothing ties it here: it is in a git repo; it names no path
+outside the system's own directories (an absolute path, or one under `~`, exists only here); it
+uses no macOS-only tool (`xcodebuild`, `xcrun`, `swift`, `codesign`, ...); and it is not
+`--opaque`, `--exclusive` or a hold. Anything else runs here. Environment variables set here don't
+travel, so a job that needs one sets it inside its command. And while this machine is full, `cpuq
+hook` refuses a `cpuq run` that says neither, so an agent chooses: `--spill`, or `--local` for
+work that needs this OS.
 
 Before the job runs there, the repo (git's top level, else the working directory) is copied to
 `HOST:cpuq-spill/s/NAME-HASH` (NAME the repo's directory, one copy per repo or worktree here)
@@ -794,6 +804,7 @@ re-reads the file when it changes; an invalid edit keeps the settings in force a
 | `min_disk` | 5G | admit nothing while `$HOME`'s, the temp directory's or `~/cpuq-spill`'s filesystem has less free than this; off turns it off |
 | `max_memory` | off | stop a job whose processes together use more memory than this (e.g. `16G`) |
 | `spill` | none | ssh hosts `--spill` may send a job to, in order (commas or spaces) |
+| `spill_default` | off | a `cpuq run` with neither `--spill` nor `--local` spills when nothing ties it here |
 | `spill_start.HOST` | none | a command (run with sh) that starts HOST when it is stopped; it returns once ssh works |
 | `spill_env.HOST` | none | shell assignments a spilled job exports on HOST, e.g. `PATH=$HOME/.local/go/bin:$PATH` |
 | `exclusive` | on | grant `--exclusive`; off, it runs as an ordinary job |

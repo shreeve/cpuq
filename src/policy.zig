@@ -146,6 +146,10 @@ pub const Config = struct {
     /// full, in the order tried: ssh names, separated by commas or spaces
     /// (`spill`).
     spill: []const u8 = "",
+    /// Every `cpuq run` acts as `--spill` when it can go elsewhere (`spill_default`): in a git
+    /// repo, naming no path outside it, using no macOS-only tool, not --opaque, --exclusive or a
+    /// hold. `--local` keeps one here.
+    spill_default: bool = false,
     /// How to start a spill host that is stopped, such as a cloud machine:
     /// `spill_start.HOST = COMMAND`, run with sh; it should return once
     /// `ssh HOST` works.
@@ -261,6 +265,8 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             cfg.settle_s = parseCount(value) orelse return bad(diag, "settle must be a whole number of seconds, at least 1");
         } else if (std.mem.eql(u8, key, "spill")) {
             cfg.spill = value;
+        } else if (std.mem.eql(u8, key, "spill_default")) {
+            cfg.spill_default = parseBool(value) orelse return bad(diag, "spill_default must be on or off");
         } else if (std.mem.startsWith(u8, key, "spill_start.")) {
             const host = key["spill_start.".len..];
             if (host.len == 0) return bad(diag, "spill_start needs a host: spill_start.HOST = COMMAND");

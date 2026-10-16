@@ -1933,6 +1933,26 @@ t_spill_gitignore() {
   check "a spilled copy ships what git ships: a \`!\` re-included file and a tracked one, none of the ignored (got '$got')" "[ '$got' = './data/keep.txt ./plain.txt ./tracked.log ' ]"
 }
 
+t_spill_default() {
+  # spill_default: with this machine full, a plain cpuq run in a repo spills; one naming a path
+  # that exists only here, or saying --local, stays (and here, full, waits).
+  setup spill-default "spill = far" "spill_default = on" "min_available = 1000000G"
+  local bin=$T/bin far=$T/far
+  mkdir -p "$bin" "$far/state"
+  printf 'pressure_check = off\nmin_disk = off\nload_check = off\n' >"$far/config"
+  printf '#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done\nshift\ncd "%s" && CPUQ_DIR="%s/state" CPUQ_CONFIG="%s/config" exec sh -c "$*"\n' "$far" "$far" "$far" >"$bin/ssh"
+  chmod +x "$bin/ssh"
+  ln -sf "$CPUQ" "$bin/cpuq"
+  ( cd "$T" && git init -q repo && cd repo && git config user.email t@t && git config user.name t && echo x > x && git add x && git commit -qm one ) >/dev/null 2>&1
+  far=$(cd "$far" && pwd)
+  local plain pinned local_rc
+  plain=$(cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --max-wait 1 --cores 1 -- sh -c 'pwd' 2>/dev/null)
+  (cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --max-wait 1 --cores 1 -- sh -c "cat $T/repo/x" >/dev/null 2>&1); pinned=$?
+  (cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --local --max-wait 1 --cores 1 -- true >/dev/null 2>&1); local_rc=$?
+  check "spill_default: a plain run spills when this machine is full (ran in '$plain'); one naming a path here (rc $pinned) or --local (rc $local_rc) stays and waits" \
+    "[[ \"\$plain\" == \"\$far\"/cpuq-spill/s/repo-* && \$pinned = 75 && \$local_rc = 75 ]]"
+}
+
 t_tethered() {
   # --tethered (what --spill runs on the spill host): the command gets
   # /dev/null for stdin, which carries the caller's heartbeats, and is
@@ -1992,7 +2012,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git spill_gitignore tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git spill_gitignore spill_default tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

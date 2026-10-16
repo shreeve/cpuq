@@ -52,9 +52,15 @@ branch names: history sizes jobs and estimates waits by label.
 ## Another machine
 
 Where `spill` is configured (`grep spill ~/.config/cpuq/config`), add `--spill` to any job
-that doesn't need this OS (builds, test suites of portable code):
+that doesn't need this OS (builds, test suites of portable code), and `--local` to one that does
+(macOS behaviour or timing, a path outside the repo):
 
     cpuq run --spill --label app:build --cores 2-6 -- sh -c 'zig build -j"$CPUQ_CORES" test'
+    cpuq run --local --label app:mac  --cores 2-4 -- ./test/macos
+
+While this machine is full, the hook refuses a `cpuq run` that says neither. With
+`spill_default = on`, a run that says neither spills when cpuq sees nothing tying it here (a path
+outside the repo, a macOS tool, --opaque): say `--local` for this OS's own work.
 
 It runs here while there's room; when this machine is full it runs on a spill host with room,
 starting a stopped cloud machine if need be, with the repo copied there by rsync. Its output and
