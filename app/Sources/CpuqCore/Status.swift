@@ -30,6 +30,8 @@ public struct Status: Decodable, Sendable, Equatable {
     public var waiters: [Waiter] = []
     public var leases: [Lease] = []
     public var outside: [Outside] = []
+    /// CPUs busy outside every cpuq job, in all (cpuq 0.24 and later; else the listed ones' sum).
+    public var outsideTotal: Double?
 
     public struct Gate: Decodable, Sendable, Equatable {
         /// open, pressure, low_memory, low_disk, load or spacing.
@@ -99,6 +101,17 @@ public struct Status: Decodable, Sendable, Equatable {
         public var pid = 0
         public var name = ""
         public var using = 0.0
+        /// Its command line and working directory (cpuq 0.24 and later): who started it.
+        public var command: String?
+        public var cwd: String?
+
+        /// "python3 -I model.py 4 p2on": the program's own name, not its path, then its arguments.
+        public var shortCommand: String {
+            guard let c = command, !c.isEmpty else { return name }
+            let first = c.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+            let prog = first.first.map { ($0 as Substring).split(separator: "/").last.map(String.init) ?? String($0) } ?? name
+            return first.count > 1 ? prog + " " + first[1] : prog
+        }
     }
 
     public init() {}
@@ -135,7 +148,7 @@ extension Status {
 // Decoding with defaults: a missing key keeps the property's default.
 extension Status {
     private enum Keys: String, CodingKey {
-        case schema, version, budget, held, free, load, memoryPressure, gate, holders, waiters, leases, outside, admit, target, activeCores, cpuTicks, bootTime, memory
+        case schema, version, budget, held, free, load, memoryPressure, gate, holders, waiters, leases, outside, outsideTotal, admit, target, activeCores, cpuTicks, bootTime, memory
     }
 
     public init(from decoder: any Decoder) throws {
@@ -158,6 +171,7 @@ extension Status {
         waiters = try c.decodeIfPresent([Waiter].self, forKey: .waiters) ?? []
         leases = try c.decodeIfPresent([Lease].self, forKey: .leases) ?? []
         outside = try c.decodeIfPresent([Outside].self, forKey: .outside) ?? []
+        outsideTotal = try c.decodeIfPresent(Double.self, forKey: .outsideTotal)
     }
 }
 
@@ -224,12 +238,14 @@ extension Status.Lease {
 }
 
 extension Status.Outside {
-    private enum Keys: String, CodingKey { case pid, name, using }
+    private enum Keys: String, CodingKey { case pid, name, using, command, cwd }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         pid = try c.decodeIfPresent(Int.self, forKey: .pid) ?? 0
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
         using = try c.decodeIfPresent(Double.self, forKey: .using) ?? 0
+        command = try c.decodeIfPresent(String.self, forKey: .command)
+        cwd = try c.decodeIfPresent(String.self, forKey: .cwd)
     }
 }
 

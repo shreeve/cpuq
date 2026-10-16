@@ -4019,6 +4019,8 @@ const JsonStatus = struct {
     leases: []const JsonLease = &.{},
     /// The busiest processes outside every cpuq job (empty with --no-usage).
     outside: []const JsonOutside = &.{},
+    /// CPUs busy outside every cpuq job, in all (0 with --no-usage).
+    outside_total: f64 = 0,
     /// Each CPU's time so far, `[busy, total]` in clock ticks, in the
     /// kernel's order: cumulative, so a reader takes the difference between
     /// two statuses. Cpuq.app draws another machine's CPUs from it.
@@ -4301,6 +4303,10 @@ const JsonOutside = struct {
     pid: i32 = 0,
     name: []const u8 = "",
     using: f64 = 0,
+    /// Its command line (cut at 300 bytes) and working directory, so the work can be traced
+    /// to whoever started it.
+    command: []const u8 = "",
+    cwd: []const u8 = "",
 };
 
 const Sample = struct {
@@ -4308,6 +4314,8 @@ const Sample = struct {
     busy: []?f64,
     /// The busiest processes outside every cpuq job, busiest first.
     outside: []JsonOutside = &.{},
+    /// CPUs busy outside every cpuq job, all of them (not only the five listed).
+    outside_total: f64 = 0,
 };
 
 /// Watches every process for `sample_ms`: what each lease's command tree
@@ -4352,7 +4360,14 @@ fn sample(io: Io, a: std.mem.Allocator, leases: []const state.Entry, measure: bo
             return x.using > y.using;
         }
     }.busier);
-    return .{ .busy = busy, .outside = outside.items[0..@min(outside.items.len, 5)] };
+    var total: f64 = 0;
+    for (outside.items) |o| total += o.using;
+    const top = outside.items[0..@min(outside.items.len, 5)];
+    for (top) |*o| {
+        o.command = sys.procCommand(a, io, o.pid, 300);
+        o.cwd = sys.procCwd(a, io, o.pid);
+    }
+    return .{ .busy = busy, .outside = top, .outside_total = total };
 }
 
 fn nullUsage(a: std.mem.Allocator, n: usize) []?f64 {
@@ -4671,6 +4686,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
             .waiters = waiters,
             .leases = named.items,
             .outside = smp.outside,
+            .outside_total = smp.outside_total,
             .cpu_ticks = cpuTicksJson(ctx.io, a),
             .boot_time = bootSeconds(ctx.io),
             .recorder = recorderRunning(ctx),

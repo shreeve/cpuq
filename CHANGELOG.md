@@ -2,6 +2,13 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.24.0 — 2026-10-15
+
+- `cpuq status --json` names work outside cpuq better: each process listed under `outside` has its
+  `command` (its command line, cut at 300 bytes) and `cwd` (its working directory), and
+  `outside_total` is the CPUs busy outside every cpuq job in all, not only the five listed.
+  Cpuq.app uses them to say what is running outside cpuq and where.
+
 ## 0.23.0 — 2026-10-15
 
 - **`cpuq clean [--dry-run] [--older AGE] [--host HOST]`** removes what jobs left on a machine once

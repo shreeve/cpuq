@@ -32,6 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var gateShut = Episode()
     private var idleWait = Episode()
     private var cloudIdle: [String: Episode] = [:]
+    private var outsideHeavy: [String: Episode] = [:]
     private let sizeGuard = MinimumSize()
     private var historyTimer: Timer?
     /// Sparkle, running only in a Cpuq.app bundle: a binary run from the build folder never offers
@@ -405,9 +406,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    /// Three things worth an interruption, each once it has lasted: cpuq's gate shut (30 s), jobs
-    /// waiting beside idle CPUs (a minute), and a cloud machine up with nothing to do for 15
-    /// minutes, which means its own 10-minute idle stop failed and it is still billing.
+    /// Four things worth an interruption, each once it has lasted: cpuq's gate shut (30 s), jobs
+    /// waiting beside idle CPUs (a minute), heavy work outside cpuq on any machine (3 minutes), and
+    /// a cloud machine up with nothing to do for 15 minutes, which means its own 10-minute idle
+    /// stop failed and it is still billing.
     private func checkAlerts() {
         guard Prefs.notify else { return }
         let now = Date()
@@ -421,6 +423,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                        String(format: "%.1f CPUs free on %@, and nothing starts: a job may be stuck, or asking for more than there is.", m.free, graphs.machine.name))
             }
         }
+        // Heavy work outside cpuq, on this Mac or another machine: most of its CPUs (at least 40%,
+        // at least 2) for 3 minutes, named by command and directory, so whoever started it can
+        // be found.
+        var machines: [(id: String, name: String, s: Status)] = []
+        if let s = status { machines.append(("local", "This Mac", s)) }
+        for c in remotes { if let s = c.status { machines.append((c.machine.id, c.machine.name, s)) } }
+        for (id, name, s) in machines {
+            let cpus = Double(max(s.activeCores > 0 ? s.activeCores : s.budget, 1))
+            let busy = s.outsideTotal ?? s.outside.reduce(0) { $0 + $1.using }
+            var e = outsideHeavy[id] ?? Episode()
+            track(&e, busy >= max(2, 0.4 * cpus), after: 3 * 60, now) {
+                notify("outside-\(id)", String(format: "%@: %.1f of %d CPUs busy outside cpuq", name, busy, Int(cpus)), Self.outsideBody(s.outside))
+            }
+            outsideHeavy[id] = e
+        }
         for c in remotes where c.machine.start != nil {
             let idle = c.isCloudRunning && (c.status.map { $0.holders.isEmpty && $0.waiters.isEmpty } ?? false)
             var e = cloudIdle[c.machine.id] ?? Episode()
@@ -430,6 +447,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
             cloudIdle[c.machine.id] = e
         }
+    }
+
+    /// What the outside work is, for its notification: the busiest commands, grouped, each with
+    /// how many run and where ("python3 -I model.py 4 p2on ×5 in …/emdb/…/scratchpad").
+    static func outsideBody(_ procs: [Status.Outside]) -> String {
+        var groups: [(key: String, cmd: String, cwd: String, n: Int)] = []
+        for p in procs {
+            let cmd = String(p.shortCommand.prefix(60))
+            let cwd = shortPath(p.cwd ?? "")
+            let key = cmd + "\u{0}" + cwd
+            if let i = groups.firstIndex(where: { $0.key == key }) { groups[i].n += 1 } else { groups.append((key, cmd, cwd, 1)) }
+        }
+        let lines = groups.prefix(2).map { g in
+            g.cmd + (g.n > 1 ? " ×\(g.n)" : "") + (g.cwd.isEmpty ? "" : " in " + g.cwd)
+        }
+        return "For 3 minutes, not under cpuq: " + lines.joined(separator: "; ") + ". Jobs queued here wait for it."
+    }
+
+    /// A path for a notification: ~ for home, and at most its last three directories.
+    static func shortPath(_ p: String) -> String {
+        var path = p
+        let home = NSHomeDirectory()
+        if path.hasPrefix(home) { path = "~" + path.dropFirst(home.count) }
+        let parts = path.split(separator: "/", omittingEmptySubsequences: true)
+        return parts.count > 4 ? "…/" + parts.suffix(3).joined(separator: "/") : path
     }
 
     private func track(_ e: inout Episode, _ wrong: Bool, after: TimeInterval, _ now: Date, tell: () -> Void) {

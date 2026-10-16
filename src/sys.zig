@@ -1117,3 +1117,53 @@ pub const Heartbeat = struct {
         self.thread = null;
     }
 };
+
+/// A process's command line, its arguments joined by spaces and cut at `max` bytes; "" when it
+/// can't be read (another user's, gone). macOS: sysctl KERN_PROCARGS2; Linux: /proc/PID/cmdline.
+pub fn procCommand(arena: std.mem.Allocator, io: Io, pid: i32, max: usize) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    if (is_darwin) {
+        // CTL_KERN, KERN_PROCARGS2: argc (an int), the executable's path, NULs, then argv.
+        var mib = [_]c_int{ 1, 49, pid };
+        var buf: [65536]u8 align(4) = undefined;
+        var size: usize = buf.len;
+        if (sysctl(&mib, 3, &buf, &size, null, 0) != 0 or size < 4) return "";
+        const argc: usize = @intCast(@max(std.mem.readInt(i32, buf[0..4], .little), 0));
+        var i: usize = 4;
+        while (i < size and buf[i] != 0) i += 1; // the executable's path
+        while (i < size and buf[i] == 0) i += 1; // its padding
+        var n: usize = 0;
+        while (n < argc and i < size) : (n += 1) {
+            const start = i;
+            while (i < size and buf[i] != 0) i += 1;
+            if (out.items.len != 0) out.append(arena, ' ') catch break;
+            out.appendSlice(arena, buf[start..i]) catch break;
+            i += 1;
+            if (out.items.len >= max) break;
+        }
+    } else {
+        var path_buf: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cmdline", .{pid}) catch return "";
+        var buf: [8192]u8 = undefined;
+        const text = Io.Dir.cwd().readFile(io, path, &buf) catch return "";
+        for (std.mem.trimEnd(u8, text, "\x00")) |ch| out.append(arena, if (ch == 0) ' ' else ch) catch break;
+    }
+    return out.items[0..@min(out.items.len, max)];
+}
+
+/// A process's working directory; "" when it can't be read. macOS: proc_pidinfo
+/// PROC_PIDVNODEPATHINFO; Linux: /proc/PID/cwd.
+pub fn procCwd(arena: std.mem.Allocator, io: Io, pid: i32) []const u8 {
+    if (is_darwin) {
+        // struct proc_vnodepathinfo: pvi_cdir first, a vnode_info (152 bytes) then its path
+        // (MAXPATHLEN, 1024); pvi_rdir after it, the same.
+        var info: [2 * (152 + 1024)]u8 align(8) = undefined;
+        if (proc_pidinfo(pid, 9, 0, &info, info.len) != info.len) return "";
+        return arena.dupe(u8, std.mem.sliceTo(info[152 .. 152 + 1024], 0)) catch "";
+    }
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cwd", .{pid}) catch return "";
+    var buf: [4096]u8 = undefined;
+    const n = Io.Dir.cwd().readLink(io, path, &buf) catch return "";
+    return arena.dupe(u8, buf[0..n]) catch "";
+}

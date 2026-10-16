@@ -3,6 +3,13 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.19.5 — 2026-10-15
+
+- A notification when work outside cpuq holds a machine: at least 40% of its CPUs (and at least
+  2) for 3 minutes, on this Mac or a machine it watches (pup, burst). It says what runs and
+  where, "python3 -I model.py 4 p2on ×5 in …/emdb/…/scratchpad", so whoever started it can be
+  found. With cpuq 0.24, which reports each process's command line and directory.
+
 ## 0.19.4 — 2026-10-15
 
 - The Jobs card orders running jobs as you pick, with a control beside its title: Started (the

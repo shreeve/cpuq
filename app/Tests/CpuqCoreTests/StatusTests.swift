@@ -180,3 +180,13 @@ import Testing
     #expect(s.holders[0].left == 540 && s.holders[0].leftFrom == "progress" && s.holders[0].typical == 2760)
     #expect(s.holders[1].progress == nil && s.holders[1].left == nil && s.holders[1].leftFrom == "")
 }
+
+@Test func decodesOutsideWork() throws {
+    let json = #"{"schema":1,"outside_total":9.8,"outside":[{"pid":7,"name":"Python","using":0.69,"command":"/opt/homebrew/bin/python3 -I model.py 4 p2on","cwd":"/tmp/x"},{"pid":8,"name":"zig","using":0.5}]}"#
+    let s = try Status.decode(Data(json.utf8))
+    #expect(s.outsideTotal == 9.8)
+    #expect(s.outside[0].shortCommand == "python3 -I model.py 4 p2on", "got \(s.outside[0].shortCommand) from \(String(describing: s.outside[0].command))")
+    #expect(s.outside[0].cwd == "/tmp/x")
+    #expect(s.outside[1].shortCommand == "zig" && s.outside[1].command == nil)
+    #expect(try Status.decode(Data(#"{"schema":1}"#.utf8)).outsideTotal == nil)
+}
