@@ -704,6 +704,8 @@ pub fn bootTime(io: Io) f64 {
 pub fn dieBySignal(sig: c.SIG) noreturn {
     const no_core: c.rlimit = .{ .cur = 0, .max = 0 };
     _ = c.setrlimit(.CORE, &no_core);
+    // Its command's death, mirrored: not a crash of cpuq's, so no crash report filed for it.
+    noCrashReport();
     var sa: c.Sigaction = .{ .handler = .{ .handler = c.SIG.DFL }, .mask = undefined, .flags = 0 };
     _ = c.sigemptyset(&sa.mask);
     _ = c.sigaction(sig, &sa, null);
@@ -1166,4 +1168,19 @@ pub fn procCwd(arena: std.mem.Allocator, io: Io, pid: i32) []const u8 {
     var buf: [4096]u8 = undefined;
     const n = Io.Dir.cwd().readLink(io, path, &buf) catch return "";
     return arena.dupe(u8, buf[0..n]) catch "";
+}
+
+extern "c" fn task_set_exception_ports(task: c_uint, mask: c_uint, port: c_uint, behavior: c_int, flavor: c_int) c_int;
+
+/// macOS: no crash report (ReportCrash's .ips in ~/Library/Logs/DiagnosticReports) for this process,
+/// nor for what it execs or starts, which inherit it: its crash exception ports (EXC_CRASH,
+/// EXC_CORPSE_NOTIFY) cleared. For a death on purpose: a test's expected abort, or cpuq mirroring
+/// its command's signal. The process still dies by its signal. Nothing elsewhere.
+pub fn noCrashReport() void {
+    if (!is_darwin) return;
+    const exc_mask_crash: c_uint = 1 << 10;
+    const exc_mask_corpse_notify: c_uint = 1 << 13;
+    const exception_default: c_int = 1;
+    const thread_state_none: c_int = if (builtin.cpu.arch == .x86_64) 13 else 5;
+    _ = task_set_exception_ports(mach_task_self_, exc_mask_crash | exc_mask_corpse_notify, 0, exception_default, thread_state_none);
 }

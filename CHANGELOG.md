@@ -2,6 +2,16 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.25.0 — 2026-10-16
+
+- **`cpuq cap --no-crash-report`**: on macOS, no crash report (an `.ips` in
+  ~/Library/Logs/DiagnosticReports) when PROGRAM crashes on purpose, such as a test that panics.
+  PROGRAM still dies by its signal (134 in a shell), its stderr unchanged. What it starts inherits
+  it, so wrap the program meant to crash, never a compiler before it. Nothing on Linux.
+- cpuq no longer files a crash report of its own when it mirrors its command's death (`cpuq run`
+  and `cpuq cap` die by the signal their command died by): a capped test's abort had also filed one
+  for cpuq.
+
 ## 0.24.3 — 2026-10-16
 
 - A submitted job given up before its copy was synced (a failed rsync, a worktree that kept

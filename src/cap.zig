@@ -31,12 +31,14 @@ const exit_failure: u8 = 125;
 const exit_usage: u8 = 2;
 
 pub const usage =
-    \\usage: cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] [--] PROGRAM [ARGS...]
+    \\usage: cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] [--no-crash-report] [--] PROGRAM [ARGS...]
     \\  --mem SIZE        stop PROGRAM when it and everything it started use more memory (2G, 512M)
     \\  --time DURATION   stop it after this long (120, 120s, 2m, 1h, 500ms)
     \\  --output SIZE     stop it when it has written more than this to stdout and stderr, which
     \\                    must be files or /dev/null (1M)
     \\  --pids N          at most N processes and threads at once (inside a cpuq job on Linux)
+    \\  --no-crash-report macOS: no crash report (.ips) when PROGRAM, or anything it starts,
+    \\                    crashes on purpose (a test that panics); it still dies by its signal
     \\exit: PROGRAM's own (death by a signal passed on as one); stopped by cpuq: 122 memory,
     \\124 time, 121 output, each with a line on stderr; 125 cpuq failed; 127 PROGRAM not found
     \\
@@ -501,6 +503,7 @@ const Stop = enum { none, memory, time, output };
 
 pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]const u8, path_env: ?[]const u8) u8 {
     var limits: Limits = .{};
+    var quiet_crash = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg: []const u8 = args[i];
@@ -512,6 +515,10 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
         if (std.mem.eql(u8, arg, "--help")) {
             std.debug.print("{s}", .{usage});
             return 0;
+        }
+        if (std.mem.eql(u8, arg, "--no-crash-report")) {
+            quiet_crash = true;
+            continue;
         }
         const eq = std.mem.findScalar(u8, arg, '=');
         const name = if (eq) |e| arg[0..e] else arg;
@@ -597,6 +604,9 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
             _ = prctl(1, @as(c_ulong, 9)); // PR_SET_PDEATHSIG, SIGKILL: dies with cpuq
             if (c.getppid() != parent) c._exit(exit_failure); // cpuq died before that was armed
         }
+        // An expected crash (a test that panics on purpose) files no crash report, nor does anything
+        // PROGRAM starts: so wrap only the program meant to crash, never a compiler before it.
+        if (quiet_crash) sys.noCrashReport();
         _ = c.execve(program.ptr, argv.ptr, envp);
         const err: u8 = @intCast(@intFromEnum(c.errno(-1)));
         _ = c.write(report[1], &[_]u8{ 'e', err }, 2);

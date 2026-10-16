@@ -285,6 +285,7 @@ can spend a large part of a big machine doing nothing else: one did, about 17 of
 | `--time DURATION` | stopped after DURATION (`120`, `120s`, `2m`, `500ms`) |
 | `--output SIZE` | stopped once it has written more than SIZE to stdout and stderr, which must be files or `/dev/null`; a pipe is refused |
 | `--pids N` | at most N processes and threads at once (inside a job on Linux) |
+| `--no-crash-report` | macOS: no crash report (`.ips` in `~/Library/Logs/DiagnosticReports`) when PROGRAM crashes on purpose, a test that panics; it still dies by its signal. What PROGRAM starts inherits it, so wrap the program meant to crash, never a compiler before it. Nothing on Linux |
 
 - **Exit status:** PROGRAM's own, or death by its signal. When cpuq stopped it, it's 122 for
   memory, 124 for time and 121 for output, each with one line on stderr. 127 means PROGRAM
