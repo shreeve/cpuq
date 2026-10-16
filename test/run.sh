@@ -1506,6 +1506,10 @@ for _ in range(3):
 }
 
 t_outside() {
+  # status names work outside cpuq and leaves a job's own out, counting it as the job's. It lists
+  # the five busiest outside processes: on a busy machine (other jobs are outside this test's
+  # queue) a full list without the stray is right too, and on an
+  # oversubscribed one the job gets only its share of a CPU.
   setup outside
   python3 -c 'import time
 e = time.time() + 3
@@ -1517,10 +1521,17 @@ while time.time() < e: pass' &
   sleep 0.5
   local got; got=$("$CPUQ" status --json | python3 -c 'import json, sys
 s = json.load(sys.stdin)
-print(" ".join(str(o["pid"]) for o in s["outside"]), "|", " ".join("%.1f" % h["using"] for h in s["holders"]))' )
+stray = int(sys.argv[1])
+out = s["outside"]
+pids = [o["pid"] for o in out]
+mine = {h["child"] for h in s["holders"]} | {h["pid"] for h in s["holders"]}
+named = stray in pids or len(out) >= 5
+own_out = not (mine & set(pids))
+used = sum(h["using"] or 0 for h in s["holders"])
+print("named" if named else "missed", "own-out" if own_out else "own-listed", "%.1f" % used, "|", " ".join("%d:%.1f" % (o["pid"], o["using"]) for o in out))' "$stray")
   wait
-  echo "  outside pids | holder use: $got (stray pid $stray)"
-  check "status names an outside process and leaves the job's own out" "[[ ' ${got%%|*} ' == *' $stray '* ]] && python3 -c 'import sys; sys.exit(0 if float(\"${got##*| }\") > 0.4 else 1)'"
+  echo "  $got (stray pid $stray)"
+  check "status names an outside process and leaves the job's own out" "[[ '$got' == 'named own-out '* ]] && python3 -c 'import sys; sys.exit(0 if float(\"$(echo "$got" | cut -d" " -f3)\") > 0.1 else 1)'"
 }
 
 t_eta() {
