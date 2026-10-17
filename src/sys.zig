@@ -700,8 +700,17 @@ pub fn bootTime(io: Io) f64 {
 }
 
 /// Ends this process the way the command ended: by the same signal, so the
-/// caller's shell reports it (128 + N), without a core dump.
+/// caller's shell reports it (128 + N), without a core dump. On macOS a signal
+/// that makes a crash report (abort, segfault, ...) ends it by exit 128 + N
+/// instead, as the shell sees it: dying by it filed a report for cpuq in the
+/// system's folder, which no setting of cpuq's own stops, each time a command
+/// under it crashed.
 pub fn dieBySignal(sig: c.SIG) noreturn {
+    const n: u8 = @intCast(@backingInt(sig));
+    if (is_darwin) switch (n) {
+        3, 4, 5, 6, 7, 8, 10, 11, 12 => c._exit(128 + n),
+        else => {},
+    };
     // Its command's death, mirrored: not a crash of cpuq's, so no core and
     // no crash report for it (on Linux, noCrashReport's core limit of 1
     // writes no core either).
@@ -718,7 +727,7 @@ pub fn dieBySignal(sig: c.SIG) noreturn {
     _ = c.sigaddset(&set, sig);
     _ = c.sigprocmask(c.SIG.UNBLOCK, &set, null);
     _ = c.raise(sig);
-    c._exit(128 + @as(u8, @intCast(@backingInt(sig))));
+    c._exit(128 + n);
 }
 
 extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, size: c_int) c_int;

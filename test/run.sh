@@ -1038,6 +1038,10 @@ t_cap_quiet_crash() {
   setup cap-quiet-crash
   local got; got=$(sh -c "\"$CPUQ\" cap --no-crash-report -- sh -c 'echo panic: on purpose >&2; kill -ABRT \$\$' 2>\"$T/err\"; echo \$?")
   check "cap --no-crash-report: PROGRAM still dies by its signal (status $got) with its stderr ($(cat "$T/err" | tr -d '\n'))" "[ '$got' = 134 ] && grep -q 'panic: on purpose' '$T/err'"
+  # cpuq run passes a command's abort on as 134 too; on macOS by exit, as the shell sees it, not by
+  # dying of it, which filed a crash report for cpuq in the system's folder.
+  local run_rc; sh -c "\"$CPUQ\" run --cores 1 -- \"$CPUQ\" cap --no-crash-report -- sh -c 'kill -ABRT \$\$'" 2>/dev/null; run_rc=$?
+  check "cpuq run passes a command's abort on as 134 (got $run_rc)" "[ $run_rc = 134 ]"
   local proto; proto=$("$CPUQ" cap --protocol)
   check "cap --protocol prints what cap does as a number (got '$proto')" "[[ '$proto' =~ ^[0-9]+\$ ]]"
   # Linux: PROGRAM's core limit is exactly 1, at which the kernel starts no core_pattern handler

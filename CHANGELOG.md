@@ -2,6 +2,14 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.26.5 — 2026-10-16
+
+- macOS: when a command under `cpuq run` or `cpuq cap` dies of a signal that makes a crash report
+  (abort, segfault, bus error, ...), cpuq ends by exit 128+N, as the shell sees it, rather than by
+  the same signal: dying of it filed a crash report for cpuq in the system's folder each time
+  (beside the command's own report, unless that was turned off). Other signals (an interrupt, a
+  termination) still end cpuq as they ended the command.
+
 ## 0.26.4 — 2026-10-16
 
 (0.26.3 was tagged, never released: its release build failed on the fix below.)
