@@ -1,13 +1,14 @@
 import AppKit
 import CpuqCore
+import os
 import Sparkle
 import SwiftUI
 import UserNotifications
 
 /// Cpuq.app: a window with a page per machine, and a chip in the menu bar that stays calm while
 /// all is well. While the window is open it is an ordinary app (Dock icon, menu bar, ⌘Tab); closed,
-/// only the chip remains (Settings can keep the Dock icon, or drop the chip). It only reads
-/// `cpuq status --json`; cpuq itself needs no app.
+/// only the chip remains (Settings can keep the Dock icon, or drop the chip). It reads cpuq's
+/// status and runs its job actions; cpuq itself needs no app.
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
@@ -17,6 +18,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var problem: String?
     private var timer: Timer?
     private var polling = false
+    /// A poll asked for while one was under way: run once it is done.
+    private var repoll = false
     private let graphs = GraphModel()
     /// The remotes in cpuq's config, each a page of the window beside this Mac's.
     private var remotes: [GraphModel] = []
@@ -25,8 +28,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var settingsWindow: NSWindow?
     /// The View menu (machines, theme, live view), its checkmarks set as it opens.
     private var viewMenu: NSMenu?
-    /// Ticks of the 3-second timer, for the once-a-minute look at cloud machines.
-    private var ticks = 0
+    /// When the cloud machines were last looked at with the window closed: once a minute.
+    private var cloudsAt = Date.distantPast
     /// What has gone wrong and since when, for the notifications: one each time a thing goes
     /// wrong and stays so, none again until it has come right.
     private var gateShut = Episode()
@@ -55,6 +58,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
     private let sizeGuard = MinimumSize()
     private var historyTimer: Timer?
+    /// The open window's watchers, removed as it closes.
+    private var graphsMonitor: Any?
+    private var graphsObservers: [NSObjectProtocol] = []
     /// Sparkle, running only in a Cpuq.app bundle: a binary run from the build folder never offers
     /// to replace itself.
     private let updater = SPUStandardUpdaterController(
@@ -77,10 +83,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         NSWindow.allowsAutomaticWindowTabbing = false
         NSApp.mainMenu = mainMenu()
         applyShape()
-        // Settings changes the shape as it is toggled.
-        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.applyShape() }
-        }
         setUpNotifications()
         poll()
         pollClouds()
@@ -91,13 +93,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         UserDefaults.standard.removeObject(forKey: UpdateRelaunch.key)
         // For testing a build: open the graphs window at launch.
         if reopen || ProcessInfo.processInfo.environment["CPUQ_SHOW_GRAPHS"] != nil { showGraphs() }
-        timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+        schedulePolls()
+    }
+
+    /// Polls every 3 seconds while the window is open, every 10 while it is closed: the chip and
+    /// the notifications need no more.
+    private func schedulePolls() {
+        let every: TimeInterval = graphsWindow?.isVisible ?? false ? 3 : 10
+        guard timer?.timeInterval != every else { return }
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: every, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.poll()
                 self.pollRemotes()
-                self.ticks += 1
-                if self.ticks % 20 == 0 { self.pollClouds() }
+                if Date().timeIntervalSince(self.cloudsAt) >= 60 { self.pollClouds() }
             }
         }
     }
@@ -130,7 +140,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     /// Reads `cpuq status --json` off the main thread, then updates the icon
     /// and the menu.
     private func poll() {
-        guard !polling else { return }
+        guard !polling else {
+            repoll = true
+            return
+        }
         polling = true
         Task.detached(priority: .utility) {
             let result = Self.readStatus()
@@ -141,15 +154,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                     self.status = s
                     self.problem = nil
                     self.graphs.add(s)
-                    if !self.graphs.backfilled { self.backfill(self.graphs) }
+                    if s.recorder && !self.graphs.backfilled { self.backfill(self.graphs) }
                     Liveliness.shared.observe(load: s.load.first, cpus: Double(ProcessInfo.processInfo.activeProcessorCount))
                 case .failure(let e):
                     self.status = nil
                     self.problem = e.message
                 }
                 self.updateChip()
-                if self.menu.highlightedItem != nil || self.menu.numberOfItems == 0 { return }
-                self.rebuild()
+                if self.menu.highlightedItem == nil && self.menu.numberOfItems > 0 { self.rebuild() }
+                if self.repoll {
+                    self.repoll = false
+                    self.poll()
+                }
             }
         }
     }
@@ -172,6 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     /// running costs money, and the chip says so whether anyone is looking or not.
     private func pollClouds() {
         guard !(graphsWindow?.isVisible ?? false) else { return }
+        cloudsAt = Date()
         for m in remotes where m.machine.start != nil { pollRemote(m) }
     }
 
@@ -187,7 +204,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 case .success(let data):
                     if let s = try? Status.decode(data) {
                         m.add(s)
-                        if !m.backfilled { self.backfill(m) }
+                        if s.recorder && !m.backfilled { self.backfill(m) }
                     } else { m.failed("its cpuq answered in a form this app cannot read") }
                 case .failure(let e): m.failed(e.message)
                 }
@@ -197,8 +214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
     }
 
-    /// The last hour from the machine's recorder (`cpuq samples`), once: nothing when it records
-    /// nothing, or its cpuq is older than 0.15.
+    /// The last hour from the machine's recorder (`cpuq samples`), once, when one is running.
     private func backfill(_ m: GraphModel) {
         m.backfilled = true
         let host: String? = m.machine.isLocal ? nil : m.machine.id
@@ -276,17 +292,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     nonisolated private static func remoteCommand(_ host: String, _ command: String) -> Result<Data, Problem> {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        p.arguments = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, command]
+        p.arguments = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", host, command]
         let out = Pipe(), err = Pipe()
         p.standardOutput = out
         p.standardError = err
         p.standardInput = FileHandle.nullDevice
         do { try p.run() } catch { return .failure(Problem(message: "cannot run ssh: \(error.localizedDescription)")) }
+        // Both at once: a pipe left unread fills, and ssh would wait on it forever.
+        let complaint = OSAllocatedUnfairLock(initialState: Data())
+        let drained = DispatchSemaphore(value: 0)
+        let errors = err.fileHandleForReading
+        DispatchQueue.global(qos: .utility).async {
+            let d = errors.readDataToEndOfFile()
+            complaint.withLock { $0 = d }
+            drained.signal()
+        }
         let data = out.fileHandleForReading.readDataToEndOfFile()
-        let complaint = err.fileHandleForReading.readDataToEndOfFile()
+        drained.wait()
         p.waitUntilExit()
         guard p.terminationStatus == 0 else {
-            let line = String(decoding: complaint, as: UTF8.self).split(separator: "\n").first.map(String.init)
+            let line = String(decoding: complaint.withLock { $0 }, as: UTF8.self).split(separator: "\n").first.map(String.init)
             return .failure(Problem(message: line ?? "ssh \(host) failed (\(p.terminationStatus))"))
         }
         return .success(data)
@@ -427,11 +452,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    /// Five things worth an interruption, each once it has lasted: cpuq's gate shut (30 s), jobs
-    /// waiting beside idle CPUs (a minute), heavy work outside cpuq on any machine (3 minutes), a
-    /// job that looks stuck (10 minutes of almost no CPU and no count), and a cloud machine up
-    /// with nothing to do for 15 minutes, which means its own 10-minute idle stop failed and it
-    /// is still billing.
+    /// What is worth an interruption, each once it has lasted: cpuq's gate shut (30 s), jobs
+    /// waiting beside idle CPUs (a minute), --opaque jobs holding cores while others wait (2
+    /// minutes), heavy work outside cpuq (3 minutes), a job that looks stuck or a machine
+    /// overloaded while another has room (10 minutes), and a cloud machine up with nothing to do
+    /// (15 minutes: its own 10-minute idle stop failed, and it is billing). Those that need the
+    /// owner are texted too.
     private func checkAlerts() {
         guard Prefs.notify else { return }
         let now = Date()
@@ -531,7 +557,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
             overloaded[id] = e
         }
-        sendTexts(now)
         for c in remotes where c.machine.start != nil {
             let idle = c.isCloudRunning && (c.status.map { $0.holders.isEmpty && $0.waiters.isEmpty } ?? false)
             var e = cloudIdle[c.machine.id] ?? Episode()
@@ -541,6 +566,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
             cloudIdle[c.machine.id] = e
         }
+        sendTexts(now)
     }
 
     /// What the outside work is, for its notification: the busiest commands, grouped, each with
@@ -616,7 +642,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let p = Process()
         p.executableURL = URL(fileURLWithPath: command)
         p.arguments = ["From Cpuq.app: " + Self.unique(lines).joined(separator: "\n")]
-        try? p.run()
+        // A text that didn't go shows in What's Happening, so its news isn't lost unseen.
+        p.terminationHandler = { p in
+            let status = p.terminationStatus
+            guard status != 0 else { return }
+            Task { @MainActor in self.textFailed("exited \(status)") }
+        }
+        do { try p.run() } catch { textFailed(error.localizedDescription) }
+    }
+
+    private func textFailed(_ why: String) {
+        found.append((Date(), "A text didn't go: \(Prefs.textCommand) \(why)."))
     }
 
     /// What's Happening?: what is wrong now, then what the rules found in the last hour, each
@@ -787,7 +823,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             let window = NSWindow(contentRect: .zero, styleMask: [.titled, .closable], backing: .buffered, defer: false)
             window.title = "Cpuq Settings"
             window.isReleasedWhenClosed = false
-            window.contentView = NSHostingView(rootView: SettingsView())
+            window.contentView = NSHostingView(rootView: SettingsView { [weak self] in self?.applyShape() })
             window.center()
             settingsWindow = window
         }
@@ -848,77 +884,104 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     // MARK: - The graphs window
 
     @objc private func showGraphs() {
-        if graphsWindow == nil {
-            let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 960, height: 780),
-                styleMask: [.titled, .closable, .resizable, .miniaturizable],
-                backing: .buffered, defer: false)
-            window.title = "cpuq"
-            window.isReleasedWhenClosed = false
-            // The cells animate smoothly only while the mouse moves in the window or it is
-            // resized (Liveliness); otherwise once a second.
-            window.acceptsMouseMovedEvents = true
-            NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .scrollWheel]) { [weak window] event in
-                if let window, event.window === window { Liveliness.shared.poke() }
-                return event
-            }
-            NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: window, queue: .main) { _ in
-                MainActor.assumeIsolated { Liveliness.shared.poke() }
-            }
-            // Covered, minimized or on another space: no frames for effects nobody sees.
-            NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main) { [weak window] _ in
-                MainActor.assumeIsolated { Liveliness.shared.visible = window?.occlusionState.contains(.visible) ?? false }
-            }
-            window.appearance = Theme.appearance
-            // The window is the size it is given and no other: what is in it never grows or
-            // shrinks it, and everything in it fits, the charts sharing what height there is.
-            let host = NSHostingView(rootView: GraphsView(models: [graphs] + remotes, control: { [weak self] machine, action, pid, who in
-                self?.perform(action, pid: String(pid), who: who, on: machine)
-            }, start: { [weak self] model in self?.startMachine(model) }))
-            host.sizingOptions = []
-            // The minimum as constraints the window cannot break: contentMinSize alone let a
-            // drag, a tile or an accessibility resize take the window down to a sliver.
-            let content = NSView()
-            host.translatesAutoresizingMaskIntoConstraints = false
-            content.addSubview(host)
-            NSLayoutConstraint.activate([
-                host.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-                host.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-                host.topAnchor.constraint(equalTo: content.topAnchor),
-                host.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-                content.widthAnchor.constraint(greaterThanOrEqualToConstant: GraphsView.minimumSize.width),
-                content.heightAnchor.constraint(greaterThanOrEqualToConstant: GraphsView.minimumSize.height),
-            ])
-            window.contentView = content
-            window.contentMinSize = GraphsView.minimumSize
-            window.minSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: GraphsView.minimumSize)).size
-            window.delegate = sizeGuard
-            window.center()
-            // Where it was and how big, kept from one opening to the next; a frame saved smaller
-            // than the minimum grows to it.
-            window.setFrameAutosaveName("cpuq graphs")
-            var frame = window.frame
-            if frame.width < window.minSize.width || frame.height < window.minSize.height {
-                frame.size = NSSize(width: max(frame.width, window.minSize.width), height: max(frame.height, window.minSize.height))
-                window.setFrame(frame, display: false)
-            }
-            graphsWindow = window
-            // Closed, the app goes back to being the chip (unless Settings keeps the Dock icon).
-            NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in
-                DispatchQueue.main.async { MainActor.assumeIsolated { self?.applyShape() } }
-            }
-            // History changes slowly: read it now and each minute while the window is open.
-            historyTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-                MainActor.assumeIsolated { self?.refreshHistory() }
-            }
-        }
+        if graphsWindow == nil { buildGraphs() }
         NSApp.activate()
         graphsWindow?.makeKeyAndOrderFront(nil)
         applyShape()
+        schedulePolls()
         // Once it is on screen: refreshHistory skips a window nobody sees, so read before
         // this, the history waited a minute for the next refresh.
         refreshHistory()
         pollRemotes()
+    }
+
+    /// The window and all it shows, built afresh each time it opens.
+    private func buildGraphs() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 960, height: 780),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            backing: .buffered, defer: false)
+        window.title = "cpuq"
+        window.isReleasedWhenClosed = false
+        // The cells animate smoothly only while the mouse moves in the window or it is
+        // resized (Liveliness); otherwise once a second.
+        window.acceptsMouseMovedEvents = true
+        graphsMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .scrollWheel]) { [weak window] event in
+            if let window, event.window === window { Liveliness.shared.poke() }
+            return event
+        }
+        let center = NotificationCenter.default
+        graphsObservers = [
+            center.addObserver(forName: NSWindow.didResizeNotification, object: window, queue: .main) { _ in
+                MainActor.assumeIsolated { Liveliness.shared.poke() }
+            },
+            // Covered, minimized or on another space: no frames for effects nobody sees.
+            center.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main) { [weak window] _ in
+                MainActor.assumeIsolated { Liveliness.shared.visible = window?.occlusionState.contains(.visible) ?? false }
+            },
+            center.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.dropGraphs() }
+            },
+        ]
+        window.appearance = Theme.appearance
+        // The window is the size it is given and no other: what is in it never grows or
+        // shrinks it, and everything in it fits, the charts sharing what height there is.
+        let host = NSHostingView(rootView: GraphsView(models: [graphs] + remotes, control: { [weak self] machine, action, pid, who in
+            self?.perform(action, pid: String(pid), who: who, on: machine)
+        }, start: { [weak self] model in self?.startMachine(model) }))
+        host.sizingOptions = []
+        // The minimum as constraints the window cannot break: contentMinSize alone let a
+        // drag, a tile or an accessibility resize take the window down to a sliver.
+        let content = NSView()
+        host.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(host)
+        NSLayoutConstraint.activate([
+            host.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            host.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            host.topAnchor.constraint(equalTo: content.topAnchor),
+            host.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            content.widthAnchor.constraint(greaterThanOrEqualToConstant: GraphsView.minimumSize.width),
+            content.heightAnchor.constraint(greaterThanOrEqualToConstant: GraphsView.minimumSize.height),
+        ])
+        window.contentView = content
+        window.contentMinSize = GraphsView.minimumSize
+        window.minSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: GraphsView.minimumSize)).size
+        window.delegate = sizeGuard
+        window.center()
+        // Where it was and how big, kept from one opening to the next; a frame saved smaller
+        // than the minimum grows to it.
+        window.setFrameAutosaveName("cpuq graphs")
+        var frame = window.frame
+        if frame.width < window.minSize.width || frame.height < window.minSize.height {
+            frame.size = NSSize(width: max(frame.width, window.minSize.width), height: max(frame.height, window.minSize.height))
+            window.setFrame(frame, display: false)
+        }
+        graphsWindow = window
+        // History changes slowly: read it now and each minute while the window is open.
+        historyTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshHistory() }
+        }
+    }
+
+    /// The window closing: it goes with all it shows, so nothing draws or redraws until it opens
+    /// again, and the app goes back to being the chip (unless Settings keeps the Dock icon).
+    private func dropGraphs() {
+        if let graphsMonitor { NSEvent.removeMonitor(graphsMonitor) }
+        graphsMonitor = nil
+        graphsObservers.forEach(NotificationCenter.default.removeObserver)
+        graphsObservers = []
+        historyTimer?.invalidate()
+        historyTimer = nil
+        // The name is free for the next window, the frame already saved.
+        graphsWindow?.setFrameAutosaveName("")
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                self.graphsWindow?.contentView = nil
+                self.graphsWindow = nil
+                self.applyShape()
+                self.schedulePolls()
+            }
+        }
     }
 
     private func refreshHistory() {
@@ -937,22 +1000,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
     }
 
-    private func name(_ label: String, _ command: String) -> String {
-        label.isEmpty ? String(command.split(separator: " ").first ?? "job") : label
-    }
-
     func perform(_ action: String, pid: String, who: String, on machine: Machine = .local) {
-        let ask: (String, String)? = switch action {
-        case "start": ("Start \(who) now?", "It starts past the queue and the budget, so the load goes up until other jobs finish.")
-        case "stop": ("Stop \(who)?", "Its work so far is lost; it gets SIGTERM and can clean up.")
+        let ask: (String, String, String)? = switch action {
+        case "start": ("Start \(who) now?", "It starts past the queue and the budget, so the load goes up until other jobs finish.", "Start Now")
+        case "stop": ("Stop \(who)?", "Its work so far is lost; it gets SIGTERM and can clean up.", "Stop")
+        case "cancel": ("Cancel \(who)?", "It leaves the queue and never runs; whoever started it sees it give up (exit 75).", "Cancel Job")
         default: nil
         }
-        if let (title, detail) = ask {
+        if let (title, detail, yes) = ask {
             let alert = NSAlert()
             alert.messageText = title
             alert.informativeText = detail
-            alert.addButton(withTitle: action == "start" ? "Start Now" : "Stop")
-            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: yes)
+            alert.addButton(withTitle: action == "cancel" ? "Keep Waiting" : "Cancel")
             NSApp.activate()
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
@@ -978,11 +1038,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     @objc private func openLiveView() {
         guard let path = findCpuq() else { return }
-        // `status --watch` is cpuq 0.4.0's; an older cpuq gets the same view
-        // redrawn by the shell.
-        let command = supportsWatch(version: status?.version ?? "")
-            ? "\(path) status --watch"
-            : "while :; do clear; \(path) status; sleep 2; done"
+        // The path quoted for the shell (a space in it), then the line for AppleScript (a quote or
+        // a backslash in it would end the string early).
+        let shell = "'" + path.replacingOccurrences(of: "'", with: #"'\''"#) + "' status --watch"
+        let command = shell.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let script = "tell application \"Terminal\"\nactivate\ndo script \"\(command)\"\nend tell"
         NSAppleScript(source: script)?.executeAndReturnError(nil)
     }

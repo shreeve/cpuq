@@ -36,7 +36,7 @@ final class GraphModel {
         let id: String
         let project: String
         let label: String
-        /// Which of the budget's cores it holds, from 0 (in the jobs view, its row).
+        /// Which of the budget's cores it holds, from 0.
         var lanes: [Int]
         var from: Date
         /// Nil while it runs.
@@ -71,41 +71,18 @@ final class GraphModel {
     /// The machine at one poll, for the top line when pointing at that moment.
     struct Sample {
         let at: Date
-        let inUse: Int
-        let active: Double
         /// CPU used by the busiest processes outside cpuq, in cores.
         let outside: Double
         let load: Double
-        let waiting: Int
         /// cpuq's gate then: open, or shut by memory pressure, the load valve or spacing (one
         /// admission per 10 s over the budget); jobs wait even beside free cores while it is shut.
         var gate = "open"
         var gateText = "open"
         var gateOpen: Bool { gate == "open" }
-        /// The load valve's trip level then, when cpuq reports it.
-        var trip: Double? = nil
-        /// Memory pressure as cpuq saw it: normal or high.
-        var memory = ""
         /// How busy the Mac's CPUs were since the poll before, 0 to 1, measured by the app.
         var busy: Double? = nil
         /// The same for each CPU, in the kernel's order.
         var perCPU: [Double]? = nil
-    }
-
-    /// A project running now: what it holds and what it uses.
-    struct Row: Identifiable {
-        var id: String { project }
-        let project: String
-        let held: Int
-        let used: Double
-    }
-
-    struct Waiting: Identifiable {
-        let id: Int
-        var pid = 0
-        let label: String
-        let cores: String
-        let since: Int
     }
 
     /// A project's finished jobs, summed.
@@ -172,8 +149,7 @@ final class GraphModel {
             let at = Date(timeIntervalSince1970: r.t)
             guard at >= since, at < first.addingTimeInterval(-1), !r.cpu.isEmpty else { return nil }
             let per = r.cpu.map { $0 / 100 }
-            return Sample(at: at, inUse: r.held, active: 0, outside: 0, load: r.load, waiting: r.wait,
-                          gate: r.gate, gateText: r.gate == "open" ? "open" : r.gate.replacingOccurrences(of: "_", with: " "),
+            return Sample(at: at, outside: 0, load: r.load, gate: r.gate, gateText: r.gate == "open" ? "open" : r.gate.replacingOccurrences(of: "_", with: " "),
                           busy: per.reduce(0, +) / Double(per.count), perCPU: per)
         }
         guard !older.isEmpty else { return }
@@ -203,8 +179,8 @@ final class GraphModel {
     /// A cloud machine (one cpuq can start) that is up, and so costing money.
     var isCloudRunning: Bool { machine.start != nil && problem == nil && upSince != nil }
 
-    /// How long it has been up: since it booted (cpuq 0.14 says when), else since the app first
-    /// saw it answer. "23m", "1h 05m".
+    /// How long it has been up: since it booted, else since the app first saw it answer. "23m",
+    /// "1h 05m".
     var upFor: String {
         let since = status?.bootTime.map { Date(timeIntervalSince1970: $0) } ?? upSince ?? Date()
         let s = Int(Date().timeIntervalSince(since))
@@ -216,10 +192,7 @@ final class GraphModel {
     var startNote: String?
     /// Each project's palette slot, assigned the first time it is seen and kept across launches,
     /// so a project's color never changes as others come and go.
-    private var slots: [String: Int] = {
-        migratePalette()
-        return (UserDefaults.standard.dictionary(forKey: "projectPalette") as? [String: Int]) ?? [:]
-    }()
+    private var slots = (UserDefaults.standard.dictionary(forKey: "projectPalette") as? [String: Int]) ?? [:]
 
     var budget: Int { max(status?.capacity ?? 8, 1) }
 
@@ -266,10 +239,8 @@ final class GraphModel {
             perCPU = zip(a, b).map { CPUTicks.busy(from: $0, to: $1) ?? 0 }
         }
         cpuTicks = each
-        samples.append(Sample(at: now, inUse: s.held, active: s.holders.reduce(0) { $0 + ($1.using ?? 0) },
-                              outside: s.outside.reduce(0) { $0 + $1.using }, load: s.load.first ?? 0, waiting: s.waiters.count,
-                              gate: s.gate.state, gateText: s.gate.text, trip: s.gate.trip, memory: s.memoryPressure, busy: busy,
-                              perCPU: perCPU))
+        samples.append(Sample(at: now, outside: s.outside.reduce(0) { $0 + $1.using }, load: s.load.first ?? 0,
+                              gate: s.gate.state, gateText: s.gate.text, busy: busy, perCPU: perCPU))
         let cutoff = now.addingTimeInterval(-Self.keep)
         samples.removeAll { $0.at < cutoff }
         blocks.removeAll { ($0.to ?? now) < cutoff }
@@ -304,7 +275,7 @@ final class GraphModel {
     }
 
     /// The hour before the app started watching, from `cpuq history`: each finished job on the
-    /// cores it took (or, from a cpuq older than 0.4.5, the lowest that were free), with its
+    /// cores it took (or the lowest that were free, when it names none), with its
     /// average active cores, and each wait from queueing to starting.
     private func seed(_ jobs: [Job], now: Date = Date()) {
         seeded = true
@@ -324,22 +295,6 @@ final class GraphModel {
             remember(Self.group(j.label, j.note))
         }
         blocks.sort { $0.from < $1.from }
-    }
-
-    /// Each job on a row of its own, for the jobs view: the lowest row free when it started, so
-    /// there are as many rows as jobs ever ran at once, never more.
-    func jobBlocks() -> [Block] {
-        var ends: [Date] = []
-        var out: [Block] = []
-        for b in blocks.sorted(by: { ($0.from, $0.id) < ($1.from, $1.id) }) {
-            let row = ends.firstIndex { $0 <= b.from } ?? ends.count
-            if row == ends.count { ends.append(.distantFuture) }
-            ends[row] = b.to ?? .distantFuture
-            var j = b
-            j.lanes = [row]
-            out.append(j)
-        }
-        return out
     }
 
     /// The lowest `n` adjacent cores free from `from` to `to` (or on), else the lowest free ones.
@@ -370,20 +325,6 @@ final class GraphModel {
     /// the rest are the same in every theme. No grey: that is work outside cpuq.
     static let palette: [Color] = (0..<6).map { Alive.slot($0) } + [.mint, Color(red: 0.62, green: 0.82, blue: 0.08), .indigo, .teal]
 
-    /// Slots saved by an app older than the design's palette moved to it: each keeps its color
-    /// where the palette still has it, and the projects the design shows take its colors.
-    private static func migratePalette() {
-        let d = UserDefaults.standard
-        guard d.integer(forKey: "paletteVersion") < 2 else { return }
-        var slots = (d.dictionary(forKey: "projectPalette") as? [String: Int]) ?? [:]
-        // Old order: blue, orange, green, purple, yellow, teal, mint, lime, indigo, system teal.
-        let moved = [0: 0, 1: 3, 2: 1, 3: 2, 4: 5, 5: 4, 6: 6, 7: 7, 8: 8, 9: 9]
-        slots = slots.mapValues { moved[$0 % 10] ?? $0 }
-        for (project, slot) in ["em": 0, "nexis": 1, "emdb": 2, "rig": 3, "cpuq": 4] { slots[project] = slot }
-        d.set(slots, forKey: "projectPalette")
-        d.set(2, forKey: "paletteVersion")
-    }
-
     func color(_ project: String) -> Color {
         Self.palette[(slots[project] ?? 0) % Self.palette.count]
     }
@@ -411,23 +352,6 @@ final class GraphModel {
         for i in waits.indices where waits[i].from < cutoff { waits[i].from = cutoff }
         samples.removeAll { $0.at < cutoff }
         if started < cutoff { started = cutoff }
-    }
-
-    /// The projects running now, the most cores first.
-    var rows: [Row] {
-        guard let s = status else { return [] }
-        var held: [String: Int] = [:]
-        var used: [String: Double] = [:]
-        for h in s.holders {
-            held[Self.group(h.label, h.note), default: 0] += h.cores
-            used[Self.group(h.label, h.note), default: 0] += h.using ?? 0
-        }
-        return held.map { Row(project: $0.key, held: $0.value, used: used[$0.key] ?? 0) }
-            .sorted { $0.held != $1.held ? $0.held > $1.held : $0.project < $1.project }
-    }
-
-    var waiting: [Waiting] {
-        (status?.waiters ?? []).map { Waiting(id: $0.order, pid: $0.pid, label: Self.label($0.label, $0.command), cores: Self.wants($0), since: $0.since) }
     }
 
     static func label(_ label: String, _ command: String) -> String {

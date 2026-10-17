@@ -1,32 +1,72 @@
 # Cpuq.app
 
-The cpuq menu-bar companion for macOS 14 and later on Apple silicon.
+The cpuq menu-bar companion for macOS 14 and later on Apple silicon: a chip in the menu bar, and
+a window with a page per machine.
 
-- **The chip** in the menu bar fills a cell per quarter of the core budget handed out (none when
-  idle, all four when the budget is full).
-- **The menu** shows what runs (cores in use and active), what waits and when it should start,
-  the named leases, and any load outside cpuq. Each running job has Pause or Resume and Stop, and
-  each waiting job Move to Front, Start Now and Cancel. **Open Live View in Terminal** (⌘L) runs
-  `cpuq status --watch`.
-- **Show Graphs** (⌘G) opens a window on the Mac's active CPUs. Its **Now** tab leads with the
-  CPUs busy right now ("8.4 / 10") and two verdicts: whether the Mac is working at full capacity,
-  and whether anyone waits, fairly (the CPUs are full) or needlessly (CPUs sit idle while jobs
-  wait, the one case worth hunting). Beside them, a glass cell per CPU fills with each project's
-  color, then other work; the jobs waiting sit in a tray, and when they wait beside idle CPUs the
-  empty glass glows rose.
-- **The last hour**, under them on the same scale, is **Stacked** by project (⌘1) or **Per Core**
-  (⌘2), a lane per CPU with the performance cores above the efficiency cores, with rose where
-  jobs waited while CPUs sat idle and a strip of how many waited. Pointing at any moment replays
-  it in the cells.
-- **Every job** comes last: the CPU it uses, the cores it holds, how long it has run, and for each
-  waiting job what it asks for and why it waits. A right click offers the menu's job actions.
-  The toolbar shows cpuq's gate, memory pressure and the load.
-- **The History tab** sums `cpuq history` per project.
+## The chip and its menu
 
-The app only reads `cpuq status --json` (every 3 seconds) and `cpuq history --json`, so cpuq
-works the same with or without it. It finds cpuq where install.sh and Homebrew put it
-(`~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`), since an app does not inherit a shell's
-`PATH`.
+The chip fills a cell per quarter of the core budget handed out. It stays calm while all is well,
+turns orange while cpuq's gate is shut or jobs wait beside idle CPUs, is struck through while cpuq
+cannot be read, and shows "☁ 23m" while a cloud machine runs.
+
+Its menu has the app's and cpuq's versions, one line of how it stands ("6 of 10 cores in use · 2
+waiting"), a line for each thing wrong (only then), and **Open Cpuq** (⌘G), **What's Happening?**,
+**Settings…**, **Check for Updates…** and **Quit Cpuq**. While the window is open the app is an
+ordinary one, with a Dock icon and a menu bar; closed, only the chip remains.
+
+## The window
+
+One page per machine: this Mac, then each remote in cpuq's config (`remotes`, started with
+`remote_start.HOST` when it is a cloud machine). ⌘1 to ⌘9 pick a page, ⌘T the next theme, ⌘M
+Automatic, Light or Dark. A stopped cloud machine's page offers to start it. Each page, top to
+bottom, its sections' heights dragged to taste:
+
+- **Right Now:** a glass cell per CPU, filled with each project's color, then other work; the jobs
+  waiting sit in a tray beside them, and when they wait beside idle CPUs the empty glass glows
+  rose. cpuq's gate, memory and the load sit at the right.
+- **Last Hour:** stacked by project and per core (a lane per CPU, performance cores above
+  efficiency cores) on one time axis, with rose where jobs waited while CPUs sat idle and a strip
+  of how many waited. Pointing at a moment replays it in the cells. A right click forgets what is
+  older than that moment, or than five minutes ago.
+- **Jobs:** each running job's progress, CPU of the cores it reserved, and how long it has run. A
+  right click pauses or resumes it, or stops it; a waiting job moves to the front, starts now or
+  is cancelled. Stop, Start Now and Cancel ask first.
+- **History:** `cpuq history` summed per project.
+
+**View ▸ Open Live View in Terminal** (⌘L) runs `cpuq status --watch`. Theme ▸ Visual Effects
+turns off the moving water and bubbles; they run at ten frames a second while the window shows
+and the Mac is not strained, thirty while the mouse moves in it.
+
+## Notifications and texts
+
+Once each time it happens and lasts, on any machine watched: cpuq's gate shut (30 seconds), jobs
+waiting beside idle CPUs (a minute), --opaque jobs holding cores while others wait (2 minutes),
+heavy work outside cpuq (3 minutes), a job that looks stuck or a machine overloaded while another
+has room (10 minutes), and a cloud machine up with nothing to do (15 minutes), with a button to
+stop it. A stuck job, an overloaded machine, idle --opaque jobs and an idle cloud machine are also
+texted, at most once every 30 minutes, with `~/bin/send-imessage` (the `textCommand` default)
+when it is there. **What's Happening?** says what is wrong now, then
+what was found in the last hour, each with its age; a text that failed to go shows there too.
+
+**Settings** shows or hides the chip, keeps the Dock icon always, turns notifications and texts on
+or off, and opens the app at login.
+
+## What it runs
+
+cpuq works the same with or without the app. The app runs:
+
+- `cpuq status --json` every 3 seconds while the window is open and every 10 while it is closed;
+- `cpuq history --json`, and `cpuq samples` once for the last hour when status says the recorder
+  runs;
+- `cpuq first`, `start`, `cancel`, `pause`, `resume` and `stop` from the Jobs actions;
+- the same over `ssh -o BatchMode=yes HOST` for each remote while the window is open, each cloud
+  machine once a minute while it is closed, and `journalctl --list-boots` there for its hours
+  this month;
+- a cloud machine's `remote_start.HOST` command, the `stop` beside it from a notification's Stop
+  button, and the text command.
+
+It finds cpuq where install.sh and Homebrew put it (`~/.local/bin`, `/opt/homebrew/bin`,
+`/usr/local/bin`), since an app does not inherit a shell's `PATH`.
 
 ## Install
 
