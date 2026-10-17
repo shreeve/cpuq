@@ -92,8 +92,8 @@ pub fn cmdRecord(ctx: *Ctx, args: []const [:0]const u8) u8 {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const x = args[i];
-        if (std.mem.eql(u8, x, "--install")) return installRecorder(ctx, true);
-        if (std.mem.eql(u8, x, "--uninstall")) return installRecorder(ctx, false);
+        if (std.mem.eql(u8, x, "--install")) return installService(ctx, .record, true);
+        if (std.mem.eql(u8, x, "--uninstall")) return installService(ctx, .record, false);
         if (std.mem.eql(u8, x, "--interval") and i + 1 < args.len) {
             i += 1;
             const secs = std.fmt.parseFloat(f64, args[i]) catch return usageError("--interval needs seconds, not '{s}'", .{args[i]});
@@ -211,70 +211,86 @@ pub fn cmdSamples(ctx: *Ctx, args: []const [:0]const u8) u8 {
 
 /// `cpuq record --install` (or --uninstall): keeps the recorder running for this user, started
 /// at login (and at boot, where systemd allows lingering), restarted if it exits.
-fn installRecorder(ctx: *Ctx, install: bool) u8 {
+pub const Service = enum {
+    record,
+    agent,
+
+    fn about(sv: Service) []const u8 {
+        return switch (sv) {
+            .record => "samples this machine for cpuq samples and Cpuq.app",
+            .agent => "keeps this machine at its target load, shared among its jobs by weight",
+        };
+    }
+};
+
+/// Installs (or removes) `cpuq record` or `cpuq agent` as a launchd agent or a systemd user
+/// service, which keeps one running and starts the next only after the last has exited.
+pub fn installService(ctx: *Ctx, sv: Service, install: bool) u8 {
     const io = ctx.io;
     const a = ctx.arena;
+    const name = @tagName(sv);
     const home = ctx.env.get("HOME") orelse fail("no HOME", .{});
     const exe = std.process.executablePathAlloc(io, a) catch |err| fail("cannot find this cpuq: {t}", .{err});
     const cwd = Io.Dir.cwd();
     if (@import("builtin").os.tag.isDarwin()) {
-        const label = "com.github.shreeve.cpuq.record";
+        const label = a.print("com.github.shreeve.cpuq.{s}", .{name}) catch fail("out of memory", .{});
         const plist = a.print("{s}/Library/LaunchAgents/{s}.plist", .{ home, label }) catch fail("out of memory", .{});
         const domain = a.print("gui/{d}", .{sys.getuid()}) catch fail("out of memory", .{});
         _ = std.process.run(a, io, .{ .argv = &.{ "launchctl", "bootout", a.print("{s}/{s}", .{ domain, label }) catch "" } }) catch {};
         if (!install) {
             cwd.deleteFile(io, plist) catch {};
-            ctx.out.writeAll("cpuq record: uninstalled (launchd agent removed)\n") catch {};
+            ctx.out.print("cpuq {s}: uninstalled (launchd agent removed)\n", .{name}) catch {};
             return 0;
         }
         cwd.createDirPath(io, std.fs.path.dirname(plist).?) catch {};
+        // The recorder is Background; the agent Standard, since what it starts inherits its role.
         const body = a.print(
             \\<?xml version="1.0" encoding="UTF-8"?>
             \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
             \\<plist version="1.0">
             \\<dict>
             \\  <key>Label</key><string>{s}</string>
-            \\  <key>ProgramArguments</key><array><string>{s}</string><string>record</string></array>
+            \\  <key>ProgramArguments</key><array><string>{s}</string><string>{s}</string></array>
             \\  <key>RunAtLoad</key><true/>
             \\  <key>KeepAlive</key><true/>
-            \\  <key>ProcessType</key><string>Background</string>
-            \\  <key>StandardErrorPath</key><string>{s}/Library/Logs/cpuq-record.log</string>
+            \\  <key>ProcessType</key><string>{s}</string>
+            \\  <key>StandardErrorPath</key><string>{s}/Library/Logs/cpuq-{s}.log</string>
             \\</dict>
             \\</plist>
             \\
-        , .{ label, exe, home }) catch fail("out of memory", .{});
+        , .{ label, exe, name, if (sv == .record) "Background" else "Standard", home, name }) catch fail("out of memory", .{});
         cwd.writeFile(io, .{ .sub_path = plist, .data = body }) catch |err| fail("{s}: {t}", .{ plist, err });
         const r = std.process.run(a, io, .{ .argv = &.{ "launchctl", "bootstrap", domain, plist } }) catch |err| fail("launchctl: {t}", .{err});
         if (!r.term.success()) fail("launchctl bootstrap: {s}", .{std.mem.trim(u8, r.stderr, " \n")});
-        ctx.out.print("cpuq record: installed as launchd agent {s}, running now\n", .{label}) catch {};
+        ctx.out.print("cpuq {s}: installed as launchd agent {s}, running now\n", .{ name, label }) catch {};
         return 0;
     }
+    const unit_name = a.print("cpuq-{s}.service", .{name}) catch fail("out of memory", .{});
     const unit_dir = a.print("{s}/.config/systemd/user", .{home}) catch fail("out of memory", .{});
-    const unit = a.print("{s}/cpuq-record.service", .{unit_dir}) catch fail("out of memory", .{});
+    const unit = a.print("{s}/{s}", .{ unit_dir, unit_name }) catch fail("out of memory", .{});
     if (!install) {
-        _ = std.process.run(a, io, .{ .argv = &.{ "systemctl", "--user", "disable", "--now", "cpuq-record.service" } }) catch {};
+        _ = std.process.run(a, io, .{ .argv = &.{ "systemctl", "--user", "disable", "--now", unit_name } }) catch {};
         cwd.deleteFile(io, unit) catch {};
         _ = std.process.run(a, io, .{ .argv = &.{ "systemctl", "--user", "daemon-reload" } }) catch {};
-        ctx.out.writeAll("cpuq record: uninstalled (systemd user service removed)\n") catch {};
+        ctx.out.print("cpuq {s}: uninstalled (systemd user service removed)\n", .{name}) catch {};
         return 0;
     }
     cwd.createDirPath(io, unit_dir) catch {};
     const body = a.print(
         \\[Unit]
-        \\Description=cpuq record: samples this machine for cpuq samples and Cpuq.app
+        \\Description=cpuq {s}: {s}
         \\
         \\[Service]
-        \\ExecStart={s} record
+        \\ExecStart={s} {s}
         \\Restart=always
         \\RestartSec=5
-        \\Nice=10
-        \\
+        \\{s}
         \\[Install]
         \\WantedBy=default.target
         \\
-    , .{exe}) catch fail("out of memory", .{});
+    , .{ name, sv.about(), exe, name, if (sv == .record) "Nice=10\n" else "" }) catch fail("out of memory", .{});
     cwd.writeFile(io, .{ .sub_path = unit, .data = body }) catch |err| fail("{s}: {t}", .{ unit, err });
-    for ([_][]const []const u8{ &.{ "systemctl", "--user", "daemon-reload" }, &.{ "systemctl", "--user", "enable", "--now", "cpuq-record.service" } }) |argv| {
+    for ([_][]const []const u8{ &.{ "systemctl", "--user", "daemon-reload" }, &.{ "systemctl", "--user", "enable", "--now", unit_name } }) |argv| {
         const r = std.process.run(a, io, .{ .argv = argv }) catch |err| fail("systemctl: {t}", .{err});
         if (!r.term.success()) fail("{s}: {s}", .{ argv[2], std.mem.trim(u8, r.stderr, " \n") });
     }
@@ -282,7 +298,7 @@ fn installRecorder(ctx: *Ctx, install: bool) u8 {
     const user = ctx.env.get("USER") orelse "";
     const linger = std.process.run(a, io, .{ .argv = &.{ "loginctl", "enable-linger", user } }) catch null;
     const lingers = linger != null and linger.?.term.success();
-    ctx.out.print("cpuq record: installed as systemd user service cpuq-record, running now{s}\n", .{if (lingers) " (lingering: it runs without a login)" else "; `loginctl enable-linger` failed, so it runs only while you are logged in"}) catch {};
+    ctx.out.print("cpuq {s}: installed as systemd user service cpuq-{s}, running now{s}\n", .{ name, name, if (lingers) " (lingering: it runs without a login)" else "; `loginctl enable-linger` failed, so it runs only while you are logged in" }) catch {};
     return 0;
 }
 

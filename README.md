@@ -181,6 +181,10 @@ A bare `zig build` uses every CPU. `zig build -jN` limits the build runner to N 
 it has no jobserver client and does not pass `-j` to the compiler processes it starts, so a step
 can still use more. GNU make 4.x lets a `-j` on its own command line override the jobserver.
 
+On Linux a job is also confined to as many CPUs as its grant, those the running jobs use least
+(`CPUQ_CPUS` lists them), so a program that sizes its threads by the CPUs it sees starts as many
+as its grant.
+
 ### Labels
 
 Give every job a label, `project:task`, the same on every run: `app:build`, `app:test`,
@@ -297,6 +301,7 @@ can spend a large part of a big machine doing nothing else: one did, about 17 of
 | `--time DURATION` | stopped after DURATION (`120`, `120s`, `2m`, `500ms`) |
 | `--output SIZE` | stopped once it has written more than SIZE to stdout and stderr, which must be files or `/dev/null`; a pipe is refused. Checked about every 0.1 s |
 | `--pids N` | at most N processes and threads at once, inside a job on Linux; elsewhere not enforced, and a job that can't give it a cgroup says so on stderr |
+| `--link FD` | stopped at once, exit 123, when the other end of the pipe whose read end is FD closes: whoever started it (a job's driver) is gone |
 | `--no-crash-report` | no crash report when PROGRAM crashes on purpose, a test that panics. macOS: cap answers PROGRAM's crashes itself, so neither the user's ReportCrash (~/Library/Logs/DiagnosticReports) nor the system's (/Library/Logs/DiagnosticReports) files one, and cap exits 128+N for a death by signal N rather than dying by it (a shell sees the same status). Linux: a core limit of exactly 1, so the kernel passes it to no `core_pattern` handler (Ubuntu's apport, seconds per crash); it still dies by its signal. What PROGRAM starts inherits it, so wrap the program meant to crash, never a compiler before it |
 
 `cpuq cap --protocol` prints what cap does as a number that changes only when that does (its
@@ -434,6 +439,35 @@ them, and frozen jobs keep their memory. `cpuq status` notes a lending window an
 jobs as paused. This suits a dedicated build or benchmark machine where those processes are the
 window's work. It needs measured admission.
 
+## Jobs: a folder of task files
+
+A job too big for one command, such as a test suite of thousands of programs, is a folder that a
+driver of its own runs:
+
+    ~/.local/state/cpuq/jobs/NAME/STAMP/     e.g. jobs/rig/20261017-180000/
+      todo/  live/  done/  fail/  jobs.sock
+
+NAME is `[a-z0-9._-]`, not starting with a dot; the part before its first dot is its project.
+A task file is its work: its text up to the first blank line runs with `sh`. Each run appends its
+output, then one line, `== TIME HOST pass|fail|died: REASON SECS`. Exit 0 moves it to `done/`,
+exit 1 to `fail/`; anything else (a signal, a limit, a driver gone) is a death, back to `todo/`,
+and the third death goes to `fail/`. Retrying is running again: `mv fail/* todo/`.
+
+| in the folder | |
+|---|---|
+| `cpuq jobs run [--workers N] [--weight W] [--gap MS]` | runs `todo/`, N tasks at once (half the CPUs), each new worker 50 ms after the last and MS after its last task; live on a terminal. Exit 0 when all are done, 1 otherwise, after the failures' output |
+| `cpuq jobs status` / `watch` | the job once, or live until it ends with its result and exit status |
+| `cpuq jobs set workers N` / `weight W` / `gap MS` | changes the running job; a count you set holds |
+| `cpuq jobs pause` / `resume` / `stop` | `stop` puts the running tasks back in `todo/`, with no death |
+| `cpuq jobs reset` | every file back in `todo/` holding only its work; refused while it runs |
+
+`cpuq jobs` lists every job folder on this host, then this worktree's submitted jobs (`--all`:
+every worktree's). Each task runs under `cpuq cap --link` in a process group of its own, at a
+normal job's priority, with its file (locked) as its stdout and stderr: every task ends with its
+driver, and a driver started again files what a dead one left in `live/` as `died: lost`.
+`cpuq status` and Cpuq.app show a running job with its workers as what it reserves, and the app
+sets its workers and weight from its row.
+
 ## Other machines: --on HOST
 
     cpuq run --on HOST [run options] [--return PATH]... [--include PATH]... -- CMD ARGS...
@@ -517,8 +551,9 @@ that submits it picks the host. cpuq does the rest:
   first, by the spec's past results on each (another host's scaled by its cores when it has none
   there): a host that's up and free before a paid one that must be started, which is started only
   for work of ten minutes or more and only when clearly sooner. Work never seen goes to the first
-  host with room, else the first stopped one, started. `--on HOST` names the host (one of the
-  remotes, or this machine); a full host queues it;
+  host with room, else the first stopped one, started. A host is passed over when it has too
+  little memory for the job, or when a cache the spec `needs` is empty there. `--on HOST` names
+  the host (one of the remotes, or this machine); a full host queues it;
 - **syncs a snapshot** of the work there with rsync, moving only what changed, then reads the copy
   back by checksum (as `cpuq run --on` does);
 - **runs it, owned by that host,** so the agent's session, or this machine sleeping, doesn't stop
@@ -582,7 +617,8 @@ that submits it picks the host. cpuq does the rest:
   - `"git": true` ships the repo's git, git's own parts only (a worktree's too), for a job that
     runs `git ls-files` and the like;
   - a directory holding something like a credential (`.env`, `*.pem`, `id_*`) is refused;
-  - `caches` live on the host, outside the copy, shared by all of a project's runs;
+  - `caches` live on the host, outside the copy, shared by all of a project's runs; `needs`
+    names those that must already hold files there;
   - `deps` ship a sibling repo's tracked files.
 
 #### Packs: tool versions on each host

@@ -158,6 +158,27 @@ t_affinity() {
   check "a run confined to 2 CPUs counts holds on every core and waits (exit $rc, want 75)" "[ $rc = 75 ]"
 }
 
+t_job_affinity() {
+  # affinity (Linux): a job is confined to as many CPUs as its grant, CPUs of its own while the
+  # grants fit; one started under taskset keeps that; with affinity off it has every CPU.
+  setup job-affinity
+  if [ "$(uname)" != Linux ] || ! command -v taskset >/dev/null || [ "$(getconf _NPROCESSORS_ONLN)" -lt 4 ]; then
+    echo "  skipped: needs Linux with taskset and 4 or more CPUs"
+    return
+  fi
+  local list='sed -n "s/^Cpus_allowed_list:[[:space:]]*//p" /proc/self/status'
+  "$CPUQ" run --cores 2 -- sh -c "$list >$T/a; sleep 3" & local a=$!
+  wait_held 2
+  "$CPUQ" run --cores 2 -- sh -c "$list >$T/b; nproc >$T/n; echo \$CPUQ_CPUS >$T/env"
+  wait $a
+  local got="a=$(cat "$T/a") b=$(cat "$T/b") nproc=$(cat "$T/n") env=$(cat "$T/env")"
+  local tasks; tasks=$(taskset -c 0 "$CPUQ" run --cores 2 -- nproc)
+  setup job-affinity-off "affinity = off"
+  local off; off=$("$CPUQ" run --cores 2 -- nproc)
+  check "jobs get CPUs of their own, as many as their grants; under taskset 1; off, all $(nproc) (got $got taskset=$tasks off=$off)" \
+    "[ '$got' = 'a=0-1 b=2-3 nproc=2 env=2-3' ] && [ '$tasks' = 1 ] && [ '$off' = $(nproc) ]"
+}
+
 t_kill_holder() {
   setup kill-holder
   "$CPUQ" run --cores 9 -- sleep 30 & local holder=$!
@@ -1083,6 +1104,32 @@ t_cap_quiet_crash() {
   check "cap --no-crash-report on Linux: a core limit of 1 1 (got $quiet), and $want without it (got $plain)" "[ '$quiet' = '1 1' ] && [ '$plain' = '$want' ]"
 }
 
+t_cap_link() {
+  # cap --link FD: when the pipe's write end closes (its driver died), cap stops the whole tree
+  # at once, 123 with a line on stderr; bytes on the pipe mean nothing.
+  setup cap-link
+  local got; got=$(python3 - "$CPUQ" "$T" <<'PY'
+import os, subprocess, sys, time
+cpuq, t = sys.argv[1], sys.argv[2]
+r, w = os.pipe()
+p = subprocess.Popen([cpuq, "cap", "--link", str(r), "--", "sh", "-c", f"sleep 30 & echo $! > {t}/kid; sleep 30"],
+                     pass_fds=[r], stderr=subprocess.PIPE, text=True)
+os.close(r)
+while not os.path.exists(f"{t}/kid") or not open(f"{t}/kid").read().strip(): time.sleep(0.02)
+os.write(w, b"ping\n"); time.sleep(0.3)
+alive = p.poll() is None
+t0 = time.time(); os.close(w); rc = p.wait(); dt = time.time() - t0
+kid = int(open(f"{t}/kid").read())
+try: os.kill(kid, 0); gone = False
+except ProcessLookupError: gone = True
+print(alive, rc, dt < 1.5, gone, "driver is gone" in p.stderr.read())
+PY
+)
+  check "cap --link: a byte changes nothing; the write end's close stops the tree at once with 123 (got '$got')" "[ '$got' = 'True 123 True True True' ]"
+  local bad; "$CPUQ" cap --link 99 -- true 2>/dev/null; bad=$?
+  check "cap --link refuses a closed descriptor with 2 (got $bad)" "[ $bad = 2 ]"
+}
+
 t_cgroups() {
   # (CPUQ_CGROUP is cleared where a check needs no job around it: the suite may itself run inside
   # a cpuq job, whose scope a nested run rightly inherits.)
@@ -1338,6 +1385,56 @@ t_submit_on() {
   local got; got=$(tr '\n' ' ' <"$T/out")
   check "submit: a spec with an unknown field is refused ($(head -1 "$T/spec")); --on a host not among the remotes is refused; --on this machine runs here (got $got)" \
     "[[ \"\$got\" == 'spec=2 unknown=2 self=0 ' ]] && grep -q 'UnknownField' '$T/spec' && grep -q 'not one of this machine' '$T/unknown'"
+  export HOME=$was_home
+  unset XDG_STATE_HOME
+}
+
+t_submit_needs() {
+  # A spec's "needs" names caches that must hold files on a host: a host where one is empty is
+  # passed over (NOT RUN when it's the only one, the reason given), and a "needs" that isn't one
+  # of the spec's caches is refused.
+  setup submit-needs
+  local was_home=$HOME
+  export HOME=$T/home XDG_STATE_HOME=$T/xdg
+  mkdir -p "$HOME" "$T/roots/repo/cpuq"
+  printf 'submit_roots = %s\n' "$T/roots" >> "$CPUQ_CONFIG"
+  (
+    cd "$T/roots/repo" || exit 1
+    git init -q && git config user.email t@t && git config user.name t
+    printf '%s\n' '{ "label": "t:needs", "run": "cat \"$DATA/x\" > saw", "caches": { "DATA": "data" }, "needs": ["DATA"], "return": ["saw"], "cores": "1" }' > cpuq/needs.json
+    printf '%s\n' '{ "label": "t:bad", "run": "true", "needs": ["DATA"], "cores": "1" }' > cpuq/bad.json
+    git add -A && git commit -qm init
+    "$CPUQ" submit cpuq/bad.json >"$T/bad" 2>&1; echo "bad=$?"
+    "$CPUQ" submit cpuq/needs.json >"$T/empty" 2>&1; echo "empty=$?"
+    mkdir -p "$HOME/cpuq/caches/t/data" && echo filled > "$HOME/cpuq/caches/t/data/x"
+    "$CPUQ" submit cpuq/needs.json >/dev/null 2>&1; echo "filled=$?"; cat saw
+  ) >"$T/out" 2>&1
+  local got; got=$(tr '\n' ' ' <"$T/out")
+  check "submit: a \"needs\" outside the caches is refused, an empty one is NOT RUN with its reason ($(grep -o 'cpuq/caches/t/data is empty' "$T/empty" | head -1)), a filled one runs (got $got)" \
+    "[[ \"\$got\" == 'bad=2 empty=75 filled=0 filled ' ]] && grep -q 'has no DATA' '$T/bad' && grep -q 'cpuq/caches/t/data is empty' '$T/empty'"
+  export HOME=$was_home
+  unset XDG_STATE_HOME
+}
+
+t_submit_mem() {
+  # A host with less RAM than the spec's "mem" is passed over, unless --on names it: a run's
+  # arguments can make the job far smaller than its spec's limit.
+  setup submit-mem
+  local was_home=$HOME
+  export HOME=$T/home XDG_STATE_HOME=$T/xdg
+  mkdir -p "$HOME" "$T/roots/repo/cpuq"
+  printf 'submit_roots = %s\n' "$T/roots" >> "$CPUQ_CONFIG"
+  (
+    cd "$T/roots/repo" || exit 1
+    git init -q && git config user.email t@t && git config user.name t
+    printf '%s\n' '{ "label": "t:mem", "run": "true", "mem": "100000G", "cores": "1" }' > cpuq/mem.json
+    git add -A && git commit -qm init
+    "$CPUQ" submit cpuq/mem.json >"$T/big" 2>&1; echo "placed=$?"
+    "$CPUQ" submit --on here cpuq/mem.json >/dev/null 2>&1; echo "named=$?"
+  ) >"$T/out" 2>&1
+  local got; got=$(tr '\n' ' ' <"$T/out")
+  check "submit: a host short of \"mem\" is passed over, but runs it when --on names it (got $got)" \
+    "[[ \"\$got\" == 'placed=75 named=0 ' ]] && grep -q 'GB of RAM, the job wants 100000' '$T/big'"
   export HOME=$was_home
   unset XDG_STATE_HOME
 }
@@ -2157,6 +2254,101 @@ t_min_disk() {
   check "under min_disk nothing starts (rc $rc, gate $got, '$text'); above it, it does (rc $rc2)" "[ $rc = 75 ] && [ '$got' = 'low_disk with-free with-path' ] && [[ '$text' == *'disk low'* ]] && [ $rc2 = 0 ]"
 }
 
+# mkjob NAME: an empty job folder J under $CPUQ_STATE; task FILE WORK writes a task file.
+mkjob() { J=$CPUQ_STATE/jobs/$1/20261017-120000; mkdir -p "$J/todo"; }
+task() { printf '%s\n' "$2" > "$J/todo/$1"; }
+count() { ls "$1" 2>/dev/null | wc -l | tr -d ' '; }
+jobs() { (cd "$J" && "$CPUQ" jobs "$@"); }
+
+t_jobs() {
+  # Exit 0 goes to done/, 1 to fail/; anything else dies back to todo/ and the third death fails.
+  # Each run appends its output and its line; the verdict lists fail/ and its status is 1.
+  setup jobs; export CPUQ_STATE=$T/state
+  mkjob outcomes
+  local i; for i in 1 2 3 4 5; do task t$i "echo hello $i"; done
+  task f1 'echo bad; exit 1'; task d1 'kill -9 $$'; task d2 "$(printf 'exit 3\n\nold output')"
+  local out; out=$(jobs run --workers 3 2>&1); local rc=$?
+  check "the job ends FAIL, 1 (rc $rc): 5 done, 3 failed, none left ($(count "$J/done") $(count "$J/fail") $(count "$J/todo") $(count "$J/live"))" \
+    "[ $rc = 1 ] && [ $(count "$J/done") = 5 ] && [ $(count "$J/fail") = 3 ] && [ $(count "$J/todo") = 0 ] && [ $(count "$J/live") = 0 ]"
+  check "a task file is its work, a blank line, its output, its line" \
+    "[[ \"\$(cat '$J/done/t1')\" == 'echo hello 1'\$'\\n\\n''hello 1'\$'\\n''== '*' pass '*s ]]"
+  check "a death is retried: the third goes to fail/ ($(grep -c 'died: signal 9' "$J/fail/d1") $(grep -c 'died: exit 3' "$J/fail/d2"))" \
+    "[ $(grep -c 'died: signal 9' "$J/fail/d1") = 3 ] && [ $(grep -c 'died: exit 3' "$J/fail/d2") = 3 ]"
+  check "the verdict is last, after each failure's output" "[[ '$out' == *'fail/f1:'*'    bad'* && \"\$(echo '$out' | tail -1)\" == 'FAIL: 3 failed, 5 done in '* ]]"
+  mkjob passing; task a 'true'; task b 'true'
+  out=$(jobs run 2>&1); rc=$?
+  check "all done: PASS, 0 (rc $rc, '$out')" "[ $rc = 0 ] && [[ '$out' == 'PASS: 2 done in '* ]]"
+  mkjob empty; out=$(jobs run 2>&1); rc=$?
+  check "no tasks: FAIL, 1 (rc $rc, '$out')" "[ $rc = 1 ] && [ '$out' = 'FAIL: no tasks' ]"
+  unset CPUQ_STATE
+}
+
+t_jobs_qos() {
+  # A task runs in a normal job's class (on macOS the caller's, not utility QoS, which keeps it
+  # off the performance cores), in a process group of its own.
+  setup jobs-qos; export CPUQ_STATE=$T/state
+  mkjob q; task t "'$CPUQ' qos; ps -o pgid= -p \$\$; ps -o pgid= -p $$"
+  jobs run >/dev/null 2>&1
+  local got; got=$(sed -n 3p "$J/done/t"); local g1 g2; g1=$(sed -n 4p "$J/done/t" | tr -d ' '); g2=$(sed -n 5p "$J/done/t" | tr -d ' ')
+  local mine; mine=$("$CPUQ" qos)
+  if [ "$(uname)" = Darwin ]; then check "a task runs in the caller's class (got '$got', the caller's '$mine')" "[ '$got' = '$mine' ] && [ '$got' != utility ]"
+  else check "a task's qos is readable (got '$got')" "[ -n '$got' ]"; fi
+  check "a task's group is its own ($g1, the caller's $g2)" "[ -n '$g1' ] && [ '$g1' != '$g2' ]"
+  unset CPUQ_STATE
+}
+
+t_jobs_kill() {
+  # kill -9 of the driver ends its tasks (the link), and a second driver can't run beside the
+  # first. Restarted, it files each one `died: lost` and runs it again; nothing finished runs twice.
+  setup jobs-kill; export CPUQ_STATE=$T/state
+  mkjob k; local i; for i in $(seq 1 8); do task t$i "echo begin >> $T/runs; sleep 30; echo end >> $T/runs"; done
+  (cd "$J" && exec "$CPUQ" jobs run --workers 4 >/dev/null 2>&1) & local d=$!
+  for i in $(seq 1 50); do [ "$(grep -c begin "$T/runs" 2>/dev/null)" = 4 ] && break; sleep 0.1; done
+  local second; second=$(jobs run 2>&1); local src=$?
+  check "a second driver is refused (rc $src, '$second')" "[ $src = 125 ] && [[ '$second' == *'a driver already runs'* ]]"
+  kill -9 $d; wait $d 2>/dev/null
+  for i in $(seq 1 30); do [ -z "$(lsof -t "$J"/live/* 2>/dev/null)" ] && break; sleep 0.1; done
+  check "the tasks end with their driver (live files held: '$(lsof -t "$J"/live/* 2>/dev/null)')" "[ -z \"\$(lsof -t '$J'/live/* 2>/dev/null)\" ]"
+  for i in $(seq 1 8); do sed -i.bak 's/sleep 30/sleep 0.1/' "$J"/todo/t$i "$J"/live/t$i 2>/dev/null; done; rm -f "$J"/todo/*.bak "$J"/live/*.bak
+  timeout 60 "$SHELL" -c "cd '$J' && '$CPUQ' jobs run >/dev/null 2>&1"; local rc=$?
+  check "restarted, all 8 are done (rc $rc, $(count "$J/done")), the 4 cut short marked lost ($(grep -l 'died: lost' "$J"/done/* | wc -l | tr -d ' ')), each ending once ($(grep -c end "$T/runs"))" \
+    "[ $rc = 0 ] && [ $(count "$J/done") = 8 ] && [ $(grep -l 'died: lost' "$J"/done/* | wc -l) = 4 ] && [ $(grep -c end "$T/runs") = 8 ]"
+  unset CPUQ_STATE
+}
+
+t_jobs_control() {
+  # status, set and stop on a running job; stop puts its live tasks back with no death; reset
+  # leaves every file holding only its work, and is refused while the job runs.
+  setup jobs-control; export CPUQ_STATE=$T/state
+  mkjob c; local i; for i in $(seq 1 6); do task t$i 'sleep 20'; done
+  (cd "$J" && exec "$CPUQ" jobs run --workers 2 > "$T/out" 2>&1) & local d=$!
+  for i in $(seq 1 50); do [ "$(count "$J/live")" = 2 ] && break; sleep 0.1; done
+  local s; s=$(jobs status)
+  check "status shows the knobs and counts" "[[ '$s' == *'workers 2  weight 1  gap 0ms'* && '$s' == *'todo 4  live 2  done 0'* ]]"
+  jobs set workers 3; local r1=$?; jobs set gap 50 && jobs set weight 2; local r2=$?
+  local e; e=$(jobs set nope 1 2>&1); local r3=$?
+  for i in $(seq 1 50); do [ "$(count "$J/live")" = 3 ] && break; sleep 0.1; done
+  s=$(jobs status)
+  check "set changes it (rc $r1 $r2), a bad knob is refused (rc $r3, '$e')" \
+    "[ $r1 = 0 ] && [ $r2 = 0 ] && [ $r3 = 2 ] && [[ '$s' == *'workers 3 (set)  weight 2  gap 50ms (set)'* && '$s' == *'live 3'* ]]"
+  local l; l=$("$CPUQ" jobs)
+  check "cpuq jobs lists it running" "[[ '$l' == *' c '*'20261017-120000'*'running'* ]]"
+  local js; js=$("$CPUQ" status --json | python3 -c 'import json, sys
+j = json.load(sys.stdin)["jobs"]
+print(len(j), j[0]["name"], j[0]["workers"], j[0]["workers_from"], j[0]["live"], j[0]["using"] is not None)')
+  check "status --json lists the job at its workers (got '$js')" "[ '$js' = '1 c 3 set 3 True' ]"
+  local rs; rs=$(jobs reset 2>&1); local rr=$?
+  check "reset is refused while it runs (rc $rr, '$rs')" "[ $rr = 125 ] && [[ '$rs' == *refused* ]]"
+  jobs stop; wait $d; local rc=$?
+  check "stop: STOPPED, 1 (rc $rc, '$(cat "$T/out")'), all 6 in todo/, 3 marked stopped, no deaths" \
+    "[ $rc = 1 ] && [[ \"\$(cat '$T/out')\" == 'STOPPED: 6 in todo/'* ]] && [ $(count "$J/todo") = 6 ] && [ \$(grep -l stopped '$J'/todo/* | wc -l) = 3 ] && ! grep -q died '$J'/todo/*"
+  s=$(jobs status)
+  check "status, not running, counts the folders ('$s')" "[[ '$s' == *'not running  todo 6  live 0'* ]]"
+  rs=$(jobs reset); rr=$?
+  check "reset: every file only its work (rc $rr, '$rs')" "[ $rr = 0 ] && [ '$rs' = '6 in todo/' ] && [ \"\$(cat '$J'/todo/* | sort -u)\" = 'sleep 20' ]"
+  unset CPUQ_STATE
+}
+
 t_status() {
   setup status
   "$CPUQ" run --cores 4 --label build -- sleep 1.5 & wait_held 4
@@ -2173,7 +2365,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
+TESTS=${*:-budget affinity job_affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cap_link cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_needs submit_mem submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean jobs jobs_qos jobs_kill jobs_control status}
 for t in $TESTS; do
   if declare -F "t_$t" >/dev/null; then "t_$t"; else echo "no such test: $t"; FAIL=$((FAIL+1)); FAILED+=" $t?"; fi
 done

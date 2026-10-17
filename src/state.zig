@@ -277,6 +277,9 @@ pub const Record = struct {
     /// The core tokens a holder took, by number, comma-separated ("0,1,2"):
     /// which of the budget's cores are its own.
     slots: []const u8 = "",
+    /// Linux: the CPUs the job is confined to (`affinity`), as a CPU list ("0-3,8"); empty
+    /// when it may use every CPU.
+    cpus: []const u8 = "",
     /// A waiter moved to the front by hand (`cpuq first`): it goes ahead of
     /// every waiter not so moved.
     first: bool = false,
@@ -302,6 +305,7 @@ pub const Record = struct {
         try w.writeAll("cmd=");
         try writeLine(w, r.cmd);
         if (r.slots.len != 0) try w.print("slots={s}\n", .{r.slots});
+        if (r.cpus.len != 0) try w.print("cpus={s}\n", .{r.cpus});
         if (r.first) try w.writeAll("first=1\n");
         if (r.hidden) try w.writeAll("opaque=1\n");
         if (r.note.len != 0) {
@@ -336,6 +340,7 @@ pub const Record = struct {
             if (std.mem.eql(u8, k, "label")) r.label = v;
             if (std.mem.eql(u8, k, "cmd")) r.cmd = v;
             if (std.mem.eql(u8, k, "slots")) r.slots = v;
+            if (std.mem.eql(u8, k, "cpus")) r.cpus = v;
             if (std.mem.eql(u8, k, "first")) r.first = std.mem.eql(u8, v, "1");
             if (std.mem.eql(u8, k, "opaque")) r.hidden = std.mem.eql(u8, v, "1");
             if (std.mem.eql(u8, k, "note")) r.note = v;
@@ -358,7 +363,7 @@ pub const Record = struct {
 test "record round trip" {
     var buf: [512]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
-    const r: Record = .{ .ticket = 42, .pid = 7, .cores = 3, .priority = .low, .exclusive = true, .since = 1700000000, .label = "heavy", .cmd = "zig build\ttest\n-x", .slots = "0,3,4" };
+    const r: Record = .{ .ticket = 42, .pid = 7, .cores = 3, .priority = .low, .exclusive = true, .since = 1700000000, .label = "heavy", .cmd = "zig build\ttest\n-x", .slots = "0,3,4", .cpus = "0-2,7" };
     try r.write(&w);
     const p = Record.parse(w.buffered());
     try std.testing.expectEqual(42, p.ticket);
@@ -366,6 +371,7 @@ test "record round trip" {
     try std.testing.expect(p.exclusive);
     try std.testing.expectEqualStrings("heavy", p.label);
     try std.testing.expectEqualStrings("zig build test -x", p.cmd);
+    try std.testing.expectEqualStrings("0-2,7", p.cpus);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectEqualSlices(u32, &.{ 0, 3, 4 }, p.slotList(arena.allocator()));

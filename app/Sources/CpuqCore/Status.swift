@@ -62,6 +62,10 @@ public struct Status: Decodable, Sendable, Equatable {
         public var leftFrom = ""
         /// Its label's usual run time, in seconds, from history.
         public var typical: Double?
+        /// A job's folder (`cpuq jobs`): its actions run there, and its cores are its workers.
+        public var job: String?
+        /// A job's weight: its share of the machine against the other jobs'.
+        public var weight: Double?
     }
 
     /// A job's own count: `DONE TOTAL FAILING`.
@@ -82,6 +86,43 @@ public struct Status: Decodable, Sendable, Equatable {
         public var note = ""
         public var command = ""
         public var since = 0
+    }
+
+    /// A running job (`cpuq jobs run`): a folder of task files run by its own driver. The status
+    /// lists each among the holders, its workers what it reserves.
+    public struct Job: Decodable, Sendable, Equatable {
+        public var name = ""
+        public var stamp = ""
+        public var path = ""
+        public var pid = 0
+        public var state = ""
+        public var workers = 0
+        public var weight = 1.0
+        public var todo = 0
+        public var live = 0
+        public var done = 0
+        public var fail = 0
+        public var using: Double?
+        public var since = 0
+        public var left: Double?
+
+        /// As a running job: its label the name, its project the part before the first dot.
+        public var holder: Holder {
+            var h = Holder()
+            h.pid = pid
+            h.cores = workers
+            h.paused = state == "paused"
+            h.using = using
+            h.label = name.replacingOccurrences(of: ".", with: ":", options: [], range: name.range(of: "."))
+            h.command = path
+            h.job = path
+            h.weight = weight
+            h.since = since
+            h.progress = Progress(done: done + fail, total: todo + live + done + fail, failing: fail)
+            h.left = left
+            h.leftFrom = left == nil ? "" : "progress"
+            return h
+        }
     }
 
     public struct Outside: Decodable, Sendable, Equatable {
@@ -135,7 +176,7 @@ extension Status {
 // Decoding with defaults: a missing key keeps the property's default.
 extension Status {
     private enum Keys: String, CodingKey {
-        case version, budget, held, load, memoryPressure, gate, holders, waiters, outside, outsideTotal, recorder, admit, activeCores, cpuTicks, bootTime, memory
+        case version, budget, held, load, memoryPressure, gate, holders, waiters, jobs, outside, outsideTotal, recorder, admit, activeCores, cpuTicks, bootTime, memory
     }
 
     public init(from decoder: any Decoder) throws {
@@ -152,6 +193,7 @@ extension Status {
         memory = try c.decodeIfPresent(Memory.self, forKey: .memory)
         gate = try c.decodeIfPresent(Gate.self, forKey: .gate) ?? Gate()
         holders = try c.decodeIfPresent([Holder].self, forKey: .holders) ?? []
+        holders += (try c.decodeIfPresent([Job].self, forKey: .jobs) ?? []).map(\.holder)
         waiters = try c.decodeIfPresent([Waiter].self, forKey: .waiters) ?? []
         outside = try c.decodeIfPresent([Outside].self, forKey: .outside) ?? []
         outsideTotal = try c.decodeIfPresent(Double.self, forKey: .outsideTotal)

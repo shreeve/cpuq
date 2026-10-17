@@ -1,6 +1,7 @@
 //! Admission: a run waits in the queue for its cores (or a named lease's slot), takes its
 //! grant, and gives it back.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const policy = @import("policy.zig");
 const state = @import("state.zig");
@@ -305,7 +306,7 @@ pub fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
                 // Only into CPUs the machine really has to spare: by the load,
                 // and by the measured busy share when there is one (the load
                 // checks, so not with load_check off or --no-load-check).
-                const cpus = sys.activeCpus();
+                const cpus = sys.activeCpus(ctx.io);
                 var room: u32 = std.math.maxInt(u32);
                 if (cfg.load_check and o.load_check) {
                     room = policy.lendRoom(mach.load1, cpus);
@@ -346,7 +347,7 @@ pub fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
 /// The CPUs' worth of use measured admission fills: `target`, else the
 /// active CPUs.
 pub fn targetCpus(ctx: *Ctx) f64 {
-    return ctx.cfg.target orelse @floatFromInt(sys.activeCpus());
+    return ctx.cfg.target orelse @floatFromInt(sys.activeCpus(ctx.io));
 }
 
 /// Under measured admission the tokens only number the cores handed out (for
@@ -483,6 +484,27 @@ fn admittedLent(ctx: *Ctx, st: *state.State, o: RunOptions, rec: *state.Record, 
     return lease;
 }
 
+/// Linux, with `affinity`: the CPUs a starting job of `cores` is confined to
+/// (`policy.pickCpus`), as a CPU list. Empty, so it may use every CPU, for an exclusive or
+/// --opaque run, a lease, and a job of a cpuq itself confined to fewer CPUs than are online
+/// (taskset, a cpuset), whose job keeps that. Call with the admission lock held.
+fn jobCpus(ctx: *Ctx, st: *state.State, o: RunOptions, cores: u32, now: i64) []const u8 {
+    if (builtin.os.tag != .linux or !ctx.cfg.affinity or o.exclusive or o.hidden or o.lease != null) return "";
+    const a = ctx.arena;
+    const online = sys.onlineCpus(ctx.io, a);
+    if (online.len == 0 or sys.activeCpus(ctx.io) < online.len) return "";
+    // Each job at what it is measured to use once settled, else at its whole grant.
+    const usage = st.readUsage(a);
+    var placed: std.ArrayList(policy.Placed) = .empty;
+    for (state.scanLeases(st, a, false) catch &.{}) |l| {
+        const cpus = policy.cpuList(a, l.record.cpus) catch continue;
+        const u = usage.get(l.name) orelse policy.Use{};
+        const settled = u.at_ms != 0 and now - l.record.since >= ctx.cfg.settle_s;
+        placed.append(a, .{ .cpus = cpus, .use = if (settled) u.avg else @floatFromInt(l.record.cores) }) catch break;
+    }
+    return policy.cpuListText(a, policy.pickCpus(a, online, placed.items, cores) catch return "");
+}
+
 /// Takes the grant: writes the lease, leaves the queue, and logs the start.
 /// Call with the admission lock held; returns with it released.
 fn admitted(ctx: *Ctx, st: *state.State, o: RunOptions, rec: *state.Record, grant: state.Grant, ticket: Io.File, ticket_name: []const u8, job: JobLog, now: i64, ahead: bool) Lease {
@@ -490,6 +512,7 @@ fn admitted(ctx: *Ctx, st: *state.State, o: RunOptions, rec: *state.Record, gran
     rec.cores = @intCast(grant.files.len);
     rec.slots = grant.slotText(ctx.arena);
     rec.since = now;
+    rec.cpus = jobCpus(ctx, st, o, rec.cores, now);
     // The lease is named by the ticket number; should a live job hold that
     // name anyway, take a fresh number rather than wait.
     var lease_name: []const u8 = undefined;

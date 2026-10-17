@@ -348,6 +348,9 @@ pub fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8
         const flags = policy.makeflags(ctx.arena, ctx.env.get("MAKEFLAGS"), pipe[0], pipe[1]) catch fail("out of memory", .{});
         ctx.env.put("MAKEFLAGS", flags) catch fail("out of memory", .{});
     }
+    // The CPUs the job is confined to: a `cpuq run` inside it, a job of its own, takes the
+    // machine's CPUs for its own, not these (sys.activeCpus).
+    if (lease.record.cpus.len != 0) ctx.env.put("CPUQ_CPUS", lease.record.cpus) catch fail("out of memory", .{});
     const envp = ctx.env.createPosixBlock(ctx.arena, .{}) catch fail("out of memory", .{});
 
     const argv = ctx.arena.allocSentinel(?[*:0]const u8, o.cmd.len, null) catch fail("out of memory", .{});
@@ -368,7 +371,8 @@ pub fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8
     const weighted: ?[*:null]const ?[*:0]const u8 = if (o.lease == null and !lease.record.exclusive and (ctx.cfg.cpu_weights or ctx.cfg.cgroups)) weightedArgv(ctx, exe, argv, k, lease.name) else null;
     // Where that scope's cgroup is: when the command ends, whatever it left in it is stopped.
     const scope_dir: ?[:0]const u8 = if (weighted != null) ctx.arena.printSentinel("/sys/fs/cgroup/user.slice/user-{d}.slice/user@{d}.service/app.slice/cpuq-{s}-{d}.scope", .{ std.c.getuid(), std.c.getuid(), lease.name, sys.getpid() }, 0) catch null else null;
-    const spawned = if (weighted) |wv| sys.spawn(wv[0].?, wv, @ptrCast(envp.slice.ptr), qos) else sys.spawn(exe, argv.ptr, @ptrCast(envp.slice.ptr), qos);
+    const cpus = policy.cpuList(ctx.arena, lease.record.cpus) catch &.{};
+    const spawned = if (weighted) |wv| sys.spawn(wv[0].?, wv, @ptrCast(envp.slice.ptr), qos, .{ .cpus = cpus }) else sys.spawn(exe, argv.ptr, @ptrCast(envp.slice.ptr), qos, .{ .cpus = cpus });
     if (pipe[0] >= 0) sys.closeFd(pipe[0]);
     if (pipe[1] >= 0) sys.closeFd(pipe[1]);
     const waited: sys.Waited = if (spawned) |pid| blk: {
