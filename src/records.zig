@@ -152,7 +152,7 @@ pub fn cmdRecord(ctx: *Ctx, args: []const [:0]const u8) u8 {
         const m = machine(ctx);
         const g = policy.gate(ctx.cfg, m, budgetNow(ctx, m), null, now);
         line.print(a, "],\"load\":{d:.2},\"held\":{d},\"wait\":{d},\"gate\":\"{t}\"}}\n", .{ sys.loadAverage()[0], held, queue.len, g }) catch continue;
-        appendSample(io, path, line.items);
+        history.appendLine(io, path, line.items, samples_rotate_bytes);
         if (n % 20 == 19) {
             if (exe) |e| {
                 const now_mtime: i96 = if (cwd.statFile(io, e, .{})) |s2| s2.mtime.nanoseconds else |_| 0;
@@ -164,27 +164,6 @@ pub fn cmdRecord(ctx: *Ctx, args: []const [:0]const u8) u8 {
             reloadConfig(ctx);
         }
     }
-}
-
-/// Appends one sample, rotating the file to .1 past samples_rotate_bytes; a whole line goes in
-/// one write, so a reader never sees half of one.
-fn appendSample(io: Io, path: []const u8, line: []const u8) void {
-    const cwd = Io.Dir.cwd();
-    if (cwd.statFile(io, path, .{})) |st| {
-        if (st.size > samples_rotate_bytes) {
-            var buf: [1024]u8 = undefined;
-            const old = std.mem.print(&buf, "{s}.1", .{path}) catch return;
-            cwd.rename(path, cwd, old, io) catch {};
-        }
-    } else |_| {}
-    var pbuf: [1024]u8 = undefined;
-    if (path.len >= pbuf.len) return;
-    @memcpy(pbuf[0..path.len], path);
-    pbuf[path.len] = 0;
-    const fd = std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o644));
-    if (fd < 0) return;
-    defer _ = std.c.close(fd);
-    _ = std.c.write(fd, line.ptr, line.len);
 }
 
 /// Whether a recorder holds the samples lock now.

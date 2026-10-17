@@ -2,6 +2,7 @@
 const std = @import("std");
 const Io = std.Io;
 const policy = @import("policy.zig");
+const hook = @import("hook.zig");
 
 const main = @import("main.zig");
 
@@ -79,7 +80,7 @@ pub fn parseRun(args: []const [:0]const u8) ?RunOptions {
             name = kv[0];
             inline_value = kv[1];
         }
-        const takes_value = for ([_][]const u8{ "--cores", "--priority", "--label", "--note", "--max-wait", "--qos", "--host", "--slots", "--return", "--on", "--include", "--repo" }) |v| {
+        const takes_value = for (hook.run_value_options) |v| {
             if (std.mem.eql(u8, name, v)) break true;
         } else false;
         var value: []const u8 = "";

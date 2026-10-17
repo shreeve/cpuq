@@ -174,7 +174,7 @@ pub fn cmdDoctor(ctx: *Ctx, args: []const [:0]const u8) u8 {
     for (queue) |e| {
         const r = e.record;
         const who = if (r.label.len != 0) r.label else r.cmd;
-        if (!r.exclusive and r.cores > @max(cpus / 2, 1)) {
+        if (!r.exclusive and r.cores > hook.maxAsk(cpus)) {
             found += 1;
             w.print("warn    {s} (pid {d}) asks for at least {d} cores on {d} CPUs: it waits for a nearly empty machine; ask for a range such as --cores 2-6\n", .{ who, r.pid, r.cores, cpus }) catch {};
         }
