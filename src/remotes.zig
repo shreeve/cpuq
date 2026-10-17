@@ -460,7 +460,7 @@ pub fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
     for (o.cmd, 0..) |arg, i| cargv[i] = arg.ptr;
 
     sys.installForwarding();
-    const waited: sys.Waited = if (sys.spawn(exe, cargv.ptr, @ptrCast(envp.slice.ptr), .unchanged, &.{})) |pid| blk: {
+    const waited: sys.Waited = if (sys.spawn(exe, cargv.ptr, @ptrCast(envp.slice.ptr), .unchanged, .{})) |pid| blk: {
         sys.setChild(pid);
         break :blk sys.waitChild(pid);
     } else |err| blk: {

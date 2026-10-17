@@ -372,7 +372,7 @@ pub fn runAdmitted(ctx: *Ctx, st: *state.State, o: RunOptions, exe: [:0]const u8
     // Where that scope's cgroup is: when the command ends, whatever it left in it is stopped.
     const scope_dir: ?[:0]const u8 = if (weighted != null) ctx.arena.printSentinel("/sys/fs/cgroup/user.slice/user-{d}.slice/user@{d}.service/app.slice/cpuq-{s}-{d}.scope", .{ std.c.getuid(), std.c.getuid(), lease.name, sys.getpid() }, 0) catch null else null;
     const cpus = policy.cpuList(ctx.arena, lease.record.cpus) catch &.{};
-    const spawned = if (weighted) |wv| sys.spawn(wv[0].?, wv, @ptrCast(envp.slice.ptr), qos, cpus) else sys.spawn(exe, argv.ptr, @ptrCast(envp.slice.ptr), qos, cpus);
+    const spawned = if (weighted) |wv| sys.spawn(wv[0].?, wv, @ptrCast(envp.slice.ptr), qos, .{ .cpus = cpus }) else sys.spawn(exe, argv.ptr, @ptrCast(envp.slice.ptr), qos, .{ .cpus = cpus });
     if (pipe[0] >= 0) sys.closeFd(pipe[0]);
     if (pipe[1] >= 0) sys.closeFd(pipe[1]);
     const waited: sys.Waited = if (spawned) |pid| blk: {

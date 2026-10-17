@@ -25,7 +25,7 @@ pub const Config = struct {
     cores: u32 = 1,
     delay: Delay = .none,
     stopped: bool = false,
-    /// When it was submitted (its stamp), in ms: ties go to the oldest.
+    /// When it was submitted: its stamp as a number (20261017112241); ties go to the oldest.
     since: i64 = 0,
     /// CPU ÷ wall per task from history, until its own tasks say.
     d: f64 = 1,
@@ -157,6 +157,12 @@ pub const Pool = struct {
         try j.known.put(p.gpa, owned, {});
     }
 
+    /// Whether a task is queued or running already, so a rescan reads only what is new.
+    pub fn knows(p: *const Pool, name: []const u8, task: []const u8) bool {
+        const j = p.jobs.getPtr(name) orelse return false;
+        return j.known.contains(task);
+    }
+
     /// Each second: moves the count toward the load target.
     pub fn tick(p: *Pool, now: i64, s: Sample) void {
         const b = @max(0.5, 0.05 * s.target);
@@ -264,20 +270,27 @@ pub const Pool = struct {
         }
     }
 
-    /// A base died: its running tasks go back to the front of todo/ (they didn't fail). True
-    /// means restart it; false, it died twice with no task finished between, so stop the job.
-    pub fn baseDied(p: *Pool, name: []const u8) !bool {
+    /// A base died: its running tasks are let go, and come back as the driver's sweep returns
+    /// their files from live/ to todo/ (they didn't fail). True means restart it; false, it died
+    /// twice with no task finished between, so stop the job.
+    pub fn baseDied(p: *Pool, name: []const u8) bool {
         const j = p.jobs.getPtr(name) orelse return false;
-        var back: std.ArrayList([]const u8) = .empty;
-        defer back.deinit(p.gpa);
         for (j.slots.items) |*slot| if (slot.*) |run| {
-            try back.append(p.gpa, run.task);
+            _ = j.known.remove(run.task);
             slot.* = null;
         };
         j.running = 0;
-        try j.todo.insertSlice(p.gpa, j.head, back.items);
         j.deaths += 1;
         return j.deaths < 2;
+    }
+
+    /// A started task that never ran (its file was gone): its slot is free, nothing learned.
+    pub fn dropped(p: *Pool, name: []const u8, slot: u32) void {
+        const j = p.jobs.getPtr(name) orelse return;
+        const run = j.slots.items[slot - 1] orelse return;
+        j.slots.items[slot - 1] = null;
+        j.running -= 1;
+        _ = j.known.remove(run.task);
     }
 
     /// Running workers, in all.
@@ -475,7 +488,7 @@ test "tasks of 1 GiB stop at free memory" {
     try testing.expect(most >= 3 and most <= 8);
 }
 
-test "a build counts as its cores; a stopped job gets no picks; a base's death requeues" {
+test "a build counts as its cores; a stopped job gets no picks; a base's death lets go" {
     var p: Pool = .init(testing.allocator);
     defer p.deinit();
     var prng: std.Random.DefaultPrng = .init(2);
@@ -493,10 +506,14 @@ test "a build counts as its cores; a stopped job gets no picks; a base's death r
     while (try p.next(0, prng.random())) |_| {}
     try testing.expectEqual(6, p.units());
     try testing.expectEqual(2, p.running("pool"));
-    // Its base died: both back to todo/, front first; a second death with none finished stops it.
-    try testing.expect(try p.baseDied("pool"));
-    try testing.expectEqual(10, p.left("pool"));
-    try testing.expect(!try p.baseDied("pool"));
+    // Its base died: both let go, and known no more, so the sweep's return adds them again; a
+    // second death with none finished stops it.
+    const slot1 = p.jobs.getPtr("pool").?.slots.items[0].?.task;
+    try testing.expect(p.baseDied("pool"));
+    try testing.expectEqual(0, p.running("pool"));
+    try p.add("pool", slot1);
+    try testing.expectEqual(9, p.left("pool"));
+    try testing.expect(!p.baseDied("pool"));
     try p.configure("pool", .{ .since = 1, .stopped = true });
     p.count = 100;
     try testing.expectEqual(null, try p.next(0, prng.random()));

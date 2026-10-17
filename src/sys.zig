@@ -114,6 +114,29 @@ pub fn loadAverage() [3]f64 {
     return l;
 }
 
+extern "c" fn processor_set_default(host: c_uint, set: *c_uint) c_int;
+extern "c" fn processor_set_statistics(set: c_uint, flavor: c_int, info: *[4]c_int, count: *c_uint) c_int;
+var processor_set: c_uint = 0;
+
+/// Threads runnable now, the caller's own included: Linux the running count in /proc/loadavg
+/// (field 4, before the slash); macOS the scheduler's load (PROCESSOR_SET_LOAD_INFO, which
+/// follows a change within half a second and needs no privilege). Null when unreadable.
+pub fn runnable(io: Io) ?f64 {
+    if (is_darwin) {
+        if (processor_set == 0 and processor_set_default(mach_host_self(), &processor_set) != 0) return null;
+        var info: [4]c_int = undefined; // task_count, thread_count, load_average, mach_factor
+        var count: c_uint = info.len;
+        if (processor_set_statistics(processor_set, 4, &info, &count) != 0) return null; // PROCESSOR_SET_LOAD_INFO
+        return @as(f64, @floatFromInt(info[2])) / 1000; // LOAD_SCALE
+    }
+    var buf: [128]u8 = undefined;
+    const text = Io.Dir.cwd().readFile(io, "/proc/loadavg", &buf) catch return null;
+    var f = std.mem.tokenizeScalar(u8, text, ' ');
+    for (0..3) |_| _ = f.next();
+    const running = std.mem.sliceTo(f.next() orelse return null, '/');
+    return @floatFromInt(std.fmt.parseInt(u32, running, 10) catch return null);
+}
+
 extern "c" fn mach_host_self() c_uint;
 extern "c" fn host_statistics(host: c_uint, flavor: c_int, info: [*]c_uint, count: *c_uint) c_int;
 
@@ -397,19 +420,33 @@ pub fn inherit(fd: c.fd_t) void {
 
 pub const SpawnError = error{ SpawnFailed, AccessDenied, FileNotFound };
 
+pub const SpawnOpts = struct {
+    /// Linux: the CPUs the command is confined to; empty leaves its affinity as it is.
+    cpus: []const u32 = &.{},
+    /// Descriptors the command gets: each `.{ from, to }` is `from` duplicated onto `to`, in
+    /// order (the same number twice: kept open across exec).
+    dups: []const [2]c.fd_t = &.{},
+    /// Where it starts; null: here.
+    dir: ?[*:0]const u8 = null,
+};
+
 /// Starts `path` with an empty signal mask, in the given scheduling class.
 pub fn spawn(
     path: [*:0]const u8,
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
     qos: policy.Qos,
-    /// Linux: the CPUs the command is confined to; empty leaves its affinity as it is.
-    cpus: []const u32,
+    o: SpawnOpts,
 ) SpawnError!c.pid_t {
     if (is_darwin) {
         var attr: c.posix_spawnattr_t = undefined;
         if (c.posix_spawnattr_init(&attr) != 0) return error.SpawnFailed;
         defer _ = c.posix_spawnattr_destroy(&attr);
+        var acts: c.posix_spawn_file_actions_t = undefined;
+        if (c.posix_spawn_file_actions_init(&acts) != 0) return error.SpawnFailed;
+        defer _ = c.posix_spawn_file_actions_destroy(&acts);
+        for (o.dups) |d| _ = if (d[0] == d[1]) c.posix_spawn_file_actions_addinherit_np(&acts, d[0]) else c.posix_spawn_file_actions_adddup2(&acts, d[0], d[1]);
+        if (o.dir) |dir| _ = c.posix_spawn_file_actions_addchdir_np(&acts, dir);
         const empty: c.sigset_t = 0;
         _ = posix_spawnattr_setsigmask(&attr, &empty);
         _ = c.posix_spawnattr_setflags(&attr, .{ .SETSIGMASK = true });
@@ -420,7 +457,7 @@ pub fn spawn(
             .niced => {},
         }
         var pid: c.pid_t = 0;
-        return switch (c.posix_spawn(&pid, path, null, &attr, argv, envp)) {
+        return switch (c.posix_spawn(&pid, path, &acts, &attr, argv, envp)) {
             0 => blk: {
                 // posix_spawn sets no nice value: set it on the child at once,
                 // before it has time to start others, which inherit it.
@@ -440,14 +477,16 @@ pub fn spawn(
     };
     var set: std.os.linux.cpu_set_t = @splat(0);
     const bits = @bitSizeOf(usize);
-    for (cpus) |cpu| if (cpu < set.len * bits) {
+    for (o.cpus) |cpu| if (cpu < set.len * bits) {
         set[cpu / bits] |= @as(usize, 1) << @intCast(cpu % bits);
     };
     const pid = c.fork();
     if (pid < 0) return error.SpawnFailed;
     if (pid == 0) {
         // Before exec, so the command's first thread, and all it starts, see only these.
-        if (cpus.len != 0) _ = std.os.linux.syscall3(.sched_setaffinity, 0, @sizeOf(std.os.linux.cpu_set_t), @intFromPtr(&set));
+        if (o.cpus.len != 0) _ = std.os.linux.syscall3(.sched_setaffinity, 0, @sizeOf(std.os.linux.cpu_set_t), @intFromPtr(&set));
+        for (o.dups) |d| _ = if (d[0] == d[1]) c.fcntl(d[0], c.F.SETFD, @as(c_int, 0)) else c.dup2(d[0], d[1]);
+        if (o.dir) |dir| if (c.chdir(dir) != 0) c._exit(126);
         var empty: c.sigset_t = undefined;
         _ = c.sigemptyset(&empty);
         _ = c.sigprocmask(c.SIG.SETMASK, &empty, null);
@@ -680,6 +719,18 @@ pub fn reapChild(pid: c.pid_t) ?Waited {
     return waitFor(pid, false);
 }
 
+/// Any child that has ended, without waiting: its pid and how it ended; null when none has.
+pub fn reapAny() ?struct { c.pid_t, Waited } {
+    var status: c_int = 0;
+    var ru: c.rusage = undefined;
+    while (true) {
+        const r = c.wait4(-1, &status, 1, &ru); // WNOHANG = 1
+        if (r > 0) return .{ r, waited(status, ru) };
+        if (r < 0 and c.errno(r) == .INTR) continue;
+        return null;
+    }
+}
+
 fn waitFor(pid: c.pid_t, block: bool) ?Waited {
     var status: c_int = 0;
     var ru: c.rusage = undefined;
@@ -690,6 +741,10 @@ fn waitFor(pid: c.pid_t, block: bool) ?Waited {
         if (r < 0 and c.errno(r) == .INTR) continue;
         return .{ .exit = .{ .code = 125 } };
     }
+    return waited(status, ru);
+}
+
+fn waited(status: c_int, ru: c.rusage) Waited {
     const cpu_s = seconds(ru.utime) + seconds(ru.stime);
     // maxrss is in bytes on macOS, kilobytes on Linux.
     const rss: u64 = @intCast(@max(ru.maxrss, 0));

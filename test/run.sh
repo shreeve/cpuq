@@ -2254,6 +2254,69 @@ t_min_disk() {
   check "under min_disk nothing starts (rc $rc, gate $got, '$text'); above it, it does (rc $rc2)" "[ $rc = 75 ] && [ '$got' = 'low_disk with-free with-path' ] && [[ '$text' == *'disk low'* ]] && [ $rc2 = 0 ]"
 }
 
+# mkjob JOB N BASE-LINES...: a job with one stamp and N empty tasks t1..tN under $CPUQ_JOBS;
+# J is its stamp dir.
+mkjob() {
+  local job=$1 n=$2 i; shift 2
+  J=$CPUQ_JOBS/$job/20261017-120000
+  mkdir -p "$J/todo" "$J/live" "$J/done" "$J/died"
+  printf '%s\n' "$@" > "$J/base"
+  for i in $(seq 1 "$n"); do : > "$J/todo/t$i"; done
+}
+count() { ls "$1" | wc -l | tr -d ' '; }
+
+t_driver() {
+  # The driver runs each task once under cap: its record holds a start and an end line with the
+  # status, and the file goes to done/ or, failed, to died/; the task sees its slot and the job.
+  setup driver; export CPUQ_JOBS=$T/jobs
+  mkjob e2e 12 'cmd: ["sh", "-c", "echo \"slot=$CPUQ_SLOT job=$CPUQ_JOB cores=$CPUQ_CORES\"; case $0 in */t3|*/t7) exit 3;; esac"]' 'max: 4'
+  timeout 60 "$CPUQ" driver --until-done --load 1000 2>"$T/err"; local rc=$?
+  local rec; rec=$(sed 1d "$J/died/t3")
+  check "the driver ends with every task run (rc $rc): 10 done, 2 died, none left ($(count "$J/done") $(count "$J/died") $(count "$J/todo") $(count "$J/live"))" \
+    "[ $rc = 0 ] && [ $(count "$J/done") = 10 ] && [ $(count "$J/died") = 2 ] && [ $(count "$J/todo") = 0 ] && [ $(count "$J/live") = 0 ]"
+  check "a task's record has its start, its output and its end (got '$rec')" \
+    "[[ '$rec' == '==cpuq== start '*' attempt 1 slot '[0-3]$'\n'slot=[0-3]' job=e2e cores='*'==cpuq== end status 3 wall '* ]]"
+  unset CPUQ_JOBS
+}
+
+t_driver_qos() {
+  # A task runs at the base's QoS (utility on macOS), not the caller's.
+  setup driver-qos; export CPUQ_JOBS=$T/jobs
+  mkjob q 1 "cmd: [\"sh\", \"-c\", \"'$CPUQ' qos\"]"
+  timeout 30 "$CPUQ" driver --until-done --load 1000 2>"$T/err"
+  local got; got=$(sed -n 3p "$J/done/t1")
+  if [ "$(uname)" = Darwin ]; then check "a task runs at utility QoS (got '$got')" "[ '$got' = utility ]"
+  else check "a task's qos is readable (got '$got')" "[ -n '$got' ]"; fi
+  unset CPUQ_JOBS
+}
+
+# driver_kill WHAT: kill -9 the driver, the base's cap or the base once 4 of 12 two-second tasks
+# run, then (the driver killed) start it again; prints rc, done, begins, ends.
+driver_kill() {
+  mkjob k 12 "cmd: [\"sh\", \"-c\", \"echo begin >> $T/runs; sleep 2; echo end >> $T/runs\"]" 'max: 4'
+  "$CPUQ" driver --until-done --load 1000 2>>"$T/err" & local d=$!
+  local i; for i in $(seq 1 50); do [ "$(grep -c begin "$T/runs" 2>/dev/null)" = 4 ] && break; sleep 0.1; done
+  local cap; cap=$(pgrep -P $d); local base; base=$(pgrep -P "$cap")
+  case $1 in driver) kill -9 $d;; cap) kill -9 "$cap";; base) kill -9 "$base";; esac
+  wait $d; local rc=$?
+  if [ "$1" = driver ]; then timeout 60 "$CPUQ" driver --until-done --load 1000 2>>"$T/err"; rc=$?; fi
+  echo "$rc $(count "$J/done") $(grep -c begin "$T/runs") $(grep -c end "$T/runs") $(grep -c 'attempt 2' "$J"/done/* | grep -vc ':0$')"
+}
+
+t_driver_kill() {
+  # Whatever is killed, the tasks it was running end with it (a link only the base holds), and the
+  # sweep runs them again: each task ends once, and each of the 4 out runs again (one sent but not
+  # yet started began only then); nothing finished runs twice.
+  local what got rc done begins ends reruns
+  for what in driver cap base; do
+    setup driver-kill-$what; export CPUQ_JOBS=$T/jobs
+    got=$(driver_kill $what); read -r rc done begins ends reruns <<<"$got"
+    check "kill -9 the $what: every task done once, the 4 cut short run again (rc done begins ends reruns: $got)" \
+      "[ $rc = 0 ] && [ $done = 12 ] && [ $ends = 12 ] && [ $reruns = 4 ] && [ $begins -ge 13 ] && [ $begins -le 16 ]"
+    unset CPUQ_JOBS
+  done
+}
+
 t_status() {
   setup status
   "$CPUQ" run --cores 4 --label build -- sleep 1.5 & wait_held 4
@@ -2270,7 +2333,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity job_affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cap_link cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_needs submit_mem submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
+TESTS=${*:-budget affinity job_affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cap_link cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_needs submit_mem submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean driver driver_qos driver_kill status}
 for t in $TESTS; do
   if declare -F "t_$t" >/dev/null; then "t_$t"; else echo "no such test: $t"; FAIL=$((FAIL+1)); FAILED+=" $t?"; fi
 done

@@ -431,9 +431,12 @@ fn treeMem() u64 {
     return total;
 }
 
-/// Stops everything below this process: freezes the tree so it can't grow while it is walked,
-/// kills it, and repeats until a walk finds nothing; then the program's group, for what left it.
+/// Stops everything below this process: the program's group first, in one step (a cap killed
+/// partway through a walk would leave what it had stopped stopped for good); then it freezes
+/// what is left so it can't grow while it is walked, kills it, and repeats until a walk finds
+/// nothing; then the group again, for what left the tree.
 fn killTree(pgid: c.pid_t) void {
+    if (pgid > 0) _ = c.kill(-pgid, .KILL);
     var round: usize = 0;
     while (round < 20) : (round += 1) {
         const n = descendants(sys.getpid(), &tree_buf);
