@@ -122,7 +122,7 @@ the `--opaque` jobs together count for the machine's busy CPUs that nothing meas
 where a container's work on this machine still shows, shared by their grants: each at least what
 its own processes are seen to use and at most its grant. Work outside cpuq counts there too, so it
 errs toward counting them whole; an idle container, or a job marked `--opaque` whose work cpuq
-can see anyway (a qemu it starts itself), no longer holds the queue behind idle CPUs. It is never
+can see anyway (a qemu it starts itself), doesn't hold the queue behind idle CPUs. It is never
 started inside a lending timing window (it couldn't be frozen), and `cpuq pause`/`stop` say they
 reach only the command cpuq started. A VM or program cpuq starts as a child is no container: leave
 `--opaque` off, and it is measured as it is.
@@ -352,8 +352,10 @@ their actions on right-click; and `cpuq history` summed by project. Every sectio
 While the window is open it is an ordinary app (Dock icon, menu bar, ⌘Tab); closed, only its
 menu bar chip remains, which stays calm while all is well, turns orange when the gate is shut or
 jobs wait beside idle CPUs, and shows ☁ with uptime and this month's hours while a cloud machine
-runs. It notifies, once each, when the gate stays shut, jobs keep waiting beside idle CPUs, or a
-cloud machine sits idle and billing. It only reads `cpuq status`, `history` and `samples`.
+runs. It notifies, once each, when the gate stays shut, jobs wait beside idle CPUs, `--opaque`
+jobs hold cores while others wait, heavy work runs outside cpuq, a job looks stuck, a machine is
+overloaded while another has room, or a cloud machine sits idle and billing; the urgent ones are
+also texted. It reads `cpuq status`, `history` and `samples`, and runs the job actions you pick.
 Install it with `brew install --cask shreeve/tap/cpuq-app`.
 
 ## Waiting and order

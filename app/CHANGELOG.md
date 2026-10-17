@@ -3,8 +3,10 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
-## 0.20.2 — 2026-10-17
+## 0.21.0 — 2026-10-17
 
+- Needs cpuq 0.28.0 or later: job actions and Live View are always offered, with no check of
+  cpuq's version.
 - The window's pages for other machines come from cpuq 0.28's `remotes` and `remote_start.HOST`
   config keys, which replace `spill` and `spill_start.HOST`. The overload notice suggests
   `cpuq run --on HOST`, since `cpuq run --spill` is gone.
