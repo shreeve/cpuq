@@ -11,6 +11,10 @@ ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cpuq-test.XXXXXX")
 # On exit, end every process the tests started, children's children
 # included, so none outlives the run holding its output open.
 killtree() { local p; for p in $(pgrep -P "$1"); do killtree "$p"; kill "$p" 2>/dev/null; done; }
+# The pids under $1, children's children included, to end by pid once $1 is gone.
+descendants() { local p; for p in $(pgrep -P "$1"); do echo "$p"; descendants "$p"; done; }
+# 0 if a pid in the file $1 still runs.
+alive() { kill -0 "$(cat "$1")" 2>/dev/null; }
 trap 'killtree $$; rm -rf "$ROOT"' EXIT
 PASS=0
 FAIL=0
@@ -183,15 +187,14 @@ t_kill_cpuq_only() {
 
 t_leaked_descendant() {
   setup leaked-descendant
-  # A distinctive duration, so the cleanup below can only match this one.
-  "$CPUQ" run --cores 9 -- sh -c 'sleep 30.417 >/dev/null 2>&1 & exit 0'
+  "$CPUQ" run --cores 9 -- sh -c 'sleep 30.417 >/dev/null 2>&1 & echo $! >"$1"; exit 0' sh "$T/bg"
   local h; h=$(held)
   local t0; t0=$(now)
   "$CPUQ" run --cores 9 -- true; local rc=$?
   local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
   echo "  after the command exits leaving 'sleep 30.417' behind: held $h; next run took ${dt}s"
   check "a background descendant does not keep the cores" "[ '$h' = 0 ] && [ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if $dt < 1 else 1)'"
-  pkill -f '^sleep 30.417$' 2>/dev/null
+  kill "$(cat "$T/bg")" 2>/dev/null
 }
 
 t_kill_waiter() {
@@ -622,12 +625,13 @@ t_lease_host() {
   check "a --host lease inside the same one starts at once (${dt}s, '$inner')" "[ '$inner' = inner ] && python3 -c 'import sys; sys.exit(0 if $dt < 2 else 1)'"
   PATH="$bin:$PATH" "$CPUQ" lease bench --host far -- sleep 30 & local p=$!
   wait_lease_holder bench
+  local kids; kids=$(descendants $p)
   t0=$(now)
   kill -9 $p
   "$CPUQ" lease bench --max-wait 5 -- true; local rc=$?
   dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
   check "a killed --host holder frees the remote lease at once (exit $rc after ${dt}s)" "[ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if $dt < 2 else 1)'"
-  pkill -f "$T" 2>/dev/null
+  kill $kids 2>/dev/null
   "$CPUQ" lease bench -- sleep 2 & wait_lease_holder bench
   PATH="$bin:$PATH" "$CPUQ" lease bench --host far --max-wait 1 -- true 2>/dev/null; rc=$?
   check "--max-wait on a --host lease gives 75 (got $rc)" "[ $rc = 75 ]"
@@ -666,7 +670,8 @@ spin(); os.wait()'
   wait
   "$CPUQ" run --label h:crash -- sleep 30.583 & local p=$!
   wait_held 2
-  kill -9 $p; pkill -f '^sleep 30.583$' 2>/dev/null; sleep 0.2
+  local kids; kids=$(descendants $p)
+  kill -9 $p; kill $kids 2>/dev/null; sleep 0.2
   local got; got=$("$CPUQ" history --json | python3 -c 'import json, sys
 j = {x["label"]: x for x in json.load(sys.stdin)}
 b = j["h:build"]
@@ -1025,10 +1030,8 @@ t_cap() {
   "$CPUQ" cap --output 1K -- sh -c 'head -c 100000 /dev/zero; sleep 10' >"$T/out" 2>"$T/err"; local rc_out=$?
   "$CPUQ" cap --output 1K -- true 2>/dev/null | cat; local rc_pipe=${PIPESTATUS[0]}
   "$CPUQ" cap -- sh -c 'kill -TERM $$'; local rc_sig=$?
-  # A duration no other session's process has, so the check can't see theirs.
-  local nap="77.$$"
-  "$CPUQ" cap --mem 1G -- sh -c "sleep $nap & exit 0"; sleep 0.3
-  local left=0; pgrep -f "^sleep $nap\$" >/dev/null && left=1
+  "$CPUQ" cap --mem 1G -- sh -c 'sleep 77 & echo $! >"$1"; exit 0' sh "$T/bg"; sleep 0.3
+  local left=0; alive "$T/bg" && left=1
   check "cap passes the exit on (7: $rc_exit), not found 127 ($rc_missing), time 124 ($rc_time after ${dt}s), memory 122 ($rc_mem; escaped the group: $rc_escaped), output 121 ($rc_out), a pipe refused 2 ($rc_pipe), a signal as itself 143 ($rc_sig), nothing left behind ($left)" "[ $rc_exit = 7 ] && [ $rc_missing = 127 ] && [ $rc_time = 124 ] && python3 -c 'import sys; sys.exit(0 if $dt < 3 else 1)' && [ $rc_mem = 122 ] && [ $rc_escaped = 122 ] && [ $rc_out = 121 ] && [ $rc_pipe = 2 ] && [ $rc_sig = 143 ] && [ $left = 0 ]"
 }
 
@@ -1073,9 +1076,8 @@ t_cgroups() {
   local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
   check "a job runs in its scope's job/ with CPUQ_CGROUP and memory for its children (got $got); a cap there is stopped by the kernel ($rc after ${dt}s)" "[[ '$got' == *'.scope/job /sys/fs/cgroup/'*'.scope '*memory* ]] && [ $rc = 122 ] && python3 -c 'import sys; sys.exit(0 if $dt < 0.9 else 1)'"
   # What a job leaves running in its scope is stopped when its command ends.
-  local nap="88.$$"
-  "$CPUQ" run --cores 1 --label leaver -- sh -c "sleep $nap >/dev/null 2>&1 & exit 0"; sleep 0.5
-  local left=0; pgrep -f "^sleep $nap\$" >/dev/null && left=1
+  "$CPUQ" run --cores 1 --label leaver -- sh -c 'sleep 88 >/dev/null 2>&1 & echo $! >"$1"; exit 0' sh "$T/bg"; sleep 0.5
+  local left=0; alive "$T/bg" && left=1
   check "what a job leaves running in its scope is stopped when it ends (left: $left)" "[ $left = 0 ]"
   # A command's own ${...} reaches its shell untouched: systemd-run (254 and later) would expand it.
   local lit; lit=$("$CPUQ" run --cores 1 --label literal -- sh -c 'x=abc/job; echo "${x%/job}"' 2>&1)
@@ -2139,7 +2141,9 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
 }
 
 TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk gone on include_git on_check on_gitignore tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
-for t in $TESTS; do "t_$t"; done
+for t in $TESTS; do
+  if declare -F "t_$t" >/dev/null; then "t_$t"; else echo "no such test: $t"; FAIL=$((FAIL+1)); FAILED+=" $t?"; fi
+done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"
-[ $FAIL = 0 ]
+[ $FAIL = 0 ] && [ $PASS != 0 ]
