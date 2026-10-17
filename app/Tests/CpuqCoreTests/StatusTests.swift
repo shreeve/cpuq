@@ -46,6 +46,7 @@ import Testing
     #expect(j.pid == 42 && j.cores == 10 && j.using == 6.6 && j.label == "rig:corpus")
     #expect(j.progress == Status.Progress(done: 2902, total: 10912, failing: 2))
     #expect(j.left == 1230.5 && j.leftFrom == "progress" && !j.paused)
+    #expect(j.job == "/s/jobs/rig.corpus/20261017-193458" && j.weight == 1 && s.holders[0].weight == nil)
 }
 
 @Test func decodesAStatusWithFieldsMissing() throws {

@@ -62,6 +62,10 @@ public struct Status: Decodable, Sendable, Equatable {
         public var leftFrom = ""
         /// Its label's usual run time, in seconds, from history.
         public var typical: Double?
+        /// A job's folder (`cpuq jobs`): its actions run there, and its cores are its workers.
+        public var job: String?
+        /// A job's weight: its share of the machine against the other jobs'.
+        public var weight: Double?
     }
 
     /// A job's own count: `DONE TOTAL FAILING`.
@@ -93,6 +97,7 @@ public struct Status: Decodable, Sendable, Equatable {
         public var pid = 0
         public var state = ""
         public var workers = 0
+        public var weight = 1.0
         public var todo = 0
         public var live = 0
         public var done = 0
@@ -110,6 +115,8 @@ public struct Status: Decodable, Sendable, Equatable {
             h.using = using
             h.label = name.replacingOccurrences(of: ".", with: ":", options: [], range: name.range(of: "."))
             h.command = path
+            h.job = path
+            h.weight = weight
             h.since = since
             h.progress = Progress(done: done + fail, total: todo + live + done + fail, failing: fail)
             h.left = left
