@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const c = std.c;
 const Io = std.Io;
 const sys = @import("sys.zig");
+const policy = @import("policy.zig");
 const lines = @import("lines.zig");
 const table = @import("table.zig");
 const main = @import("main.zig");
@@ -27,6 +28,9 @@ const fail = main.fail;
 const usageError = main.usageError;
 
 pub const folders = [_][:0]const u8{ "todo", "live", "done", "fail" };
+/// A task's scheduling class: a normal job's (on macOS the caller's, so a task may use the
+/// performance cores; nice 5 on Linux).
+const task_qos = policy.qosFor(.normal, false, true);
 /// The death that sends a task to fail/.
 pub const deaths_max = 3;
 /// Each new worker starts this long after the last, give or take half.
@@ -273,6 +277,8 @@ pub const Snap = struct {
     died: u64,
     /// Tasks this run finished (done or failed): the rate.
     finished: u64,
+    /// The driver's pid: its tree is the job's work.
+    pid: i32 = 0,
     lives: []const Live = &.{},
     fails: []const Note = &.{},
 
@@ -280,11 +286,11 @@ pub const Snap = struct {
     pub const Note = struct { name: []const u8, line: []const u8 };
 
     /// `snap NAME STAMP HOST STATE WORKERS WSRC WEIGHT GAP GSRC ELAPSED_MS TODO LIVE DONE FAIL
-    /// DIED FINISHED`, then `live MS NAME` and `fail NAME<tab>LINE` lines, then `end`.
+    /// DIED FINISHED PID`, then `live MS NAME` and `fail NAME<tab>LINE` lines, then `end`.
     pub fn write(s: Snap, w: *Io.Writer) Io.Writer.Error!void {
-        try w.print("snap {s} {s} {s} {s} {d} {t} {d} {d} {t} {d} {d} {d} {d} {d} {d} {d}\n", .{
+        try w.print("snap {s} {s} {s} {s} {d} {t} {d} {d} {t} {d} {d} {d} {d} {d} {d} {d} {d}\n", .{
             s.name,       s.stamp, s.host, s.state, s.workers, s.wsrc, s.weight,   s.gap, s.gsrc,
-            s.elapsed_ms, s.todo,  s.live, s.done,  s.fail,    s.died, s.finished,
+            s.elapsed_ms, s.todo,  s.live, s.done,  s.fail,    s.died, s.finished, s.pid,
         });
         for (s.lives) |l| try w.print("live {d} {s}\n", .{ l.ms, l.name });
         for (s.fails) |f| try w.print("fail {s}\t{s}\n", .{ f.name, f.line });
@@ -309,6 +315,7 @@ pub const Snap = struct {
         inline for (.{ "elapsed_ms", "todo", "live", "done", "fail", "died", "finished" }) |field| {
             @field(s, field) = int(u64, f.next()) orelse return null;
         }
+        s.pid = int(i32, f.next()) orelse return null;
         var lives: std.ArrayList(Live) = .empty;
         var fails: std.ArrayList(Note) = .empty;
         for (text[1..]) |line| {
@@ -752,7 +759,7 @@ const Driver = struct {
             const link = d.print("{d}", .{d.link_r});
             defer d.gpa.free(link);
             const argv = [_:null]?[*:0]const u8{ d.exe, "cap", "--link", link, "--", "/bin/sh", "-c", work };
-            const pid = sys.spawn(d.exe, &argv, @ptrCast(c.environ), .utility, .{
+            const pid = sys.spawn(d.exe, &argv, @ptrCast(c.environ), task_qos, .{
                 .dups = &.{ .{ d.null_fd, 0 }, .{ fd, 1 }, .{ fd, 2 }, .{ d.link_r, d.link_r } },
                 .group = true,
             }) catch {
@@ -894,6 +901,7 @@ const Driver = struct {
             .fail = d.fail,
             .died = d.died,
             .finished = d.finished,
+            .pid = sys.getpid(),
             .lives = lives,
             .fails = d.notes.items,
         };
@@ -1353,6 +1361,54 @@ fn reset(ctx: *Ctx, args: []const [:0]const u8) u8 {
     return 0;
 }
 
+/// The snapshot of the driver running in the folder open at `dir`; null when none answers within
+/// a second.
+pub fn snapAt(a: Allocator, dir: c.fd_t) ?Snap {
+    var conn: lines.Conn = .{ .fd = lines.connect(dir, "jobs.sock") orelse return null };
+    defer conn.deinit(a);
+    lines.nonblock(conn.fd);
+    conn.print(a, "status\n", .{});
+    const deadline = sys.monoMs() + 1000;
+    var got: std.ArrayList([]const u8) = .empty;
+    while (true) {
+        while (conn.next()) |line| {
+            if (std.mem.eql(u8, line, "end")) return Snap.parse(a, got.items);
+            got.append(a, a.dupe(u8, line) catch return null) catch return null;
+        }
+        const left = deadline - sys.monoMs();
+        if (conn.closed or left <= 0) return null;
+        const out: i16 = if (conn.out.items.len > 0) c.POLL.OUT else 0;
+        var pfd = [_]c.pollfd{.{ .fd = conn.fd, .events = c.POLL.IN | out, .revents = 0 }};
+        _ = c.poll(&pfd, 1, @intCast(left));
+        if (pfd[0].revents & c.POLL.OUT != 0) conn.flush();
+        conn.fill(a);
+    }
+}
+
+/// A running job: its folder and its driver's snapshot.
+pub const Running = struct { path: []const u8, snap: Snap };
+
+/// Every job running on this host, by name then stamp.
+pub fn running(io: Io, a: Allocator, env: *const std.process.Environ.Map) []Running {
+    var out: std.ArrayList(Running) = .empty;
+    const state = stateDir(a, env) orelse return &.{};
+    const root = a.print("{s}/jobs", .{state}) catch return &.{};
+    for (subdirs(io, a, root)) |name| {
+        if (!validName(name)) continue;
+        const job_dir = a.print("{s}/{s}", .{ root, name }) catch continue;
+        for (subdirs(io, a, job_dir)) |stamp| {
+            if (!visible(stamp)) continue;
+            const path = a.dupeSentinel(u8, a.print("{s}/{s}", .{ job_dir, stamp }) catch continue, 0) catch continue;
+            const dir = c.open(path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+            if (dir < 0) continue;
+            defer _ = c.close(dir);
+            const s = snapAt(a, dir) orelse continue;
+            out.append(a, .{ .path = path, .snap = s }) catch {};
+        }
+    }
+    return out.items;
+}
+
 /// `cpuq jobs`: every job on this host, its running driver's snapshot or its folders' counts.
 fn listJobs(ctx: *Ctx) u8 {
     const io = ctx.io;
@@ -1376,17 +1432,7 @@ fn listJobs(ctx: *Ctx) u8 {
             const dir = c.open(dir_path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
             if (dir < 0) continue;
             defer _ = c.close(dir);
-            const s: ?Snap = blk: {
-                var conn: lines.Conn = .{ .fd = lines.connect(dir, "jobs.sock") orelse break :blk null };
-                defer _ = c.close(conn.fd);
-                conn.send(a, "status\n", .{});
-                var got: std.ArrayList([]const u8) = .empty;
-                while (conn.wait(a)) |line| {
-                    if (std.mem.eql(u8, line, "end")) break;
-                    got.append(a, a.dupe(u8, line) catch oom()) catch oom();
-                }
-                break :blk Snap.parse(a, got.items);
-            };
+            const s = snapAt(a, dir);
             const cell = struct {
                 fn f(al: Allocator, comptime fmt: []const u8, args: anytype) table.Cell {
                     return .{ .text = std.fmt.allocPrint(al, fmt, args) catch "" };
@@ -1548,6 +1594,7 @@ test "a snapshot reads back as it was written, and renders" {
         .fail = 1,
         .died = 3,
         .finished = 4201,
+        .pid = 4242,
         .lives = &.{ .{ .ms = 12_300, .name = "t 0042" }, .{ .ms = 800, .name = "t0043" } },
         .fails = &.{.{ .name = "t0007", .line = "expected 3, got 4" }},
     };
@@ -1561,6 +1608,7 @@ test "a snapshot reads back as it was written, and renders" {
     try testing.expectEqual(Src.agent, r.wsrc);
     try testing.expectEqual(2.5, r.weight);
     try testing.expectEqual(4201, r.finished);
+    try testing.expectEqual(4242, r.pid);
     try testing.expectEqualStrings("t 0042", r.lives[0].name);
     try testing.expectEqualStrings("expected 3, got 4", r.fails[0].line);
     var view: Io.Writer.Allocating = .init(a);

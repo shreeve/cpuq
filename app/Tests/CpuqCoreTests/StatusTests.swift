@@ -33,6 +33,21 @@ import Testing
     #expect(s.outside.first?.name == "Python")
 }
 
+@Test func listsAJobAmongTheHoldersAtItsWorkers() throws {
+    let json = """
+    {"budget": 10, "held": 5, "holders": [{"pid": 10, "cores": 5, "label": "em:build"}],
+     "jobs": [{"name": "rig.corpus", "stamp": "20261017-193458", "path": "/s/jobs/rig.corpus/20261017-193458",
+               "pid": 42, "state": "running", "workers": 10, "workers_from": "set", "weight": 1, "gap_ms": 0,
+               "todo": 8000, "live": 10, "done": 2900, "fail": 2, "died": 0, "using": 6.6, "since": 100, "left": 1230.5}]}
+    """
+    let s = try Status.decode(Data(json.utf8))
+    #expect(s.holders.count == 2)
+    let j = s.holders[1]
+    #expect(j.pid == 42 && j.cores == 10 && j.using == 6.6 && j.label == "rig:corpus")
+    #expect(j.progress == Status.Progress(done: 2902, total: 10912, failing: 2))
+    #expect(j.left == 1230.5 && j.leftFrom == "progress" && !j.paused)
+}
+
 @Test func decodesAStatusWithFieldsMissing() throws {
     // Each field left out keeps its default.
     let json = """

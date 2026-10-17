@@ -14,6 +14,7 @@ const control = @import("control.zig");
 const records = @import("records.zig");
 const runtimes = @import("runtimes.zig");
 const statusjson = @import("statusjson.zig");
+const jobs_mod = @import("jobs.zig");
 
 const version = main.version;
 const exit_failure = main.exit_failure;
@@ -348,16 +349,18 @@ const sample_ms = 500;
 const Sample = struct {
     /// Cores each lease's command keeps busy; null for one with no command.
     busy: []?f64,
+    /// CPUs each job's driver tree keeps busy, as `drivers` lists them.
+    jobs: []f64 = &.{},
     /// The busiest processes outside every cpuq job, busiest first.
     outside: []JsonOutside = &.{},
     /// CPUs busy outside every cpuq job, all of them (not only the five listed).
     outside_total: f64 = 0,
 };
 
-/// Watches every process for `sample_ms`: what each lease's command tree
-/// keeps busy, and the busiest processes no cpuq job accounts for. Nothing
-/// is sampled when `measure` is off.
-pub fn sample(io: Io, a: std.mem.Allocator, leases: []const state.Entry, measure: bool) Sample {
+/// Watches every process for `sample_ms`: what each lease's command tree and each job's driver
+/// tree keep busy, and the busiest processes no cpuq job accounts for. Nothing is sampled when
+/// `measure` is off.
+pub fn sample(io: Io, a: std.mem.Allocator, leases: []const state.Entry, drivers: []const i32, measure: bool) Sample {
     const busy = nullUsage(a, leases.len);
     if (!measure) return .{ .busy = busy };
     const t0 = Io.Clock.awake.now(io);
@@ -371,6 +374,11 @@ pub fn sample(io: Io, a: std.mem.Allocator, leases: []const state.Entry, measure
         const used = sys.treeCpu(after, l.record.child) -| sys.treeCpu(before, l.record.child);
         u.* = @as(f64, @floatFromInt(used)) / wall_ns;
     }
+    const jobs = a.alloc(f64, drivers.len) catch return .{ .busy = busy };
+    for (drivers, jobs) |pid, *u| {
+        const used = sys.treeCpu(after, pid) -| sys.treeCpu(before, pid);
+        u.* = @as(f64, @floatFromInt(used)) / wall_ns;
+    }
     // Everything else: cpuq's jobs (their cpuq and command trees) and this
     // process are accounted for; what is left is outside load.
     const in_job = a.alloc(bool, after.len) catch return .{ .busy = busy };
@@ -379,6 +387,7 @@ pub fn sample(io: Io, a: std.mem.Allocator, leases: []const state.Entry, measure
         sys.markTree(after, l.record.pid, in_job);
         if (l.record.child > 0) sys.markTree(after, l.record.child, in_job);
     }
+    for (drivers) |pid| sys.markTree(after, pid, in_job);
     // A process's own CPU only: its reaped children were counted while they
     // ran (see sys.Proc.own_ns).
     var cpu_before: std.AutoHashMapUnmanaged(i32, u64) = .empty;
@@ -403,7 +412,7 @@ pub fn sample(io: Io, a: std.mem.Allocator, leases: []const state.Entry, measure
         o.command = sys.procCommand(a, io, o.pid, 300);
         o.cwd = sys.procCwd(a, io, o.pid);
     }
-    return .{ .busy = busy, .outside = top, .outside_total = total };
+    return .{ .busy = busy, .jobs = jobs, .outside = top, .outside_total = total };
 }
 
 fn nullUsage(a: std.mem.Allocator, n: usize) []?f64 {
@@ -624,7 +633,10 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
 
     // What each holder actually uses: its command's process tree, CPU time
     // over wall time between two snapshots.
-    const smp = sample(io, a, leases, measure);
+    const running = jobs_mod.running(io, a, ctx.env);
+    const drivers = a.alloc(i32, running.len) catch main.fail("out of memory", .{});
+    for (running, drivers) |r, *pid| pid.* = r.snap.pid;
+    const smp = sample(io, a, leases, drivers, measure);
     const busy = smp.busy;
 
     const holders = toHolders(a, leases, busy);
@@ -721,6 +733,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
             },
             .holders = holders,
             .waiters = waiters,
+            .jobs = statusjson.toJobs(a, running, smp.jobs, now),
             .leases = named.items,
             .outside = smp.outside,
             .outside_total = smp.outside_total,

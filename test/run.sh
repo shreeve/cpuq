@@ -2284,12 +2284,14 @@ t_jobs() {
 }
 
 t_jobs_qos() {
-  # A task runs at utility QoS on macOS, not the caller's, in a process group of its own.
+  # A task runs in a normal job's class (on macOS the caller's, not utility QoS, which keeps it
+  # off the performance cores), in a process group of its own.
   setup jobs-qos; export CPUQ_STATE=$T/state
   mkjob q; task t "'$CPUQ' qos; ps -o pgid= -p \$\$; ps -o pgid= -p $$"
   jobs run >/dev/null 2>&1
   local got; got=$(sed -n 3p "$J/done/t"); local g1 g2; g1=$(sed -n 4p "$J/done/t" | tr -d ' '); g2=$(sed -n 5p "$J/done/t" | tr -d ' ')
-  if [ "$(uname)" = Darwin ]; then check "a task runs at utility QoS (got '$got')" "[ '$got' = utility ]"
+  local mine; mine=$("$CPUQ" qos)
+  if [ "$(uname)" = Darwin ]; then check "a task runs in the caller's class (got '$got', the caller's '$mine')" "[ '$got' = '$mine' ] && [ '$got' != utility ]"
   else check "a task's qos is readable (got '$got')" "[ -n '$got' ]"; fi
   check "a task's group is its own ($g1, the caller's $g2)" "[ -n '$g1' ] && [ '$g1' != '$g2' ]"
   unset CPUQ_STATE
@@ -2331,6 +2333,10 @@ t_jobs_control() {
     "[ $r1 = 0 ] && [ $r2 = 0 ] && [ $r3 = 2 ] && [[ '$s' == *'workers 3 (set)  weight 2  gap 50ms (set)'* && '$s' == *'live 3'* ]]"
   local l; l=$("$CPUQ" jobs)
   check "cpuq jobs lists it running" "[[ '$l' == *' c '*'20261017-120000'*'running'* ]]"
+  local js; js=$("$CPUQ" status --json | python3 -c 'import json, sys
+j = json.load(sys.stdin)["jobs"]
+print(len(j), j[0]["name"], j[0]["workers"], j[0]["workers_from"], j[0]["live"], j[0]["using"] is not None)')
+  check "status --json lists the job at its workers (got '$js')" "[ '$js' = '1 c 3 set 3 True' ]"
   local rs; rs=$(jobs reset 2>&1); local rr=$?
   check "reset is refused while it runs (rc $rr, '$rs')" "[ $rr = 125 ] && [[ '$rs' == *refused* ]]"
   jobs stop; wait $d; local rc=$?
