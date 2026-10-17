@@ -1325,7 +1325,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
                         }
                     }
                 }
-            } else if (!named and !o.exclusive and cfg.backfill) {
+            } else if (!named and !o.exclusive and cfg.backfill and (cfg.window_backfill or !queue[0].record.exclusive)) {
                 const budget: u32 = budgetNow(ctx, mach);
                 var v = st.readValve();
                 const g = policy.gate(cfg, mach, budget, if (o.load_check) &v else null, now);
@@ -4884,7 +4884,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
         var using_buf: [16]u8 = undefined;
         const using_text = if (h.using) |u| std.mem.print(&using_buf, "{d:.1}", .{u}) catch "?" else "-";
         w.print("  {s:<8} {s:<8} {d:<6} {s:<6} {s:<7} {s:<8} {s} {s}{s}\n", .{
-            pid_text,                child_text,                    h.cores,   using_text,                                                                   if (h.exclusive) "excl" else h.priority,
+            pid_text,                child_text,                                           h.cores,   using_text,                                                                   if (h.exclusive) "excl" else h.priority,
             age(&b1, now - h.since), pad(&lbuf, withNote(ctx.arena, h.label, h.note), lw), h.command, if (h.holder_alive) "" else "  (cpuq gone; the command still has the cores)",
         }) catch {};
         // How far it is, on a line of its own under the job, so the columns keep their places.

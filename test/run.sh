@@ -1536,6 +1536,23 @@ t_backfill_exclusive() {
   check "behind an exclusive head a job known to be quick uses the free cores; an unknown one waits for the window (got: $got)" "[ '$got' = 'quick timing unknown ' ]"
 }
 
+t_window_backfill_off() {
+  # window_backfill = off (a timing machine): behind an exclusive head nothing starts ahead, not
+  # even a job known to be quick; both wait for the window.
+  setup window-backfill-off "window_backfill = off"
+  local f=$T/order h=$CPUQ_DIR/history.jsonl
+  mkdir -p "$CPUQ_DIR"
+  ev() { printf '{"v":1,"event":"%s","id":"%s","t":%s,"pid":1,"label":"%s","cores":%s,"min":%s,"max":%s,"exit":0}\n' "$@" >>"$h"; }
+  ev started 1 1 hold 3 3 3; ev ended 1 5 hold 3 3 3
+  ev started 2 1 quick 1 1 1; ev ended 2 1.2 quick 1 1 1
+  "$CPUQ" run --cores 3 --label hold -- sleep 3 & wait_held 3
+  "$CPUQ" run --exclusive --label timing -- sh -c "echo timing >>$f" & wait_waiters 1
+  "$CPUQ" run --cores 1 --label quick -- sh -c "echo quick >>$f" &
+  wait
+  local got; got=$(tr '\n' ' ' <"$f")
+  check "with window_backfill off, a quick job waits behind the timing window too (got: $got)" "[ '$got' = 'timing quick ' ]"
+}
+
 t_lease_exclusive() {
   setup lease-exclusive
   local bin=$T/bin f=$T/log
@@ -2083,7 +2100,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git spill_gitignore spill_default tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git spill_gitignore spill_default tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

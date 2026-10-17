@@ -306,9 +306,9 @@ const CloneArgs = extern struct {
 /// fork(2), but with the child born in the cgroup `cg_fd`: 0 in the child, its pid in the
 /// parent, -errno on failure.
 fn forkInto(cg_fd: c.fd_t) isize {
-    var args: CloneArgs = .{ .flags = linux.CLONE.INTO_CGROUP, .exit_signal = @intFromEnum(c.SIG.CHLD), .cgroup = @intCast(cg_fd) };
+    var args: CloneArgs = .{ .flags = linux.CLONE.INTO_CGROUP, .exit_signal = @backingInt(c.SIG.CHLD), .cgroup = @intCast(cg_fd) };
     const rc = linux.syscall2(.clone3, @intFromPtr(&args), @sizeOf(CloneArgs));
-    if (linux.errno(rc) != .SUCCESS) return -@as(isize, @intCast(@intFromEnum(linux.errno(rc))));
+    if (linux.errno(rc) != .SUCCESS) return -@as(isize, @intCast(@backingInt(linux.errno(rc))));
     return @intCast(rc);
 }
 
@@ -631,7 +631,7 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
         // core limit of 1, which keeps the crash from apport).
         if (quiet_crash and catcher == null) sys.noCrashReport();
         _ = c.execve(program.ptr, argv.ptr, envp);
-        const err: u8 = @intCast(@intFromEnum(c.errno(-1)));
+        const err: u8 = @intCast(@backingInt(c.errno(-1)));
         _ = c.write(report[1], &[_]u8{ 'e', err }, 2);
         c._exit(126);
     }
@@ -656,7 +656,7 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
         var status: c_int = 0;
         while (c.waitpid(child, &status, 0) < 0 and c.errno(-1) == .INTR) {}
         if (cgroup) |cg| cg.remove();
-        if (note[1] == @intFromEnum(c.E.NOENT)) {
+        if (note[1] == @backingInt(c.E.NOENT)) {
             std.debug.print("cpuq cap: {s}: not found\n", .{cmd[0]});
             return 127;
         }

@@ -88,6 +88,10 @@ pub const Config = struct {
     /// Let a waiter behind the head start on cores the head cannot use yet
     /// (`backfill`).
     backfill: bool = true,
+    /// Behind a timing window waiting at the front (an --exclusive run or lease), let a job known
+    /// to end before the machine drains start meanwhile (`window_backfill`). Off on a timing
+    /// machine: nothing starts ahead of a waiting window, so it waits only for what already runs.
+    window_backfill: bool = true,
     /// Grant `--exclusive` (`exclusive`): a run or lease that asks for it
     /// waits for the machine to drain and holds it alone. Off, it runs as an
     /// ordinary job alongside the others, and says so: for a machine shared
@@ -246,6 +250,8 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             cfg.exclusive = parseBool(value) orelse return bad(diag, "exclusive must be on or off");
         } else if (std.mem.eql(u8, key, "backfill")) {
             cfg.backfill = parseBool(value) orelse return bad(diag, "backfill must be on or off");
+        } else if (std.mem.eql(u8, key, "window_backfill")) {
+            cfg.window_backfill = parseBool(value) orelse return bad(diag, "window_backfill must be on or off");
         } else if (std.mem.eql(u8, key, "right_size")) {
             cfg.right_size = parseBool(value) orelse return bad(diag, "right_size must be on or off");
         } else if (std.mem.eql(u8, key, "lend_after")) {

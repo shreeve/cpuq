@@ -384,7 +384,8 @@ unchanged (`--qos auto`, the default, maps it). Exclusive runs and named leases 
 `cpuq run --exclusive` is for timing, nothing else. At its turn it waits until no job holds any
 cores, then takes the budget's worth of cores (`CPUQ_CORES`) and admits nothing else until it
 exits, however it exits. While it waits at the front, a job behind it may start only when
-history says that job ends before the running work does (`backfill`). Its own builds and
+history says that job ends before the running work does (`backfill`; `window_backfill = off`
+keeps even those waiting, on a machine kept for timing). Its own builds and
 helpers run inside it as nested runs. A window that spans several commands wraps them in one:
 `cpuq run --exclusive --label app:bench -- ./bench.sh`, or an interactive
 `cpuq run --exclusive -- $SHELL`.
@@ -838,6 +839,7 @@ re-reads the file when it changes; an invalid edit keeps the settings in force a
 | `load_check` | on | the load valve (under measured admission, for exclusive runs only) and the 97%-busy check; off ignores the machine's load |
 | `load_margin` | 4 | the valve trips above budget + margin; as `load_check` |
 | `backfill` | on | let a job start ahead of the first waiter when both fit (measured), or on cores the first cannot use yet (`admit = cores`, and behind an exclusive first waiter) |
+| `window_backfill` | on | behind a timing window waiting at the front, let a job known to end before the machine drains start meanwhile; off on a timing machine (nothing starts ahead of a waiting window) |
 | `lend` | on | `admit = cores` only: lend the first waiter the cores a running job leaves idle |
 | `lend_after` | 60 | `admit = cores` only: seconds a core must stay idle before it is lent |
 | `right_size` | on | `admit = cores` only: cap a range near what its label has used (measured admission always does) |

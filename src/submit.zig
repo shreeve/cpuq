@@ -836,7 +836,7 @@ fn printVerdict(cx: Cx, id: []const u8) u8 {
     }
     const word = v.word();
     // The words line up: the longest, NOT STARTED, has 11 letters.
-    w.print("{s}{s}  {s}  {s}  ", .{ word, "           "[0 .. 11 -| word.len], r.label, r.digest[0..@min(8, r.digest.len)] }) catch {};
+    w.print("{s}{s}  {s}  {s}  ", .{ word, "           "[0..11 -| word.len], r.label, r.digest[0..@min(8, r.digest.len)] }) catch {};
     switch (v) {
         .pass => w.print("{s}  {s}  {s} cores{s}\n", .{ ageText(cx, @intFromFloat(r.seconds)), r.host, r.cores, countsText(cx, r) }) catch {},
         .fail => w.print("exit {d}  {s}  {s}{s}\n", .{ r.code orelse -1, ageText(cx, @intFromFloat(r.seconds)), r.host, countsText(cx, r) }) catch {},
@@ -1768,11 +1768,7 @@ pub fn cmdJob(cx: Cx, args: []const [:0]const u8) u8 {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a: []const u8 = args[i];
-        if (std.mem.eql(u8, a, "--wait")) wait = true
-        else if (std.mem.eql(u8, a, "--json")) as_json = true
-        else if (std.mem.eql(u8, a, "--cancel")) cancel = true
-        else if (std.mem.eql(u8, a, "--force")) force = true
-        else if (std.mem.eql(u8, a, "--max-wait") and i + 1 < args.len) {
+        if (std.mem.eql(u8, a, "--wait")) wait = true else if (std.mem.eql(u8, a, "--json")) as_json = true else if (std.mem.eql(u8, a, "--cancel")) cancel = true else if (std.mem.eql(u8, a, "--force")) force = true else if (std.mem.eql(u8, a, "--max-wait") and i + 1 < args.len) {
             i += 1;
             max_wait = std.fmt.parseInt(i64, args[i], 10) catch return fail2("--max-wait needs whole seconds", .{});
         } else if (std.mem.eql(u8, a, "--tail") and i + 1 < args.len) {
@@ -1815,7 +1811,7 @@ pub fn cmdJob(cx: Cx, args: []const [:0]const u8) u8 {
         var lines: std.ArrayList([]const u8) = .empty;
         var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
         while (it.next()) |l| lines.append(cx.a, l) catch {};
-        for (lines.items[lines.items.len -| n ..]) |l| cx.out.print("{s}\n", .{l}) catch {};
+        for (lines.items[lines.items.len -| n..]) |l| cx.out.print("{s}\n", .{l}) catch {};
         return 0;
     }
     if (as_json) {

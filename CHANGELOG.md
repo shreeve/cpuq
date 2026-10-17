@@ -2,6 +2,13 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.26.3 — 2026-10-16
+
+- **`window_backfill`** (default on): off, nothing starts ahead of a timing window (an
+  `--exclusive` run or lease) waiting at the front, not even a job history says is quick, so the
+  window waits only for what already runs. pup sets it off: a 1-second job slipped in ahead of a
+  waiting pup-bench window and ran 30 s and more.
+
 ## 0.26.2 — 2026-10-16
 
 - macOS: `cpuq cap --no-crash-report` stops the system's crash report too. Clearing PROGRAM's crash
