@@ -63,16 +63,30 @@ const QOS_CLASS_UTILITY = 0x11;
 const QOS_CLASS_BACKGROUND = 0x09;
 
 /// Cores the OS has active now: macOS hw.activecpu (it drops under thermal
-/// limits); Linux the CPUs in this process's affinity mask.
-pub fn activeCpus() u32 {
+/// limits); Linux the CPUs in this process's affinity mask, or every CPU online
+/// in a job cpuq confined to its own (CPUQ_CPUS): a cpuq run there is a job of
+/// its own, on the machine's CPUs.
+pub fn activeCpus(io: Io) u32 {
     if (is_darwin) {
         var n: c_int = 0;
         var len: usize = @sizeOf(c_int);
         if (c.sysctlbyname("hw.activecpu", &n, &len, null, 0) == 0 and n > 0) return @intCast(n);
         return 1;
     }
+    if (c.getenv("CPUQ_CPUS") != null) {
+        var buf: [1024]u8 = undefined;
+        const text = Io.Dir.cwd().readFile(io, "/sys/devices/system/cpu/online", &buf) catch "";
+        if (policy.cpuListCount(text)) |n| return n;
+    }
     const n = std.Thread.getCpuCount() catch return 1;
     return @intCast(@max(n, 1));
+}
+
+/// Linux: the CPUs online now; empty when they cannot be read.
+pub fn onlineCpus(io: Io, a: std.mem.Allocator) []const u32 {
+    var buf: [1024]u8 = undefined;
+    const text = Io.Dir.cwd().readFile(io, "/sys/devices/system/cpu/online", &buf) catch return &.{};
+    return policy.cpuList(a, text) catch &.{};
 }
 
 /// The machine's cores: one token file each. On Linux this is every CPU the
@@ -389,6 +403,8 @@ pub fn spawn(
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
     qos: policy.Qos,
+    /// Linux: the CPUs the command is confined to; empty leaves its affinity as it is.
+    cpus: []const u32,
 ) SpawnError!c.pid_t {
     if (is_darwin) {
         var attr: c.posix_spawnattr_t = undefined;
@@ -422,9 +438,16 @@ pub fn spawn(
         .niced => 10,
         .background => 15,
     };
+    var set: std.os.linux.cpu_set_t = @splat(0);
+    const bits = @bitSizeOf(usize);
+    for (cpus) |cpu| if (cpu < set.len * bits) {
+        set[cpu / bits] |= @as(usize, 1) << @intCast(cpu % bits);
+    };
     const pid = c.fork();
     if (pid < 0) return error.SpawnFailed;
     if (pid == 0) {
+        // Before exec, so the command's first thread, and all it starts, see only these.
+        if (cpus.len != 0) _ = std.os.linux.syscall3(.sched_setaffinity, 0, @sizeOf(std.os.linux.cpu_set_t), @intFromPtr(&set));
         var empty: c.sigset_t = undefined;
         _ = c.sigemptyset(&empty);
         _ = c.sigprocmask(c.SIG.SETMASK, &empty, null);

@@ -158,6 +158,27 @@ t_affinity() {
   check "a run confined to 2 CPUs counts holds on every core and waits (exit $rc, want 75)" "[ $rc = 75 ]"
 }
 
+t_job_affinity() {
+  # affinity (Linux): a job is confined to as many CPUs as its grant, CPUs of its own while the
+  # grants fit; one started under taskset keeps that; with affinity off it has every CPU.
+  setup job-affinity
+  if [ "$(uname)" != Linux ] || ! command -v taskset >/dev/null || [ "$(getconf _NPROCESSORS_ONLN)" -lt 4 ]; then
+    echo "  skipped: needs Linux with taskset and 4 or more CPUs"
+    return
+  fi
+  local list='sed -n "s/^Cpus_allowed_list:[[:space:]]*//p" /proc/self/status'
+  "$CPUQ" run --cores 2 -- sh -c "$list >$T/a; sleep 3" & local a=$!
+  wait_held 2
+  "$CPUQ" run --cores 2 -- sh -c "$list >$T/b; nproc >$T/n; echo \$CPUQ_CPUS >$T/env"
+  wait $a
+  local got="a=$(cat "$T/a") b=$(cat "$T/b") nproc=$(cat "$T/n") env=$(cat "$T/env")"
+  local tasks; tasks=$(taskset -c 0 "$CPUQ" run --cores 2 -- nproc)
+  setup job-affinity-off "affinity = off"
+  local off; off=$("$CPUQ" run --cores 2 -- nproc)
+  check "jobs get CPUs of their own, as many as their grants; under taskset 1; off, all $(nproc) (got $got taskset=$tasks off=$off)" \
+    "[ '$got' = 'a=0-1 b=2-3 nproc=2 env=2-3' ] && [ '$tasks' = 1 ] && [ '$off' = $(nproc) ]"
+}
+
 t_kill_holder() {
   setup kill-holder
   "$CPUQ" run --cores 9 -- sleep 30 & local holder=$!
@@ -2223,7 +2244,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_needs submit_mem submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
+TESTS=${*:-budget affinity job_affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_needs submit_mem submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
 for t in $TESTS; do
   if declare -F "t_$t" >/dev/null; then "t_$t"; else echo "no such test: $t"; FAIL=$((FAIL+1)); FAILED+=" $t?"; fi
 done

@@ -347,7 +347,7 @@ pub fn openState(ctx: *Ctx) state.State {
 
 pub fn machine(ctx: *Ctx) policy.Machine {
     return .{
-        .active = sys.activeCpus(),
+        .active = sys.activeCpus(ctx.io),
         .load1 = sys.loadAverage()[0],
         .pressure = if (ctx.cfg.pressure_check) sys.memoryPressure(ctx.io, ctx.cfg.pressure_psi) else .off,
         .available = if (ctx.cfg.min_available > 0) sys.memAvailable(ctx.io) else null,
