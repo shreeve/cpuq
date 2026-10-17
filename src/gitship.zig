@@ -130,7 +130,11 @@ pub fn seedPath(a: std.mem.Allocator, dir: []const u8, marker: ?[]const u8, keep
             "rm -rf \"$t\"; mkdir -p \"$d\"; fi",
         .{ quote(a, dir), parent, parent, same, if (keep_git) "" else "rm -rf \"$t/.git\"; ", aged(a, "\"$t\"") },
     ) catch return "rsync";
-    return a.print("sh -c {s} && rsync", .{quote(a, script)}) catch "rsync";
+    // Sent as base64, with no quotes: rsyncs differ in how they pass quotes in `--rsync-path` on
+    // (macOS's openrsync escapes them).
+    const enc = std.base64.standard.Encoder;
+    const b64 = a.alloc(u8, enc.calcSize(script.len)) catch return "rsync";
+    return a.print("echo {s} | base64 -d | sh && rsync", .{enc.encode(b64, script)}) catch "rsync";
 }
 
 /// A shell command that dates everything in folder `path` (as the shell reads it; a symlink
