@@ -64,15 +64,15 @@ pub const RunTimes = struct {
         var command_runs: std.StringHashMapUnmanaged(std.ArrayList(f64)) = .empty;
         for (jobs) |j| {
             const r = j.ran() orelse continue;
-            const spilled = std.mem.eql(u8, j.pool, "spill");
+            const sent = std.mem.eql(u8, j.pool, "remote");
             // A work's times are its runs that did it: one that failed early (a missing input on
             // another OS, a compile error) would make the place it failed look quick.
             const did = j.signal == null and (j.exit orelse 1) == 0;
-            if (did and (spilled or std.mem.eql(u8, j.pool, "cores"))) {
-                const key = workAt(a, if (spilled) j.host orelse continue else "", workKeyOf(a, j));
+            if (did and (sent or std.mem.eql(u8, j.pool, "cores"))) {
+                const key = workAt(a, if (sent) j.host orelse continue else "", workKeyOf(a, j));
                 const gop = rt.work.getOrPut(a, key) catch continue;
                 if (!gop.found_existing) gop.value_ptr.* = .{};
-                gop.value_ptr.add(a, r, if (spilled) null else j.cpu_peak orelse j.used(), if (spilled) null else j.cores);
+                gop.value_ptr.add(a, r, if (sent) null else j.cpu_peak orelse j.used(), if (sent) null else j.cores);
             }
             if (j.label.len == 0 or !std.mem.eql(u8, j.pool, "cores")) continue;
             {

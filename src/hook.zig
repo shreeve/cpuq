@@ -597,8 +597,8 @@ fn suggest(a: std.mem.Allocator, w: []const []const u8, project: []const u8, hos
     const opaque_opt = if (hidesWork(w)) " --opaque" else "";
     const run = a.print("cpuq run --label {s} --cores 2-6{s} -- {s}", .{ label, opaque_opt, inner }) catch "cpuq run --label P:T --cores 2-6 -- CMD";
     // On another machine: sent there by cpuq, the repo copied over, or through that machine's own.
-    const spilled = a.print("cpuq run --on {s} --label {s} --cores 2-6{s} -- {s}", .{ host orelse "", label, opaque_opt, inner }) catch run;
-    return if (host) |h| a.print("{s} (it copies this repo to {s}; or ssh {s} 'cd … && {s}', the inner quotes as needed)", .{ spilled, h, h, run }) catch run else run;
+    const sent = a.print("cpuq run --on {s} --label {s} --cores 2-6{s} -- {s}", .{ host orelse "", label, opaque_opt, inner }) catch run;
+    return if (host) |h| a.print("{s} (it copies this repo to {s}; or ssh {s} 'cd … && {s}', the inner quotes as needed)", .{ sent, h, h, run }) catch run else run;
 }
 
 /// A heredoc opened on a line (`<<EOF`, `<<-EOF`, `<<'EOF'`, `<<"EOF"`): where its delimiter

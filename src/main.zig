@@ -364,11 +364,11 @@ fn leastDisk(ctx: *Ctx) ?policy.Disk {
         const dir: ?[:0]const u8 = ctx.arena.dupeSentinel(u8, stateDir(ctx), 0) catch null;
         // ~/cpuq, where work sent here from other machines lands: on a machine that gives it its
         // own filesystem (burst's ZFS dataset), the one their copies and scratch fill.
-        const spill: ?[:0]const u8 = if (ctx.env.get("HOME")) |h| spill: {
-            const p = ctx.arena.print("{s}/{s}", .{ h, layout.root }) catch break :spill null;
-            break :spill ctx.arena.dupeSentinel(u8, p, 0) catch null;
+        const root: ?[:0]const u8 = if (ctx.env.get("HOME")) |h| root: {
+            const p = ctx.arena.print("{s}/{s}", .{ h, layout.root }) catch break :root null;
+            break :root ctx.arena.dupeSentinel(u8, p, 0) catch null;
         } else null;
-        ctx.disk_paths = .{ home, dir, spill };
+        ctx.disk_paths = .{ home, dir, root };
         break :blk ctx.disk_paths.?;
     };
     var least: ?policy.Disk = null;

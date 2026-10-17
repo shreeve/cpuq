@@ -208,14 +208,14 @@ fn sendTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     if (o.hidden) remote.appendSlice(a, " --opaque") catch {};
     remote.appendSlice(a, " --") catch {};
     for (o.cmd) |arg| remote.print(a, " {s}", .{shellQuote(a, arg)}) catch {};
-    // Kept here too, as pool "spill": how long the trip took (copy, queue and run), which
+    // Kept here too, as pool "remote": how long the trip took (copy, queue and run), which
     // placement goes by next time.
     var job = newJobLog(ctx, o);
-    job.base.pool = "spill";
+    job.base.pool = "remote";
     job.base.host = host;
     job.base.repo = repo_named;
-    logSpill(ctx, job, "queued", trip_t, null);
-    logSpill(ctx, job, "started", trip_t, null);
+    logSent(ctx, job, "queued", trip_t, null);
+    logSent(ctx, job, "started", trip_t, null);
     const argv = [_][]const u8{ "ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4", host, remote.items };
     var child = std.process.spawn(io, .{ .argv = &argv, .stdin = .pipe, .stdout = .inherit, .stderr = .inherit }) catch |err|
         fail("ssh {s}: {t}", .{ host, err });
@@ -230,7 +230,7 @@ fn sendTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
         else => exit_failure,
     };
     // Its own status is the command's; 75, 125 and 255 are cpuq's or ssh's, not a run.
-    logSpill(ctx, job, if (code == exit_timeout or code == exit_failure or code == 255) "gave_up" else "ended", nowFloat(io), code);
+    logSent(ctx, job, if (code == exit_timeout or code == exit_failure or code == 255) "gave_up" else "ended", nowFloat(io), code);
     // 255 is ssh's own failure; a death by signal can be the host shutting
     // down under the job (a Spot reclaim powers the VM off gracefully, and
     // the shutdown kills the job before the connection drops). Either way,
@@ -257,8 +257,8 @@ fn sendTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     return code;
 }
 
-/// One event of a spilled job's record here, at `t`.
-fn logSpill(ctx: *Ctx, job: JobLog, event: []const u8, t: f64, code: ?u8) void {
+/// One event of a sent job's record here, at `t`.
+fn logSent(ctx: *Ctx, job: JobLog, event: []const u8, t: f64, code: ?u8) void {
     const path = historyPath(ctx);
     if (path.len == 0) return;
     var ev = job.base;

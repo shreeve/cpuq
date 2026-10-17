@@ -1,7 +1,7 @@
 //! Where a job finishes first. A job's work is known by what it runs, not by its label (agents
 //! label one suite five ways): its repo and its command, counts and core numbers as `#`. Each
 //! machine's history says how long that work took there; a run sent to another machine is kept in
-//! this one's history too (pool "spill", host the machine), so the time it took there, copy and
+//! this one's history too (pool "remote", host the machine), so the time it took there, copy and
 //! queue included, is known here without asking. From those, `finish` gives each place's expected
 //! finish (wait + start + copy + run) and `better` says whether going elsewhere is worth it.
 

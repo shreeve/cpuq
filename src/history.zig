@@ -21,10 +21,10 @@ pub const Event = struct {
     /// Unix time in seconds.
     t: f64 = 0,
     pid: i32 = 0,
-    /// "cores"; the lease's name for a named lease; "spill" for a job this machine sent to
+    /// "cores"; the lease's name for a named lease; "remote" for a job this machine sent to
     /// another (`host`), its run there timed from here, copy and queue included.
     pool: []const u8 = "cores",
-    /// The host a `--host` lease is held on; for pool "spill", the host the job was sent to.
+    /// The host a `--host` lease is held on; for pool "remote", the host the job was sent to.
     host: ?[]const u8 = null,
     /// The repository it ran in, by name: the same for each of its worktrees and its copies on
     /// other machines.
