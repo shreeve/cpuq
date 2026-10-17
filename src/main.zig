@@ -33,6 +33,7 @@ const records = @import("records.zig");
 const runtimes = @import("runtimes.zig");
 const statusjson = @import("statusjson.zig");
 const status = @import("status.zig");
+const pool = @import("pool.zig");
 
 const cmdRun = runner.cmdRun;
 const cmdJob = runner.cmdJob;
@@ -49,6 +50,7 @@ const cmdHistory = records.cmdHistory;
 const cmdStatus = status.cmdStatus;
 
 test {
+    _ = pool;
     _ = cap;
     _ = submit;
     _ = hook;
