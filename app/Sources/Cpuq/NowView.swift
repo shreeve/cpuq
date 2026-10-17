@@ -574,7 +574,7 @@ struct WaiterActions: View {
         if let control, pid > 0, supportsControls(version: model.status?.version ?? "") {
             Button("Move to Front") { control("first", pid, label) }
             Button("Start Now…") { control("start", pid, label) }
-            Button("Cancel") { control("cancel", pid, label) }
+            Button("Cancel…") { control("cancel", pid, label) }
         }
     }
 }

@@ -17,6 +17,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var problem: String?
     private var timer: Timer?
     private var polling = false
+    /// A poll asked for while one was under way: run once it is done.
+    private var repoll = false
     private let graphs = GraphModel()
     /// The remotes in cpuq's config, each a page of the window beside this Mac's.
     private var remotes: [GraphModel] = []
@@ -25,8 +27,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var settingsWindow: NSWindow?
     /// The View menu (machines, theme, live view), its checkmarks set as it opens.
     private var viewMenu: NSMenu?
-    /// Ticks of the 3-second timer, for the once-a-minute look at cloud machines.
-    private var ticks = 0
+    /// When the cloud machines were last looked at with the window closed: once a minute.
+    private var cloudsAt = Date.distantPast
     /// What has gone wrong and since when, for the notifications: one each time a thing goes
     /// wrong and stays so, none again until it has come right.
     private var gateShut = Episode()
@@ -94,13 +96,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         UserDefaults.standard.removeObject(forKey: UpdateRelaunch.key)
         // For testing a build: open the graphs window at launch.
         if reopen || ProcessInfo.processInfo.environment["CPUQ_SHOW_GRAPHS"] != nil { showGraphs() }
-        timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+        schedulePolls()
+    }
+
+    /// Polls every 3 seconds while the window is open, every 10 while it is closed: the chip and
+    /// the notifications need no more.
+    private func schedulePolls() {
+        let every: TimeInterval = graphsWindow?.isVisible ?? false ? 3 : 10
+        guard timer?.timeInterval != every else { return }
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: every, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.poll()
                 self.pollRemotes()
-                self.ticks += 1
-                if self.ticks % 20 == 0 { self.pollClouds() }
+                if Date().timeIntervalSince(self.cloudsAt) >= 60 { self.pollClouds() }
             }
         }
     }
@@ -133,7 +143,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     /// Reads `cpuq status --json` off the main thread, then updates the icon
     /// and the menu.
     private func poll() {
-        guard !polling else { return }
+        guard !polling else {
+            repoll = true
+            return
+        }
         polling = true
         Task.detached(priority: .utility) {
             let result = Self.readStatus()
@@ -151,8 +164,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                     self.problem = e.message
                 }
                 self.updateChip()
-                if self.menu.highlightedItem != nil || self.menu.numberOfItems == 0 { return }
-                self.rebuild()
+                if self.menu.highlightedItem == nil && self.menu.numberOfItems > 0 { self.rebuild() }
+                if self.repoll {
+                    self.repoll = false
+                    self.poll()
+                }
             }
         }
     }
@@ -175,6 +191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     /// running costs money, and the chip says so whether anyone is looking or not.
     private func pollClouds() {
         guard !(graphsWindow?.isVisible ?? false) else { return }
+        cloudsAt = Date()
         for m in remotes where m.machine.start != nil { pollRemote(m) }
     }
 
@@ -855,6 +872,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         NSApp.activate()
         graphsWindow?.makeKeyAndOrderFront(nil)
         applyShape()
+        schedulePolls()
         // Once it is on screen: refreshHistory skips a window nobody sees, so read before
         // this, the history waited a minute for the next refresh.
         refreshHistory()
@@ -945,6 +963,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 self.graphsWindow?.contentView = nil
                 self.graphsWindow = nil
                 self.applyShape()
+                self.schedulePolls()
             }
         }
     }
@@ -970,17 +989,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     func perform(_ action: String, pid: String, who: String, on machine: Machine = .local) {
-        let ask: (String, String)? = switch action {
-        case "start": ("Start \(who) now?", "It starts past the queue and the budget, so the load goes up until other jobs finish.")
-        case "stop": ("Stop \(who)?", "Its work so far is lost; it gets SIGTERM and can clean up.")
+        let ask: (String, String, String)? = switch action {
+        case "start": ("Start \(who) now?", "It starts past the queue and the budget, so the load goes up until other jobs finish.", "Start Now")
+        case "stop": ("Stop \(who)?", "Its work so far is lost; it gets SIGTERM and can clean up.", "Stop")
+        case "cancel": ("Cancel \(who)?", "It leaves the queue and never runs; whoever started it sees it give up (exit 75).", "Cancel Job")
         default: nil
         }
-        if let (title, detail) = ask {
+        if let (title, detail, yes) = ask {
             let alert = NSAlert()
             alert.messageText = title
             alert.informativeText = detail
-            alert.addButton(withTitle: action == "start" ? "Start Now" : "Stop")
-            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: yes)
+            alert.addButton(withTitle: action == "cancel" ? "Keep Waiting" : "Cancel")
             NSApp.activate()
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
