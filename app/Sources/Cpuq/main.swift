@@ -1,5 +1,6 @@
 import AppKit
 import CpuqCore
+import os
 import Sparkle
 import SwiftUI
 import UserNotifications
@@ -296,17 +297,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     nonisolated private static func remoteCommand(_ host: String, _ command: String) -> Result<Data, Problem> {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        p.arguments = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, command]
+        p.arguments = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", host, command]
         let out = Pipe(), err = Pipe()
         p.standardOutput = out
         p.standardError = err
         p.standardInput = FileHandle.nullDevice
         do { try p.run() } catch { return .failure(Problem(message: "cannot run ssh: \(error.localizedDescription)")) }
+        // Both at once: a pipe left unread fills, and ssh would wait on it forever.
+        let complaint = OSAllocatedUnfairLock(initialState: Data())
+        let drained = DispatchSemaphore(value: 0)
+        let errors = err.fileHandleForReading
+        DispatchQueue.global(qos: .utility).async {
+            let d = errors.readDataToEndOfFile()
+            complaint.withLock { $0 = d }
+            drained.signal()
+        }
         let data = out.fileHandleForReading.readDataToEndOfFile()
-        let complaint = err.fileHandleForReading.readDataToEndOfFile()
+        drained.wait()
         p.waitUntilExit()
         guard p.terminationStatus == 0 else {
-            let line = String(decoding: complaint, as: UTF8.self).split(separator: "\n").first.map(String.init)
+            let line = String(decoding: complaint.withLock { $0 }, as: UTF8.self).split(separator: "\n").first.map(String.init)
             return .failure(Problem(message: line ?? "ssh \(host) failed (\(p.terminationStatus))"))
         }
         return .success(data)

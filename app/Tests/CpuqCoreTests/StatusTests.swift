@@ -128,7 +128,8 @@ import Testing
     """)
     #expect(hosts.map(\.host) == ["pup", "burst"])
     #expect(hosts[0].start == nil && hosts[1].start == "~/runbooks/host-gcp-burst/start")
-    #expect(remoteHosts(config: "budget = 8\nspill = pup\n").isEmpty)
+    #expect(remoteHosts(config: "budget = 8\nload_check = on\n").isEmpty)
+    #expect(remoteHosts(config: "remotes = -oProxyCommand=touch, pup").map(\.host) == ["pup"])
 }
 
 @Test func decodesAnotherMachinesCPUTicks() throws {
