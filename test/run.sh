@@ -1104,6 +1104,32 @@ t_cap_quiet_crash() {
   check "cap --no-crash-report on Linux: a core limit of 1 1 (got $quiet), and $want without it (got $plain)" "[ '$quiet' = '1 1' ] && [ '$plain' = '$want' ]"
 }
 
+t_cap_link() {
+  # cap --link FD: when the pipe's write end closes (its driver died), cap stops the whole tree
+  # at once, 123 with a line on stderr; bytes on the pipe mean nothing.
+  setup cap-link
+  local got; got=$(python3 - "$CPUQ" "$T" <<'PY'
+import os, subprocess, sys, time
+cpuq, t = sys.argv[1], sys.argv[2]
+r, w = os.pipe()
+p = subprocess.Popen([cpuq, "cap", "--link", str(r), "--", "sh", "-c", f"sleep 30 & echo $! > {t}/kid; sleep 30"],
+                     pass_fds=[r], stderr=subprocess.PIPE, text=True)
+os.close(r)
+while not os.path.exists(f"{t}/kid") or not open(f"{t}/kid").read().strip(): time.sleep(0.02)
+os.write(w, b"ping\n"); time.sleep(0.3)
+alive = p.poll() is None
+t0 = time.time(); os.close(w); rc = p.wait(); dt = time.time() - t0
+kid = int(open(f"{t}/kid").read())
+try: os.kill(kid, 0); gone = False
+except ProcessLookupError: gone = True
+print(alive, rc, dt < 1.5, gone, "driver is gone" in p.stderr.read())
+PY
+)
+  check "cap --link: a byte changes nothing; the write end's close stops the tree at once with 123 (got '$got')" "[ '$got' = 'True 123 True True True' ]"
+  local bad; "$CPUQ" cap --link 99 -- true 2>/dev/null; bad=$?
+  check "cap --link refuses a closed descriptor with 2 (got $bad)" "[ $bad = 2 ]"
+}
+
 t_cgroups() {
   # (CPUQ_CGROUP is cleared where a check needs no job around it: the suite may itself run inside
   # a cpuq job, whose scope a nested run rightly inherits.)
@@ -2244,7 +2270,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity job_affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_needs submit_mem submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
+TESTS=${*:-budget affinity job_affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cap_link cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_needs submit_mem submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
 for t in $TESTS; do
   if declare -F "t_$t" >/dev/null; then "t_$t"; else echo "no such test: $t"; FAIL=$((FAIL+1)); FAILED+=" $t?"; fi
 done

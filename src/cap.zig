@@ -30,11 +30,12 @@ const linux = std.os.linux;
 pub const exit_output: u8 = 121;
 pub const exit_memory: u8 = 122;
 pub const exit_time: u8 = 124;
+pub const exit_link: u8 = 123;
 const exit_failure: u8 = 125;
 const exit_usage: u8 = 2;
 
 pub const usage =
-    \\usage: cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] [--no-crash-report] [--] PROGRAM [ARGS...]
+    \\usage: cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] [--link FD] [--no-crash-report] [--] PROGRAM [ARGS...]
     \\       cpuq cap --protocol   what cap does, as a number that changes only when that does
     \\  --mem SIZE        stop PROGRAM when it and everything it started use more memory (2G, 512M)
     \\  --time DURATION   stop it after this long (120, 120s, 2m, 1h, 500ms)
@@ -42,11 +43,13 @@ pub const usage =
     \\                    must be files or /dev/null (1M)
     \\  --pids N          at most N processes and threads at once (inside a cpuq job on Linux;
     \\                    elsewhere it is not enforced)
+    \\  --link FD         stop it when FD, the read end of a pipe, closes: whoever holds the
+    \\                    write end (cpuq's driver) is gone
     \\  --no-crash-report no crash report when PROGRAM, or anything it starts, crashes on
     \\                    purpose (a test that panics): no .ips on macOS, no apport on Linux;
     \\                    it still dies by its signal
     \\exit: PROGRAM's own (death by a signal passed on as one); stopped by cpuq: 122 memory,
-    \\124 time, 121 output, each with a line on stderr; 2 usage, 125 cpuq failed, 126 PROGRAM
+    \\124 time, 121 output, 123 link, each with a line on stderr; 2 usage, 125 cpuq failed, 126 PROGRAM
     \\can't be run, 127 PROGRAM not found. PROGRAM may exit with these too: the stderr line tells.
     \\
 ;
@@ -538,7 +541,7 @@ fn childEnv(a: std.mem.Allocator) ?[*:null]const ?[*:0]const u8 {
 
 // --- The command --------------------------------------------------------------------------
 
-const Stop = enum { none, memory, time, output };
+const Stop = enum { none, memory, time, output, link };
 
 /// What cap does with a program, as a number that changes only when that does: its limits, how it
 /// stops a program, its exit statuses, `--no-crash-report`. A test runner keys cached results on it
@@ -560,6 +563,7 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
     }
     var limits: Limits = .{};
     var quiet_crash = false;
+    var link: c.fd_t = -1;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg: []const u8 = args[i];
@@ -589,6 +593,9 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
             limits.time_ms = parseDuration(value) orelse return bad("--time needs a duration like 120s or 2m, not '{s}'", .{value});
         } else if (std.mem.eql(u8, name, "--output")) {
             limits.output = nonzero(policy.parseBytes(value)) orelse return bad("--output needs a size like 1M, not '{s}'", .{value});
+        } else if (std.mem.eql(u8, name, "--link")) {
+            link = std.fmt.parseInt(c.fd_t, value, 10) catch -1;
+            if (link < 3 or c.fcntl(link, c.F.GETFD) < 0) return bad("--link needs an open file descriptor above 2, not '{s}'", .{value});
         } else if (std.mem.eql(u8, name, "--pids")) {
             limits.pids = nonzero(std.fmt.parseInt(u64, value, 10) catch null) orelse return bad("--pids needs a whole number above 0, not '{s}'", .{value});
         } else return bad("unknown option '{s}'", .{name});
@@ -650,6 +657,7 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
     if (pid == 0) {
         // The child: only async-signal-safe calls until exec.
         _ = c.close(report[0]);
+        if (link >= 0) _ = c.close(link); // the program never holds the link
         var dfl: c.Sigaction = .{ .handler = .{ .handler = c.SIG.DFL }, .mask = undefined, .flags = 0 };
         _ = c.sigemptyset(&dfl.mask);
         for (handled) |sig| {
@@ -749,9 +757,18 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
         if (limits.time_ms != 0) timeout = start + @as(i64, @intCast(limits.time_ms)) - now;
         if (watch_out) timeout = if (timeout < 0) next_out - now else @min(timeout, next_out - now);
         if (watch_mem) timeout = if (timeout < 0) next_mem - now else @min(timeout, next_mem - now);
-        var fds = [_]c.pollfd{.{ .fd = wake[0], .events = c.POLL.IN, .revents = 0 }};
-        _ = c.poll(&fds, 1, @intCast(std.math.clamp(timeout, -1, 60_000)));
+        var fds = [_]c.pollfd{
+            .{ .fd = wake[0], .events = c.POLL.IN, .revents = 0 },
+            .{ .fd = link, .events = c.POLL.IN, .revents = 0 }, // poll skips a negative fd
+        };
+        _ = c.poll(&fds, fds.len, @intCast(std.math.clamp(timeout, -1, 60_000)));
         drainWake();
+        if (fds[1].revents != 0 and linkClosed(link)) {
+            stop = .link;
+            if (cgroup) |cg| _ = cg.set("cgroup.kill", "1") else killTree(child);
+            while (c.waitpid(child, &status, 0) < 0 and c.errno(-1) == .INTR) {}
+            break;
+        }
     }
     child_pid.store(0, .release);
 
@@ -777,6 +794,10 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
             std.debug.print("cpuq cap: stopped {s}: it ran past {s} (--time)\n", .{ cmd[0], timeText(a, limits.time_ms) });
             return exit_time;
         },
+        .link => {
+            std.debug.print("cpuq cap: stopped {s}: its driver is gone (--link)\n", .{cmd[0]});
+            return exit_link;
+        },
         .output => {
             std.debug.print("cpuq cap: stopped {s}: it printed more than {s} (--output)\n", .{ cmd[0], sizeText(a, limits.output) });
             return exit_output;
@@ -791,6 +812,17 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
         sys.dieBySignal(c.W.TERMSIG(s));
     }
     return exit_failure;
+}
+
+/// Whether the link's write end is closed: a read sees end of file. Bytes written to it mean
+/// nothing and are read away.
+fn linkClosed(fd: c.fd_t) bool {
+    var buf: [64]u8 = undefined;
+    while (true) {
+        const n = c.read(fd, &buf, buf.len);
+        if (n < 0 and c.errno(n) == .INTR) continue;
+        return n == 0 or (n < 0 and c.errno(n) != .AGAIN);
+    }
 }
 
 fn sizeText(a: std.mem.Allocator, bytes: u64) []const u8 {
