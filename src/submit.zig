@@ -1770,8 +1770,10 @@ fn seedCopy(cx: Cx, base: []const u8, dest: []const u8) void {
     }
     const src = free orelse busy orelse return;
     const cp = if (builtin.os.tag == .linux) "cp -a --reflink=auto" else "cp -a -c";
-    // A seed that half fails is only a start: the sync makes the copy whole.
-    _ = run(cx, &.{ "/bin/sh", "-c", cx.a.print("{s} {s}/. {s}/ 2>/dev/null || cp -a {s}/. {s}/ 2>/dev/null", .{ cp, quote(cx, src), quote(cx, dest), quote(cx, src), quote(cx, dest) }) catch return }, null);
+    // A seed that half fails is only a start: the sync makes the copy whole. Every file is dated
+    // 30 years back (gitship.aged): an output another branch built is older than every source.
+    // Where that can't be done, the copy starts empty.
+    _ = run(cx, &.{ "/bin/sh", "-c", cx.a.print("{s} {s}/. {s}/ 2>/dev/null || cp -a {s}/. {s}/ 2>/dev/null; {s} 2>/dev/null || find {s} -mindepth 1 -delete", .{ cp, quote(cx, src), quote(cx, dest), quote(cx, src), quote(cx, dest), gitship.aged(cx.a, quote(cx, dest)), quote(cx, dest) }) catch return }, null);
     // Not the source's generation: the sync marks this copy's own.
     Io.Dir.cwd().deleteFile(cx.io, cx.a.print("{s}/.cpuq-generation", .{dest}) catch return) catch {};
 }

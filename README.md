@@ -461,16 +461,23 @@ travel, so a job that needs one sets it inside its command. And while this machi
 hook` refuses a `cpuq run` that says neither, so an agent chooses: `--spill`, or `--local` for
 work that needs this OS.
 
-The hook also refuses long work (ten minutes or more here) that would finish in half the time
-elsewhere: a spec's work, with each host's time by the spec's results and the `cpuq submit` line;
-and `--local` work whose own trips to a spill host took half its time here (it ran there, so it
-needs nothing of this machine), with "drop --local". Heavy work typed over `ssh HOST` is pointed to
+The hook also refuses a spec's work run as `cpuq run` when it is long (ten minutes or more here)
+and would finish in half the time elsewhere, with each host's time by the spec's results and the
+`cpuq submit` line. `--local` is never refused: it is the caller's word that the work runs here (a
+macOS test, or a quick check that decides whether to send work elsewhere at all), and nothing
+places it off this machine. Heavy work typed over `ssh HOST` is pointed to
 `cpuq run --spill-to HOST`.
 
 Before the job runs there, the repo (git's top level, else the working directory) is copied to
 `HOST:cpuq-spill/s/NAME-HASH` (NAME the repo's directory, one copy per repo or worktree here)
 with rsync, honoring `.gitignore` and leaving `.git` behind.
-Each repo and worktree keeps its own copy there, so build caches stay warm between runs. The job
+Each repo and worktree keeps its own copy there, so build caches stay warm between runs. A new
+worktree's first copy starts, on a filesystem that clones (ZFS, btrfs), as a clone of the newest
+copy of the same repo there, so rsync sends only what differs: a Rig copy to burst took 5 s
+instead of 33. Each file of the clone is dated 30 years back (each still apart from the others),
+so rsync compares every file it ships, and an output another branch built there (a make or cargo
+target) is older than every source and is built again; a cache that goes by content (zig's)
+stays warm. The job
 starts in the same subdirectory, with the same options; its output streams back, and its exit
 status is cpuq's. `--return PATH` copies a path (relative to the working directory) back
 afterwards, for a build's output; it repeats.
@@ -478,7 +485,8 @@ afterwards, for a build's output; it repeats.
 - **Gitignored paths a job needs** (a vendored tree its tests read, or `.git` for `git ls-files`)
   ship too when listed in `.cpuq-spill` at the repo's top, a path a line (`#` comments), or given
   with `--ship PATH`. A gitignored path not listed never ships, and never leaves the host's copy
-  either: a build cache there (`.zig-cache`) stays warm from one run to the next. "Gitignored" is
+  either, whether or not it's here: a build cache there (`.zig-cache`) stays warm from one run to
+  the next. "Gitignored" is
   as git reads it (in a git repo, cpuq asks git): a file a `!` line brings back ships, and so does
   a tracked file a pattern happens to match.
 - **`.git` ships as a git of the copy's own:** a `.git` directory with only git's parts of the
@@ -566,7 +574,8 @@ rest:
   each job takes the first free one, so a gate's suite, corpus and matrix run side by side, not
   one after another. A copy never synced is first seeded on the host from the project's most
   recently synced copy (a free one if there is one; the filesystem's cheap copy where it has one),
-  so the sync sends only what differs and build caches start warm. `submit_slots = 1` runs a
+  so the sync sends only what differs and build caches start warm. Its files are dated 30 years
+  back, as a spilled copy's are. `submit_slots = 1` runs a
   worktree's jobs one after another on a single copy.
 - **Where the time goes:** each job's supervisor log (`~/.local/state/cpuq/jobs/ID/supervisor.log`)
   has a line with each phase's seconds: start, waiting for a copy, packs, copy, check, marked.

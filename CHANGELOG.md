@@ -2,6 +2,24 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.27.1 — 2026-10-17
+
+- A new worktree's first `--spill` copy starts, on a host whose filesystem clones (ZFS, btrfs), as
+  a clone of the newest copy of the same repo there, so rsync sends only what differs: a Rig copy
+  to burst takes 5 s instead of 33. Elsewhere it starts empty, as before.
+- A spilled copy keeps what `.gitignore` names even when it isn't here: a build cache made on the
+  host by the last run was deleted by the next sync from a worktree that never built locally.
+- `cpuq hook` never refuses a `--local` run: `--local` is the caller's word that it runs here (a
+  quick local check that decides whether to send work elsewhere at all), and nothing places it off
+  this machine. 0.27.0's "drop --local" refusal is gone.
+- A seeded copy (spilled or submitted) has every file dated 30 years back to start, each still
+  apart from the others, so an output another branch built there is older than every source and
+  is built again (make, cargo); a cache that goes by content (zig's) stays warm. Where dates can't
+  be moved, the copy starts empty.
+- A spill copy whose kept caches stand in the way of the sync (a folder there, a file here) is
+  synced again without them, rather than failing every run. A `.gitignore` with `!` lines keeps
+  nothing there, so files deleted here are deleted there too.
+
 ## 0.27.0 — 2026-10-17
 
 - `--spill` (and `spill_default = on`) places work by when it should finish, not only when this

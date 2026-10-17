@@ -53,7 +53,8 @@ branch names: history sizes jobs and estimates waits by label.
 
 Where `spill` is configured (`grep spill ~/.config/cpuq/config`), add `--spill` to any job
 that doesn't need this OS (builds, test suites of portable code), and `--local` to one that does
-(macOS behaviour or timing, a path outside the repo):
+(macOS behaviour or timing, a path outside the repo, or a quick local check that decides whether
+work is worth sending elsewhere at all):
 
     cpuq run --spill --label app:build --cores 2-6 -- sh -c 'zig build -j"$CPUQ_CORES" test'
     cpuq run --local --label app:mac  --cores 2-4 -- ./test/macos
@@ -62,7 +63,8 @@ While this machine is full, the hook refuses a `cpuq run` that says neither. Wit
 `spill_default = on`, a run that says neither spills when cpuq sees nothing tying it here (a path
 outside the repo, a macOS tool, --opaque): say `--local` for this OS's own work.
 
-`--local` only for that: not for speed or habit. A fixed `--cores 2` for a full suite starves it;
+`--local` always runs here: nothing moves it and the hook never refuses it. Use it only for
+that, not for speed or habit. A fixed `--cores 2` for a full suite starves it;
 give a range, or none. A full suite of a repo with `cpuq/*.json` goes through `cpuq submit`
 (below), and the hook refuses it as a `cpuq run` when it is long here and quicker there.
 

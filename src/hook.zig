@@ -17,11 +17,12 @@ pub const Refusal = struct {
 };
 
 /// Judges a `cpuq run`'s work by its history: a refusal when it would finish far sooner elsewhere.
-/// Asked only for a run on this machine that may move (not --spill, --exclusive, --opaque, …).
+/// Asked only for a run on this machine that may move (not --local, --spill, --exclusive, …):
+/// --local is the caller's word that it runs here, never refused for running elsewhere.
 pub const Advisor = struct {
     ctx: *anyopaque,
-    /// `cmd`: the command after `--`, its words joined by spaces. `local`: it says --local.
-    advise: *const fn (ctx: *anyopaque, cmd: []const u8, local: bool) ?Refusal,
+    /// `cmd`: the command after `--`, its words joined by spaces.
+    advise: *const fn (ctx: *anyopaque, cmd: []const u8) ?Refusal,
 };
 
 /// Checks one shell command line. `cpus` is the machine's CPU count, for
@@ -96,8 +97,6 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32
     };
     var opaque_flag = false;
     var elsewhere = false;
-    var stays = false;
-    var local = false;
     var pinned = false;
     var min_cores: ?u32 = null;
     // A lease's name comes first.
@@ -113,9 +112,7 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32
         // Sent to another machine: its size, not this one's, judges the request.
         if (std.mem.eql(u8, o, "--spill-to") or std.mem.startsWith(u8, o, "--spill-to=") or std.mem.eql(u8, o, "--spill")) elsewhere = true;
         // Said to run here, or of a kind --spill never sends.
-        if (std.mem.eql(u8, o, "--local")) local = true;
-        if (std.mem.eql(u8, o, "--exclusive") or std.mem.eql(u8, o, "--opaque") or std.mem.eql(u8, o, "--tethered") or std.mem.eql(u8, o, "--hold")) pinned = true;
-        if (std.mem.eql(u8, o, "--local") or std.mem.eql(u8, o, "--exclusive") or std.mem.eql(u8, o, "--opaque") or std.mem.eql(u8, o, "--tethered") or std.mem.eql(u8, o, "--hold")) stays = true;
+        if (std.mem.eql(u8, o, "--local") or std.mem.eql(u8, o, "--exclusive") or std.mem.eql(u8, o, "--opaque") or std.mem.eql(u8, o, "--tethered") or std.mem.eql(u8, o, "--hold")) pinned = true;
         const value: ?[]const u8 = if (std.mem.startsWith(u8, o, "--cores=")) o["--cores=".len..] else if (std.mem.eql(u8, o, "--cores") and i + 1 < w.len) w[i + 1] else null;
         if (value) |v| min_cores = std.fmt.parseInt(u32, std.mem.sliceTo(v, '-'), 10) catch null;
         // Options that take a value skip it.
@@ -130,7 +127,7 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32
     };
     // This machine is full: a run must say whether it may go elsewhere, not drift there (a test of
     // this OS run on another) nor wait here beside a machine with room.
-    if (full) |why| if (std.mem.eql(u8, sub, "run") and !elsewhere and !stays) return .{
+    if (full) |why| if (std.mem.eql(u8, sub, "run") and !elsewhere and !pinned) return .{
         .reason = a.print("this machine {s}, and spill hosts may have room: say where this job may run", .{why}) catch "this machine is full",
         .instead = "add --spill if it doesn't need this OS (it runs here while there's room, else on a spill host: repo-relative paths only, environment set inside the command), or --local if it does",
     };
@@ -152,9 +149,9 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32
         };
     }
     _ = project;
-    // Long work that finishes far sooner elsewhere; only --local of the kinds that stay here.
+    // Long work that finishes far sooner elsewhere, of a run that may move.
     if (advisor) |ad| if (std.mem.eql(u8, sub, "run") and !elsewhere and !pinned) {
-        return ad.advise(ad.ctx, std.mem.join(a, " ", inner) catch return null, local);
+        return ad.advise(ad.ctx, std.mem.join(a, " ", inner) catch return null);
     };
     return null;
 }
@@ -689,29 +686,26 @@ test "a suggested jobs flag goes before the redirections" {
     );
 }
 
-test "a run here that may move is put to the advisor, with its command and --local" {
+test "a run here that may move is put to the advisor, with its command; --local never is" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const Seen = struct {
         cmd: []const u8 = "",
-        local: bool = false,
-        fn advise(p: *anyopaque, cmd: []const u8, local: bool) ?Refusal {
+        fn advise(p: *anyopaque, cmd: []const u8) ?Refusal {
             const s: *@This() = @ptrCast(@alignCast(p));
             s.cmd = cmd;
-            s.local = local;
             return .{ .reason = "slow here", .instead = "cpuq submit cpuq/suite.json" };
         }
     };
     var seen: Seen = .{};
     const ad: Advisor = .{ .ctx = &seen, .advise = Seen.advise };
-    const r = check(a, "cpuq run --local --cores 2 --label rig:test -- sh -c './test/run -j \"$CPUQ_CORES\"'", 10, "app", null, ad);
+    const r = check(a, "cpuq run --cores 2 --label rig:test -- sh -c './test/run -j \"$CPUQ_CORES\"'", 10, "app", null, ad);
     try std.testing.expectEqualStrings("slow here", r.?.reason);
     try std.testing.expectEqualStrings("sh -c ./test/run -j \"$CPUQ_CORES\"", seen.cmd);
-    try std.testing.expect(seen.local);
-    try std.testing.expect(check(a, "cpuq run --label rig:test -- make", 10, "app", null, ad) != null);
-    try std.testing.expect(!seen.local);
-    // Sent elsewhere, held for timing or hidden work: not asked.
+    // Said to run here (a smoke test that decides whether to send work elsewhere), sent
+    // elsewhere, held for timing or hidden work: not asked.
+    try std.testing.expect(check(a, "cpuq run --local --cores 2-6 --label rig:check -- sh -c 'zig build -j\"$CPUQ_CORES\" test'", 10, "app", null, ad) == null);
     try std.testing.expect(check(a, "cpuq run --spill --label rig:test -- make", 10, "app", null, ad) == null);
     try std.testing.expect(check(a, "cpuq run --exclusive --label rig:bench -- ./bench", 10, "app", null, ad) == null);
     try std.testing.expect(check(a, "cpuq run --opaque --cores 4 --label e:t -- incus exec c -- make", 10, "app", null, ad) == null);

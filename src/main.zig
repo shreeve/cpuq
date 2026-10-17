@@ -882,6 +882,8 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     // its own build caches between runs, and `cpuq clean` finds them all in one directory.
     const dir = a.print("cpuq-spill/s/{s}-{x:0>8}", .{ std.fs.path.basename(root), @as(u32, @truncate(std.hash.Wyhash.hash(0, a.print("{s}\x00{s}", .{ shortHost(a), root }) catch root))) }) catch fail("out of memory", .{});
     std.debug.print("cpuq: {s}; running {s} on {s}\n", .{ why, if (o.label.len != 0) o.label else o.cmd[0], host });
+    const repo_named = repoOf(ctx, o);
+    const repo = repo_named orelse std.fs.path.basename(root);
 
     // What ships beyond the tracked files: --ship paths and the repo's .cpuq-spill list, each
     // included (with the folders above it) ahead of the rules that leave out .git and what
@@ -912,11 +914,24 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     const excludes = if (gitTop(ctx) != null) gitIgnored(ctx, root) else null;
     defer if (excludes) |f| Io.Dir.cwd().deleteFile(io, f) catch {};
     sync.append(a, if (excludes) |f| a.print("--exclude-from={s}", .{f}) catch "" else "--filter=:- .gitignore") catch fail("out of memory", .{});
+    // And there, what .gitignore names stays, though it isn't here: the build cache made there
+    // by the last run (or brought by a new copy's clone).
+    const keeps = if (excludes != null) gitKept(ctx, root) else null;
+    defer if (keeps) |f| Io.Dir.cwd().deleteFile(io, f) catch {};
+    const keep_at = sync.items.len;
+    if (keeps) |f| sync.append(a, a.print("--filter=merge {s}", .{f}) catch "") catch {};
     sync.appendSlice(a, &.{
-        a.print("--rsync-path=mkdir -p {s} && rsync", .{shellQuote(a, dir)}) catch "", a.print("{s}/", .{root}) catch "",
+        // A first copy there starts as a clone of another of this repo's (gitship.seedPath).
+        a.print("--rsync-path={s}", .{gitship.seedPath(a, dir, repo, ship_git)}) catch "", a.print("{s}/", .{root}) catch "",
         a.print("{s}:{s}/", .{ host, dir }) catch "",
     }) catch fail("out of memory", .{});
-    const copied = std.process.run(a, io, .{ .argv = sync.items }) catch |err| fail("rsync: {t}", .{err});
+    var copied = std.process.run(a, io, .{ .argv = sync.items }) catch |err| fail("rsync: {t}", .{err});
+    // What's kept there can stand in the way (a folder there where a file is here), which only
+    // a sync that keeps none of it clears.
+    if (!gitship.copied(copied.term) and keeps != null) {
+        _ = sync.orderedRemove(keep_at);
+        copied = std.process.run(a, io, .{ .argv = sync.items }) catch |err| fail("rsync: {t}", .{err});
+    }
     const failed: ?[]const u8 = if (!gitship.copied(copied.term)) std.mem.trim(u8, copied.stderr, " \n") else if (shipChecked(ctx, sync.items, host)) |e| e else if (ship_git) shipGit(ctx, root, host, dir) else null;
     if (failed) |err_text| {
         // Sent there by name, a job never runs here: it was sized for that host.
@@ -931,15 +946,15 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     // ssh joins its arguments into one line for the remote shell, so
     // everything is quoted for it.
     var remote: std.ArrayList(u8) = .empty;
-    // `.cpuq-used`: when a job last ran in the copy, which `cpuq clean` goes by.
-    remote.print(a, "cd {s} && touch .cpuq-used && ", .{shellQuote(a, dir)}) catch fail("out of memory", .{});
+    // `.cpuq-used`: when a job last ran in the copy, which `cpuq clean` goes by, and whose copy
+    // it is, for the next new copy of that repo to start from.
+    remote.print(a, "cd {s} && printf %s {s} >|.cpuq-used && ", .{ shellQuote(a, dir), shellQuote(a, repo) }) catch fail("out of memory", .{});
     if (rel.len != 0) remote.print(a, "cd {s} && ", .{shellQuote(a, a.print(".{s}", .{rel}) catch ".")}) catch {};
     // `spill_env.HOST`: the user's own shell assignments, expanded there (an ssh command's
     // shell reads no login profile, so ~/.local tools are off its PATH).
     if (ctx.cfg.spillEnv(host)) |env| remote.print(a, "export {s} && ", .{env}) catch {};
     // The repo's name for its history there (the copy's folder is named by the worktree).
-    const repo = repoOf(ctx, o);
-    if (repo) |r| remote.print(a, "export CPUQ_REPO={s} && ", .{shellQuote(a, r)}) catch {};
+    if (repo_named) |r| remote.print(a, "export CPUQ_REPO={s} && ", .{shellQuote(a, r)}) catch {};
     remote.print(a, "exec cpuq run --tethered --priority {t}", .{o.priority}) catch fail("out of memory", .{});
     if (o.label.len != 0) remote.print(a, " --label {s}", .{shellQuote(a, o.label)}) catch {};
     // Without --note, the worktree it came from: every job on another machine says what it's for.
@@ -957,7 +972,7 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     var job = newJobLog(ctx, o);
     job.base.pool = "spill";
     job.base.host = host;
-    job.base.repo = repo;
+    job.base.repo = repo_named;
     logSpill(ctx, job, "queued", trip_t, null);
     logSpill(ctx, job, "started", trip_t, null);
     const argv = [_][]const u8{ "ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4", host, remote.items };
@@ -1076,7 +1091,31 @@ fn shipList(ctx: *Ctx, root: []const u8, o: RunOptions) []const []const u8 {
     return out.items;
 }
 
-/// The top of the git work tree holding the working directory, if any.
+/// A file of rsync protect rules for what the repo's .gitignore files (and .git/info/exclude)
+/// name (gitship.kept), or null when there are none.
+fn gitKept(ctx: *Ctx, root: []const u8) ?[]const u8 {
+    const a = ctx.arena;
+    var out: std.ArrayList(u8) = .empty;
+    const r = std.process.run(a, ctx.io, .{ .argv = &.{ "git", "-C", root, "ls-files", "-z", "--", "*.gitignore" } }) catch return null;
+    if (r.term.success()) {
+        var paths = std.mem.splitScalar(u8, r.stdout, 0);
+        while (paths.next()) |path| {
+            if (!std.mem.eql(u8, std.fs.path.basename(path), ".gitignore")) continue;
+            const text = Io.Dir.cwd().readFileAlloc(ctx.io, a.print("{s}/{s}", .{ root, path }) catch continue, a, .limited(1 << 20)) catch continue;
+            out.appendSlice(a, gitship.kept(a, std.fs.path.dirname(path) orelse "", text)) catch {};
+        }
+    }
+    const info = std.process.run(a, ctx.io, .{ .argv = &.{ "git", "-C", root, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude" } }) catch null;
+    if (info) |i| if (i.term.success()) {
+        if (Io.Dir.cwd().readFileAlloc(ctx.io, std.mem.trim(u8, i.stdout, " \n"), a, .limited(1 << 20))) |text| out.appendSlice(a, gitship.kept(a, "", text)) catch {} else |_| {}
+    };
+    if (out.items.len == 0) return null;
+    const tmp = ctx.env.get("TMPDIR") orelse "/tmp";
+    const file = a.print("{s}/cpuq-spill-{d}.keep", .{ std.mem.trimEnd(u8, tmp, "/"), sys.getpid() }) catch return null;
+    Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = file, .data = out.items }) catch return null;
+    return file;
+}
+
 /// The untracked files git ignores in the repo at `root`, as an rsync exclude file of anchored
 /// patterns (an ignored folder whole, as `dir/`), written to a temporary file the caller deletes;
 /// null when git can't say.
@@ -1134,6 +1173,7 @@ fn repoAt(ctx: *Ctx, start: []const u8) ?[]const u8 {
     }
 }
 
+/// The top of the git work tree holding the working directory, if any.
 fn gitTop(ctx: *Ctx) ?[]const u8 {
     return gitTopAt(ctx, ".");
 }
@@ -3417,7 +3457,7 @@ const HookAdvisor = struct {
         return .{ .ctx = h, .advise = advise };
     }
 
-    fn advise(p: *anyopaque, cmd: []const u8, local: bool) ?hook.Refusal {
+    fn advise(p: *anyopaque, cmd: []const u8) ?hook.Refusal {
         const h: *HookAdvisor = @ptrCast(@alignCast(p));
         const ctx = h.ctx;
         const a = ctx.arena;
@@ -3425,45 +3465,30 @@ const HookAdvisor = struct {
         const repo = repoAt(ctx, h.cwd) orelse return null;
         const top = gitTopAt(ctx, h.cwd);
         const found = if (top) |root| submit.specFor(a, ctx.io, root, cmd) else null;
-        const needs = if (found) |f| f.needs else false;
-        // Neither a spec's work nor said to stay here: placement sends it where it finishes first.
-        if (!needs and !local) return null;
+        // Not a spec's work: placement sends it where it finishes first.
+        const spec = found orelse return null;
+        if (!spec.needs) return null;
         const rt = RunTimes.load(ctx, a);
         const key = place.workKey(a, repo, cmd);
         const here = rt.workStats(a, null, key);
         if (here.runs == 0 or here.ran < place.long_s) return null;
         var hb: [32]u8 = undefined;
         const here_txt = place.approx(&hb, here.ran);
-        if (found) |spec| if (spec.needs) {
-            const self = std.process.executablePathAlloc(ctx.io, a) catch "cpuq";
-            const cx: submit.Cx = .{ .io = ctx.io, .a = a, .env = ctx.env, .out = ctx.out, .version = version, .cfg = &ctx.cfg, .self = self };
-            var times: std.ArrayList(u8) = .empty;
-            var fastest: ?f64 = null;
-            for (submit.specTimes(cx, spec.label)) |t| {
-                var b: [32]u8 = undefined;
-                times.print(a, ", {s} on {s}", .{ place.approx(&b, t.seconds), t.host }) catch {};
-                fastest = @min(fastest orelse t.seconds, t.seconds);
-            }
-            const f = fastest orelse return null;
-            if (f * 2 > here.ran) return null;
-            return .{
-                .reason = a.print("this is {s}'s work: {s} here{s}", .{ spec.path, here_txt, times.items }) catch "this is a spec's work",
-                .instead = a.print("cpuq submit {s}{s}{s} (in the background: it ends with a verdict line){s}", .{ spec.path, if (spec.rest.len != 0) " -- " else "", spec.rest, if (local) "; if it must run on this OS, end the command with `# cpuq: skip`" else "" }) catch "cpuq submit",
-            };
-        };
-        if (!local) return null;
-        loadConfig(ctx);
-        var hosts = ctx.cfg.spillHosts();
-        while (hosts.next()) |host| {
-            const there = rt.workStats(a, host, key);
-            if (there.runs == 0 or there.ran * 2 > here.ran) continue;
+        const self = std.process.executablePathAlloc(ctx.io, a) catch "cpuq";
+        const cx: submit.Cx = .{ .io = ctx.io, .a = a, .env = ctx.env, .out = ctx.out, .version = version, .cfg = &ctx.cfg, .self = self };
+        var times: std.ArrayList(u8) = .empty;
+        var fastest: ?f64 = null;
+        for (submit.specTimes(cx, spec.label)) |t| {
             var b: [32]u8 = undefined;
-            return .{
-                .reason = a.print("--local keeps this here, {s}; its runs on {s} took {s}, copy and queue included", .{ here_txt, host, place.approx(&b, there.ran) }) catch "it runs faster elsewhere",
-                .instead = "drop --local (or say --spill): cpuq sends it where it finishes first",
-            };
+            times.print(a, ", {s} on {s}", .{ place.approx(&b, t.seconds), t.host }) catch {};
+            fastest = @min(fastest orelse t.seconds, t.seconds);
         }
-        return null;
+        const f = fastest orelse return null;
+        if (f * 2 > here.ran) return null;
+        return .{
+            .reason = a.print("this is {s}'s work: {s} here{s}", .{ spec.path, here_txt, times.items }) catch "this is a spec's work",
+            .instead = a.print("cpuq submit {s}{s}{s} (in the background: it ends with a verdict line)", .{ spec.path, if (spec.rest.len != 0) " -- " else "", spec.rest }) catch "cpuq submit",
+        };
     }
 };
 
