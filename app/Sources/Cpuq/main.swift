@@ -83,10 +83,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         NSWindow.allowsAutomaticWindowTabbing = false
         NSApp.mainMenu = mainMenu()
         applyShape()
-        // Settings changes the shape as it is toggled.
-        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.applyShape() }
-        }
         setUpNotifications()
         poll()
         pollClouds()
@@ -456,11 +452,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    /// Five things worth an interruption, each once it has lasted: cpuq's gate shut (30 s), jobs
-    /// waiting beside idle CPUs (a minute), heavy work outside cpuq on any machine (3 minutes), a
-    /// job that looks stuck (10 minutes of almost no CPU and no count), and a cloud machine up
-    /// with nothing to do for 15 minutes, which means its own 10-minute idle stop failed and it
-    /// is still billing.
+    /// What is worth an interruption, each once it has lasted: cpuq's gate shut (30 s), jobs
+    /// waiting beside idle CPUs (a minute), --opaque jobs holding cores while others wait (2
+    /// minutes), heavy work outside cpuq (3 minutes), a job that looks stuck or a machine
+    /// overloaded while another has room (10 minutes), and a cloud machine up with nothing to do
+    /// (15 minutes: its own 10-minute idle stop failed, and it is billing). Those that need the
+    /// owner are texted too.
     private func checkAlerts() {
         guard Prefs.notify else { return }
         let now = Date()
@@ -560,7 +557,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
             overloaded[id] = e
         }
-        sendTexts(now)
         for c in remotes where c.machine.start != nil {
             let idle = c.isCloudRunning && (c.status.map { $0.holders.isEmpty && $0.waiters.isEmpty } ?? false)
             var e = cloudIdle[c.machine.id] ?? Episode()
@@ -570,6 +566,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
             cloudIdle[c.machine.id] = e
         }
+        sendTexts(now)
     }
 
     /// What the outside work is, for its notification: the busiest commands, grouped, each with
@@ -645,7 +642,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let p = Process()
         p.executableURL = URL(fileURLWithPath: command)
         p.arguments = ["From Cpuq.app: " + Self.unique(lines).joined(separator: "\n")]
-        try? p.run()
+        // A text that didn't go shows in What's Happening, so its news isn't lost unseen.
+        p.terminationHandler = { p in
+            let status = p.terminationStatus
+            guard status != 0 else { return }
+            Task { @MainActor in self.textFailed("exited \(status)") }
+        }
+        do { try p.run() } catch { textFailed(error.localizedDescription) }
+    }
+
+    private func textFailed(_ why: String) {
+        found.append((Date(), "A text didn't go: \(Prefs.textCommand) \(why)."))
     }
 
     /// What's Happening?: what is wrong now, then what the rules found in the last hour, each
@@ -816,7 +823,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             let window = NSWindow(contentRect: .zero, styleMask: [.titled, .closable], backing: .buffered, defer: false)
             window.title = "Cpuq Settings"
             window.isReleasedWhenClosed = false
-            window.contentView = NSHostingView(rootView: SettingsView())
+            window.contentView = NSHostingView(rootView: SettingsView { [weak self] in self?.applyShape() })
             window.center()
             settingsWindow = window
         }

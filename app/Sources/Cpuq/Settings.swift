@@ -20,6 +20,8 @@ enum Prefs {
 
 /// Cpuq ▸ Settings: where the app shows itself, and whether it opens at login.
 struct SettingsView: View {
+    /// Shows or hides the chip and the Dock icon as the toggles say.
+    let shape: () -> Void
     @AppStorage("showInMenuBar") private var showInMenuBar = true
     @AppStorage("dockAlways") private var dockAlways = false
     @AppStorage("notify") private var notify = true
@@ -31,11 +33,13 @@ struct SettingsView: View {
         Form {
             Section {
                 Toggle("Show in the menu bar", isOn: $showInMenuBar)
+                    .onChange(of: showInMenuBar) { shape() }
                 Picker("Dock icon", selection: $dockAlways) {
                     Text("While the window is open").tag(false)
                     Text("Always").tag(true)
                 }
                 .disabled(!showInMenuBar)
+                .onChange(of: dockAlways) { shape() }
                 if !showInMenuBar {
                     Text("Without the menu bar item, Cpuq keeps its Dock icon, so it can always be reached.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -54,7 +58,7 @@ struct SettingsView: View {
             Section {
                 Toggle("Notify when something goes wrong", isOn: $notify)
             } footer: {
-                Text("Once each time it happens and lasts: cpuq's gate shut for 30 seconds; jobs waiting beside idle CPUs for a minute; a cloud machine up with nothing to do for 15 minutes (its own idle stop failed, and it is billing), with a button to stop it.")
+                Text("Once each time it happens and lasts, on any machine watched: cpuq's gate shut (30 seconds); jobs waiting beside idle CPUs (a minute); --opaque jobs holding cores while others wait (2 minutes); heavy work outside cpuq (3 minutes); a job that looks stuck, or a machine overloaded while another has room (10 minutes); a cloud machine up with nothing to do (15 minutes: its idle stop failed, and it is billing), with a button to stop it.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
