@@ -41,8 +41,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var idleWaitThere: [String: Episode] = [:]
     private var opaqueIdle: [String: Episode] = [:]
     private var overloaded: [String: Episode] = [:]
-    /// What the rules found lately, for What's Happening? and the owner's texts: the last hour's.
-    private var found: [(at: Date, line: String)] = []
     /// Lines waiting to be texted, and when the last text went: at most one every 30 minutes.
     private var toText: [String] = []
     private var textedAt: Date?
@@ -377,27 +375,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
     }
 
-    /// Fills the chip's menu: the versions, one line of how it stands, a line for each thing
-    /// wrong (and only then), and the commands. The jobs, the theme and the details live in the
-    /// window.
+    /// Fills the chip's menu in the order of a Mac app's own menu: the name and versions, a line
+    /// for each thing wrong (and only then), Settings and updates, the window, and Quit. The
+    /// jobs, the theme and the details live in the window.
     private func fill(_ m: NSMenu) {
         m.addItem(versions())
-        if let s = status {
-            let waiting = s.waiters.count
-            m.addItem(text("\(s.held) of \(s.capacity) cores in use" + (waiting > 0 ? " · \(waiting) waiting" : ""), bold: true))
-        } else {
-            m.addItem(text(problem ?? "reading cpuq status…", bold: false))
-        }
+        if status == nil { m.addItem(text(problem ?? "reading cpuq status…", bold: false)) }
         for line in alerts() { m.addItem(text(line, bold: false)) }
         m.addItem(.separator())
-        m.addItem(withTitle: "Open Cpuq", action: #selector(showGraphs), keyEquivalent: "g").target = self
-        m.addItem(withTitle: "What's Happening?", action: #selector(whatsHappening), keyEquivalent: "").target = self
         m.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",").target = self
         if Bundle.main.bundleURL.pathExtension == "app" {
             let check = NSMenuItem(title: "Check for Updates…", action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)), keyEquivalent: "")
             check.target = updater
             m.addItem(check)
         }
+        m.addItem(.separator())
+        m.addItem(withTitle: "Show Activity", action: #selector(showGraphs), keyEquivalent: "g").target = self
         m.addItem(.separator())
         m.addItem(withTitle: "Quit Cpuq", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }
@@ -614,8 +607,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     private func notify(_ id: String, _ title: String, _ body: String, stop: String? = nil, text: Bool = false) {
         let line = title + ". " + body
-        found.append((Date(), line))
-        found.removeAll { Date().timeIntervalSince($0.at) > 3600 }
         if text { toText.append(line) }
         guard Bundle.main.bundleIdentifier != nil else { return }
         let content = UNMutableNotificationContent()
@@ -642,7 +633,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let p = Process()
         p.executableURL = URL(fileURLWithPath: command)
         p.arguments = ["From Cpuq.app: " + Self.unique(lines).joined(separator: "\n")]
-        // A text that didn't go shows in What's Happening, so its news isn't lost unseen.
+        // A text that didn't go is a notification of its own, so its news isn't lost unseen.
         p.terminationHandler = { p in
             let status = p.terminationStatus
             guard status != 0 else { return }
@@ -652,31 +643,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     private func textFailed(_ why: String) {
-        found.append((Date(), "A text didn't go: \(Prefs.textCommand) \(why)."))
-    }
-
-    /// What's Happening?: what is wrong now, then what the rules found in the last hour, each
-    /// with how long ago, so an hour-old finding never reads as the present.
-    @objc private func whatsHappening() {
-        let alert = NSAlert()
-        alert.messageText = "What's happening"
-        alert.informativeText = Self.happening(now: alerts(), found: found, at: Date())
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
-    }
-
-    /// The text of What's Happening?: the present, then the last hour's findings, newest first,
-    /// each once, with its age.
-    static func happening(now: [String], found: [(at: Date, line: String)], at: Date) -> String {
-        var seen = Set<String>()
-        let earlier = found.reversed().filter { seen.insert($0.line).inserted }.map { f in
-            let m = Int(at.timeIntervalSince(f.at) / 60)
-            return (m < 1 ? "just now" : "\(m) min ago") + ": " + f.line
-        }
-        if now.isEmpty && earlier.isEmpty { return "All clear: nothing wrong now, and nothing found in the last hour." }
-        var parts = ["Now: " + (now.isEmpty ? "nothing wrong." : now.joined(separator: "\n"))]
-        if !earlier.isEmpty { parts.append("Earlier this hour (over unless it says so above):\n" + earlier.joined(separator: "\n")) }
-        return parts.joined(separator: "\n\n")
+        notify("text-failed", "A text didn't go", "\(Prefs.textCommand) \(why).")
     }
 
     /// Lines in order, each once.
@@ -709,16 +676,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         completionHandler()
     }
 
-    /// "App 0.17.1 · CLI 0.16.3", in grey: this app's version and the command-line cpuq it reads.
-    /// Enabled, as the lines below it are (it opens the window): a disabled item is drawn so faint
-    /// it can hardly be read.
+    /// "Cpuq • app 0.17.1 • cli 0.16.3", in bold: the name, this app's version, and the
+    /// command-line cpuq it reads. Enabled, as the lines below it are (it opens the window): a
+    /// disabled item is drawn so faint it can hardly be read.
     private func versions() -> NSMenuItem {
-        var s = "App \(appVersion)"
-        if let cli = status?.version, !cli.isEmpty { s += " · CLI \(cli)" }
-        let item = NSMenuItem(title: s, action: #selector(showGraphs), keyEquivalent: "")
-        item.target = self
-        item.attributedTitle = NSAttributedString(string: s, attributes: [.font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize), .foregroundColor: NSColor.secondaryLabelColor])
-        return item
+        var s = "Cpuq • app \(appVersion)"
+        if let cli = status?.version, !cli.isEmpty { s += " • cli \(cli)" }
+        return text(s, bold: true)
     }
 
     private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev" }
