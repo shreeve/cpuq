@@ -4,6 +4,19 @@ User-visible changes to cpuq. Each version's section is its release notes.
 
 ## 0.29.0 — unreleased
 
+- **`cpuq jobs`: a job is a folder of task files run by a driver of its own** (README, "Jobs").
+  `cpuq jobs run` in `jobs/NAME/STAMP/` runs `todo/` with N workers, each task's text up to its
+  first blank line under `sh`, moving each file to `done/`, `fail/`, or back to `todo/` after a
+  death (the third fails it). `status`, `watch`, `set workers|weight|gap`, `pause`, `resume`,
+  `stop` and `reset` act on the folder they run in. `cpuq jobs` lists the job folders, then the
+  submitted jobs as before.
+- **`cpuq status --json` lists the running jobs** (`jobs`): workers and who set them, weight,
+  counts, and the CPU each uses; their processes are not counted outside cpuq.
+- **`cpuq cap --link FD`** stops the program's tree at once, exit 123, when the pipe's other end
+  closes: its driver is gone.
+- **Linux: a job is confined to as many CPUs as its grant** (affinity), those the running jobs
+  use least, listed in `CPUQ_CPUS`.
+
 - **`needs`** in a spec names caches (from its `caches`) that must already hold files on a host:
   inputs filled by hand on some hosts only. `cpuq submit` passes over a host where one is missing
   or empty, `--on`'s too, with a line saying which; none left is NOT RUN.

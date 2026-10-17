@@ -1409,7 +1409,8 @@ pub fn running(io: Io, a: Allocator, env: *const std.process.Environ.Map) []Runn
     return out.items;
 }
 
-/// `cpuq jobs`: every job on this host, its running driver's snapshot or its folders' counts.
+/// `cpuq jobs`: every job folder on this host, its running driver's snapshot or its folders'
+/// counts; nothing when there are none.
 fn listJobs(ctx: *Ctx) u8 {
     const io = ctx.io;
     const a = ctx.arena;
@@ -1456,6 +1457,7 @@ fn listJobs(ctx: *Ctx) u8 {
             }
         }
     }
+    if (rows.items.len == 0) return 0;
     const t: table.Table = .{
         .title = "jobs",
         .columns = &.{
@@ -1465,7 +1467,6 @@ fn listJobs(ctx: *Ctx) u8 {
             .{ .head = "FAIL", .alignment = .right },
         },
         .rows = rows.items,
-        .notes = if (rows.items.len == 0) &.{"no jobs"} else &.{},
     };
     t.boxed(a, ctx.out, table.terminalWidth(1), c.isatty(1) == 1) catch {};
     return 0;
