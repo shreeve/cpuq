@@ -172,15 +172,6 @@ pub fn parseRun(args: []const [:0]const u8) ?RunOptions {
             }
             o.returns[o.return_count] = value;
             o.return_count += 1;
-        } else if (std.mem.eql(u8, name, "--spill")) {
-            _ = usageError("--spill is gone: cpuq run runs here; --on HOST sends it to one of this machine's remotes", .{});
-            return null;
-        } else if (std.mem.eql(u8, name, "--local")) {
-            _ = usageError("--local is gone: cpuq run always runs here", .{});
-            return null;
-        } else if (std.mem.eql(u8, name, "--ship")) {
-            _ = usageError("--ship is now --include (and the repo's .cpuq-spill is now .cpuqinclude)", .{});
-            return null;
         } else {
             _ = usageError("unknown option '{s}'", .{a});
             return null;

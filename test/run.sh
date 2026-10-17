@@ -1311,8 +1311,8 @@ t_submit_slots() {
 }
 
 t_submit_on() {
-  # A spec names no host: one with "on" is refused, saying why. --on HOST is one of this
-  # machine's remotes, and --on this machine runs the job here.
+  # A spec with a field it doesn't know is refused. --on HOST is one of this machine's
+  # remotes, and --on this machine runs the job here.
   setup submit-on
   local was_home=$HOME
   export HOME=$T/home XDG_STATE_HOME=$T/xdg
@@ -1321,7 +1321,7 @@ t_submit_on() {
   (
     cd "$T/roots/repo" || exit 1
     git init -q && git config user.email t@t && git config user.name t
-    printf '%s\n' '{ "label": "t:on", "run": "true", "cores": "1", "on": ["burst"] }' > cpuq/on.json
+    printf '%s\n' '{ "label": "t:on", "run": "true", "cores": "1", "host": "burst" }' > cpuq/on.json
     printf '%s\n' '{ "label": "t:here", "run": "true", "cores": "1" }' > cpuq/here.json
     git add -A && git commit -qm init
     "$CPUQ" submit cpuq/on.json >"$T/spec" 2>&1; echo "spec=$?"
@@ -1329,8 +1329,8 @@ t_submit_on() {
     "$CPUQ" submit --on "$(hostname -s)" cpuq/here.json >/dev/null 2>&1; echo "self=$?"
   ) >"$T/out" 2>&1
   local got; got=$(tr '\n' ' ' <"$T/out")
-  check "submit: a spec with \"on\" is refused ($(head -1 "$T/spec")); --on a host not among the remotes is refused; --on this machine runs here (got $got)" \
-    "[[ \"\$got\" == 'spec=2 unknown=2 self=0 ' ]] && grep -q 'is gone' '$T/spec' && grep -q 'not one of this machine' '$T/unknown'"
+  check "submit: a spec with an unknown field is refused ($(head -1 "$T/spec")); --on a host not among the remotes is refused; --on this machine runs here (got $got)" \
+    "[[ \"\$got\" == 'spec=2 unknown=2 self=0 ' ]] && grep -q 'UnknownField' '$T/spec' && grep -q 'not one of this machine' '$T/unknown'"
   export HOME=$was_home
   unset XDG_STATE_HOME
 }
@@ -2021,25 +2021,11 @@ t_min_available() {
   check "under min_available nothing starts (rc $rc, gate $state); above it, it does (rc $rc2)" "[ $rc = 75 ] && [ '$state' = 'low_memory with-available' ] && [ $rc2 = 0 ]"
 }
 
-t_gone() {
-  # --spill, --local and --ship are gone: cpuq run runs here, and --on HOST sends it; each old
-  # word is a usage error that names the new way, and so are the old spill config keys.
-  setup gone
-  local spill local_ ship cfg src lrc hrc crc
-  "$CPUQ" run --spill --cores 1 -- echo ran >/dev/null 2>"$T/spill"; src=$?
-  "$CPUQ" run --local --cores 1 -- echo ran >/dev/null 2>"$T/local"; lrc=$?
-  "$CPUQ" run --ship x --cores 1 -- echo ran >/dev/null 2>"$T/ship"; hrc=$?
-  spill=$(head -1 "$T/spill"); local_=$(head -1 "$T/local"); ship=$(head -1 "$T/ship")
-  setup gone-config "spill = far"
-  "$CPUQ" run --cores 1 -- echo ran >/dev/null 2>"$T/cfg"; crc=$?; cfg=$(head -1 "$T/cfg")
-  check "--spill (rc $src), --local (rc $lrc), --ship (rc $hrc) and config spill (rc $crc) are refused, naming what replaced them" \
-    "[[ \$src = 2 && \"\$spill\" == *'--on HOST'* && \$lrc = 2 && \"\$local_\" == *'always runs here'* && \$hrc = 2 && \"\$ship\" == *'--include'* && \$crc = 2 && \"\$cfg\" == *'remotes = '* ]]"
-}
 
 t_on() {
   # --on HOST runs there whatever this machine's state; a host that neither answers nor has a
   # remote_start command is an error, not a quiet run here. HOST is one of this machine's
-  # remotes, or this machine itself (which runs here); --spill-to is gone.
+  # remotes, or this machine itself (which runs here).
   setup on "remotes = cpuq-test-nohost.invalid, x"
   local out rc
   out=$("$CPUQ" run --on cpuq-test-nohost.invalid --cores 1 -- echo ran-here 2>&1); rc=$?
@@ -2047,13 +2033,12 @@ t_on() {
   "$CPUQ" run --include vendor --cores 1 -- true 2>/dev/null; local alone=$?
   check "--on an unreachable host without remote_start fails (rc $rc: '$out'), never running here; --include outside the repo (rc $outside) or without --on (rc $alone) is refused" \
     "[[ $rc = 125 && '$out' == *'does not answer'* && '$out' != *ran-here* && $outside = 2 && $alone = 2 ]]"
-  local unknown urc self src old orc
+  local unknown urc self src
   unknown=$("$CPUQ" run --on cheese --cores 1 -- echo ran 2>&1); urc=$?
   self=$("$CPUQ" run --on "$(hostname -s)" --cores 1 -- echo ran-here 2>&1); src=$?
-  old=$("$CPUQ" run --spill-to x --cores 1 -- echo ran 2>&1); orc=$?
-  unknown=$(printf '%s\n' "$unknown" | head -1); old=$(printf '%s\n' "$old" | head -1)
-  check "--on a host not among this machine's remotes is refused (rc $urc: '$unknown'); --on this machine runs here (rc $src: '$self'); --spill-to is refused (rc $orc: '$old')" \
-    "[[ \$urc = 2 && \"\$unknown\" == *'not one of this machine'* && \$src = 0 && \$self = ran-here && \$orc = 2 ]]"
+  unknown=$(printf '%s\n' "$unknown" | head -1)
+  check "--on a host not among this machine's remotes is refused (rc $urc: '$unknown'); --on this machine runs here (rc $src: '$self')" \
+    "[[ \$urc = 2 && \"\$unknown\" == *'not one of this machine'* && \$src = 0 && \$self = ran-here ]]"
 }
 
 t_include_git() {
@@ -2182,7 +2167,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk gone on include_git on_check on_gitignore tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
 for t in $TESTS; do
   if declare -F "t_$t" >/dev/null; then "t_$t"; else echo "no such test: $t"; FAIL=$((FAIL+1)); FAILED+=" $t?"; fi
 done
