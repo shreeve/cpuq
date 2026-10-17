@@ -183,11 +183,12 @@ can still use more. GNU make 4.x lets a `-j` on its own command line override th
 
 ### Labels
 
-Give every job a label, `project:task`, lowercase and the same on every run: `app:build`,
-`app:test`, `site:deploy`. History sizes jobs, sets their expected use and estimates waits by
-label, so a label with a run id, date or branch name in it never has a history. `cpuq status`
-sums the cores in use by project, the label up to its first `:`, and a new label's wait estimate
-uses its project's.
+Give every job a label, `project:task`, the same on every run: `app:build`, `app:test`,
+`site:deploy`. A label is parts split by `:`, each of lowercase letters, digits, `.`, `_` and `-`,
+none starting with `.`; anything else is a usage error. History sizes jobs, sets their expected
+use and estimates waits by label, so a label with a run id, date or branch name in it never has
+a history. `cpuq status` sums the cores in use by project, the label up to its first `:`, and a
+new label's wait estimate uses its project's.
 
 ### One job per phase
 

@@ -224,6 +224,9 @@ t_exit_status() {
   check "exit 7 passes through as 7 (got $rc)" "[ $rc = 7 ]"
   "$CPUQ" run -- sh -c 'kill -TERM $$'; rc=$?
   check "a command killed by SIGTERM reports 143 (got $rc)" "[ $rc = 143 ]"
+  local bad
+  bad=$("$CPUQ" run --label ../../x:y -- echo ran 2>&1); rc=$?
+  check "a label outside project:task of [a-z0-9._-] is a usage error, never running (rc $rc: '$bad')" "[[ \$rc = 2 && \"\$bad\" == *'lowercase letters'* ]] && ! grep -qx ran <<<\"\$bad\""
   local how
   # SIGINT at its default first: a suite started as a `&` job hands it down
   # ignored, cpuq keeps it ignored for the command, and sh survives its kill.
@@ -867,7 +870,7 @@ t_last_words() {
     if [ $((n % 2)) = 1 ]; then
       "$CPUQ" lease near --hold --label kit <"$T/k$n" >/dev/null & h1=$!
     else
-      PATH="$bin:$PATH" "$CPUQ" lease far --host far --hold --label kit@far <"$T/k$n" >/dev/null & h1=$!
+      PATH="$bin:$PATH" "$CPUQ" lease far --host far --hold --label kit-far <"$T/k$n" >/dev/null & h1=$!
     fi
     exec 7>"$T/k$n"
     if [ $((n % 2)) = 1 ]; then wait_lease_holder near; else wait_lease_holder far; fi
@@ -881,7 +884,7 @@ print(" ".join("%s%s:%s:%s" % (j["label"], "@" + j["host"] if j["host"] else "",
   echo "  exits $rc_w $rc_h1 $rc_h2; history: $got"
   check "killed while waiting, a run exits by the signal and gave up (not lost)" "[ $rc_w = 143 ] && [[ '$got' == *'waiter:gave_up:15'* ]]"
   check "killed while held, a --hold lease ends by the signal, here and on a host" "[ $rc_h1 = 129 ] && [ $rc_h2 = 143 ] && [[ '$got' == *'near:done:1 '* && '$got' == *'far@far:done:15'* ]]"
-  local kit; kit=$(echo "$got" | tr ' ' '\n' | grep -cE '^kit(@far@far)?:done:')
+  local kit; kit=$(echo "$got" | tr ' ' '\n' | grep -cE '^kit(-far@far)?:done:')
   check "closed and killed at once (the kit's release), a hold still ends, 5 of 5 (got $kit)" "[ '$kit' = 5 ]"
   check "nothing is lost" "[[ '$got' != *lost* ]]"
 }

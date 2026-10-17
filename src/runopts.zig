@@ -112,6 +112,10 @@ pub fn parseRun(args: []const [:0]const u8) ?RunOptions {
                 return null;
             };
         } else if (std.mem.eql(u8, name, "--label")) {
+            if (!policy.validLabel(value)) {
+                _ = usageError("--label is project:task, of lowercase letters, digits, '.', '_' and '-', not '{s}'", .{value});
+                return null;
+            }
             o.label = value;
         } else if (std.mem.eql(u8, name, "--note")) {
             o.note = value;

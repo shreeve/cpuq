@@ -397,6 +397,27 @@ test "parseAge" {
     try std.testing.expectEqual(@as(?u32, null), parseAge("0d"));
 }
 
+/// A job's label: parts split by `:` (`project:task`), each of lowercase letters, digits, `.`, `_`
+/// and `-`, none starting with `.`, and the first not with `-`. A project names directories on
+/// the hosts a job is sent to, so it never needs quoting there and never climbs out of them.
+pub fn validLabel(s: []const u8) bool {
+    if (s.len == 0 or s.len > 128 or s[0] == '-') return false;
+    var parts = std.mem.splitScalar(u8, s, ':');
+    while (parts.next()) |part| {
+        if (part.len == 0 or part[0] == '.') return false;
+        for (part) |ch| switch (ch) {
+            'a'...'z', '0'...'9', '.', '_', '-' => {},
+            else => return false,
+        };
+    }
+    return true;
+}
+
+test "labels" {
+    for ([_][]const u8{ "app:build", "cpuq", "emdb:gate-linux", "a.b_c-d:x:y", "0:9" }) |s| try std.testing.expect(validLabel(s));
+    for ([_][]const u8{ "", "App:build", "app:", ":x", "a::b", "../../x:y", ".git:x", "-x", "a b:c", "a$b:c", "a/b:c", "app:*" }) |s| try std.testing.expect(!validLabel(s));
+}
+
 /// A whole number, at least 1.
 pub fn parseCount(s: []const u8) ?u32 {
     const n = parseWhole(u32, s) orelse return null;
