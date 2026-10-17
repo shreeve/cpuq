@@ -195,6 +195,8 @@ pub const max_remote_lines = 8;
 pub const RemoteLine = struct {
     host: []const u8 = "",
     cmd: []const u8 = "",
+    /// The config line it came from, for the error when HOST is not one of the remotes.
+    line: usize = 0,
 };
 
 pub const Diagnostic = struct {
@@ -203,114 +205,137 @@ pub const Diagnostic = struct {
     message: []const u8 = "",
 };
 
-/// Parses `key = value` lines; `#` starts a comment.
+/// What a key's value is, and so how it is read.
+const Kind = enum { on_off, whole, number, seconds_ms, bytes, age, text, admit };
+
+/// A config key: the Config field it sets, how its value reads, and the bounds of a number.
+const Key = struct {
+    name: []const u8,
+    field: []const u8,
+    kind: Kind,
+    min: f64 = 0,
+    max: f64 = 0,
+    unit: []const u8 = "",
+
+    fn message(comptime k: Key) []const u8 {
+        const of = if (k.unit.len == 0) "" else " of " ++ k.unit;
+        return switch (k.kind) {
+            .on_off => k.name ++ " must be on or off",
+            .whole => std.fmt.comptimePrint("{s} must be a whole number{s}, {d} to {d}", .{ k.name, of, k.min, k.max }),
+            .number, .seconds_ms => std.fmt.comptimePrint("{s} must be a number{s}, {d} to {d}", .{ k.name, of, k.min, k.max }),
+            .bytes => k.name ++ " must be off or a size such as 5G or 512M",
+            .age => k.name ++ " must be off or a time such as 3d, 36h or 90m",
+            .text => unreachable,
+            .admit => k.name ++ " must be measured or cores",
+        };
+    }
+};
+
+const day = 86400;
+const keys = [_]Key{
+    .{ .name = "admit", .field = "admit", .kind = .admit },
+    .{ .name = "target", .field = "target", .kind = .number, .min = 1, .max = 4096, .unit = "CPUs" },
+    .{ .name = "settle", .field = "settle_s", .kind = .whole, .min = 1, .max = 3600, .unit = "seconds" },
+    .{ .name = "budget", .field = "budget", .kind = .whole, .min = 1, .max = 4096, .unit = "cores" },
+    .{ .name = "load_check", .field = "load_check", .kind = .on_off },
+    .{ .name = "load_margin", .field = "load_margin", .kind = .number, .min = 0, .max = 4096 },
+    .{ .name = "pressure_check", .field = "pressure_check", .kind = .on_off },
+    .{ .name = "pressure_psi", .field = "pressure_psi", .kind = .number, .min = 0, .max = 100 },
+    .{ .name = "active_cap", .field = "active_cap", .kind = .on_off },
+    .{ .name = "qos", .field = "qos", .kind = .on_off },
+    .{ .name = "poll", .field = "poll_ms", .kind = .seconds_ms, .min = 0.1, .max = 3600, .unit = "seconds" },
+    .{ .name = "aging", .field = "aging_s", .kind = .whole, .min = 0, .max = 7 * day, .unit = "seconds" },
+    .{ .name = "note", .field = "note_s", .kind = .whole, .min = 1, .max = day, .unit = "seconds" },
+    .{ .name = "backfill", .field = "backfill", .kind = .on_off },
+    .{ .name = "window_backfill", .field = "window_backfill", .kind = .on_off },
+    .{ .name = "exclusive", .field = "exclusive", .kind = .on_off },
+    .{ .name = "patience", .field = "patience_s", .kind = .whole, .min = 0, .max = day, .unit = "seconds" },
+    .{ .name = "max_memory", .field = "max_memory", .kind = .bytes },
+    .{ .name = "min_available", .field = "min_available", .kind = .bytes },
+    .{ .name = "min_disk", .field = "min_disk", .kind = .bytes },
+    .{ .name = "lend", .field = "lend", .kind = .on_off },
+    .{ .name = "lend_after", .field = "lend_after_s", .kind = .whole, .min = 1, .max = day, .unit = "seconds" },
+    .{ .name = "right_size", .field = "right_size", .kind = .on_off },
+    .{ .name = "window_gap", .field = "window_gap_s", .kind = .whole, .min = 0, .max = day, .unit = "seconds" },
+    .{ .name = "window_lend", .field = "window_lend_s", .kind = .whole, .min = 0, .max = day, .unit = "seconds" },
+    .{ .name = "cpu_weights", .field = "cpu_weights", .kind = .on_off },
+    .{ .name = "cgroups", .field = "cgroups", .kind = .on_off },
+    .{ .name = "submit_roots", .field = "submit_roots", .kind = .text },
+    .{ .name = "clean_after", .field = "clean_after_s", .kind = .age },
+    .{ .name = "remotes", .field = "remotes", .kind = .text },
+    .{ .name = "submit_slots", .field = "submit_slots", .kind = .whole, .min = 1, .max = 8 },
+};
+
+/// Parses `key = value` lines. `#` starts a comment at the start of a line or after a space or
+/// tab, so a value may hold one (`a#b`). Each key appears at most once; `remote_start.HOST` and
+/// `remote_env.HOST` once per HOST, and HOST must be one of the remotes.
 pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{ConfigInvalid}!void {
+    var seen: std.StaticBitSet(keys.len) = .empty;
     var lines = std.mem.splitScalar(u8, text, '\n');
     var n: usize = 0;
-    while (lines.next()) |raw| {
+    next: while (lines.next()) |raw| {
         n += 1;
-        const uncommented = if (std.mem.findScalar(u8, raw, '#')) |i| raw[0..i] else raw;
-        const line = std.mem.trim(u8, uncommented, " \t\r");
+        const line = std.mem.trim(u8, raw[0..commentStart(raw)], " \t\r");
         if (line.len == 0) continue;
         diag.line = n;
         diag.key = line;
-        const key_raw, const value_raw = std.mem.cutScalar(u8, line, '=') orelse {
-            diag.message = "expected key = value";
-            return error.ConfigInvalid;
-        };
+        const key_raw, const value_raw = std.mem.cutScalar(u8, line, '=') orelse return bad(diag, "expected key = value");
         const key = std.mem.trim(u8, key_raw, " \t");
         diag.key = key;
         const value = std.mem.trim(u8, value_raw, " \t");
-        if (std.mem.eql(u8, key, "budget")) {
-            const b = parseCount(value) orelse return bad(diag, "budget must be a whole number of cores, at least 1");
-            cfg.budget = b;
-        } else if (std.mem.eql(u8, key, "load_check")) {
-            cfg.load_check = parseBool(value) orelse return bad(diag, "load_check must be on or off");
-        } else if (std.mem.eql(u8, key, "load_margin")) {
-            cfg.load_margin = parseNonNegative(value) orelse return bad(diag, "load_margin must be a number, 0 or more");
-        } else if (std.mem.eql(u8, key, "pressure_check")) {
-            cfg.pressure_check = parseBool(value) orelse return bad(diag, "pressure_check must be on or off");
-        } else if (std.mem.eql(u8, key, "pressure_psi")) {
-            cfg.pressure_psi = parseNonNegative(value) orelse return bad(diag, "pressure_psi must be a number, 0 or more");
-        } else if (std.mem.eql(u8, key, "active_cap")) {
-            cfg.active_cap = parseBool(value) orelse return bad(diag, "active_cap must be on or off");
-        } else if (std.mem.eql(u8, key, "qos")) {
-            cfg.qos = parseBool(value) orelse return bad(diag, "qos must be on or off");
-        } else if (std.mem.eql(u8, key, "poll")) {
-            const s = parseNonNegative(value) orelse return bad(diag, "poll must be a number of seconds");
-            if (s < 0.1 or s > 3600) return bad(diag, "poll must be between 0.1 and 3600 seconds");
-            cfg.poll_ms = @round(s * 1000);
-        } else if (std.mem.eql(u8, key, "aging")) {
-            const a = std.fmt.parseInt(u32, value, 10) catch return bad(diag, "aging must be a whole number of seconds");
-            cfg.aging_s = a;
-        } else if (std.mem.eql(u8, key, "note")) {
-            cfg.note_s = parseCount(value) orelse return bad(diag, "note must be a whole number of seconds, at least 1");
-        } else if (std.mem.eql(u8, key, "exclusive")) {
-            cfg.exclusive = parseBool(value) orelse return bad(diag, "exclusive must be on or off");
-        } else if (std.mem.eql(u8, key, "backfill")) {
-            cfg.backfill = parseBool(value) orelse return bad(diag, "backfill must be on or off");
-        } else if (std.mem.eql(u8, key, "window_backfill")) {
-            cfg.window_backfill = parseBool(value) orelse return bad(diag, "window_backfill must be on or off");
-        } else if (std.mem.eql(u8, key, "right_size")) {
-            cfg.right_size = parseBool(value) orelse return bad(diag, "right_size must be on or off");
-        } else if (std.mem.eql(u8, key, "lend_after")) {
-            cfg.lend_after_s = parseCount(value) orelse return bad(diag, "lend_after must be a whole number of seconds, at least 1");
-        } else if (std.mem.eql(u8, key, "window_gap")) {
-            cfg.window_gap_s = std.fmt.parseInt(u32, value, 10) catch return bad(diag, "window_gap must be a whole number of seconds");
-        } else if (std.mem.eql(u8, key, "submit_roots")) {
-            cfg.submit_roots = value;
-        } else if (std.mem.eql(u8, key, "cgroups")) {
-            cfg.cgroups = parseBool(value) orelse return bad(diag, "cgroups must be on or off");
-        } else if (std.mem.eql(u8, key, "cpu_weights")) {
-            cfg.cpu_weights = parseBool(value) orelse return bad(diag, "cpu_weights must be on or off");
-        } else if (std.mem.eql(u8, key, "window_lend")) {
-            cfg.window_lend_s = std.fmt.parseInt(u32, value, 10) catch return bad(diag, "window_lend must be a whole number of seconds");
-        } else if (std.mem.eql(u8, key, "lend")) {
-            cfg.lend = parseBool(value) orelse return bad(diag, "lend must be on or off");
-        } else if (std.mem.eql(u8, key, "admit")) {
-            cfg.admit = std.meta.stringToEnum(Admit, value) orelse return bad(diag, "admit must be measured or cores");
-        } else if (std.mem.eql(u8, key, "target")) {
-            const t = parseNonNegative(value) orelse return bad(diag, "target must be a number of CPUs, more than 0");
-            if (t <= 0) return bad(diag, "target must be a number of CPUs, more than 0");
-            cfg.target = t;
-        } else if (std.mem.eql(u8, key, "settle")) {
-            cfg.settle_s = parseCount(value) orelse return bad(diag, "settle must be a whole number of seconds, at least 1");
-        } else if (std.mem.eql(u8, key, "remotes")) {
-            cfg.remotes = value;
-        } else if (std.mem.eql(u8, key, "submit_slots")) {
-            const slots = parseCount(value) orelse return bad(diag, "submit_slots must be a whole number, 1 to 8");
-            if (slots > 8) return bad(diag, "submit_slots must be a whole number, 1 to 8");
-            cfg.submit_slots = slots;
-        } else if (std.mem.startsWith(u8, key, "remote_start.")) {
-            const host = key["remote_start.".len..];
-            if (host.len == 0) return bad(diag, "remote_start needs a host: remote_start.HOST = COMMAND");
+        inline for (keys, 0..) |k, i| if (std.mem.eql(u8, key, k.name)) {
+            if (seen.isSet(i)) return bad(diag, "set twice");
+            seen.set(i);
+            const field = &@field(cfg, k.field);
+            switch (k.kind) {
+                .on_off => field.* = parseBool(value) orelse return bad(diag, comptime k.message()),
+                .whole => {
+                    const w = parseWhole(u32, value) orelse return bad(diag, comptime k.message());
+                    if (@as(f64, @floatFromInt(w)) < k.min or @as(f64, @floatFromInt(w)) > k.max) return bad(diag, comptime k.message());
+                    field.* = w;
+                },
+                .number, .seconds_ms => {
+                    const x = parseDecimal(value) orelse return bad(diag, comptime k.message());
+                    if (x < k.min or x > k.max) return bad(diag, comptime k.message());
+                    field.* = if (k.kind == .seconds_ms) @round(x * 1000) else x;
+                },
+                .bytes => field.* = parseBytes(value) orelse return bad(diag, comptime k.message()),
+                .age => field.* = parseAge(value) orelse return bad(diag, comptime k.message()),
+                .text => field.* = value,
+                .admit => field.* = std.meta.stringToEnum(Admit, value) orelse return bad(diag, comptime k.message()),
+            }
+            continue :next;
+        };
+        if (std.mem.cutPrefix(u8, key, "remote_start.")) |host| {
             if (value.len == 0) return bad(diag, "remote_start needs a command to start the host");
-            if (cfg.remote_start_count == max_remote_lines) return bad(diag, "at most 8 remote_start commands");
-            cfg.remote_starts[cfg.remote_start_count] = .{ .host = host, .cmd = value };
-            cfg.remote_start_count += 1;
-        } else if (std.mem.startsWith(u8, key, "remote_env.")) {
-            const host = key["remote_env.".len..];
-            if (host.len == 0) return bad(diag, "remote_env needs a host: remote_env.HOST = NAME=VALUE");
+            try addRemoteLine(&cfg.remote_starts, &cfg.remote_start_count, host, value, n, diag);
+        } else if (std.mem.cutPrefix(u8, key, "remote_env.")) |host| {
             if (std.mem.findScalar(u8, value, '=') == null) return bad(diag, "remote_env needs assignments: NAME=VALUE ...");
-            if (cfg.remote_env_count == max_remote_lines) return bad(diag, "at most 8 remote_env lines");
-            cfg.remote_envs[cfg.remote_env_count] = .{ .host = host, .cmd = value };
-            cfg.remote_env_count += 1;
-        } else if (std.mem.eql(u8, key, "spill") or std.mem.startsWith(u8, key, "spill_")) {
-            return bad(diag, "spill is gone: remotes = HOST, ... lists the machines this one sends work to (remote_start.HOST, remote_env.HOST); cpuq run runs here, --on HOST sends it");
-        } else if (std.mem.eql(u8, key, "clean_after")) {
-            cfg.clean_after_s = parseAge(value) orelse return bad(diag, "clean_after must be off or a time such as 3d, 36h or 90m");
-        } else if (std.mem.eql(u8, key, "min_disk")) {
-            cfg.min_disk = parseBytes(value) orelse return bad(diag, "min_disk must be off or a size such as 5G or 512M");
-        } else if (std.mem.eql(u8, key, "min_available")) {
-            cfg.min_available = parseBytes(value) orelse return bad(diag, "min_available must be off or a size such as 6G or 512M");
-        } else if (std.mem.eql(u8, key, "max_memory")) {
-            cfg.max_memory = parseBytes(value) orelse return bad(diag, "max_memory must be off or a size such as 16G or 512M");
-        } else if (std.mem.eql(u8, key, "patience")) {
-            cfg.patience_s = std.fmt.parseInt(u32, value, 10) catch return bad(diag, "patience must be a whole number of seconds");
-        } else {
-            return bad(diag, "unknown key");
-        }
+            try addRemoteLine(&cfg.remote_envs, &cfg.remote_env_count, host, value, n, diag);
+        } else return bad(diag, "unknown key");
     }
+    inline for (.{ "remote_start.", "remote_env." }, .{ cfg.remote_starts[0..cfg.remote_start_count], cfg.remote_envs[0..cfg.remote_env_count] }) |prefix, list| {
+        for (list) |r| if (!cfg.isRemote(r.host)) {
+            diag.line = r.line;
+            diag.key = r.host;
+            return bad(diag, prefix ++ "HOST must name one of the remotes");
+        };
+    }
+}
+
+fn addRemoteLine(list: *[max_remote_lines]RemoteLine, count: *u8, host: []const u8, value: []const u8, line: usize, diag: *Diagnostic) error{ConfigInvalid}!void {
+    if (host.len == 0) return bad(diag, "needs a host: remote_start.HOST or remote_env.HOST");
+    for (list[0..count.*]) |r| if (std.mem.eql(u8, r.host, host)) return bad(diag, "set twice");
+    if (count.* == max_remote_lines) return bad(diag, std.fmt.comptimePrint("at most {d} hosts", .{max_remote_lines}));
+    list[count.*] = .{ .host = host, .cmd = value, .line = line };
+    count.* += 1;
+}
+
+/// Where a line's comment starts: a `#` at the start or after a space or tab; the line's length
+/// when it has none.
+fn commentStart(raw: []const u8) usize {
+    for (raw, 0..) |ch, i| if (ch == '#' and (i == 0 or raw[i - 1] == ' ' or raw[i - 1] == '\t')) return i;
+    return raw.len;
 }
 
 /// A size: off (0), or a whole number with an optional K, M or G (powers of
@@ -326,7 +351,7 @@ pub fn parseBytes(s: []const u8) ?u64 {
         else => return null,
     };
     const digits = if (unit == 1) s else s[0 .. s.len - 1];
-    const n = std.fmt.parseInt(u64, digits, 10) catch return null;
+    const n = parseWhole(u64, digits) orelse return null;
     return std.math.mul(u64, n, unit) catch null;
 }
 
@@ -357,7 +382,7 @@ pub fn parseAge(s: []const u8) ?u32 {
         else => return null,
     };
     const digits = if (std.ascii.isDigit(s[s.len - 1])) s else s[0 .. s.len - 1];
-    const n = std.fmt.parseInt(u32, digits, 10) catch return null;
+    const n = parseWhole(u32, digits) orelse return null;
     if (n == 0) return null;
     return std.math.mul(u32, n, unit) catch null;
 }
@@ -372,20 +397,36 @@ test "parseAge" {
     try std.testing.expectEqual(@as(?u32, null), parseAge("0d"));
 }
 
+/// A whole number, at least 1.
 pub fn parseCount(s: []const u8) ?u32 {
-    const n = std.fmt.parseInt(u32, s, 10) catch return null;
+    const n = parseWhole(u32, s) orelse return null;
     return if (n >= 1) n else null;
+}
+
+/// A whole number written in decimal digits alone: no sign, no `_`.
+pub fn parseWhole(comptime T: type, s: []const u8) ?T {
+    if (s.len == 0) return null;
+    for (s) |ch| if (!std.ascii.isDigit(ch)) return null;
+    return std.fmt.parseInt(T, s, 10) catch null;
+}
+
+/// A number written in decimal digits with at most one point (`4`, `0.5`).
+fn parseDecimal(s: []const u8) ?f64 {
+    var points: usize = 0;
+    var digits: usize = 0;
+    for (s) |ch| switch (ch) {
+        '0'...'9' => digits += 1,
+        '.' => points += 1,
+        else => return null,
+    };
+    if (digits == 0 or points > 1) return null;
+    return std.fmt.parseFloat(f64, s) catch null;
 }
 
 fn parseBool(s: []const u8) ?bool {
     if (std.mem.eql(u8, s, "on") or std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "yes")) return true;
     if (std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "false") or std.mem.eql(u8, s, "no")) return false;
     return null;
-}
-
-fn parseNonNegative(s: []const u8) ?f64 {
-    const x = std.fmt.parseFloat(f64, s) catch return null;
-    return if (x >= 0 and !std.math.isNan(x) and !std.math.isInf(x)) x else null;
 }
 
 /// The budget in force now: CPUQ_BUDGET, else the configured budget, else
@@ -605,7 +646,7 @@ pub fn admit(req: Request, exclusive: bool, budget: u32, held: u32, exclusive_ru
     if (held >= budget) return null;
     const free = budget - held;
     if (free < lo) return null;
-    const room = if (free >= lo + reserve) free - reserve else free;
+    const room = if (free - lo >= reserve) free - reserve else free;
     return @min(hi, room);
 }
 
@@ -973,8 +1014,9 @@ test "remotes and their start commands" {
     var cfg: Config = .{};
     var diag: Diagnostic = .{};
     try parseConfig(
-        \\remotes = pup, burst
         \\remote_start.burst = ~/runbooks/host-gcp-burst/start  # a cloud machine
+        \\remotes = pup, burst
+        \\remote_env.pup = PATH=$HOME/.local/go/bin:$PATH
         \\
     , &cfg, &diag);
     var it = cfg.remoteHosts();
@@ -983,15 +1025,23 @@ test "remotes and their start commands" {
     try testing.expectEqual(@as(?[]const u8, null), it.next());
     try testing.expectEqualStrings("~/runbooks/host-gcp-burst/start", cfg.remoteStart("burst").?);
     try testing.expect(cfg.isRemote("pup") and !cfg.isRemote("cheese"));
-    try parseConfig("remote_env.pup = PATH=$HOME/.local/go/bin:$PATH\n", &cfg, &diag);
     try testing.expectEqualStrings("PATH=$HOME/.local/go/bin:$PATH", cfg.remoteEnv("pup").?);
     try testing.expectEqual(@as(?[]const u8, null), cfg.remoteEnv("burst"));
-    try testing.expectError(error.ConfigInvalid, parseConfig("remote_env.pup = nothing\n", &cfg, &diag));
     try testing.expectEqual(@as(?[]const u8, null), cfg.remoteStart("pup"));
-    try testing.expectError(error.ConfigInvalid, parseConfig("remote_start. = x\n", &cfg, &diag));
-    // The old names are an error that names the new ones.
-    try testing.expectError(error.ConfigInvalid, parseConfig("spill = pup\n", &cfg, &diag));
-    try testing.expectError(error.ConfigInvalid, parseConfig("spill_default = on\n", &cfg, &diag));
+    const refused = [_][]const u8{
+        "remotes = pup\nremote_env.pup = nothing\n",
+        "remotes = pup\nremote_start. = x\n",
+        "remotes = pup\nremote_start.pup = a\nremote_start.pup = b\n",
+        "remotes = pup\nremote_start.burst = start\n",
+        "remote = pup\n",
+    };
+    for (refused) |text| {
+        var c: Config = .{};
+        try testing.expectError(error.ConfigInvalid, parseConfig(text, &c, &diag));
+    }
+    var c: Config = .{};
+    try testing.expectError(error.ConfigInvalid, parseConfig("remotes = pup\n\nremote_env.burst = A=1\n", &c, &diag));
+    try testing.expectEqual(3, diag.line);
 }
 
 test "disk gate" {
@@ -1139,14 +1189,32 @@ test "makeflags keeps the caller's flags" {
 test "config file" {
     var cfg: Config = .{};
     var diag: Diagnostic = .{};
-    try parseConfig("# cpuq\nbudget = 6\nload_check = off # quiet\npoll = 0.5\naging = 60\n", &cfg, &diag);
+    try parseConfig("# cpuq\nbudget = 6\nload_check = off # quiet\npoll = 0.5\naging = 60\nsubmit_roots = ~/a#b\n", &cfg, &diag);
     try testing.expectEqual(6, cfg.budget.?);
     try testing.expect(!cfg.load_check);
     try testing.expectEqual(500, cfg.poll_ms);
     try testing.expectEqual(60, cfg.aging_s);
+    try testing.expectEqualStrings("~/a#b", cfg.submit_roots);
 
     var cfg3: Config = .{};
     try testing.expectError(error.ConfigInvalid, parseConfig("budget = 6\nbudgte = 3\n", &cfg3, &diag));
     try testing.expectEqual(2, diag.line);
-    try testing.expectError(error.ConfigInvalid, parseConfig("budget = 0\n", &cfg3, &diag));
+    const refused = [_][]const u8{
+        "budget = 0\n",             "budget = +5\n",      "budget = 1_000\n",   "budget = 5000\n",
+        "budget = 4\nbudget = 5\n", "poll = 0.05\n",      "poll = 1e3\n",       "target = 0\n",
+        "pressure_psi = 101\n",     "submit_slots = 9\n", "load_margin = -1\n", "aging = 1.5\n",
+    };
+    for (refused) |text| {
+        var c: Config = .{};
+        try testing.expectError(error.ConfigInvalid, parseConfig(text, &c, &diag));
+    }
+    try testing.expectError(error.ConfigInvalid, parseConfig("budget = 4\n# two\nbudget = 5\n", &cfg3, &diag));
+    try testing.expectEqualStrings("set twice", diag.message);
+    try testing.expectEqual(3, diag.line);
+}
+
+test "admit leaves the reserve without overflowing" {
+    const r: Request = .{ .min = 2, .max = 8 };
+    try testing.expectEqual(@as(?u32, 6), admit(r, false, 10, 0, false, 4));
+    try testing.expectEqual(@as(?u32, 8), admit(r, false, 10, 0, false, std.math.maxInt(u32)));
 }

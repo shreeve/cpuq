@@ -841,9 +841,12 @@ only what another machine sent it.
 
 ## Configuration
 
-The config file is `CPUQ_CONFIG`, default `~/.config/cpuq/config`: `key = value` lines, `#` for
-comments. An invalid line is an error naming the file and line (exit 2). A run already waiting
-re-reads the file when it changes; an invalid edit keeps the settings in force and says so.
+The config file is `CPUQ_CONFIG`, default `~/.config/cpuq/config`: `key = value` lines, each key
+at most once. `#` starts a comment at the start of a line or after a space or tab, so a value may
+hold one (`a#b`). Numbers are plain decimal digits, within a range the error gives. HOST in
+`remote_start.HOST` and `remote_env.HOST` is one of `remotes`. An invalid line is an error naming
+the file and line (exit 2). A run already waiting re-reads the file when it changes; an invalid
+edit keeps the settings in force and says so.
 
 | key | default | meaning |
 |---|---|---|
@@ -886,11 +889,11 @@ balloons would otherwise fill the swap and shut the memory gate on everyone.
 
 ## Reservation mode (admit = cores)
 
-With `admit = cores`, each job counts at the cores it holds, out of a fixed budget, as cpuq did
-before measured admission. The budget is `CPUQ_BUDGET`, else `budget` in the config, else the
-active CPUs minus 2 (8 on a 10-CPU Mac), leaving a reserve for the owner's own work; it is
-capped by the CPUs active now unless `active_cap = off`, which lets it oversubscribe the machine
-on purpose. `cpuq budget` prints it. A request is clamped to the budget.
+With `admit = cores`, each job counts at the cores it holds, out of a fixed budget. The budget
+is `CPUQ_BUDGET`, else `budget` in the config, else the active CPUs minus 2 (8 on a 10-CPU Mac),
+leaving a reserve for the owner's own work; it is capped by the CPUs active now unless
+`active_cap = off`, which lets it oversubscribe the machine on purpose. `cpuq budget` prints it.
+A request is clamped to the budget.
 
 In this mode a few things keep reserved cores from sitting idle:
 

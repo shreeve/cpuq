@@ -31,13 +31,17 @@ setup() {
   mkdir -p "$T"
   export CPUQ_DIR=$T/state CPUQ_CONFIG=$T/config CPUQ_BUDGET=9
   unset CPUQ_TOKEN MAKEFLAGS
+  # Each key at most once: a line given here replaces the default for its key.
+  # min_disk: t_min_disk tests it; the rest must not hang on the host's disk.
+  # active_cap: a budget of 9 on a machine with fewer cores.
+  # admit: the reservation model; t_measured tests the default.
+  local line keys=" "
+  for line in "$@"; do keys="$keys${line%% *} "; done
   {
-    echo "load_check = off"
-    echo "pressure_check = off"
-    echo "min_disk = off" # t_min_disk tests it; the rest must not hang on the host's disk
-    echo "poll = 0.2"
-    echo "active_cap = off" # a budget of 9 on a machine with fewer cores
-    echo "admit = cores" # the reservation model; t_measured tests the default
+    for line in "load_check = off" "pressure_check = off" "min_disk = off" "poll = 0.2" \
+        "active_cap = off" "admit = cores"; do
+      case $keys in *" ${line%% *} "*) ;; *) echo "$line" ;; esac
+    done
     for line in "$@"; do echo "$line"; done
   } >"$CPUQ_CONFIG"
   echo "== $CUR"
@@ -788,7 +792,7 @@ t_config_reload() {
   "$CPUQ" run --cores 2 -- true & local w=$!
   wait_waiters 1
   sleep 0.6
-  echo "budget = 11" >>"$CPUQ_CONFIG"
+  { grep -v '^budget' "$CPUQ_CONFIG"; echo "budget = 11"; } >"$CPUQ_CONFIG.new" && mv "$CPUQ_CONFIG.new" "$CPUQ_CONFIG"
   wait $w
   local dt; dt=$(python3 -c "print('%.1f' % ($(now) - $t0))")
   kill $h 2>/dev/null; wait $h 2>/dev/null
@@ -2020,7 +2024,6 @@ t_min_available() {
   "$CPUQ" run --cores 1 --max-wait 1 -- true; local rc2=$?
   check "under min_available nothing starts (rc $rc, gate $state); above it, it does (rc $rc2)" "[ $rc = 75 ] && [ '$state' = 'low_memory with-available' ] && [ $rc2 = 0 ]"
 }
-
 
 t_on() {
   # --on HOST runs there whatever this machine's state; a host that neither answers nor has a
