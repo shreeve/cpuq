@@ -291,7 +291,7 @@ can spend a large part of a big machine doing nothing else: one did, about 17 of
 | `--time DURATION` | stopped after DURATION (`120`, `120s`, `2m`, `500ms`) |
 | `--output SIZE` | stopped once it has written more than SIZE to stdout and stderr, which must be files or `/dev/null`; a pipe is refused |
 | `--pids N` | at most N processes and threads at once (inside a job on Linux) |
-| `--no-crash-report` | no crash report when PROGRAM crashes on purpose, a test that panics: on macOS no `.ips` in `~/Library/Logs/DiagnosticReports`; on Linux a core limit of exactly 1, so the kernel passes it to no `core_pattern` handler (Ubuntu's apport, seconds per crash). It still dies by its signal. What PROGRAM starts inherits it, so wrap the program meant to crash, never a compiler before it |
+| `--no-crash-report` | no crash report when PROGRAM crashes on purpose, a test that panics. macOS: cap answers PROGRAM's crashes itself, so neither the user's ReportCrash (~/Library/Logs/DiagnosticReports) nor the system's (/Library/Logs/DiagnosticReports) files one, and cap exits 128+N for a death by signal N rather than dying by it (a shell sees the same status). Linux: a core limit of exactly 1, so the kernel passes it to no `core_pattern` handler (Ubuntu's apport, seconds per crash); it still dies by its signal. What PROGRAM starts inherits it, so wrap the program meant to crash, never a compiler before it |
 
 `cpuq cap --protocol` prints what cap does as a number that changes only when that does (its
 limits, how it stops a program, its exit statuses, `--no-crash-report`): a test runner that caches

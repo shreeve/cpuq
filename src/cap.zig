@@ -507,8 +507,10 @@ const Stop = enum { none, memory, time, output };
 /// stops a program, its exit statuses, `--no-crash-report`. A test runner keys cached results on it
 /// (`cpuq cap --protocol`), not on cpuq's version, so a release that leaves cap alone keeps them.
 /// 1: --mem/--time/--output/--pids, exits 122/124/121, cgroups inside a job on Linux;
-/// 2: --no-crash-report (macOS ports; Linux core limit 1).
-pub const protocol = 2;
+/// 2: --no-crash-report (macOS ports; Linux core limit 1);
+/// 3: --no-crash-report on macOS answers PROGRAM's crashes (no user or system report) and exits
+/// 128+N for a death by signal N.
+pub const protocol = 3;
 
 pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]const u8, path_env: ?[]const u8) u8 {
     if (args.len == 1 and std.mem.eql(u8, args[0], "--protocol")) {
@@ -596,7 +598,11 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
             cgroup = null;
         }
     }
+    // macOS: PROGRAM's crash exceptions come here and are answered as handled, so neither the
+    // user's nor the system's ReportCrash files a report; cpuq's own are back after the fork.
+    const catcher: ?sys.CrashCatcher = if (quiet_crash) sys.CrashCatcher.start() else null;
     if (pid < 0) pid = c.fork();
+    if (pid != 0) if (catcher) |*k| k.restore();
     if (pid < 0) {
         _ = c.sigprocmask(c.SIG.SETMASK, &before, null);
         std.debug.print("cpuq cap: could not start {s}\n", .{cmd[0]});
@@ -621,7 +627,9 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
         }
         // An expected crash (a test that panics on purpose) files no crash report, nor does anything
         // PROGRAM starts: so wrap only the program meant to crash, never a compiler before it.
-        if (quiet_crash) sys.noCrashReport();
+        // macOS with the catcher: the handler it inherited stands; else no handler (Linux: a
+        // core limit of 1, which keeps the crash from apport).
+        if (quiet_crash and catcher == null) sys.noCrashReport();
         _ = c.execve(program.ptr, argv.ptr, envp);
         const err: u8 = @intCast(@intFromEnum(c.errno(-1)));
         _ = c.write(report[1], &[_]u8{ 'e', err }, 2);
@@ -728,7 +736,12 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
         .none => {},
     }
     if (c.W.IFEXITED(s)) return c.W.EXITSTATUS(s);
-    if (c.W.IFSIGNALED(s)) sys.dieBySignal(c.W.TERMSIG(s));
+    if (c.W.IFSIGNALED(s)) {
+        // An expected crash, on macOS: 128+N, the status a shell shows for it, rather than dying
+        // by the signal too, which would have the system's ReportCrash file one for cpuq.
+        if (catcher != null) return 128 +| @as(u8, @intCast(@backingInt(c.W.TERMSIG(s))));
+        sys.dieBySignal(c.W.TERMSIG(s));
+    }
     return exit_failure;
 }
 

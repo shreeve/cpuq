@@ -2,6 +2,16 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.26.2 — 2026-10-16
+
+- macOS: `cpuq cap --no-crash-report` stops the system's crash report too. Clearing PROGRAM's crash
+  handler (0.25.0) only stopped the user's ReportCrash: the crash went on to the system's, which
+  filed it in /Library/Logs/DiagnosticReports (75 such reports today from tests that panic on
+  purpose). cap now answers PROGRAM's crashes itself, from a port PROGRAM inherits, so neither
+  files one; and it exits 128+N for a death by signal N instead of dying by the signal too, which
+  had the system file one for cpuq. A shell sees the same status (134 for an abort). `cpuq cap
+  --protocol` is now 3.
+
 ## 0.26.1 — 2026-10-16
 
 - `cpuq cap --protocol` prints what cap does as a number that changes only when that does (now 2).

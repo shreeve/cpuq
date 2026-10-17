@@ -133,7 +133,8 @@ every process (`ps`):
   alone.
 - **Put it inside `cpuq run`, never around it:** its `--time` would count the time spent queued.
 - **Exit:**
-  - PROGRAM's own status, or 128+N if signal N killed it;
+  - PROGRAM's own status, or 128+N if signal N killed it (with `--no-crash-report` on macOS, cap
+    exits 128+N itself rather than dying by the signal);
   - 122 memory, 124 time (as GNU timeout) or 121 output when cap stopped it, each with one stderr
     line;
   - 2 on bad usage, before PROGRAM runs.

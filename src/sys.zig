@@ -1234,6 +1234,71 @@ extern "c" fn task_set_exception_ports(task: c_uint, mask: c_uint, port: c_uint,
 /// EXC_CORPSE_NOTIFY) cleared. Linux: no core_pattern handler (apport), by a core limit of
 /// exactly 1. For a death on purpose: a test's expected abort, or cpuq mirroring its command's
 /// signal. The process still dies by its signal.
+extern "c" fn mach_port_allocate(task: c_uint, right: c_uint, name: *c_uint) c_int;
+extern "c" fn mach_port_insert_right(task: c_uint, name: c_uint, poly: c_uint, poly_type: c_uint) c_int;
+extern "c" fn task_get_exception_ports(task: c_uint, mask: c_uint, masks: [*]c_uint, count: *c_uint, ports: [*]c_uint, behaviors: [*]c_int, flavors: [*]c_int) c_int;
+extern "c" fn mach_msg(msg: *anyopaque, option: c_int, send_size: c_uint, rcv_size: c_uint, rcv_name: c_uint, timeout: c_uint, notify: c_uint) c_int;
+extern "c" var NDR_record: [8]u8;
+
+/// macOS: answers the crashes of the processes this one starts as handled, so no crash report is
+/// filed for them, by the user's ReportCrash or the system's: their crash exceptions come to a
+/// port of this process's (they inherit it across fork and exec), where a thread replies to each.
+/// Clearing a process's handler (noCrashReport) passes its crash on to the system's ReportCrash,
+/// which files it in /Library/Logs/DiagnosticReports. This process's own handlers are put back
+/// after the fork (`restore`), so its own crashes are reported as ever.
+pub const CrashCatcher = struct {
+    const mask: c_uint = (1 << 10) | (1 << 13); // EXC_MASK_CRASH | EXC_MASK_CORPSE_NOTIFY
+    const max = 32;
+    port: c_uint = 0,
+    count: c_uint = max,
+    masks: [max]c_uint = undefined,
+    ports: [max]c_uint = undefined,
+    behaviors: [max]c_int = undefined,
+    flavors: [max]c_int = undefined,
+
+    /// Takes over this process's crash handlers for the processes it is about to start; null
+    /// where it can't (not macOS, or a Mach call failed).
+    pub fn start() ?CrashCatcher {
+        if (!is_darwin) return null;
+        var k: CrashCatcher = .{};
+        if (mach_port_allocate(mach_task_self_, 1, &k.port) != 0) return null; // MACH_PORT_RIGHT_RECEIVE
+        if (mach_port_insert_right(mach_task_self_, k.port, k.port, 20) != 0) return null; // MACH_MSG_TYPE_MAKE_SEND
+        if (task_get_exception_ports(mach_task_self_, mask, &k.masks, &k.count, &k.ports, &k.behaviors, &k.flavors) != 0) return null;
+        const thread_state_none: c_int = if (builtin.cpu.arch == .x86_64) 13 else 5;
+        if (task_set_exception_ports(mach_task_self_, mask, k.port, 1, thread_state_none) != 0) return null; // EXCEPTION_DEFAULT
+        const t = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, serve, .{k.port}) catch {
+            k.restore();
+            return null;
+        };
+        t.detach();
+        return k;
+    }
+
+    /// This process's own crash handlers, as they were before `start`.
+    pub fn restore(k: *const CrashCatcher) void {
+        if (!is_darwin) return;
+        for (0..k.count) |i| _ = task_set_exception_ports(mach_task_self_, k.masks[i], k.ports[i], k.behaviors[i], k.flavors[i]);
+    }
+
+    fn serve(port: c_uint) void {
+        // mach_msg_header_t: bits, size, remote port, local port, voucher port, id.
+        const Header = extern struct { bits: u32, size: u32, remote: u32, local: u32, voucher: u32, id: i32 };
+        var req: [4096]u8 align(8) = undefined;
+        while (true) {
+            const h: *Header = @ptrCast(&req);
+            if (mach_msg(&req, 2, 0, req.len, port, 0, 0) != 0) continue; // MACH_RCV_MSG
+            // The reply to exception_raise: handled (KERN_SUCCESS), so no one else is told.
+            const Reply = extern struct { h: Header, ndr: [8]u8, ret: i32 };
+            var rep: Reply = .{
+                .h = .{ .bits = h.bits & 0x1f, .size = @sizeOf(Reply), .remote = h.remote, .local = 0, .voucher = 0, .id = h.id + 100 },
+                .ndr = NDR_record,
+                .ret = 0,
+            };
+            _ = mach_msg(&rep, 1, @sizeOf(Reply), 0, 0, 0, 0); // MACH_SEND_MSG
+        }
+    }
+};
+
 pub fn noCrashReport() void {
     if (!is_darwin) {
         // Linux: at a core limit of exactly 1 the kernel starts no
