@@ -580,11 +580,10 @@ struct WaiterActions: View {
 }
 
 /// How lively the cells are. One decision says whether the water moves and bubbles rise: effects
-/// are on and the Mac is not strained. Then they always do, at thirty frames a second while the
-/// window is on screen (measured: about 6% of one CPU; fewer frames look jerky, sixty costs two to
-/// five times as much). Otherwise they never do, hovering or not: the cells keep still, drawn once
-/// a second, and ease smoothly to new readings only while the mouse moves in the window or it is
-/// resized.
+/// are on and the Mac is not strained. Then they always do while the window is on screen, at ten
+/// frames a second, thirty while the mouse moves in the window or it is resized. Otherwise they
+/// never do: the cells keep still, drawn once a second, easing to new readings at thirty frames a
+/// second only while the mouse moves in the window or it is resized.
 @MainActor
 final class Liveliness: ObservableObject {
     static let shared = Liveliness()
@@ -604,7 +603,7 @@ final class Liveliness: ObservableObject {
     /// Effects run on their own while someone can see them.
     var ambient: Bool { showsEffects && visible }
     /// Seconds between frames.
-    var interval: Double { lively || ambient ? 1.0 / 30 : 1 }
+    var interval: Double { lively ? 1.0 / 30 : ambient ? 1.0 / 10 : 1 }
 
     private var until = Date.distantPast
     private var timer: Timer?
