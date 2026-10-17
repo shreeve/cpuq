@@ -18,7 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var timer: Timer?
     private var polling = false
     private let graphs = GraphModel()
-    /// The spill hosts in cpuq's config, each a page of the window beside this Mac's.
+    /// The remotes in cpuq's config, each a page of the window beside this Mac's.
     private var remotes: [GraphModel] = []
     private var remotePolling: Set<String> = []
     private var graphsWindow: NSWindow?
@@ -154,14 +154,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
     }
 
-    /// The spill hosts named in cpuq's config (`spill`, `spill_start.HOST`).
+    /// The remotes named in cpuq's config (`remotes`, `remote_start.HOST`).
     private func loadMachines() {
         let path = ProcessInfo.processInfo.environment["CPUQ_CONFIG"] ?? NSHomeDirectory() + "/.config/cpuq/config"
         let text = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
-        remotes = spillHosts(config: text).map { GraphModel(machine: Machine(id: $0.host, start: $0.start)) }
+        remotes = remoteHosts(config: text).map { GraphModel(machine: Machine(id: $0.host, start: $0.start)) }
     }
 
-    /// Each spill host's status over ssh, while the window is open: nobody watches it otherwise,
+    /// Each remote's status over ssh, while the window is open: nobody watches it otherwise,
     /// and a stopped cloud machine need not be dialed every 3 seconds for the menu.
     private func pollRemotes() {
         guard graphsWindow?.isVisible ?? false else { return }
@@ -227,7 +227,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
     }
 
-    /// Runs a stopped machine's `spill_start` command (a cloud VM's start script), then polls it.
+    /// Runs a stopped machine's `remote_start` command (a cloud VM's start script), then polls it.
     private func startMachine(_ m: GraphModel) {
         guard let command = m.machine.start, !m.starting else { return }
         m.starting = true
@@ -527,7 +527,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             var e = overloaded[id] ?? Episode()
             track(&e, load > 1.5 * cpus && !s.waiters.isEmpty && !roomy.isEmpty, after: 600, now) {
                 notify("overload-\(id)", String(format: "%@ overloaded: %d waiting at load %.0f on %.0f CPUs", name, s.waiters.count, load, cpus),
-                       "For 10 minutes, while \(roomy.joined(separator: " and ")) \(roomy.count == 1 ? "has" : "have") room: portable jobs can go there (cpuq run --spill).", text: true)
+                       "For 10 minutes, while \(roomy.joined(separator: " and ")) \(roomy.count == 1 ? "has" : "have") room: work too big for \(name) can go there (cpuq run --on HOST).", text: true)
             }
             overloaded[id] = e
         }

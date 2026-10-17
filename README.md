@@ -8,7 +8,7 @@
   A machine-wide jobserver for builds, tests, benchmarks and coding agents, on macOS and Linux.
 </p>
 
-cpuq is a CPU queue. Heavy commands started from many shells, sessions and agents wait their
+cpuq is a CPU queue (say "CPU queue" or, lovingly, "see puke"). Heavy commands started from many shells, sessions and agents wait their
 turn for room on the CPUs, then run in the foreground. One binary, no daemon: every hold is a
 `flock(2)` on a file, so the kernel releases it however its holder dies.
 
@@ -149,6 +149,11 @@ container's own cgroup.
 - Without `--cores`, the label's history decides: from 1 up to its 75th percentile plus 0.3,
   rounded, at most half the machine's CPUs, as room allows. A label with fewer than three
   finished runs, or no label, gets 2.
+
+A small fixed `--cores N` (2 or more) for a command that takes its width from cpuq (`"$CPUQ_CORES"` inside
+it) is widened once its runs show it used what it had: to twice N when it kept all N busy, else
+to what it used, never past half the CPUs. stderr says so. Jobs are sized by their work's own
+measured use when it has three runs or more, else by their label's.
 
 A request can be at most four times `target`. Under `admit = cores` a request is clamped to the
 budget, a job without `--cores` gets 2, and only `right_size` caps a range. Size a job by what
@@ -325,14 +330,14 @@ cpuq gives every job a file, `$CPUQ_PROGRESS`, to write one line to, `DONE TOTAL
 - **A job that writes nothing** shows its usual time instead, from earlier runs of the same
   command (numbers aside: a different seed or count is the same work), with `left_from` `history`.
   A command not run before has none, whatever else ran under its label.
-- **Inside another machine's job** (`--spill`, `cpuq submit`) the file is that machine's, and
+- **Inside another machine's job** (`cpuq run --on`, `cpuq submit`) the file is that machine's, and
   `cpuq status --host HOST` (and Cpuq.app) shows it there. `cpuq submit` prints it as it follows.
 - The file is removed when the job ends.
 
 ### Cpuq.app (macOS)
 
-[`app/`](app/) holds Cpuq.app. Its window has a page per machine: this Mac (⌘1), then each spill
-host in the config (⌘2, ⌘3…), read over ssh while the window is open. Each page shows the CPUs
+[`app/`](app/) holds Cpuq.app. Its window has a page per machine: this Mac (⌘1), then each remote
+in the config (⌘2, ⌘3…), read over ssh while the window is open. Each page shows the CPUs
 busy right now with each project's share and who waits and why; the last hour, Stacked by project
 and Per Core (one lane per CPU) together, rose where jobs waited beside idle CPUs; the jobs, with
 their actions on right-click; and `cpuq history` summed by project. Every section's height drags.
@@ -367,7 +372,7 @@ The gates hold the whole queue while they are closed:
 - **low memory** (`min_available`, off by default): available memory under that size;
 - **low disk** (`min_disk`, 5G): less than that free on the filesystem holding `$HOME`, the one
   holding cpuq's state directory (the temp directory), or, where it is a filesystem of its own,
-  `~/cpuq-spill`, where jobs spilled here land. A full disk fails every job and every tool
+  `~/cpuq`, where jobs sent here keep their copies, caches and scratch. A full disk fails every job and every tool
   that writes a file, so the queue holds new ones until there is room;
 - **the load valve** (`load_check`): the 1-minute load over the budget plus `load_margin` while
   the CPUs are at least 90% busy. Under measured admission it gates only exclusive runs, though
@@ -419,61 +424,35 @@ them, and frozen jobs keep their memory. `cpuq status` notes a lending window an
 jobs as paused. This suits a dedicated build or benchmark machine where those processes are the
 window's work. It needs measured admission.
 
-## Spilling to other machines
+## Other machines: --on HOST
 
-    cpuq run --spill [run options] [--return PATH]... -- CMD ARGS...
-    cpuq run --spill-to HOST [run options] [--return PATH]... -- CMD ARGS...
-    (either with --ship PATH... to copy gitignored paths, or .git, too)
+    cpuq run --on HOST [run options] [--return PATH]... [--include PATH]... -- CMD ARGS...
 
-`--spill` runs the job where it should finish first. Work that is short here (under two minutes
-by its past runs) or never seen stays here while this machine has room, so nothing is asked of
-other machines for it. Longer work is placed by each place's expected finish: its wait (none with
-room, a couple of minutes on a full machine, two to start a stopped one), the copy of the repo
-(half a minute the first time, seconds after), and its run time there. Run times come from the
-work's own history, kept by repo and command (counts and `$CPUQ_CORES` aside), not by label: its
-runs here, and its trips to each spill host, timed here from before the copy to the end. A host
-it has never run on is judged by its time here, shortened by the host's extra cores when the
-command takes its width from cpuq and kept every core it had busy. It leaves here only when
-another place is sooner by a minute and by 30%; a stopped host is started only for work of ten
-minutes or more. Work never seen goes as before: here while there is room, else the first spill
-host with room, else a stopped one started, else it waits here. It says on stderr which it chose
-and why (`~41 min here, ~6 min on burst`).
+`cpuq run` always runs here. `--on HOST` runs the job on HOST instead, one of this machine's
+remotes, whatever this machine's state. Each machine's own config lists the machines it can reach
+and send work to:
 
-A command that is a spec's work (it matches the `run` of a `cpuq/*.json` that needs packs, caches,
-deps, a setup or git) is never spilled bare, as the copy would lack them: it runs here, and
-stderr gives the `cpuq submit` line that runs it with them.
+    remotes = burst, pup
+    remote_start.burst = ~/Data/Code/runbooks/host-gcp-burst/start
+    remote_env.pup = PATH=$HOME/.local/bin:$PATH
 
-A small fixed `--cores N` (2 or more) for a command that takes its width from cpuq (`"$CPUQ_CORES"` inside
-it) is widened once its runs show it used what it had: to twice N when it kept all N busy, else
-to what it used, never past half the CPUs. stderr says so. Jobs are sized by their work's own
-measured use when it has three runs or more, else by their label's.
+So the Mac may list burst and pup, pup only burst, and burst (a cloud machine that can see
+neither) none. `--on` this machine itself runs the job here; a host not listed is a usage error.
+The job goes at once when HOST has room, else into HOST's queue; HOST is started first when it is
+stopped and has a `remote_start` command. A HOST that neither answers nor can be started is an
+error (exit 125), never a quiet run here.
 
-    spill = pup, burst
-    spill_start.burst = ~/Data/Code/runbooks/host-gcp-burst/start
-    spill_default = on
-
-`--local` keeps a job here. With `spill_default = on`, a `cpuq run` with neither `--spill` nor
-`--local` acts as `--spill` when nothing ties it here: it is in a git repo; it names no path
-outside the system's own directories (an absolute path, or one under `~`, exists only here); it
-uses no macOS-only tool (`xcodebuild`, `xcrun`, `swift`, `codesign`, ...); and it is not
-`--opaque`, `--exclusive` or a hold. Anything else runs here. Environment variables set here don't
-travel, so a job that needs one sets it inside its command. And while this machine is full, `cpuq
-hook` refuses a `cpuq run` that says neither, so an agent chooses: `--spill`, or `--local` for
-work that needs this OS.
-
-The hook also refuses a spec's work run as `cpuq run` when it is long (ten minutes or more here)
+`cpuq hook` refuses a spec's work run as `cpuq run` when it is long (ten minutes or more here)
 and would finish in half the time elsewhere, with each host's time by the spec's results and the
-`cpuq submit` line. `--local` is never refused: it is the caller's word that the work runs here (a
-macOS test, or a quick check that decides whether to send work elsewhere at all), and nothing
-places it off this machine. Heavy work typed over `ssh HOST` is pointed to
-`cpuq run --spill-to HOST`.
+`cpuq submit` line. Heavy work typed over `ssh HOST` is pointed to `cpuq run --on HOST`.
 
 Before the job runs there, the repo (git's top level, else the working directory) is copied to
-`HOST:cpuq-spill/s/NAME-HASH` (NAME the repo's directory, one copy per repo or worktree here)
-with rsync, honoring `.gitignore` and leaving `.git` behind.
+`HOST:cpuq/worktrees/PROJECT/NAME-HASH` (PROJECT the repo's name, NAME its directory here, one
+copy per repo or worktree here) with rsync, honoring `.gitignore` and leaving `.git` behind.
 Each repo and worktree keeps its own copy there, so build caches stay warm between runs. A new
-worktree's first copy starts, on a filesystem that clones (ZFS, btrfs), as a clone of the newest
-copy of the same repo there, so rsync sends only what differs: a Rig copy to burst took 5 s
+worktree's first copy starts, on a filesystem that clones (ZFS, btrfs), as a clone of the
+project's most recently used copy there (a `cpuq run --on`'s or a `cpuq submit`'s: they share
+the folder), so rsync sends only what differs: a Rig copy to burst took 5 s
 instead of 33. Each file of the clone is dated 30 years back (each still apart from the others),
 so rsync compares every file it ships, and an output another branch built there (a make or cargo
 target) is older than every source and is built again; a cache that goes by content (zig's)
@@ -483,8 +462,8 @@ status is cpuq's. `--return PATH` copies a path (relative to the working directo
 afterwards, for a build's output; it repeats.
 
 - **Gitignored paths a job needs** (a vendored tree its tests read, or `.git` for `git ls-files`)
-  ship too when listed in `.cpuq-spill` at the repo's top, a path a line (`#` comments), or given
-  with `--ship PATH`. A gitignored path not listed never ships, and never leaves the host's copy
+  go too when listed in `.cpuqinclude` at the repo's top (beside `.gitignore`), a path a line
+  (`#` comments), or given with `--include PATH`. A gitignored path not listed never ships, and never leaves the host's copy
   either, whether or not it's here: a build cache there (`.zig-cache`) stays warm from one run to
   the next. "Gitignored" is
   as git reads it (in a git repo, cpuq asks git): a file a `!` line brings back ships, and so does
@@ -498,10 +477,10 @@ afterwards, for a build's output; it repeats.
 - **The copy is read back** by each file's checksum after rsync makes it. rsync's own quick check
   (size and mtime) never sends again a file damaged there that kept both, so a run would go on
   using it. A file that differs is sent again and checked once more; if the copy still differs,
-  the job doesn't run there (`--spill` runs it here, `--spill-to` fails with exit 125), and
+  the job doesn't run there (it fails with exit 125), and
   stderr names the files.
 - **Tools under `~/.local`** are off the PATH of a command run over ssh, whose shell reads no login
-  profile. `spill_env.HOST = PATH=$HOME/.local/go/bin:$PATH` in the config is exported on HOST
+  profile. `remote_env.HOST = PATH=$HOME/.local/go/bin:$PATH` in the config is exported on HOST
   before the job: shell assignments, expanded there.
 - **The command must not reach outside the repo.** Absolute paths here (a scratch directory, a
   file in another checkout) do not exist on the other machine, and nothing writes back except
@@ -509,30 +488,29 @@ afterwards, for a build's output; it repeats.
 - **The job stays tied to this cpuq.** It sends heartbeats down the connection, and the job on the
   other machine stops when they stop: when this cpuq is killed, or the connection is lost.
 - **A machine that goes away mid-job** (a Spot VM reclaimed, the network down) is noticed: when
-  the connection fails or the job dies by a signal and the machine then stops answering, the job
-  runs again here.
-- **Only work that doesn't need this OS** belongs on `--spill`: the other machine may run Linux.
-- **`--spill-to HOST`** sends the job to HOST whatever this machine's state, copied and tied the
-  same way: at once when HOST has room, else into HOST's queue; started first when it is stopped
-  and has a `spill_start` command. A HOST that neither answers nor can be started is an error
-  (exit 125), never a quiet run here. Lost mid-job, HOST is started again and the job reruns there
-  once; if HOST can't be brought back, the run ends with exit 125, and never falls back to this
-  machine, since a job sized for HOST would swamp it.
-- The other machines need cpuq 0.12 or later, and ssh to them must work without a prompt.
+  the connection fails or the job dies by a signal and the machine then stops answering, HOST is
+  started again and the job reruns there once; if HOST can't be brought back, the run ends with
+  exit 125, and never falls back to this machine, since a job sized for HOST would swamp it.
+- **Only work that doesn't need this OS** belongs on `--on`: the other machine may run Linux.
+- The other machines need cpuq 0.28 or later, and ssh to them must work without a prompt.
 
 ### cpuq submit: a spec, and cpuq does the rest
 
-    cpuq submit SPEC [-- ARGS] [--env K=V]... [--note TEXT] [--replace | --again] [--max-wait S]
+    cpuq submit SPEC [-- ARGS] [--on HOST] [--env K=V]... [--note TEXT] [--replace | --again] [--max-wait S]
     cpuq jobs [--all]
     cpuq job [ID | last] [--wait [--max-wait S]] [--tail N] [--json] [--cancel]
 
-A spec in the repo (`cpuq/matrix.json`) says what a job runs and where it may go. cpuq does the
-rest:
+A spec in the repo (`cpuq/matrix.json`) says what a job runs and needs, never where: the machine
+that submits it picks the host. cpuq does the rest:
 
-- **places it:** on the first host in `on` that has room, else queues it there, starting a
-  stopped cloud host if need be;
+- **places it** among this machine's remotes (here when it has none) where it should finish
+  first, by the spec's past results on each (another host's scaled by its cores when it has none
+  there): a host that's up and free before a paid one that must be started, which is started only
+  for work of ten minutes or more and only when clearly sooner. Work never seen goes to the first
+  host with room, else the first stopped one, started. `--on HOST` names the host (one of the
+  remotes, or this machine); a full host queues it;
 - **syncs a snapshot** of the work there with rsync, moving only what changed, then reads the copy
-  back by checksum (as `--spill` does);
+  back by checksum (as `cpuq run --on` does);
 - **runs it, owned by that host,** so the agent's session, or this machine sleeping, doesn't stop
   it;
 - **reports:** progress while it runs, then a verdict that names the code it tested.
@@ -543,7 +521,6 @@ rest:
   "run": "./test/run -j $CPUQ_CORES \"$@\"",
   "setup": "zig build -j$CPUQ_CORES",
   "cores": "8-32",
-  "on": ["burst", "here"],
   "time": "60m",
   "exclude": [".zig-cache", "zig-out"],
   "caches": { "PROJ_RESULTS_CACHE": "results" },
@@ -575,7 +552,7 @@ rest:
   one after another. A copy never synced is first seeded on the host from the project's most
   recently synced copy (a free one if there is one; the filesystem's cheap copy where it has one),
   so the sync sends only what differs and build caches start warm. Its files are dated 30 years
-  back, as a spilled copy's are. `submit_slots = 1` runs a
+  back, as a `cpuq run --on` copy's are. `submit_slots = 1` runs a
   worktree's jobs one after another on a single copy.
 - **Where the time goes:** each job's supervisor log (`~/.local/state/cpuq/jobs/ID/supervisor.log`)
   has a line with each phase's seconds: start, waiting for a copy, packs, copy, check, marked.
@@ -650,11 +627,11 @@ A test suite that takes an hour on a laptop takes minutes on a 96-CPU cloud mach
 goes there whole, keeps its caches warm, and cleans up after itself. This is how an agent sends
 one:
 
-    cpuq run --spill-to burst --label proj:matrix --cores 8-32 --return .zig-cache/gate.log -- sh -c '
+    cpuq run --on burst --label proj:matrix --cores 8-32 --return .zig-cache/gate.log -- sh -c '
       : >.zig-cache/gate.log
-      mkdir -p "$HOME/cpuq-spill/c/proj/results"
+      mkdir -p "$HOME/cpuq/caches/proj/results"
       zig build -j"$CPUQ_CORES" >>.zig-cache/gate.log 2>&1 &&
-      PROJ_RESULTS_CACHE=$HOME/cpuq-spill/c/proj/results timeout 90m ./test/run -j "$CPUQ_CORES" >>.zig-cache/gate.log 2>&1
+      PROJ_RESULTS_CACHE=$HOME/cpuq/caches/proj/results timeout 90m ./test/run -j "$CPUQ_CORES" >>.zig-cache/gate.log 2>&1
       rc=$?
       grep -E "^(fail|FAIL)" .zig-cache/gate.log | head -20; tail -2 .zig-cache/gate.log
       rm -rf .zig-cache/proj-test
@@ -665,13 +642,13 @@ one:
 - **A core range sized to share:** at most a third of the host's CPUs each, so three runs fit at
   once and more queue on the host. Every tool inside takes `$CPUQ_CORES`.
 - **Caches outside the copy.** Each worktree gets its own copy on the host, so a cache inside it
-  is cold for every new branch. A path under `$HOME/cpuq-spill/c/PROJECT/`, outside every copy,
+  is cold for every new branch. A path under `$HOME/cpuq/caches/PROJECT/`, outside every copy,
   is shared by all of a project's runs there. A results cache keyed by content then carries a
   pass from one branch to the next.
   - That's sound only when the key covers everything that decides a result: the inputs, the
     compiler's own hash, flags, and toolchain.
   - Entries are written by renaming into place, since runs share the cache.
-  - Nothing evicts these caches yet, so watch their size (`du -sh ~/cpuq-spill/c/*` on the host).
+  - Nothing evicts these caches yet, so watch their size (`du -sh ~/cpuq/caches/*` on the host).
 - **A fresh log each run:** the copy keeps the last one, so the command empties it first. Without
   that, a failed build would report the previous run's failures.
 - **A time limit inside the command** (`timeout 90m`): a hung test otherwise keeps a billing
@@ -684,15 +661,15 @@ one:
 - **Run it as a background command.** It waits in the host's queue, then runs as long as it
   takes, often past an agent tool's timeout.
 - **Tools the host lacks** are built there, pinned, under the project's cache
-  (`$HOME/cpuq-spill/c/PROJECT/tools/NAME-COMMIT`), so later runs find them already built, and no
+  (`$HOME/cpuq/caches/PROJECT/tools/NAME-COMMIT`), so later runs find them already built, and no
   branch can swap in a different one.
   - Fetched by commit or checksum, never by a branch or tag that can move.
-  - A private source is shipped from here with `--ship`: never put a token on the host to clone
+  - A private source is sent from here with `--include`: never put a token on the host to clone
     it.
 - **Per-program limits** in a test runner come from `cpuq cap`, never from a watchdog listing
   every process.
 - **Only work that doesn't need this OS** goes there.
-- **The hook judges a `--spill-to` request by the host it goes to**, so `--cores 8-32` for a
+- **The hook judges an `--on` request by the host it goes to**, so `--cores 8-32` for a
   96-CPU machine isn't refused on a 10-CPU laptop.
 - **The first run of a branch is cold:** it copies the repo and builds from scratch. Later runs
   move only what changed.
@@ -705,17 +682,17 @@ project. Copies and caches sit on a ZFS dataset with lz4 compression and a size 
 
     cpuq clean [--dry-run] [--older AGE] [--host HOST]
 
-A machine that takes spilled and submitted jobs keeps their copies, so the next run of the same
+A machine that takes jobs from others (`cpuq run --on`, `cpuq submit`) keeps their copies, so the next run of the same
 worktree syncs only what changed, and keeps pack versions. Left alone they pile up: every agent
-worktree that ever spilled leaves a copy of up to tens of GB. `cpuq clean` removes them once
+worktree ever sent there leaves a copy of up to tens of GB. `cpuq clean` removes them once
 unused for `clean_after` (3 days); `cpuq record`, where it's installed, runs it every hour.
 
-- **Spilled jobs' copies** (`~/cpuq-spill/s/…`) go by when a job last ran in one.
-- **Submitted jobs' copies** (`~/cpuq-spill/w/PROJECT/…`) go by their last sync, never while a
-  job holds the copy's lock.
+- **Copies of repos** (`~/cpuq/worktrees/PROJECT/…`) go by when a `cpuq run --on` job last ran in one or
+  a submitted job last synced it, never while a job holds the copy's lock.
+- **Submitted jobs' scratch** (`~/cpuq/tmp/ID`, their TMPDIR) that a killed job left behind.
 - **Pack versions** go by when a job last used one, never one `latest` or `stable` names.
 - **Submitted jobs' records** go a week after they ended.
-- **Never anything a process is working in**, and never the caches (`~/cpuq-spill/c`), which are
+- **Never anything a process is working in**, and never the caches (`~/cpuq/caches`), which are
   the jobs' own to bound.
 
 `--dry-run` lists what would go and how much; `--older 1d` overrides the age.
@@ -838,6 +815,23 @@ passes. Install it for every session in `~/.claude/settings.json`:
     {"hooks": {"PreToolUse": [{"matcher": "Bash",
        "hooks": [{"type": "command", "command": "cpuq hook"}]}]}}
 
+## Where things live
+
+Every machine is laid out the same way, the Mac you work on and the hosts it sends work to alike:
+
+```
+~/.local/bin/cpuq        the binary
+~/.config/cpuq/config    the config, same shape; only lines about that machine differ
+~/.local/state/cpuq/     cpuq's own records (history, samples, job logs)
+~/cpuq/packs/            tools jobs ask for (zig, rig, nexus)
+~/cpuq/worktrees/        copies of repos sent from another machine
+~/cpuq/caches/PROJECT/   build caches shared across branches
+~/cpuq/tmp/              scratch
+```
+
+Work started on a machine runs in its own checkout, not a copy: `~/cpuq/worktrees/` there holds
+only what another machine sent it.
+
 ## Configuration
 
 The config file is `CPUQ_CONFIG`, default `~/.config/cpuq/config`: `key = value` lines, `#` for
@@ -857,15 +851,13 @@ re-reads the file when it changes; an invalid edit keeps the settings in force a
 | `pressure_check` | on | admit nothing under memory pressure |
 | `pressure_psi` | 10 | Linux: the `some avg10` percentage that counts as pressure |
 | `min_available` | off | admit nothing while available memory is under this (e.g. `6G`) |
-| `clean_after` | 3d | what jobs left on this machine (spilled and submitted jobs' copies, pack versions no link names, job records after a week) is removed once unused this long, by `cpuq record` hourly and `cpuq clean`; off keeps everything |
-| `min_disk` | 5G | admit nothing while `$HOME`'s, the temp directory's or `~/cpuq-spill`'s filesystem has less free than this; off turns it off |
+| `clean_after` | 3d | what jobs left on this machine (copies of jobs sent here, pack versions no link names, job records after a week) is removed once unused this long, by `cpuq record` hourly and `cpuq clean`; off keeps everything |
+| `min_disk` | 5G | admit nothing while `$HOME`'s, the temp directory's or `~/cpuq`'s filesystem has less free than this; off turns it off |
 | `max_memory` | off | stop a job whose processes together use more memory than this (e.g. `16G`) |
-| `spill` | none | ssh hosts `--spill` may send a job to, in order (commas or spaces) |
-| `spill_default` | off | a `cpuq run` with neither `--spill` nor `--local` spills when nothing ties it here |
+| `remotes` | none | ssh hosts this machine sends work to (`cpuq run --on`, `cpuq submit`), in order (commas or spaces) |
 | `submit_slots` | 3 | copies of a worktree a submitted job may use on its host (1–8): so many of its jobs run at once |
-| `job_tmp` | none | where a submitted job's TMPDIR goes on this host (a directory per job, removed after); empty: beside its record |
-| `spill_start.HOST` | none | a command (run with sh) that starts HOST when it is stopped; it returns once ssh works |
-| `spill_env.HOST` | none | shell assignments a spilled job exports on HOST, e.g. `PATH=$HOME/.local/go/bin:$PATH` |
+| `remote_start.HOST` | none | a command (run with sh) that starts HOST when it is stopped; it returns once ssh works |
+| `remote_env.HOST` | none | shell assignments a job sent there exports on HOST, e.g. `PATH=$HOME/.local/go/bin:$PATH` |
 | `exclusive` | on | grant `--exclusive`; off, it runs as an ordinary job |
 | `window_gap` | 0 | seconds after an exclusive run ends during which waiting ones go behind other work |
 | `cgroups` | on | Linux: run each job in a delegated systemd scope, its command in `job/`, for `cpuq cap` |

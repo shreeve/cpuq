@@ -2,6 +2,38 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.28.0 — 2026-10-17
+
+- **One layout on every machine,** with no links back to the old one:
+  `~/.local/bin/cpuq` (the binary), `~/.config/cpuq/config`, `~/.local/state/cpuq/` (records), and
+  under `~/cpuq/`: `packs/`, `worktrees/PROJECT/` (copies of repos sent from another machine),
+  `caches/PROJECT/` (a spec's caches) and `tmp/` (a submitted job's TMPDIR). `~/cpuq-spill` is
+  no longer read: move its contents, or let the next jobs rebuild them. `job_tmp` is gone from
+  the config (an unknown key is an error).
+- **`cpuq run` always runs here.** `--spill`, `--local` and `spill_default` are gone, and so is
+  placing a run on another machine by itself: each is a usage error saying what to use instead.
+  `--on HOST` sends a run to HOST, one of this machine's remotes, for work too big for this one.
+- **`remotes = HOST, ...`** in the config names the machines this one sends work to, with
+  `remote_start.HOST` (how to start a stopped one) and `remote_env.HOST`. They replace `spill`,
+  `spill_start.HOST` and `spill_env.HOST`, which are errors that give the new names. Each machine
+  lists its own: the Mac may list burst and pup, pup only burst, and burst none.
+- **`--on HOST`** on `cpuq run` and `cpuq submit` runs here when HOST is this machine, and is
+  refused when HOST isn't one of this machine's remotes. `--spill-to` is gone: use `--on`.
+- **`.cpuqinclude`**, beside `.gitignore`, names a path a line that `cpuq run --on` copies though
+  it is gitignored (`.git`, a vendored tree); it replaces `.cpuq-spill`. `--ship PATH` is now
+  `--include PATH`.
+- **`cpuq hook`** no longer refuses a plain `cpuq run` when this machine is full: where it runs is
+  the caller's to say. It still sends long spec work to `cpuq submit`, and heavy work over
+  `ssh HOST` to `cpuq run --on HOST`.
+- **A spec names no host.** `"on"` is gone from `cpuq/*.json`, and a spec that has it is refused
+  with a line saying to remove it. `cpuq submit` without `--on` places a job among this machine's
+  remotes (here when it has none) where it should finish first by the spec's past results: a free
+  host that's up before a cloud host that must be started, which is started only for work of ten
+  minutes or more and taken only when clearly sooner.
+- Copies from `cpuq run --on` and from `cpuq submit` share one folder per project, so a new copy
+  of either starts as a clone of the project's most recently used one.
+- Cpuq.app 0.20.2 reads its machines from `remotes` and `remote_start.HOST`.
+
 ## 0.27.1 — 2026-10-17
 
 - A new worktree's first `--spill` copy starts, on a host whose filesystem clones (ZFS, btrfs), as

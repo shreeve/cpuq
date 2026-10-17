@@ -23,6 +23,7 @@ const gitship = @import("gitship.zig");
 const packs = @import("packs.zig");
 const place_mod = @import("place.zig");
 const history = @import("history.zig");
+const layout = @import("layout.zig");
 
 pub const Cx = struct {
     io: Io,
@@ -98,7 +99,6 @@ const Spec = struct {
     run: []const u8,
     setup: ?[]const u8 = null,
     cores: ?[]const u8 = null,
-    on: []const []const u8 = &.{"here"},
     time: ?[]const u8 = null,
     mem: ?[]const u8 = null,
     tools: ?Map = null,
@@ -138,13 +138,13 @@ const Payload = struct {
     /// this job's, not an earlier job's left on the copy (or on the copy this one was seeded from).
     returns: []const []const u8 = &.{},
     args: []const []const u8 = &.{},
-    /// The copy, relative to the host's home: cpuq-spill/w/PROJECT/ID12.
+    /// The copy, relative to the host's home: cpuq/worktrees/PROJECT/ID12.
     copy: []const u8,
     generation: []const u8,
     digest: []const u8,
     attempt: u32 = 1,
     packs: []const packs.Pack = &.{},
-    /// The config's `spill_env.HOST`: shell assignments the job's shell exports first (a PATH to
+    /// The config's `remote_env.HOST`: shell assignments the job's shell exports first (a PATH to
     /// tools under ~/.local, which a command run over ssh doesn't otherwise get).
     host_env: []const u8 = "",
 };
@@ -167,6 +167,8 @@ const Record = struct {
     deps: ?Map = null,
     git: bool = false,
     packs: []const packs.Pack = &.{},
+    /// The hosts it may go to, in order: `--on`'s one, else this machine's remotes, else
+    /// "here".
     on: []const []const u8 = &.{},
     payload: []const u8,
     /// What shipped, by git, once its copy was synced (null outside git, or before the sync).
@@ -216,6 +218,8 @@ const Result = struct {
     code: ?i64 = null,
     seconds: f64 = 0,
     cores: []const u8 = "",
+    /// The host's CPUs (0 from a host before 0.28.0): what its time is scaled by for another.
+    cpus: u32 = 0,
     total: u64 = 0,
     ok: u64 = 0,
     failed: u64 = 0,
@@ -477,6 +481,7 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
     var again = false;
     var max_wait: ?i64 = null;
     var note: ?[]const u8 = null;
+    var on: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg: []const u8 = args[i];
@@ -495,6 +500,11 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
         } else if (std.mem.eql(u8, arg, "--note") and i + 1 < args.len) {
             i += 1;
             note = args[i];
+        } else if (std.mem.eql(u8, arg, "--on") and i + 1 < args.len) {
+            i += 1;
+            on = args[i];
+        } else if (std.mem.startsWith(u8, arg, "--on=")) {
+            on = arg["--on=".len..];
         } else if (std.mem.eql(u8, arg, "--env") and i + 1 < args.len) {
             i += 1;
             if (std.mem.findScalar(u8, args[i], '=') == null) return fail2("--env needs NAME=VALUE, not '{s}'", .{args[i]});
@@ -504,17 +514,34 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
         } else return fail2("unknown option '{s}'", .{arg});
     }
     if (replace and again) return fail2("--replace and --again don't go together", .{});
-    const sp = spec_path orelse return fail2("usage: cpuq submit SPEC [-- ARGS] [--env K=V]... [--note TEXT] [--replace | --again] [--max-wait S]", .{});
+    const sp = spec_path orelse return fail2("usage: cpuq submit SPEC [-- ARGS] [--on HOST] [--env K=V]... [--note TEXT] [--replace | --again] [--max-wait S]", .{});
+    // Where it may go: --on's host (this machine itself is "here"), else this machine's remotes
+    // in order, else here.
+    var hosts: std.ArrayList([]const u8) = .empty;
+    if (on) |h| {
+        if (h.len == 0) return fail2("--on needs a host", .{});
+        if (std.ascii.eqlIgnoreCase(h, hostname(cx)) or std.mem.eql(u8, h, "here")) {
+            hosts.append(cx.a, "here") catch {};
+        } else if (cx.cfg.isRemote(h)) {
+            hosts.append(cx.a, h) catch {};
+        } else return fail2("--on {s}: not one of this machine's remotes (config remotes = {s})", .{ h, if (cx.cfg.remotes.len == 0) "none" else cx.cfg.remotes });
+    } else {
+        var it = cx.cfg.remoteHosts();
+        while (it.next()) |h| hosts.append(cx.a, h) catch {};
+        if (hosts.items.len == 0) hosts.append(cx.a, "here") catch {};
+    }
 
     // The spec, and the directory it's for: the git top of the spec's repo.
     const spec_abs = realpath(cx, sp) orelse return fail2("{s}: not found", .{sp});
     const text = readFile(cx, spec_abs) orelse return fail2("{s}: can't be read", .{sp});
-    const spec = std.json.parseFromSliceLeaky(Spec, cx.a, text, .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err|
-        return fail2("spec {s}: {t} (fields: label, run, setup, cores, on, time, mem, tools, env, exclude, deps, caches, report, return, git, packs)", .{ sp, err });
+    const spec = std.json.parseFromSliceLeaky(Spec, cx.a, text, .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| {
+        if (err == error.UnknownField and std.mem.find(u8, text, "\"on\"") != null)
+            return fail2("spec {s}: \"on\" is gone: a spec says what a job needs, and the machine that submits it picks the host (its config's remotes, or --on HOST); remove the line", .{sp});
+        return fail2("spec {s}: {t} (fields: label, run, setup, cores, time, mem, tools, env, exclude, deps, caches, report, return, git, packs)", .{ sp, err });
+    };
     const top_run = run(cx, &.{ "git", "-C", std.fs.path.dirname(spec_abs) orelse ".", "rev-parse", "--show-toplevel" }, null);
     const dir = if (top_run.ok) std.mem.trim(u8, top_run.out, " \n") else (std.fs.path.dirname(spec_abs) orelse ".");
     if (std.mem.findScalar(u8, spec.label, ':') == null) return fail2("spec {s}: \"label\" must be project:task, not '{s}'", .{ sp, spec.label });
-    if (spec.on.len == 0) return fail2("spec {s}: \"on\" names no host", .{sp});
     if (spec.cores) |cr| if (policy.Request.parse(cr) == null) return fail2("spec {s}: \"cores\" must be N or MIN-MAX, not '{s}'", .{ sp, cr });
     if (spec.time) |t| if (@import("cap.zig").parseDuration(t) == null) return fail2("spec {s}: \"time\" must be a duration like 90m, not '{s}'", .{ sp, t });
     if (spec.mem) |m| if (policy.parseBytes(m) == null) return fail2("spec {s}: \"mem\" must be a size like 64G, not '{s}'", .{ sp, m });
@@ -578,7 +605,7 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
     // A new job.
     const id = sha(cx, &.{ job_digest, cx.a.print("{d} {d}", .{ Io.Clock.real.now(cx.io).toNanoseconds(), sys.getpid() }) catch "" })[0..8];
     const origin = sha(cx, &.{ hostname(cx), dir })[0..12];
-    const copy = cx.a.print("cpuq-spill/w/{s}/{s}", .{ project, origin }) catch return 125;
+    const copy = cx.a.print("{s}/{s}/{s}", .{ layout.worktrees, project, origin }) catch return 125;
     var env_map: Map = .{};
     if (spec.env) |e| {
         var it = e.map.iterator();
@@ -626,7 +653,7 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
         .deps = spec.deps,
         .git = spec.git,
         .packs = wanted.packs,
-        .on = spec.on,
+        .on = hosts.items,
         .payload = jsonString(cx, payload),
     };
     writeFile(cx, jobFile(cx, id, "job.json"), jsonString(cx, rec));
@@ -791,7 +818,7 @@ pub fn specFor(a: std.mem.Allocator, io: Io, root: []const u8, cmd: []const u8) 
 }
 
 /// How long a spec's jobs took on one host: the middle of its finished runs (passed or failed).
-pub const HostTime = struct { host: []const u8, seconds: f64, runs: u32 };
+pub const HostTime = struct { host: []const u8, seconds: f64, runs: u32, cpus: u32 = 0 };
 
 /// Each host's time for jobs labelled `label`, by their results here.
 pub fn specTimes(cx: Cx, label: []const u8) []HostTime {
@@ -950,7 +977,7 @@ fn placeDetail(cx: Cx) []const u8 {
     return cx.a.print("no host could take it ({s}): not your code", .{notes}) catch "no host could take it: not your code";
 }
 
-const Probe = struct { reachable: bool, room: bool, mem_total: u64, note: []const u8 };
+const Probe = struct { reachable: bool, room: bool, mem_total: u64, note: []const u8, cpus: u32 = 0 };
 
 fn probe(cx: Cx, host: []const u8, min: [3]u32) Probe {
     const r = onHost(cx, host, cx.a.print("{s} status --json --no-usage", .{cpuqOn(cx, host)}) catch "");
@@ -967,7 +994,7 @@ fn probe(cx: Cx, host: []const u8, min: [3]u32) Probe {
         return .{ .reachable = false, .room = false, .mem_total = 0, .note = cx.a.print("{s}: its cpuq answered in a form this one can't read", .{host}) catch "" };
     if (!versionAtLeast(st.version, min)) return .{ .reachable = false, .room = false, .mem_total = 0, .note = cx.a.print("{s} runs cpuq {s}, and this job needs {d}.{d} (curl -fsSL https://raw.githubusercontent.com/shreeve/cpuq/main/install.sh | bash, on {s})", .{ host, st.version, min[0], min[1], host }) catch "" };
     const room = st.waiters.len == 0 and st.load[0] < @as(f64, @floatFromInt(st.active_cores)) and std.mem.eql(u8, st.gate.state, "open");
-    return .{ .reachable = true, .room = room, .mem_total = if (st.memory) |m| m.total else 0, .note = "" };
+    return .{ .reachable = true, .room = room, .mem_total = if (st.memory) |m| m.total else 0, .note = "", .cpus = st.active_cores };
 }
 
 fn versionAtLeast(v: []const u8, min: [3]u32) bool {
@@ -980,36 +1007,117 @@ fn versionAtLeast(v: []const u8, min: [3]u32) bool {
     return true;
 }
 
-/// The first host in `on` that answers, fits `mem` and has room; else the first that answers;
-/// else the first that can be started.
+/// A host a job could go to, as `place` weighs it.
+const Option = struct {
+    host: []const u8,
+    /// It answered; else it is stopped and has a `remote_start` to start it.
+    up: bool,
+    room: bool,
+    cpus: u32,
+    /// Paid for while it runs (a cloud machine: it has a `remote_start`).
+    paid: bool,
+    /// Expected seconds to its end: waiting (a queue, a start), then the run; null when unknown.
+    finish: ?f64 = null,
+};
+
+/// Where a job goes, of `rec.on` (in order). Each host's expected finish is the label's past
+/// runs there (else its runs on another host, scaled by their CPUs, at most 4 times either way),
+/// plus a wait: a queue there, or starting a stopped one. A stopped host is started only for work
+/// that would take `place.start_worth_s` or more on one that is up; and a paid host (a cloud
+/// machine) is taken over a free one only when clearly sooner (`place.better`), so short work
+/// stays on the free one and heavy work goes to the big one. Work no host's runs know: the first
+/// with room, else the first stopped one, which is started, else the first that answers.
 fn place(cx: Cx, rec: *const Record) ?[]const u8 {
     const payload = std.json.parseFromSliceLeaky(Payload, cx.a, rec.payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return null;
     const need: u64 = if (payload.mem) |m| policy.parseBytes(m) orelse 0 else 0;
-    var first_up: ?[]const u8 = null;
+    const min = if (rec.packs.len != 0) packs_min else host_min;
+    var opts: std.ArrayList(Option) = .empty;
     for (rec.on) |host| {
-        const p = probe(cx, host, if (rec.packs.len != 0) packs_min else host_min);
+        const p = probe(cx, host, min);
+        const paid = cx.cfg.remoteStart(host) != null;
         if (!p.reachable) {
             place_notes.append(cx.a, p.note) catch {};
+            if (paid and !std.mem.eql(u8, host, "here")) opts.append(cx.a, .{ .host = host, .up = false, .room = false, .cpus = 0, .paid = true }) catch {};
             continue;
         }
         if (need != 0 and p.mem_total != 0 and need > p.mem_total) {
             place_notes.append(cx.a, cx.a.print("{s}: {d} GB of RAM, the job wants {d}", .{ host, p.mem_total >> 30, need >> 30 }) catch "") catch {};
             continue;
         }
-        if (p.room) return host;
-        if (first_up == null) first_up = host;
+        opts.append(cx.a, .{ .host = host, .up = true, .room = p.room, .cpus = p.cpus, .paid = paid }) catch {};
     }
-    if (first_up) |h| return h;
-    for (rec.on) |host| {
-        const start = cx.cfg.spillStart(host) orelse continue;
-        setState(cx, rec.id, "starting", cx.a.print("starting {s}", .{host}) catch "");
-        const r = run(cx, &.{ "/bin/sh", "-c", cx.a.print("{s} 1>&2", .{start}) catch continue }, null);
-        if (!r.ok) {
-            place_notes.append(cx.a, cx.a.print("{s}: its start command failed", .{host}) catch "") catch {};
-            continue;
-        }
-        if (probe(cx, host, if (rec.packs.len != 0) packs_min else host_min).reachable) return host;
+    if (opts.items.len == 0) return null;
+    if (opts.items.len == 1) return startIfStopped(cx, rec, opts.items[0]);
+
+    // Expected finishes, by the label's runs.
+    const times = specTimes(cx, rec.label);
+    var known = false;
+    for (opts.items) |*o| {
+        const run_s = expectedRun(times, o.host, o.cpus) orelse continue;
+        const wait: f64 = if (!o.up) place_mod.start_s else if (!o.room) busy_wait_s else 0;
+        o.finish = wait + run_s;
+        known = true;
     }
+    if (!known) {
+        for (opts.items) |o| if (o.up and o.room) return o.host;
+        for (opts.items) |o| if (!o.up) return startIfStopped(cx, rec, o);
+        return opts.items[0].host;
+    }
+    // A stopped host only for long work: as long as the soonest up host would take.
+    var up_best: ?f64 = null;
+    for (opts.items) |o| if (o.up) if (o.finish) |f| {
+        up_best = @min(up_best orelse f, f);
+    };
+    const free = soonest(opts.items, false, up_best);
+    const paid = soonest(opts.items, true, up_best);
+    const pick = if (free) |f| (if (paid) |p| (if (place_mod.better(f.finish.?, p.finish.?)) p else f) else f) else paid orelse {
+        for (opts.items) |o| if (o.up) return o.host;
+        return null;
+    };
+    return startIfStopped(cx, rec, pick);
+}
+
+/// The soonest to finish of the paid hosts (or of the free ones), a stopped one only when the
+/// soonest up host would take `place.start_worth_s` or more (or none is known).
+fn soonest(opts: []const Option, paid: bool, up_best: ?f64) ?Option {
+    var best: ?Option = null;
+    for (opts) |o| {
+        if (o.paid != paid) continue;
+        const f = o.finish orelse continue;
+        if (!o.up) if (up_best) |u| if (u < place_mod.start_worth_s) continue;
+        if (best == null or f < best.?.finish.?) best = o;
+    }
+    return best;
+}
+
+/// How long a spec's run would take on `host` (with `cpus`, 0 when unknown): its runs there, else
+/// the fastest of its runs elsewhere, scaled by the CPUs (at most 4 times either way); null when
+/// it has run nowhere.
+fn expectedRun(times: []const HostTime, host: []const u8, cpus: u32) ?f64 {
+    for (times) |t| if (std.mem.eql(u8, t.host, host)) return t.seconds;
+    var best: ?f64 = null;
+    for (times) |t| {
+        const scale: f64 = if (cpus != 0 and t.cpus != 0) std.math.clamp(@as(f64, @floatFromInt(t.cpus)) / @as(f64, @floatFromInt(cpus)), 0.25, 4) else 1;
+        best = @min(best orelse t.seconds * scale, t.seconds * scale);
+    }
+    return best;
+}
+
+/// Seconds a job is taken to wait in a host's queue that has others waiting, for placement.
+const busy_wait_s: f64 = 120;
+
+/// `o`'s host, started first when it is stopped; null when it can't be.
+fn startIfStopped(cx: Cx, rec: *const Record, o: Option) ?[]const u8 {
+    if (o.up) return o.host;
+    const start = cx.cfg.remoteStart(o.host) orelse return null;
+    setState(cx, rec.id, "starting", cx.a.print("starting {s}", .{o.host}) catch "");
+    const r = run(cx, &.{ "/bin/sh", "-c", cx.a.print("{s} 1>&2", .{start}) catch return null }, null);
+    if (!r.ok) {
+        place_notes.append(cx.a, cx.a.print("{s}: its start command failed", .{o.host}) catch "") catch {};
+        return null;
+    }
+    if (probe(cx, o.host, if (rec.packs.len != 0) packs_min else host_min).reachable) return o.host;
+    place_notes.append(cx.a, cx.a.print("{s}: started, but no answer", .{o.host}) catch "") catch {};
     return null;
 }
 
@@ -1040,7 +1148,7 @@ fn startAndWatch(cx: Cx, rec: *Record, payload: *Payload, host: []const u8) u8 {
     const id = rec.id;
     if (host_has_time_rule(cx, host) and payload.time == null) payload.time = "2h";
     payload.attempt = rec.attempt;
-    payload.host_env = cx.cfg.spillEnv(host) orelse "";
+    payload.host_env = cx.cfg.remoteEnv(host) orelse "";
     payload.slots = cx.cfg.submit_slots;
     setState(cx, id, "starting", cx.a.print("on {s}", .{host}) catch "");
     // Where the time to a running job goes, in supervisor.log: each phase's seconds.
@@ -1103,7 +1211,7 @@ fn abandon(cx: Cx, id: []const u8, rec: Record, v: Verdict, code: ?i64, detail: 
 }
 
 fn host_has_time_rule(cx: Cx, host: []const u8) bool {
-    return cx.cfg.spillStart(host) != null;
+    return cx.cfg.remoteStart(host) != null;
 }
 
 fn resnapshot(cx: Cx, rec: *const Record) []const u8 {
@@ -1206,7 +1314,7 @@ fn lostOrRetry(cx: Cx, rec: *Record, payload: *Payload, host: []const u8) u8 {
     const id = rec.id;
     if (rec.attempt >= 2) return done(cx, id, rec.*, .lost, null, cx.a.print("{s} went away twice: not your code, resubmit once", .{host}) catch "", host);
     if (!probe(cx, host, if (rec.packs.len != 0) packs_min else host_min).reachable) {
-        const start = cx.cfg.spillStart(host) orelse return done(cx, id, rec.*, .lost, null, cx.a.print("{s} went away: not your code, resubmit once", .{host}) catch "", host);
+        const start = cx.cfg.remoteStart(host) orelse return done(cx, id, rec.*, .lost, null, cx.a.print("{s} went away: not your code, resubmit once", .{host}) catch "", host);
         setState(cx, id, "starting", cx.a.print("{s} went away; starting it again", .{host}) catch "");
         if (!run(cx, &.{ "/bin/sh", "-c", cx.a.print("{s} 1>&2", .{start}) catch "" }, null).ok)
             return done(cx, id, rec.*, .lost, null, cx.a.print("{s} went away and couldn't be started: not your code, resubmit once", .{host}) catch "", host);
@@ -1396,7 +1504,7 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
         var it = caches.map.iterator();
         while (it.next()) |kv| {
             if (!inside(kv.value_ptr.*)) continue;
-            const dir = cx.a.print("{s}/cpuq-spill/c/{s}/{s}", .{ home(cx), p.project, kv.value_ptr.* }) catch continue;
+            const dir = cx.a.print("{s}/{s}/{s}/{s}", .{ home(cx), layout.caches, p.project, kv.value_ptr.* }) catch continue;
             Io.Dir.cwd().createDirPath(cx.io, dir) catch {};
             env.put(kv.key_ptr.*, dir) catch {};
         }
@@ -1418,9 +1526,8 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
             prelude.print(cx.a, "{s} _pack {s} {s} {s} {s} {s} {s} || exit\n", .{ quote(cx, cx.self), quote(cx, pk.name), quote(cx, pk.version), quote(cx, if (pk.alias.len == 0) "-" else pk.alias), quote(cx, pk.kind), quote(cx, pk.bin), quote(cx, if (pk.build.len == 0) "-" else pk.build) }) catch {};
         }
     }
-    // A TMPDIR of its own: under `job_tmp` where the host sets one (a filesystem that syncs
-    // fast), else beside the job's record.
-    const tmp = if (cx.cfg.job_tmp.len != 0) cx.a.print("{s}/{s}", .{ expandHome(cx, std.mem.trimEnd(u8, cx.cfg.job_tmp, "/")), id }) catch jobFile(cx, id, "tmp") else jobFile(cx, id, "tmp");
+    // A TMPDIR of its own, removed when it ends.
+    const tmp = cx.a.print("{s}/{s}/{s}", .{ home(cx), layout.tmp, id }) catch jobFile(cx, id, "tmp");
     Io.Dir.cwd().createDirPath(cx.io, tmp) catch {};
     env.put("TMPDIR", tmp) catch {};
     // The job's progress (`DONE TOTAL FAILING`), where _peek finds it; cpuq run keeps it.
@@ -1640,6 +1747,7 @@ fn hostDone(cx: Cx, id: []const u8, p: Payload, v: Verdict, code: ?i64, detail: 
         .code = code,
         .seconds = @floatFromInt(now(cx.io) - started),
         .cores = p.cores orelse "",
+        .cpus = sys.totalCpus(cx.io),
         .detail = detail,
     };
     if (p.report) |rp| if (inside(rp)) {
@@ -1709,13 +1817,6 @@ pub fn cmdPeek(cx: Cx, args: []const [:0]const u8) u8 {
     return 0;
 }
 
-/// `~/x` as a path under this user's home.
-fn expandHome(cx: Cx, path: []const u8) []const u8 {
-    if (std.mem.eql(u8, path, "~")) return home(cx);
-    if (std.mem.startsWith(u8, path, "~/")) return cx.a.print("{s}/{s}", .{ home(cx), path[2..] }) catch path;
-    return path;
-}
-
 /// The most copies of one worktree a host keeps (`submit_slots` asks for up to this many).
 const copy_slots = 8;
 
@@ -1733,6 +1834,12 @@ fn jobCopy(cx: Cx, id: []const u8, base: []const u8) []const u8 {
 /// Fills the new copy `dest` from the project's most recently synced copy, one no job holds if
 /// there is one (its lock taken while it's read), with the filesystem's own cheap copy where it
 /// has one (reflinks, APFS clones). Nothing to seed from: it stays empty, and the sync sends all.
+/// When marker `name` in `dir` was last written (nanoseconds); 0 when it isn't there.
+fn markTime(cx: Cx, dir: []const u8, name: []const u8) i96 {
+    const st = Io.Dir.cwd().statFile(cx.io, cx.a.print("{s}/{s}", .{ dir, name }) catch return 0, .{}) catch return 0;
+    return st.mtime.toNanoseconds();
+}
+
 fn seedCopy(cx: Cx, base: []const u8, dest: []const u8) void {
     const project = std.fs.path.dirname(base) orelse return;
     const pdir = cx.a.print("{s}/{s}", .{ home(cx), project }) catch return;
@@ -1750,9 +1857,10 @@ fn seedCopy(cx: Cx, base: []const u8, dest: []const u8) void {
     while (it.next(cx.io) catch null) |e| {
         if (e.kind != .directory) continue;
         const dir = cx.a.print("{s}/{s}", .{ pdir, e.name }) catch continue;
-        if (std.mem.eql(u8, dir, dest)) continue;
-        const st = Io.Dir.cwd().statFile(cx.io, cx.a.print("{s}/.cpuq-generation", .{dir}) catch continue, .{}) catch continue;
-        const t = st.mtime.toNanoseconds();
+        if (std.mem.eql(u8, dir, dest) or std.mem.find(u8, e.name, ".seed.") != null) continue;
+        // A submitted job's copy by its last sync, a `cpuq run --on`'s by its last use.
+        const t = @max(markTime(cx, dir, ".cpuq-generation"), markTime(cx, dir, ".cpuq-used"));
+        if (t == 0) continue;
         const lock = Io.Dir.cwd().createFile(cx.io, cx.a.print("{s}.lock", .{dir}) catch continue, .{ .truncate = false }) catch continue;
         if (lock.tryLock(cx.io, .exclusive) catch false) {
             if (free == null or t > free_t) {

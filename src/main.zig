@@ -11,6 +11,7 @@ const clean = @import("clean.zig");
 const packs_mod = @import("packs.zig");
 
 const history = @import("history.zig");
+const layout = @import("layout.zig");
 const hook = @import("hook.zig");
 const table = @import("table.zig");
 const cap = @import("cap.zig");
@@ -67,15 +68,13 @@ const usage =
     \\                        a VM): counted at its whole grant; give --cores
     \\  --no-load-check       ignore the load valve
     \\  --qos none|auto       none: leave the command's scheduling class alone
-    \\  --spill               when this machine is full, run on a spill host with
-    \\                        room (config `spill`), starting a stopped one if
-    \\                        need be; the repo is copied there with rsync
-    \\  --local               run here only, whatever config `spill_default` says
-    \\  --spill-to HOST       run on HOST, here full or not: queue there if it is busy,
-    \\                        start it if stopped (config `spill_start.HOST`)
-    \\  --return PATH         with --spill or --spill-to: copy PATH back here afterwards
-    \\  --ship PATH           with --spill or --spill-to: copy PATH there too, gitignored
-    \\                        or not, .git included (also listed in .cpuq-spill)
+    \\  --on HOST             run on HOST, one of this machine's remotes (config
+    \\                        `remotes`), or this machine itself: the repo is copied
+    \\                        there with rsync; it queues there if HOST is busy, and
+    \\                        a stopped HOST is started (config `remote_start.HOST`)
+    \\  --return PATH         with --on: copy PATH back here afterwards
+    \\  --include PATH        with --on: copy PATH there too, gitignored or not,
+    \\                        .git included (also listed in the repo's .cpuqinclude)
     \\
     \\lease options (NAME: letters, digits, . _ -):
     \\  --slots N             let N hold NAME at once (default 1)
@@ -312,10 +311,10 @@ fn leastDisk(ctx: *Ctx) ?policy.Disk {
     const paths = ctx.disk_paths orelse blk: {
         const home: ?[:0]const u8 = if (ctx.env.get("HOME")) |h| ctx.arena.dupeSentinel(u8, h, 0) catch null else null;
         const dir: ?[:0]const u8 = ctx.arena.dupeSentinel(u8, stateDir(ctx), 0) catch null;
-        // Where jobs spilled here from other machines land: on a machine that gives it its own
-        // filesystem (burst's ZFS dataset), the one their scratch fills. Absent, it is skipped.
+        // ~/cpuq, where work sent here from other machines lands: on a machine that gives it its
+        // own filesystem (burst's ZFS dataset), the one their copies and scratch fill.
         const spill: ?[:0]const u8 = if (ctx.env.get("HOME")) |h| spill: {
-            const p = ctx.arena.print("{s}/cpuq-spill", .{h}) catch break :spill null;
+            const p = ctx.arena.print("{s}/{s}", .{ h, layout.root }) catch break :spill null;
             break :spill ctx.arena.dupeSentinel(u8, p, 0) catch null;
         } else null;
         ctx.disk_paths = .{ home, dir, spill };
@@ -372,22 +371,18 @@ const RunOptions = struct {
     /// stop it (inside a container or a VM): counted at its whole grant,
     /// never lent a timing window it could not be frozen out of.
     hidden: bool = false,
-    /// `--spill`: when this machine is full, run on a spill host instead.
-    spill: bool = false,
-    /// `--local`: run on this machine only, whatever `spill_default` says.
-    local: bool = false,
-    /// `--spill-to HOST`: run on HOST, whether this machine is full or not.
-    spill_to: ?[]const u8 = null,
-    /// `--return PATH` (with --spill): copied back from the spill host after.
+    /// `--on HOST`: run on HOST, one of this machine's remotes.
+    on: ?[]const u8 = null,
+    /// `--return PATH` (with --on): copied back from HOST after.
     returns: [max_returns][]const u8 = undefined,
     return_count: u8 = 0,
-    /// `--ship PATH` (with --spill): copied there although gitignored (or .git).
-    ships: [max_returns][]const u8 = undefined,
-    ship_count: u8 = 0,
-    /// `--tethered` (internal, what --spill runs on the spill host): stdin
-    /// carries the caller's heartbeats; when they stop, the job stops.
+    /// `--include PATH` (with --on): copied there although gitignored (or .git).
+    includes: [max_returns][]const u8 = undefined,
+    include_count: u8 = 0,
+    /// `--tethered` (internal, what --on runs on HOST): stdin carries the caller's heartbeats;
+    /// when they stop, the job stops.
     tethered: bool = false,
-    /// `--repo NAME` (internal, what --spill passes on): the repository the job's copy came
+    /// `--repo NAME` (internal, what --on passes on): the repository the job's copy came
     /// from, for its history.
     repo: ?[]const u8 = null,
 };
@@ -413,7 +408,7 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             name = kv[0];
             inline_value = kv[1];
         }
-        const takes_value = for ([_][]const u8{ "--cores", "--priority", "--label", "--note", "--max-wait", "--qos", "--host", "--slots", "--return", "--spill-to", "--ship", "--repo" }) |v| {
+        const takes_value = for ([_][]const u8{ "--cores", "--priority", "--label", "--note", "--max-wait", "--qos", "--host", "--slots", "--return", "--on", "--include", "--repo" }) |v| {
             if (std.mem.eql(u8, name, v)) break true;
         } else false;
         var value: []const u8 = "";
@@ -430,7 +425,7 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             _ = usageError("{s} takes no value", .{name});
             return null;
         }
-        for ([_][]const u8{ "--cores", "--no-load-check", "--qos", "--opaque", "--spill", "--local", "--return", "--tethered", "--spill-to", "--ship", "--repo" }) |r| {
+        for ([_][]const u8{ "--cores", "--no-load-check", "--qos", "--opaque", "--return", "--tethered", "--on", "--include", "--repo" }) |r| {
             if (std.mem.eql(u8, name, r)) o.run_only = r;
         }
         if (std.mem.eql(u8, name, "--cores")) {
@@ -473,31 +468,27 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             };
         } else if (std.mem.eql(u8, name, "--hold")) {
             o.hold = true;
-        } else if (std.mem.eql(u8, name, "--spill")) {
-            o.spill = true;
-        } else if (std.mem.eql(u8, name, "--local")) {
-            o.local = true;
-        } else if (std.mem.eql(u8, name, "--spill-to")) {
+        } else if (std.mem.eql(u8, name, "--on")) {
             if (value.len == 0) {
-                _ = usageError("--spill-to needs a host", .{});
+                _ = usageError("--on needs a host", .{});
                 return null;
             }
-            o.spill_to = value;
+            o.on = value;
         } else if (std.mem.eql(u8, name, "--tethered")) {
             o.tethered = true;
         } else if (std.mem.eql(u8, name, "--repo")) {
             o.repo = value;
-        } else if (std.mem.eql(u8, name, "--ship")) {
+        } else if (std.mem.eql(u8, name, "--include")) {
             if (!repoPath(value)) {
-                _ = usageError("--ship needs a path inside the repo, not '{s}'", .{value});
+                _ = usageError("--include needs a path inside the repo, not '{s}'", .{value});
                 return null;
             }
-            if (o.ship_count == max_returns) {
-                _ = usageError("at most {d} --ship paths", .{max_returns});
+            if (o.include_count == max_returns) {
+                _ = usageError("at most {d} --include paths", .{max_returns});
                 return null;
             }
-            o.ships[o.ship_count] = value;
-            o.ship_count += 1;
+            o.includes[o.include_count] = value;
+            o.include_count += 1;
         } else if (std.mem.eql(u8, name, "--return")) {
             if (value.len == 0 or value[0] == '/' or std.mem.find(u8, value, "..") != null) {
                 _ = usageError("--return needs a path inside the repo, not '{s}'", .{value});
@@ -509,6 +500,15 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             }
             o.returns[o.return_count] = value;
             o.return_count += 1;
+        } else if (std.mem.eql(u8, name, "--spill")) {
+            _ = usageError("--spill is gone: cpuq run runs here; --on HOST sends it to one of this machine's remotes", .{});
+            return null;
+        } else if (std.mem.eql(u8, name, "--local")) {
+            _ = usageError("--local is gone: cpuq run always runs here", .{});
+            return null;
+        } else if (std.mem.eql(u8, name, "--ship")) {
+            _ = usageError("--ship is now --include (and the repo's .cpuq-spill is now .cpuqinclude)", .{});
+            return null;
         } else {
             _ = usageError("unknown option '{s}'", .{a});
             return null;
@@ -585,47 +585,23 @@ fn cmdRun(ctx: *Ctx, args: []const [:0]const u8) u8 {
 
     loadConfig(ctx);
     if (o.exclusive and !ctx.cfg.exclusive) o.exclusive = exclusiveOff(o.label);
-    if ((o.return_count != 0 or o.ship_count != 0) and !o.spill and o.spill_to == null) return usageError("--return and --ship go with --spill or --spill-to", .{});
-    if (o.spill and o.spill_to != null) return usageError("--spill and --spill-to: choose one", .{});
-    if (o.local and (o.spill or o.spill_to != null)) return usageError("--local runs here: not with --spill or --spill-to", .{});
-    // `spill_default`: a job that can go elsewhere spills unless it says --local.
-    if (ctx.cfg.spill_default and !o.local and !o.spill and o.spill_to == null and notPortable(ctx, o) == null) o.spill = true;
-    if (o.tethered) tether();
-    if (o.spill or o.spill_to != null) {
-        if (o.exclusive) return usageError("--spill sends ordinary jobs, not --exclusive ones (time on the machine you mean)", .{});
-        if (o.spill_to) |h| return runSpillTo(ctx, o, h);
-        return runSpill(ctx, o);
-    }
-    return runHere(ctx, o);
-}
-
-/// Why a job can't run on another machine as it is (for `spill_default`), or null when it can:
-/// it isn't in a git repo, names a path that exists only here (absolute or under ~, outside the
-/// system's own directories), uses a macOS-only tool, or is a kind --spill doesn't send.
-fn notPortable(ctx: *Ctx, o: RunOptions) ?[]const u8 {
-    if (o.exclusive) return "--exclusive";
-    if (o.hidden) return "--opaque";
-    if (o.hold) return "a hold";
-    if (o.tethered or o.host != null) return "run for another machine";
-    if (gitTop(ctx) == null) return "not in a git repo";
-    const system = [_][]const u8{ "/usr/", "/bin/", "/sbin/", "/etc/", "/dev/", "/proc/", "/opt/homebrew/" };
-    const mac_only = [_][]const u8{ "xcodebuild", "xcrun", "swift", "swiftc", "codesign", "osascript", "launchctl", "sw_vers", "hdiutil", "plutil", "simctl", "instruments", "notarytool", "lipo", "install_name_tool", "otool", "dtrace", "pkgbuild", "productbuild" };
-    for (o.cmd) |arg| {
-        var words = std.mem.tokenizeAny(u8, arg, " \t\n'\";=:|&()<>`");
-        while (words.next()) |word| {
-            const base = std.fs.path.basename(word);
-            for (mac_only) |m| if (std.mem.eql(u8, base, m)) return ctx.arena.print("it uses {s}, a macOS tool", .{m}) catch "a macOS tool";
-            const path = word[0..@min(word.len, 200)];
-            if (std.mem.startsWith(u8, word, "~/") or std.mem.startsWith(u8, word, "$HOME") or std.mem.startsWith(u8, word, "${HOME}"))
-                return ctx.arena.print("it names {s}, under this machine's home", .{path}) catch "a path here";
-            if (word.len < 2 or word[0] != '/') continue;
-            const ok = for (system) |prefix| {
-                if (std.mem.startsWith(u8, word, prefix)) break true;
-            } else false;
-            if (!ok) return ctx.arena.print("it names {s}, which exists only here", .{path}) catch "a path here";
+    if ((o.return_count != 0 or o.include_count != 0) and o.on == null) return usageError("--return and --include go with --on", .{});
+    // `--on` this machine itself runs here; any other host must be one of this machine's remotes.
+    if (o.on) |h| {
+        if (isSelf(ctx.arena, h)) {
+            o.on = null;
+            o.return_count = 0;
+            o.include_count = 0;
+        } else if (!ctx.cfg.isRemote(h)) {
+            return usageError("--on {s}: not one of this machine's remotes (config remotes = {s})", .{ h, if (ctx.cfg.remotes.len == 0) "none" else ctx.cfg.remotes });
         }
     }
-    return null;
+    if (o.tethered) tether();
+    if (o.on) |h| {
+        if (o.exclusive) return usageError("--on sends ordinary jobs, not --exclusive ones (time on the machine you mean)", .{});
+        return runOn(ctx, o, h);
+    }
+    return runHere(ctx, o);
 }
 
 /// Waits its turn on this machine and runs the command.
@@ -642,7 +618,7 @@ fn runHere(ctx: *Ctx, o: RunOptions) u8 {
 /// Whether this run is tethered to a caller over ssh (`--tethered`).
 var tethered = false;
 
-/// `--tethered`: the caller (a `cpuq run --spill` on another machine)
+/// `--tethered`: the caller (a `cpuq run --on` on another machine)
 /// sends heartbeats down stdin. A waiting run gives up once they stop, and a
 /// running one stops its command, as when the caller is killed or loses the
 /// connection. The command gets /dev/null for stdin.
@@ -653,184 +629,44 @@ fn tether() void {
     sys.StdinWatch.startAside();
 }
 
-/// `cpuq run --spill`: runs where it should finish first. Work this machine's history knows
-/// (place.zig: its repo and command, whatever its label) goes by each place's expected finish:
-/// the queue, starting a stopped host, the copy, and its run time there (by its runs there, else
-/// by its runs here, faster where it has more cores if it takes its width from cpuq). It leaves
-/// only for a clear win (a minute and 30% sooner), starts a stopped host only for work over ten
-/// minutes here, and asks no host about work that takes under two. Work not seen before runs
-/// here while there's room, else on the first spill host with room, else on the first stopped
-/// one with a `spill_start` command, else in the queue here. Full means anyone waiting, the
-/// 1-minute load above the CPUs, or a gate shut, here and on each host alike. Work a spec of the
-/// repo runs, needing its packs or caches, stays here and names the `cpuq submit` that sends it.
-/// The repo (git's top level, else the working directory) is copied to HOST:cpuq-spill/s/NAME-HASH
-/// with rsync, honoring .gitignore and leaving .git behind, and the job runs there through HOST's
-/// cpuq, tethered to this one, which streams its output and returns its status.
-fn runSpill(ctx: *Ctx, o: RunOptions) u8 {
-    const a = ctx.arena;
-    var hosts = ctx.cfg.spillHosts();
-    if (hosts.peek() == null) {
-        std.debug.print("cpuq: --spill: no spill hosts configured (`spill = HOST, ...` in {s}); running here\n", .{ctx.cfg_path});
-        return runHere(ctx, o);
-    }
-    var why_buf: [96]u8 = undefined;
-    const full = localFull(ctx, &why_buf);
-    var rt = RunTimes.load(ctx, a);
-    const key = jobWorkKey(ctx, o);
-    const here = rt.workStats(a, null, key);
-    if (full == null and (here.runs == 0 or here.ran < place.short_s)) return runHere(ctx, o);
-    if (gitTop(ctx)) |root| if (submit.specFor(a, ctx.io, root, joinCommand(ctx, o.cmd))) |spec| if (spec.needs) {
-        var b: [32]u8 = undefined;
-        std.debug.print("cpuq: this is {s}'s work{s}{s}{s}, which needs the spec's packs or caches: `cpuq submit {s}{s}{s}` runs it on a spill host with them; running here\n", .{
-            spec.path, if (here.runs != 0) " (" else "",       if (here.runs != 0) place.approx(&b, here.ran) else "", if (here.runs != 0) " here)" else "",
-            spec.path, if (spec.rest.len != 0) " -- " else "", spec.rest,
-        });
-        return runHere(ctx, o);
-    };
-    if (here.runs == 0) return spillFirstFree(ctx, o, full.?);
-
-    // Known work: each place's expected finish.
-    const scaling = place.scales(joinCommand(ctx, o.cmd));
-    const here_place: place.Place = .{ .name = "here", .wait = if (full != null) busy_wait_s else 0, .run = here.ran };
-    const here_s = here_place.finish().?;
-    var best: ?place.Place = null;
-    var best_stopped = false;
-    var seen: std.ArrayList(u8) = .empty;
-    while (hosts.next()) |h| {
-        const there = rt.workStats(a, h, key);
-        var p: place.Place = .{ .name = h, .copy = if (there.runs != 0) 0 else place.copy_first_s };
-        var stopped = false;
-        switch (probeHost(ctx, h)) {
-            .room => |cpus| p.run = place.runTime(there, here, coresThere(o, cpus, scaling), scaling),
-            .full => |f| {
-                p.run = place.runTime(there, here, coresThere(o, f.cpus, scaling), scaling);
-                p.wait = busy_wait_s;
-                seen.print(a, "{s}{s} {s}", .{ if (seen.items.len == 0) "" else ", ", h, f.why }) catch {};
-            },
-            .gone => {
-                if (ctx.cfg.spillStart(h) == null or here_s < place.start_worth_s) continue;
-                stopped = true;
-                p.wait = place.start_s;
-                p.run = place.runTime(there, here, coresThere(o, 96, scaling), scaling);
-            },
-        }
-        const f = p.finish() orelse continue;
-        if (best == null or f < best.?.finish().?) {
-            best = p;
-            best_stopped = stopped;
-        }
-    }
-    var b1: [32]u8 = undefined;
-    var b2: [32]u8 = undefined;
-    if (best) |p| if (place.better(here_s, p.finish().?)) {
-        const why = a.print("{s}{s}{s} here, {s} on {s}", .{ if (full) |w| w else "", if (full != null) ", " else "", place.approx(&b1, here_s), place.approx(&b2, p.finish().?), p.name }) catch "faster there";
-        if (best_stopped) {
-            std.debug.print("cpuq: {s}; starting {s}\n", .{ why, p.name });
-            if (!startHost(ctx, p.name)) {
-                std.debug.print("cpuq: could not start {s}; running here\n", .{p.name});
-                return runHere(ctx, o);
-            }
-        }
-        return spillTo(ctx, o, p.name, why);
-    };
-    if (full) |w| std.debug.print("cpuq: here {s}, but no spill host would finish it sooner ({s} here{s}{s}); queueing here\n", .{ w, place.approx(&b1, here_s), if (seen.items.len == 0) "" else "; ", seen.items });
-    return runHere(ctx, o);
-}
-
-/// The most cores a job would get on a host with `cpus`: what it asked for (a small fixed count
-/// that takes its width from cpuq widened to twice itself, as `place.widen` may), at most half the
-/// host's CPUs.
-fn coresThere(o: RunOptions, cpus: u32, scaling: bool) u32 {
-    const half = @max(cpus / 2, 1);
-    if (!o.cores_given) return half;
-    const asked = if (o.request.fixed() and scaling) 2 * o.request.max else o.request.max;
-    return @min(asked, half);
-}
-
-/// Seconds a job is taken to wait in a queue that has others waiting, for placement.
-const busy_wait_s: f64 = 120;
-
-/// Work no machine's history knows, with this machine full (`why`): the first spill host with
-/// room, else the first stopped one with a `spill_start` command, else the queue here.
-fn spillFirstFree(ctx: *Ctx, o: RunOptions, why: []const u8) u8 {
-    var hosts = ctx.cfg.spillHosts();
-    var stopped: ?[]const u8 = null;
-    var seen: std.ArrayList(u8) = .empty;
-    while (hosts.next()) |h| {
-        switch (probeHost(ctx, h)) {
-            .room => return spillTo(ctx, o, h, a2(ctx, "here {s}", why)),
-            .full => |f| seen.print(ctx.arena, "{s}{s} {s}", .{ if (seen.items.len == 0) "" else ", ", h, f.why }) catch {},
-            .gone => if (stopped == null and ctx.cfg.spillStart(h) != null) {
-                stopped = h;
-            } else {
-                seen.print(ctx.arena, "{s}{s} unreachable", .{ if (seen.items.len == 0) "" else ", ", h }) catch {};
-            },
-        }
-    }
-    if (stopped) |h| {
-        std.debug.print("cpuq: here {s}{s}{s}; starting {s}\n", .{ why, if (seen.items.len == 0) "" else "; ", seen.items, h });
-        if (startHost(ctx, h)) return spillTo(ctx, o, h, a2(ctx, "here {s}", why));
-        std.debug.print("cpuq: could not start {s}; queueing here\n", .{h});
-        return runHere(ctx, o);
-    }
-    std.debug.print("cpuq: here {s}, and no spill host has room ({s}); queueing here\n", .{ why, seen.items });
-    return runHere(ctx, o);
-}
-
 /// This job's work, for history (place.workKey): its repo, else its label's project, and its
 /// command.
 fn jobWorkKey(ctx: *Ctx, o: RunOptions) []const u8 {
     return place.workKey(ctx.arena, repoOf(ctx, o) orelse std.mem.sliceTo(o.label, ':'), joinCommand(ctx, o.cmd));
 }
 
-/// `cpuq run --spill-to HOST`: runs on HOST whatever this machine's state: there at once
-/// when it has room, else in its queue; started first if it is stopped and has a `spill_start`
+/// `cpuq run --on HOST`: runs on HOST whatever this machine's state: there at once
+/// when it has room, else in its queue; started first if it is stopped and has a `remote_start`
 /// command. A host that cannot be reached or started is an error (exit 125), not a quiet run
 /// somewhere else: HOST was asked for by name.
-fn runSpillTo(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
+fn runOn(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
     switch (probeHost(ctx, host)) {
-        .room => return spillTo(ctx, o, host, a2(ctx, "--spill-to {s}", host)),
-        .full => |f| return spillTo(ctx, o, host, a2(ctx, "--spill-to: it {s}, so the job queues there", f.why)),
+        .room => return sendTo(ctx, o, host, a2(ctx, "--on {s}", host)),
+        .full => |f| return sendTo(ctx, o, host, ctx.arena.print("--on {s}: it {s}, so the job queues there", .{ host, f.why }) catch f.why),
         .gone => {
-            if (ctx.cfg.spillStart(host) == null) {
-                std.debug.print("cpuq: --spill-to {s}: it does not answer, and the config has no spill_start.{s} to start it\n", .{ host, host });
+            if (ctx.cfg.remoteStart(host) == null) {
+                std.debug.print("cpuq: --on {s}: it does not answer, and the config has no remote_start.{s} to start it\n", .{ host, host });
                 return exit_failure;
             }
-            std.debug.print("cpuq: --spill-to {s}: it is stopped; starting it\n", .{host});
+            std.debug.print("cpuq: --on {s}: it is stopped; starting it\n", .{host});
             if (!startHost(ctx, host)) {
-                std.debug.print("cpuq: --spill-to {s}: could not start it\n", .{host});
+                std.debug.print("cpuq: --on {s}: could not start it\n", .{host});
                 return exit_failure;
             }
-            return spillTo(ctx, o, host, a2(ctx, "--spill-to {s}", host));
+            return sendTo(ctx, o, host, a2(ctx, "--on {s}", host));
         },
     }
 }
 
 /// A run sent to a host by name and lost there is started again and rerun only once.
-var spill_retried = false;
+var send_retried = false;
 
 /// A formatted line in the arena, for messages.
 fn a2(ctx: *Ctx, comptime fmt: []const u8, arg: []const u8) []const u8 {
     return ctx.arena.print(fmt, .{arg}) catch arg;
 }
 
-/// Why this machine is full, for `--spill`; null when it has room.
-fn localFull(ctx: *Ctx, buf: []u8) ?[]const u8 {
-    var st = openState(ctx);
-    lockOrFail(&st);
-    const now = nowSeconds(ctx.io);
-    const queue = state.scanQueue(&st, ctx.arena, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{});
-    st.unlock();
-    if (queue.len != 0) return std.mem.print(buf, "has {d} waiting", .{queue.len}) catch "is full";
-    const m = machine(ctx);
-    const load = sys.loadAverage()[0];
-    // `load_check = off` ignores the machine load, here as everywhere.
-    if (ctx.cfg.load_check and load > @as(f64, @floatFromInt(m.active))) return std.mem.print(buf, "is at load {d:.1} on {d} CPUs", .{ load, m.active }) catch "is full";
-    if (policy.gate(ctx.cfg, m, budgetNow(ctx, m), null, now) != .open) return "has its gate shut";
-    return null;
-}
-
-/// A spill host as `cpuq status` there describes it.
+/// A remote as `cpuq status` there describes it.
 const Probe = union(enum) {
     /// Its CPUs.
     room: u32,
@@ -853,13 +689,13 @@ fn probeHost(ctx: *Ctx, host: []const u8) Probe {
     return .{ .room = cpus };
 }
 
-/// Runs `host`'s `spill_start` command, one start at a time: a second
-/// --spill waits for the first's start and finds the host up.
+/// Runs `host`'s `remote_start` command, one start at a time: a second
+/// --on waits for the first's start and finds the host up.
 fn startHost(ctx: *Ctx, host: []const u8) bool {
     const io = ctx.io;
     const a = ctx.arena;
-    const cmd = ctx.cfg.spillStart(host) orelse return false;
-    const lock_path = a.print("{s}/spill-start-{s}", .{ stateDir(ctx), host }) catch return false;
+    const cmd = ctx.cfg.remoteStart(host) orelse return false;
+    const lock_path = a.print("{s}/remote-start-{s}", .{ stateDir(ctx), host }) catch return false;
     const lock = Io.Dir.cwd().createFile(io, lock_path, .{ .lock = .exclusive, .truncate = false }) catch null;
     defer if (lock) |f| f.close(io);
     if (probeHost(ctx, host) != .gone) return true;
@@ -871,27 +707,29 @@ fn startHost(ctx: *Ctx, host: []const u8) bool {
 }
 
 /// Copies the repo to `host` and runs the job there through its cpuq.
-fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
+fn sendTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     const io = ctx.io;
     const a = ctx.arena;
     const cwd = std.process.currentPathAlloc(io, a) catch fail("current directory: cannot read it", .{});
     const root = gitTop(ctx) orelse cwd;
     const rel = if (std.mem.startsWith(u8, cwd, root)) cwd[root.len..] else "";
     const trip_t = nowFloat(io);
-    // The copy's place on the host: one per repo (and worktree) here, named by it, so each keeps
-    // its own build caches between runs, and `cpuq clean` finds them all in one directory.
-    const dir = a.print("cpuq-spill/s/{s}-{x:0>8}", .{ std.fs.path.basename(root), @as(u32, @truncate(std.hash.Wyhash.hash(0, a.print("{s}\x00{s}", .{ shortHost(a), root }) catch root))) }) catch fail("out of memory", .{});
-    std.debug.print("cpuq: {s}; running {s} on {s}\n", .{ why, if (o.label.len != 0) o.label else o.cmd[0], host });
     const repo_named = repoOf(ctx, o);
     const repo = repo_named orelse std.fs.path.basename(root);
+    // The copy's place on the host: one per repo (and worktree) here, named by it, so each keeps
+    // its own build caches between runs; beside its project's other copies, so a first one is
+    // seeded from them.
+    const project = if (safeName(repo)) repo else std.fs.path.basename(root);
+    const dir = a.print("{s}/{s}/{s}-{x:0>8}", .{ layout.worktrees, project, std.fs.path.basename(root), @as(u32, @truncate(std.hash.Wyhash.hash(0, a.print("{s}\x00{s}", .{ shortHost(a), root }) catch root))) }) catch fail("out of memory", .{});
+    std.debug.print("cpuq: {s}; running {s} on {s}\n", .{ why, if (o.label.len != 0) o.label else o.cmd[0], host });
 
-    // What ships beyond the tracked files: --ship paths and the repo's .cpuq-spill list, each
+    // What goes beyond the tracked files: --include paths and the repo's .cpuqinclude list, each
     // included (with the folders above it) ahead of the rules that leave out .git and what
     // .gitignore names; rsync takes the first rule that matches.
     var sync: std.ArrayList([]const u8) = .empty;
     sync.appendSlice(a, &.{ "rsync", "-a", "--delete" }) catch fail("out of memory", .{});
     var ship_git = false;
-    for (shipList(ctx, root, o)) |path| {
+    for (includeList(ctx, root, o)) |path| {
         // `.git` ships as a git of the copy's own (shipGit), never as it is here.
         if (std.mem.eql(u8, path, ".git")) {
             ship_git = true;
@@ -922,7 +760,7 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     if (keeps) |f| sync.append(a, a.print("--filter=merge {s}", .{f}) catch "") catch {};
     sync.appendSlice(a, &.{
         // A first copy there starts as a clone of another of this repo's (gitship.seedPath).
-        a.print("--rsync-path={s}", .{gitship.seedPath(a, dir, repo, ship_git)}) catch "", a.print("{s}/", .{root}) catch "",
+        a.print("--rsync-path={s}", .{gitship.seedPath(a, dir, ship_git)}) catch "", a.print("{s}/", .{root}) catch "",
         a.print("{s}:{s}/", .{ host, dir }) catch "",
     }) catch fail("out of memory", .{});
     var copied = std.process.run(a, io, .{ .argv = sync.items }) catch |err| fail("rsync: {t}", .{err});
@@ -935,8 +773,8 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     const failed: ?[]const u8 = if (!gitship.copied(copied.term)) std.mem.trim(u8, copied.stderr, " \n") else if (shipChecked(ctx, sync.items, host)) |e| e else if (ship_git) shipGit(ctx, root, host, dir) else null;
     if (failed) |err_text| {
         // Sent there by name, a job never runs here: it was sized for that host.
-        if (o.spill_to != null) {
-            std.debug.print("cpuq: could not copy {s} to {s}: {s}; --spill-to runs it nowhere else\n", .{ root, host, err_text });
+        if (o.on != null) {
+            std.debug.print("cpuq: could not copy {s} to {s}: {s}; --on runs it nowhere else\n", .{ root, host, err_text });
             return exit_failure;
         }
         std.debug.print("cpuq: could not copy {s} to {s}: {s}; running here\n", .{ root, host, err_text });
@@ -950,9 +788,9 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     // it is, for the next new copy of that repo to start from.
     remote.print(a, "cd {s} && printf %s {s} >|.cpuq-used && ", .{ shellQuote(a, dir), shellQuote(a, repo) }) catch fail("out of memory", .{});
     if (rel.len != 0) remote.print(a, "cd {s} && ", .{shellQuote(a, a.print(".{s}", .{rel}) catch ".")}) catch {};
-    // `spill_env.HOST`: the user's own shell assignments, expanded there (an ssh command's
+    // `remote_env.HOST`: the user's own shell assignments, expanded there (an ssh command's
     // shell reads no login profile, so ~/.local tools are off its PATH).
-    if (ctx.cfg.spillEnv(host)) |env| remote.print(a, "export {s} && ", .{env}) catch {};
+    if (ctx.cfg.remoteEnv(host)) |env| remote.print(a, "export {s} && ", .{env}) catch {};
     // The repo's name for its history there (the copy's folder is named by the worktree).
     if (repo_named) |r| remote.print(a, "export CPUQ_REPO={s} && ", .{shellQuote(a, r)}) catch {};
     remote.print(a, "exec cpuq run --tethered --priority {t}", .{o.priority}) catch fail("out of memory", .{});
@@ -994,22 +832,18 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     // down under the job (a Spot reclaim powers the VM off gracefully, and
     // the shutdown kills the job before the connection drops). Either way,
     // give a host that is going a moment to go, and if it has, run the job
-    // again: under --spill here, under --spill-to on that host or nowhere.
+    // again, on that host or nowhere.
     if ((code == 255 or code > 128) and hostWentAway(ctx, host)) {
         const who = if (o.label.len != 0) o.label else o.cmd[0];
-        if (o.spill_to == null) {
-            std.debug.print("cpuq: lost {s} while {s} ran there; running it here instead\n", .{ host, who });
-            return runHere(ctx, o);
-        }
         // Sent there by name: start it again and run there once more, as a Spot VM reclaimed is
         // usually back a minute later. Never here: a job sized for that host (--cores 8-48 for 96
         // CPUs) would swamp this machine.
-        if (!spill_retried and ctx.cfg.spillStart(host) != null) {
+        if (!send_retried and ctx.cfg.remoteStart(host) != null) {
             std.debug.print("cpuq: lost {s} while {s} ran there; starting it again\n", .{ host, who });
-            spill_retried = true;
-            if (startHost(ctx, host)) return spillTo(ctx, o, host, "running again");
+            send_retried = true;
+            if (startHost(ctx, host)) return sendTo(ctx, o, host, "running again");
         }
-        std.debug.print("cpuq: lost {s} while {s} ran there, and --spill-to runs it nowhere else: run it again when {s} is back\n", .{ host, who, host });
+        std.debug.print("cpuq: lost {s} while {s} ran there, and --on runs it nowhere else: run it again when {s} is back\n", .{ host, who, host });
         return exit_failure;
     }
     for (o.returns[0..o.return_count]) |path| {
@@ -1061,29 +895,29 @@ fn shipChecked(ctx: *Ctx, sync: []const []const u8, host: []const u8) ?[]const u
     };
 }
 
-/// `.git` shipped (`--ship .git`, or a `.git` line in `.cpuq-spill`): the copy gets a git of
+/// `.git` included (`--include .git`, or a `.git` line in `.cpuqinclude`): the copy gets a git of
 /// its own, git's parts only (gitship.zig). The error text when it fails, else null.
 fn shipGit(ctx: *Ctx, root: []const u8, host: []const u8, dir: []const u8) ?[]const u8 {
     const a = ctx.arena;
     const e = gitship.ship(a, ctx.io, "rsync", root, host, a.print("{s}/.git", .{dir}) catch return "out of memory") orelse return null;
-    return a.print("--ship .git: {s}", .{e}) catch e;
+    return a.print("--include .git: {s}", .{e}) catch e;
 }
 
-/// The paths a spilled job ships beyond the tracked files: its --ship paths, then the repo's
-/// `.cpuq-spill` list (a path a line, `#` comments), each inside the repo. Trailing slashes are
+/// The paths a job sent with --on takes beyond the tracked files: its --include paths, then the
+/// repo's `.cpuqinclude` list (a path a line, `#` comments), each inside the repo. Trailing slashes are
 /// dropped; anything else is said and skipped.
-fn shipList(ctx: *Ctx, root: []const u8, o: RunOptions) []const []const u8 {
+fn includeList(ctx: *Ctx, root: []const u8, o: RunOptions) []const []const u8 {
     const a = ctx.arena;
     var out: std.ArrayList([]const u8) = .empty;
-    for (o.ships[0..o.ship_count]) |p| out.append(a, std.mem.trimEnd(u8, p, "/")) catch {};
-    const list = a.print("{s}/.cpuq-spill", .{root}) catch return out.items;
+    for (o.includes[0..o.include_count]) |p| out.append(a, std.mem.trimEnd(u8, p, "/")) catch {};
+    const list = a.print("{s}/.cpuqinclude", .{root}) catch return out.items;
     const text = Io.Dir.cwd().readFileAlloc(ctx.io, list, a, .limited(1 << 16)) catch return out.items;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trimEnd(u8, std.mem.trim(u8, if (std.mem.findScalar(u8, raw, '#')) |i| raw[0..i] else raw, " \t\r"), "/");
         if (line.len == 0) continue;
         if (!repoPath(line)) {
-            std.debug.print("cpuq: .cpuq-spill: '{s}' is not a path inside the repo; skipped\n", .{line});
+            std.debug.print("cpuq: .cpuqinclude: '{s}' is not a path inside the repo; skipped\n", .{line});
             continue;
         }
         out.append(a, line) catch {};
@@ -1111,7 +945,7 @@ fn gitKept(ctx: *Ctx, root: []const u8) ?[]const u8 {
     };
     if (out.items.len == 0) return null;
     const tmp = ctx.env.get("TMPDIR") orelse "/tmp";
-    const file = a.print("{s}/cpuq-spill-{d}.keep", .{ std.mem.trimEnd(u8, tmp, "/"), sys.getpid() }) catch return null;
+    const file = a.print("{s}/cpuq-send-{d}.keep", .{ std.mem.trimEnd(u8, tmp, "/"), sys.getpid() }) catch return null;
     Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = file, .data = out.items }) catch return null;
     return file;
 }
@@ -1135,12 +969,12 @@ fn gitIgnored(ctx: *Ctx, root: []const u8) ?[]const u8 {
             out.append(a, ch) catch return null;
         }
         // An ignored folder (git's `dir/`), with all it holds: a path shipped from inside it
-        // (--ship) is included by an earlier rule, and the rest stays behind.
+        // (--include) is included by an earlier rule, and the rest stays behind.
         if (path[path.len - 1] == '/') out.appendSlice(a, "***") catch return null;
         out.append(a, '\n') catch return null;
     }
     const tmp = ctx.env.get("TMPDIR") orelse "/tmp";
-    const file = a.print("{s}/cpuq-spill-{d}.exclude", .{ std.mem.trimEnd(u8, tmp, "/"), sys.getpid() }) catch return null;
+    const file = a.print("{s}/cpuq-send-{d}.exclude", .{ std.mem.trimEnd(u8, tmp, "/"), sys.getpid() }) catch return null;
     Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = file, .data = out.items }) catch return null;
     return file;
 }
@@ -1152,6 +986,12 @@ fn repoOf(ctx: *Ctx, o: RunOptions) ?[]const u8 {
     if (o.repo) |r| return r;
     if (ctx.env.get("CPUQ_REPO")) |r| if (r.len != 0) return r;
     return repoAt(ctx, std.process.currentPathAlloc(ctx.io, ctx.arena) catch return null);
+}
+
+/// Whether `name` is one plain path component: a folder name on another machine.
+fn safeName(name: []const u8) bool {
+    if (name.len == 0 or name[0] == '.') return false;
+    return std.mem.findAny(u8, name, "/\\\x00") == null;
 }
 
 /// The name of the repo `start` is in (a worktree's, its main repo's), by the `.git` above it.
@@ -3179,6 +3019,11 @@ fn namedLeases(ctx: *Ctx, a: std.mem.Allocator) []const []const u8 {
 /// it on. A paused job's cores count as idle, so they are lent at once.
 /// Nothing touches an exclusive run. Several matches need --all.
 /// This machine's name, short (`pop`, not pop.local).
+/// Whether `host` names this machine (its short hostname, any case): `--on` it runs here.
+fn isSelf(a: std.mem.Allocator, host: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(host, shortHost(a));
+}
+
 fn shortHost(a: std.mem.Allocator) []const u8 {
     var buf: [256]u8 = undefined;
     if (std.c.gethostname(&buf, buf.len) != 0) return "here";
@@ -3428,27 +3273,15 @@ fn cmdHook(ctx: *Ctx) u8 {
     const call = std.json.parseFromSliceLeaky(Call, a, input.items, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return 0;
     if (!std.mem.eql(u8, call.tool_name, "Bash") or call.tool_input.command.len == 0) return 0;
     const project = std.fs.path.basename(call.cwd);
-    // Whether this machine is full, for a `cpuq run` that says neither --spill nor --local: only
-    // when the command has one and there's somewhere else to send it.
-    var full: ?[]const u8 = null;
-    if (std.mem.find(u8, call.tool_input.command, "cpuq") != null and std.mem.find(u8, call.tool_input.command, "run") != null) {
-        loadConfig(ctx);
-        var hosts = ctx.cfg.spillHosts();
-        if (hosts.peek() != null) {
-            var why_buf: [96]u8 = undefined;
-            if (localFull(ctx, &why_buf)) |why| full = a.dupe(u8, why) catch null;
-        }
-    }
     var advisor: HookAdvisor = .{ .ctx = ctx, .cwd = call.cwd };
-    const r = hook.check(a, call.tool_input.command, sys.totalCpus(ctx.io), project, full, advisor.it()) orelse return 0;
+    const r = hook.check(a, call.tool_input.command, sys.totalCpus(ctx.io), project, advisor.it()) orelse return 0;
     std.debug.print("cpuq: {s}.\nRun instead: {s}\n(See AGENTS.md in the cpuq repo. A command that must run as it is can end with `# cpuq: skip`.)\n", .{ r.reason, r.instead });
     return 2;
 }
 
 /// What the hook knows of a `cpuq run`'s work: its runs here and elsewhere, and the repo's specs.
 /// Long work (over place.long_s here) is refused when another place runs it in half the time:
-/// a spec's work (one needing its packs or caches) through `cpuq submit`, other work said to stay
-/// here (--local) by dropping --local, its runs on a spill host proving it needs nothing of here.
+/// a spec's work (one needing its packs or caches) through `cpuq submit`.
 const HookAdvisor = struct {
     ctx: *Ctx,
     cwd: []const u8,
@@ -4461,7 +4294,7 @@ const JsonStatus = struct {
     free: u32 = 0,
     load: [3]f64 = .{ 0, 0, 0 },
     /// Whether this machine counts its load against admitting work (config `load_check`): a
-    /// --spill sending work here judges it by its load only when it does.
+    /// --on sending work here judges it by its load only when it does.
     load_check: bool = true,
     memory_pressure: []const u8 = "",
     /// Memory and swap in bytes: `used` is what Activity Monitor calls Memory

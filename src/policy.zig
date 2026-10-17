@@ -146,54 +146,53 @@ pub const Config = struct {
     /// What jobs left (copies, pack versions, job records) goes once unused this long
     /// (`clean_after`, e.g. 3d; off: never), by `cpuq record` hourly and `cpuq clean`.
     clean_after_s: u32 = 3 * 86400,
-    /// The machines `cpuq run --spill` may send a job to when this one is
-    /// full, in the order tried: ssh names, separated by commas or spaces
-    /// (`spill`).
-    spill: []const u8 = "",
-    /// Every `cpuq run` acts as `--spill` when it can go elsewhere (`spill_default`): in a git
-    /// repo, naming no path outside it, using no macOS-only tool, not --opaque, --exclusive or a
-    /// hold. `--local` keeps one here.
-    spill_default: bool = false,
+    /// The machines this one can send work to, in the order tried: ssh names, separated by
+    /// commas or spaces (`remotes`). `--on HOST` names one; `cpuq submit` chooses among them.
+    /// Each machine lists the ones it can reach: a cloud host may list none.
+    remotes: []const u8 = "",
     /// Copies of one worktree a submitted job may use on its host (`submit_slots`, 1–8): so many
     /// of a worktree's jobs run there at once; 1 runs them one after another on a single copy.
     submit_slots: u32 = 3,
-    /// Where a submitted job's TMPDIR goes on this host, a directory of its own per job, removed
-    /// when it ends (`job_tmp`, `~` for home; empty: beside the job's record). On burst it is the
-    /// ZFS spill dataset: its root ext4 disk made an fsync wait ~0.36 s behind other jobs' writes.
-    job_tmp: []const u8 = "",
-    /// How to start a spill host that is stopped, such as a cloud machine:
-    /// `spill_start.HOST = COMMAND`, run with sh; it should return once
+    /// How to start a remote that is stopped, such as a cloud machine:
+    /// `remote_start.HOST = COMMAND`, run with sh; it should return once
     /// `ssh HOST` works.
-    spill_starts: [max_spill_starts]SpillStart = @splat(.{}),
-    spill_start_count: u8 = 0,
-    /// What a spilled job's shell exports on HOST before cpuq runs it there:
-    /// `spill_env.HOST = PATH=$HOME/.local/go/bin:$PATH` (one or more shell
+    remote_starts: [max_remote_lines]RemoteLine = @splat(.{}),
+    remote_start_count: u8 = 0,
+    /// What a job's shell exports on HOST before cpuq runs it there:
+    /// `remote_env.HOST = PATH=$HOME/.local/go/bin:$PATH` (one or more shell
     /// assignments, expanded by HOST's shell). An ssh command's shell reads
     /// no login profile, so tools under ~/.local are off its PATH.
-    spill_envs: [max_spill_starts]SpillStart = @splat(.{}),
-    spill_env_count: u8 = 0,
+    remote_envs: [max_remote_lines]RemoteLine = @splat(.{}),
+    remote_env_count: u8 = 0,
 
-    /// The spill hosts, in order.
-    pub fn spillHosts(self: *const Config) std.mem.TokenIterator(u8, .any) {
-        return std.mem.tokenizeAny(u8, self.spill, ", \t");
+    /// The remotes, in order.
+    pub fn remoteHosts(self: *const Config) std.mem.TokenIterator(u8, .any) {
+        return std.mem.tokenizeAny(u8, self.remotes, ", \t");
+    }
+
+    /// Whether `host` is one of the remotes.
+    pub fn isRemote(self: *const Config, host: []const u8) bool {
+        var it = self.remoteHosts();
+        while (it.next()) |h| if (std.mem.eql(u8, h, host)) return true;
+        return false;
     }
 
     /// The command that starts `host`, if one is configured.
-    pub fn spillStart(self: *const Config, host: []const u8) ?[]const u8 {
-        for (self.spill_starts[0..self.spill_start_count]) |s| if (std.mem.eql(u8, s.host, host)) return s.cmd;
+    pub fn remoteStart(self: *const Config, host: []const u8) ?[]const u8 {
+        for (self.remote_starts[0..self.remote_start_count]) |s| if (std.mem.eql(u8, s.host, host)) return s.cmd;
         return null;
     }
 
-    /// The assignments a job spilled to `host` exports there, if any.
-    pub fn spillEnv(self: *const Config, host: []const u8) ?[]const u8 {
-        for (self.spill_envs[0..self.spill_env_count]) |s| if (std.mem.eql(u8, s.host, host)) return s.cmd;
+    /// The assignments a job sent to `host` exports there, if any.
+    pub fn remoteEnv(self: *const Config, host: []const u8) ?[]const u8 {
+        for (self.remote_envs[0..self.remote_env_count]) |s| if (std.mem.eql(u8, s.host, host)) return s.cmd;
         return null;
     }
 };
 
-pub const max_spill_starts = 8;
+pub const max_remote_lines = 8;
 
-pub const SpillStart = struct {
+pub const RemoteLine = struct {
     host: []const u8 = "",
     cmd: []const u8 = "",
 };
@@ -276,30 +275,28 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             cfg.target = t;
         } else if (std.mem.eql(u8, key, "settle")) {
             cfg.settle_s = parseCount(value) orelse return bad(diag, "settle must be a whole number of seconds, at least 1");
-        } else if (std.mem.eql(u8, key, "spill")) {
-            cfg.spill = value;
+        } else if (std.mem.eql(u8, key, "remotes")) {
+            cfg.remotes = value;
         } else if (std.mem.eql(u8, key, "submit_slots")) {
             const slots = parseCount(value) orelse return bad(diag, "submit_slots must be a whole number, 1 to 8");
             if (slots > 8) return bad(diag, "submit_slots must be a whole number, 1 to 8");
             cfg.submit_slots = slots;
-        } else if (std.mem.eql(u8, key, "job_tmp")) {
-            cfg.job_tmp = value;
-        } else if (std.mem.eql(u8, key, "spill_default")) {
-            cfg.spill_default = parseBool(value) orelse return bad(diag, "spill_default must be on or off");
-        } else if (std.mem.startsWith(u8, key, "spill_start.")) {
-            const host = key["spill_start.".len..];
-            if (host.len == 0) return bad(diag, "spill_start needs a host: spill_start.HOST = COMMAND");
-            if (value.len == 0) return bad(diag, "spill_start needs a command to start the host");
-            if (cfg.spill_start_count == max_spill_starts) return bad(diag, "at most 8 spill_start commands");
-            cfg.spill_starts[cfg.spill_start_count] = .{ .host = host, .cmd = value };
-            cfg.spill_start_count += 1;
-        } else if (std.mem.startsWith(u8, key, "spill_env.")) {
-            const host = key["spill_env.".len..];
-            if (host.len == 0) return bad(diag, "spill_env needs a host: spill_env.HOST = NAME=VALUE");
-            if (std.mem.findScalar(u8, value, '=') == null) return bad(diag, "spill_env needs assignments: NAME=VALUE ...");
-            if (cfg.spill_env_count == max_spill_starts) return bad(diag, "at most 8 spill_env lines");
-            cfg.spill_envs[cfg.spill_env_count] = .{ .host = host, .cmd = value };
-            cfg.spill_env_count += 1;
+        } else if (std.mem.startsWith(u8, key, "remote_start.")) {
+            const host = key["remote_start.".len..];
+            if (host.len == 0) return bad(diag, "remote_start needs a host: remote_start.HOST = COMMAND");
+            if (value.len == 0) return bad(diag, "remote_start needs a command to start the host");
+            if (cfg.remote_start_count == max_remote_lines) return bad(diag, "at most 8 remote_start commands");
+            cfg.remote_starts[cfg.remote_start_count] = .{ .host = host, .cmd = value };
+            cfg.remote_start_count += 1;
+        } else if (std.mem.startsWith(u8, key, "remote_env.")) {
+            const host = key["remote_env.".len..];
+            if (host.len == 0) return bad(diag, "remote_env needs a host: remote_env.HOST = NAME=VALUE");
+            if (std.mem.findScalar(u8, value, '=') == null) return bad(diag, "remote_env needs assignments: NAME=VALUE ...");
+            if (cfg.remote_env_count == max_remote_lines) return bad(diag, "at most 8 remote_env lines");
+            cfg.remote_envs[cfg.remote_env_count] = .{ .host = host, .cmd = value };
+            cfg.remote_env_count += 1;
+        } else if (std.mem.eql(u8, key, "spill") or std.mem.startsWith(u8, key, "spill_")) {
+            return bad(diag, "spill is gone: remotes = HOST, ... lists the machines this one sends work to (remote_start.HOST, remote_env.HOST); cpuq run runs here, --on HOST sends it");
         } else if (std.mem.eql(u8, key, "clean_after")) {
             cfg.clean_after_s = parseAge(value) orelse return bad(diag, "clean_after must be off or a time such as 3d, 36h or 90m");
         } else if (std.mem.eql(u8, key, "min_disk")) {
@@ -972,25 +969,29 @@ test "memory pressure gate" {
     try testing.expectEqual(Gate.open, gate(cfg, .{ .active = 10, .load1 = 3, .pressure = .unknown }, 8, null, 0));
 }
 
-test "spill hosts and their start commands" {
+test "remotes and their start commands" {
     var cfg: Config = .{};
     var diag: Diagnostic = .{};
     try parseConfig(
-        \\spill = pup, burst
-        \\spill_start.burst = ~/runbooks/host-gcp-burst/start  # a cloud machine
+        \\remotes = pup, burst
+        \\remote_start.burst = ~/runbooks/host-gcp-burst/start  # a cloud machine
         \\
     , &cfg, &diag);
-    var it = cfg.spillHosts();
+    var it = cfg.remoteHosts();
     try testing.expectEqualStrings("pup", it.next().?);
     try testing.expectEqualStrings("burst", it.next().?);
     try testing.expectEqual(@as(?[]const u8, null), it.next());
-    try testing.expectEqualStrings("~/runbooks/host-gcp-burst/start", cfg.spillStart("burst").?);
-    try parseConfig("spill_env.pup = PATH=$HOME/.local/go/bin:$PATH\n", &cfg, &diag);
-    try testing.expectEqualStrings("PATH=$HOME/.local/go/bin:$PATH", cfg.spillEnv("pup").?);
-    try testing.expectEqual(@as(?[]const u8, null), cfg.spillEnv("burst"));
-    try testing.expectError(error.ConfigInvalid, parseConfig("spill_env.pup = nothing\n", &cfg, &diag));
-    try testing.expectEqual(@as(?[]const u8, null), cfg.spillStart("pup"));
-    try testing.expectError(error.ConfigInvalid, parseConfig("spill_start. = x\n", &cfg, &diag));
+    try testing.expectEqualStrings("~/runbooks/host-gcp-burst/start", cfg.remoteStart("burst").?);
+    try testing.expect(cfg.isRemote("pup") and !cfg.isRemote("cheese"));
+    try parseConfig("remote_env.pup = PATH=$HOME/.local/go/bin:$PATH\n", &cfg, &diag);
+    try testing.expectEqualStrings("PATH=$HOME/.local/go/bin:$PATH", cfg.remoteEnv("pup").?);
+    try testing.expectEqual(@as(?[]const u8, null), cfg.remoteEnv("burst"));
+    try testing.expectError(error.ConfigInvalid, parseConfig("remote_env.pup = nothing\n", &cfg, &diag));
+    try testing.expectEqual(@as(?[]const u8, null), cfg.remoteStart("pup"));
+    try testing.expectError(error.ConfigInvalid, parseConfig("remote_start. = x\n", &cfg, &diag));
+    // The old names are an error that names the new ones.
+    try testing.expectError(error.ConfigInvalid, parseConfig("spill = pup\n", &cfg, &diag));
+    try testing.expectError(error.ConfigInvalid, parseConfig("spill_default = on\n", &cfg, &diag));
 }
 
 test "disk gate" {

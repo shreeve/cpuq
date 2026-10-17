@@ -275,7 +275,7 @@ pub fn varName(a: std.mem.Allocator, name: []const u8) []const u8 {
 
 /// The store: ~/cpuq/packs.
 pub fn storeRoot(a: std.mem.Allocator, env: *const std.process.Environ.Map) []const u8 {
-    return a.print("{s}/cpuq/packs", .{env.get("HOME") orelse "."}) catch "";
+    return a.print("{s}/{s}", .{ env.get("HOME") orelse ".", @import("layout.zig").packs }) catch "";
 }
 
 /// Ships a git pack's source (`git archive` of its commit, from its checkout here) to the store on

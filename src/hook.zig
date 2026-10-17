@@ -4,9 +4,8 @@
 //! with the corrected form, so the queue is enforced where agents act rather
 //! than asked for in AGENTS.md.
 //!
-//! It reads the command's text, and what the caller knows: whether this machine is full now, with
-//! spill hosts to send work to, and (through an Advisor) whether a `cpuq run`'s work goes faster
-//! elsewhere. Nothing it cannot parse is refused. A command marked `# cpuq: skip` runs as it is.
+//! It reads the command's text, and what the caller knows (through an Advisor): whether a `cpuq
+//! run`'s work goes faster elsewhere. Nothing it cannot parse is refused. A command marked `# cpuq: skip` runs as it is.
 
 const std = @import("std");
 
@@ -17,8 +16,8 @@ pub const Refusal = struct {
 };
 
 /// Judges a `cpuq run`'s work by its history: a refusal when it would finish far sooner elsewhere.
-/// Asked only for a run on this machine that may move (not --local, --spill, --exclusive, …):
-/// --local is the caller's word that it runs here, never refused for running elsewhere.
+/// Asked only for a run on this machine of a kind that could go elsewhere (not --on, --exclusive,
+/// --opaque, …).
 pub const Advisor = struct {
     ctx: *anyopaque,
     /// `cmd`: the command after `--`, its words joined by spaces.
@@ -27,17 +26,13 @@ pub const Advisor = struct {
 
 /// Checks one shell command line. `cpus` is the machine's CPU count, for
 /// requests over half of it; `project` names the job in suggested labels.
-/// `full`: why this machine is full (null when it isn't, or there's no spill host), so a `cpuq
-/// run` here must say where it may run.
-pub fn check(a: std.mem.Allocator, command: []const u8, cpus: u32, project: []const u8, full: ?[]const u8, advisor: ?Advisor) ?Refusal {
+pub fn check(a: std.mem.Allocator, command: []const u8, cpus: u32, project: []const u8, advisor: ?Advisor) ?Refusal {
     if (std.mem.find(u8, command, "# cpuq: skip") != null) return null;
-    full_now = full;
     advisor_now = advisor;
     return checkScript(a, command, cpus, project, null, 0);
 }
 
-/// `check`'s `full` and `advisor`, for the `cpuq run`s it finds on this machine.
-var full_now: ?[]const u8 = null;
+/// `check`'s `advisor`, for the `cpuq run`s it finds on this machine.
 var advisor_now: ?Advisor = null;
 
 /// A simple command: its words, unquoted, and its text as written.
@@ -60,7 +55,7 @@ fn checkSimple(a: std.mem.Allocator, cmd: Simple, cpus: u32, project: []const u8
     const w = stripWrappers(cmd.words);
     if (w.len == 0) return null;
     const prog = std.fs.path.basename(w[0]);
-    if (std.mem.eql(u8, prog, "cpuq")) return checkCpuq(a, cmd, w, cpus, project, if (host == null) full_now else null, if (host == null) advisor_now else null);
+    if (std.mem.eql(u8, prog, "cpuq")) return checkCpuq(a, cmd, w, cpus, project, if (host == null) advisor_now else null);
     if (std.mem.eql(u8, prog, "ssh")) {
         const remote = sshRemote(a, w) orelse return null;
         // `ssh HOST <<EOF`: the heredoc is the script HOST runs.
@@ -87,7 +82,7 @@ fn checkSimple(a: std.mem.Allocator, cmd: Simple, cpus: u32, project: []const u8
 /// A `cpuq run` (or lease): the grant must reach the command, not the shell
 /// that types it; a large fixed request waits for an empty machine; work in a
 /// container or simulator needs --opaque.
-fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32, project: []const u8, full: ?[]const u8, advisor: ?Advisor) ?Refusal {
+fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32, project: []const u8, advisor: ?Advisor) ?Refusal {
     if (w.len < 2) return null;
     const sub = w[1];
     if (!std.mem.eql(u8, sub, "run") and !std.mem.eql(u8, sub, "lease")) return null;
@@ -110,13 +105,13 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32
         if (o.len == 0 or o[0] != '-') break;
         if (std.mem.eql(u8, o, "--opaque")) opaque_flag = true;
         // Sent to another machine: its size, not this one's, judges the request.
-        if (std.mem.eql(u8, o, "--spill-to") or std.mem.startsWith(u8, o, "--spill-to=") or std.mem.eql(u8, o, "--spill")) elsewhere = true;
-        // Said to run here, or of a kind --spill never sends.
-        if (std.mem.eql(u8, o, "--local") or std.mem.eql(u8, o, "--exclusive") or std.mem.eql(u8, o, "--opaque") or std.mem.eql(u8, o, "--tethered") or std.mem.eql(u8, o, "--hold")) pinned = true;
+        if (std.mem.eql(u8, o, "--on") or std.mem.startsWith(u8, o, "--on=")) elsewhere = true;
+        // Of a kind that runs only here.
+        if (std.mem.eql(u8, o, "--exclusive") or std.mem.eql(u8, o, "--opaque") or std.mem.eql(u8, o, "--tethered") or std.mem.eql(u8, o, "--hold")) pinned = true;
         const value: ?[]const u8 = if (std.mem.startsWith(u8, o, "--cores=")) o["--cores=".len..] else if (std.mem.eql(u8, o, "--cores") and i + 1 < w.len) w[i + 1] else null;
         if (value) |v| min_cores = std.fmt.parseInt(u32, std.mem.sliceTo(v, '-'), 10) catch null;
         // Options that take a value skip it.
-        for ([_][]const u8{ "--cores", "--priority", "--label", "--max-wait", "--qos", "--host", "--slots", "--return", "--note", "--spill-to" }) |takes| {
+        for ([_][]const u8{ "--cores", "--priority", "--label", "--max-wait", "--qos", "--host", "--slots", "--return", "--note", "--on", "--include" }) |takes| {
             if (std.mem.eql(u8, o, takes)) i += 1;
         }
     }
@@ -124,12 +119,6 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32
     if (min_cores) |m| if (!elsewhere and m > @max(cpus / 2, 2)) return .{
         .reason = a.print("asking for at least {d} cores on a {d}-CPU machine: a request over half the CPUs waits until the machine is nearly empty", .{ m, cpus }) catch "too many cores asked for",
         .instead = "ask for a range the job can shrink to, such as --cores 2-6, and pass \"$CPUQ_CORES\" on; run big jobs on the larger machine",
-    };
-    // This machine is full: a run must say whether it may go elsewhere, not drift there (a test of
-    // this OS run on another) nor wait here beside a machine with room.
-    if (full) |why| if (std.mem.eql(u8, sub, "run") and !elsewhere and !pinned) return .{
-        .reason = a.print("this machine {s}, and spill hosts may have room: say where this job may run", .{why}) catch "this machine is full",
-        .instead = "add --spill if it doesn't need this OS (it runs here while there's room, else on a spill host: repo-relative paths only, environment set inside the command), or --local if it does",
     };
     if (i >= w.len) return null;
     const inner = w[i..];
@@ -407,7 +396,7 @@ fn suggest(a: std.mem.Allocator, w: []const []const u8, project: []const u8, hos
     const opaque_opt = if (hidesWork(w)) " --opaque" else "";
     const run = a.print("cpuq run --label {s} --cores 2-6{s} -- {s}", .{ label, opaque_opt, inner }) catch "cpuq run --label P:T --cores 2-6 -- CMD";
     // On another machine: sent there by cpuq, the repo copied over, or through that machine's own.
-    const spilled = a.print("cpuq run --spill-to {s} --label {s} --cores 2-6{s} -- {s}", .{ host orelse "", label, opaque_opt, inner }) catch run;
+    const spilled = a.print("cpuq run --on {s} --label {s} --cores 2-6{s} -- {s}", .{ host orelse "", label, opaque_opt, inner }) catch run;
     return if (host) |h| a.print("{s} (it copies this repo to {s}; or ssh {s} 'cd … && {s}', the inner quotes as needed)", .{ spilled, h, h, run }) catch run else run;
 }
 
@@ -561,37 +550,22 @@ fn split(a: std.mem.Allocator, script: []const u8) ![]Simple {
 fn refused(command: []const u8) bool {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    return check(arena.allocator(), command, 10, "app", null, null) != null;
+    return check(arena.allocator(), command, 10, "app", null) != null;
 }
 
-fn refusedFull(command: []const u8) bool {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    return check(arena.allocator(), command, 10, "app", "has 3 waiting", null) != null;
-}
-
-test "a full machine wants each cpuq run to say where it may run" {
-    try std.testing.expect(refusedFull("cpuq run --label app:test --cores 2 -- make test"));
-    try std.testing.expect(refusedFull("cd repo && cpuq run --cores 1-4 -- sh -c 'pytest -n \"$CPUQ_CORES\"'"));
-    try std.testing.expect(!refusedFull("cpuq run --spill --label app:test --cores 2 -- make test"));
-    try std.testing.expect(!refusedFull("cpuq run --spill-to burst --cores 2 -- make test"));
-    try std.testing.expect(!refusedFull("cpuq run --local --label app:mac --cores 2 -- make test"));
-    try std.testing.expect(!refusedFull("cpuq run --exclusive --label app:bench -- ./bench"));
-    try std.testing.expect(!refusedFull("cpuq run --opaque --cores 4 -- incus exec box -- make"));
-    // Another machine's cpuq judges its own room; a lease is a window, not a job.
-    try std.testing.expect(!refusedFull("ssh pup 'cd repo && cpuq run --cores 2 -- make'"));
-    try std.testing.expect(!refusedFull("cpuq lease w --host pup --exclusive -- ./bench"));
-    try std.testing.expect(!refusedFull("cpuq status"));
-    // Not full: as before.
+test "a plain cpuq run is never refused for where it runs" {
     try std.testing.expect(!refused("cpuq run --label app:test --cores 2 -- make test"));
+    try std.testing.expect(!refused("cpuq run --on burst --cores 2 -- make test"));
+    try std.testing.expect(!refused("ssh pup 'cd repo && cpuq run --cores 2 -- make'"));
+    try std.testing.expect(!refused("cpuq lease w --host pup --exclusive -- ./bench"));
 }
 
 test "a minimum of 2 cores fits even a small machine" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expect(check(a, "cpuq run --cores 2-6 -- make", 3, "app", null, null) == null);
-    try std.testing.expect(check(a, "cpuq run --cores 3 -- make", 4, "app", null, null) != null);
+    try std.testing.expect(check(a, "cpuq run --cores 2-6 -- make", 3, "app", null) == null);
+    try std.testing.expect(check(a, "cpuq run --cores 3 -- make", 4, "app", null) != null);
 }
 
 test "heavy commands outside cpuq are refused" {
@@ -622,7 +596,7 @@ test "light and wrapped commands pass" {
     try std.testing.expect(!refused("ssh pup 'cd repo && cpuq run --label app:build -- make'"));
     try std.testing.expect(!refused("cpuq run --label lede:test --cores 4 --opaque -- nice xcodebuild test -destination 'platform=iOS Simulator,id=X' -jobs 4"));
     // A request for a bigger machine is judged by that machine, not this one.
-    try std.testing.expect(!refused("cpuq run --spill-to burst --label proj:matrix --cores 8-32 -- sh -c 'zig build -j\"$CPUQ_CORES\"'"));
+    try std.testing.expect(!refused("cpuq run --on burst --label proj:matrix --cores 8-32 -- sh -c 'zig build -j\"$CPUQ_CORES\"'"));
     // cpuq cap limits a program but doesn't queue it: heavy work inside it is still refused.
     try std.testing.expect(refused("cpuq cap --time 600s -- zig build test"));
     try std.testing.expect(refused("cpuq cap --mem=2G -- make"));
@@ -686,7 +660,7 @@ test "a suggested jobs flag goes before the redirections" {
     );
 }
 
-test "a run here that may move is put to the advisor, with its command; --local never is" {
+test "a run here is put to the advisor, with its command; one sent or pinned never is" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -700,23 +674,20 @@ test "a run here that may move is put to the advisor, with its command; --local 
     };
     var seen: Seen = .{};
     const ad: Advisor = .{ .ctx = &seen, .advise = Seen.advise };
-    const r = check(a, "cpuq run --cores 2 --label rig:test -- sh -c './test/run -j \"$CPUQ_CORES\"'", 10, "app", null, ad);
+    const r = check(a, "cpuq run --cores 2 --label rig:test -- sh -c './test/run -j \"$CPUQ_CORES\"'", 10, "app", ad);
     try std.testing.expectEqualStrings("slow here", r.?.reason);
     try std.testing.expectEqualStrings("sh -c ./test/run -j \"$CPUQ_CORES\"", seen.cmd);
-    // Said to run here (a smoke test that decides whether to send work elsewhere), sent
-    // elsewhere, held for timing or hidden work: not asked.
-    try std.testing.expect(check(a, "cpuq run --local --cores 2-6 --label rig:check -- sh -c 'zig build -j\"$CPUQ_CORES\" test'", 10, "app", null, ad) == null);
-    try std.testing.expect(check(a, "cpuq run --spill --label rig:test -- make", 10, "app", null, ad) == null);
-    try std.testing.expect(check(a, "cpuq run --exclusive --label rig:bench -- ./bench", 10, "app", null, ad) == null);
-    try std.testing.expect(check(a, "cpuq run --opaque --cores 4 --label e:t -- incus exec c -- make", 10, "app", null, ad) == null);
-    try std.testing.expect(check(a, "cpuq run --local --exclusive --label rig:bench -- ./bench", 10, "app", null, ad) == null);
+    // Sent elsewhere, held for timing or hidden work: not asked.
+    try std.testing.expect(check(a, "cpuq run --on burst --label rig:test -- make", 10, "app", ad) == null);
+    try std.testing.expect(check(a, "cpuq run --exclusive --label rig:bench -- ./bench", 10, "app", ad) == null);
+    try std.testing.expect(check(a, "cpuq run --opaque --cores 4 --label e:t -- incus exec c -- make", 10, "app", ad) == null);
     // On another machine, through its own cpuq: not this machine's history.
-    try std.testing.expect(check(a, "ssh pup 'cd repo && cpuq run --label rig:test -- make'", 10, "app", null, ad) == null);
+    try std.testing.expect(check(a, "ssh pup 'cd repo && cpuq run --label rig:test -- make'", 10, "app", ad) == null);
 }
 
-test "heavy work over ssh is pointed to --spill-to" {
+test "heavy work over ssh is pointed to --on" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const r = check(arena.allocator(), "ssh burst 'cd repo && zig build test'", 10, "app", null, null).?;
-    try std.testing.expect(std.mem.startsWith(u8, r.instead, "cpuq run --spill-to burst --label app:build --cores 2-6 -- sh -c 'zig build test -j\"$CPUQ_CORES\"'"));
+    const r = check(arena.allocator(), "ssh burst 'cd repo && zig build test'", 10, "app", null).?;
+    try std.testing.expect(std.mem.startsWith(u8, r.instead, "cpuq run --on burst --label app:build --cores 2-6 -- sh -c 'zig build test -j\"$CPUQ_CORES\"'"));
 }

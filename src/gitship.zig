@@ -107,28 +107,27 @@ fn sent(a: std.mem.Allocator, listing: []const u8) []const u8 {
 /// rsync's `--rsync-path` for a copy at `dir` on another machine (relative to its home): the
 /// command that makes the folder before rsync runs. A copy not there yet starts as a block clone
 /// (`cp --reflink=always`: ZFS's or btrfs's, sharing the blocks) of the last used other copy in
-/// the same folder, so rsync sends only what differs: seconds, where a first copy takes half a
-/// minute. With `marker`, a copy counts only when its `.cpuq-used` holds that text (copies of one
-/// repo among others'). Every file of the clone is dated back by 30 years (`aged`): rsync then
+/// the same folder (its project's: a `cpuq run --on`'s, by `.cpuq-used`, or a submitted job's, by
+/// `.cpuq-generation`), so rsync sends only what differs: seconds, where a first copy takes half
+/// a minute. Every file of the clone is dated back by 30 years (`aged`): rsync then
 /// compares each one it ships, and an output the build left there (a make or cargo target from
 /// another branch) is older than every source, so it's built again; a cache that goes by
 /// content (zig's) stays warm. (`.cpuq-used` is dated now, so `cpuq clean` keeps the new copy.)
 /// The clone's `.git` is left out unless `keep_git` (git ships after, sending what differs).
 /// Where the filesystem can't clone, or the dates can't be moved, the copy starts empty, as
 /// without this.
-pub fn seedPath(a: std.mem.Allocator, dir: []const u8, marker: ?[]const u8, keep_git: bool) []const u8 {
+pub fn seedPath(a: std.mem.Allocator, dir: []const u8, keep_git: bool) []const u8 {
     const parent = quote(a, std.fs.path.dirname(dir) orelse ".");
     // Run by `sh`: the login shell there may be zsh, which doesn't split `$(ls)` into words.
-    const same = if (marker) |m| a.print("[ \"$(cat \"$u\" 2>/dev/null)\" = {s} ] || continue; ", .{quote(a, m)}) catch "" else "";
     const script = a.print(
         "d={s}; if [ ! -d \"$d\" ]; then t=\"$d.seed.$$\"; mkdir -p {s}; " ++
-            "for u in $(ls -t {s}/*/.cpuq-used 2>/dev/null); do s=${{u%/.cpuq-used}}; case $s in *.seed.*) continue;; esac; {s}" ++
+            "for u in $(ls -t {s}/*/.cpuq-used {s}/*/.cpuq-generation 2>/dev/null); do s=${{u%/*}}; case $s in *.seed.*) continue;; esac; " ++
             "cp -a --reflink=always \"$s\" \"$t\" 2>/dev/null || rm -rf \"$t\"; break; done; " ++
             "if [ -d \"$t\" ]; then {s}{s} || rm -rf \"$t\"; fi; " ++
             // A copy made meanwhile by another first sync stays; this clone isn't moved into it.
             "if [ -d \"$t\" ]; then touch \"$t/.cpuq-used\"; [ -d \"$d\" ] || mv \"$t\" \"$d\" 2>/dev/null; rm -rf \"$d/${{t##*/}}\"; fi; " ++
             "rm -rf \"$t\"; mkdir -p \"$d\"; fi",
-        .{ quote(a, dir), parent, parent, same, if (keep_git) "" else "rm -rf \"$t/.git\"; ", aged(a, "\"$t\"") },
+        .{ quote(a, dir), parent, parent, parent, if (keep_git) "" else "rm -rf \"$t/.git\"; ", aged(a, "\"$t\"") },
     ) catch return "rsync";
     // Sent as base64, with no quotes: rsyncs differ in how they pass quotes in `--rsync-path` on
     // (macOS's openrsync escapes them).
@@ -206,7 +205,7 @@ test "a checksum listing names the files it would send, not deletions or folders
     try std.testing.expectEqualStrings("", sent(arena.allocator(), ""));
 }
 
-test "a new copy starts as a clone of another copy of its repo, else empty" {
+test "a new copy starts as a clone of its project's newest copy, from cpuq run --on or cpuq submit, else empty" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -214,22 +213,23 @@ test "a new copy starts as a clone of another copy of its repo, else empty" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const top = try tmp.dir.realPathFileAlloc(io, ".", a);
-    // A copy of the same repo, and a newer one of another.
-    try tmp.dir.createDirPath(io, "s/rig-1/.git");
+    // The project's copies: a `cpuq run --on`'s, and a submitted job's used since.
+    try tmp.dir.createDirPath(io, "s/rig-1");
     try tmp.dir.writeFile(io, .{ .sub_path = "s/rig-1/.cpuq-used", .data = "rig" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "s/rig-1/a", .data = "x" });
-    try tmp.dir.createDirPath(io, "s/other-1");
-    try tmp.dir.writeFile(io, .{ .sub_path = "s/other-1/.cpuq-used", .data = "other" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "s/other-1/b", .data = "y" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "s/rig-1/b", .data = "y" });
+    _ = try std.process.run(a, io, .{ .argv = &.{ "touch", "-t", "202001010000", "s/rig-1/.cpuq-used" }, .cwd = .{ .path = top } });
+    try tmp.dir.createDirPath(io, "s/0123456789ab/.git");
+    try tmp.dir.writeFile(io, .{ .sub_path = "s/0123456789ab/.cpuq-generation", .data = "g" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "s/0123456789ab/a", .data = "x" });
     // As rsync runs it, with its own arguments after: `true` stands in for rsync.
-    const script = seedPath(a, "s/rig-2", "rig", false);
+    const script = seedPath(a, "s/rig-2", false);
     const sh = try std.mem.concat(a, u8, &.{ script[0 .. script.len - "rsync".len], "true" });
     // By zsh where there is one, as a login shell there may be.
     const shell = if (Io.Dir.cwd().access(io, "/bin/zsh", .{})) |_| "/bin/zsh" else |_| "/bin/sh";
     const r = try std.process.run(a, io, .{ .argv = &.{ shell, "-c", sh }, .cwd = .{ .path = top } });
     try std.testing.expect(r.term.success());
-    // Cloned where the filesystem can, else empty: never the other repo's, never the clone's
-    // .git, and no scratch left beside it.
+    // Cloned from the newest where the filesystem can, else empty: never the clone's .git, and
+    // no scratch left beside it.
     try std.testing.expect((try tmp.dir.statFile(io, "s/rig-2", .{})).kind == .directory);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "s/rig-2/b", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "s/rig-2/.git", .{}));

@@ -3,6 +3,12 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.20.2 — 2026-10-17
+
+- The window's pages for other machines come from cpuq 0.28's `remotes` and `remote_start.HOST`
+  config keys, which replace `spill` and `spill_start.HOST`. The overload notice suggests
+  `cpuq run --on HOST`, since `cpuq run --spill` is gone.
+
 ## 0.20.1 — 2026-10-16
 
 - **What's Happening?** says what is wrong now, then what was found earlier in the hour, each with

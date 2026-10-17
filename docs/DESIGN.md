@@ -156,7 +156,7 @@ The head admits nothing while one of these is closed:
   macOS the kernel's free share (`kern.memorystatus_level`) of `hw.memsize`.
 - **Low disk.** Less than `min_disk` (5G by default) free to an ordinary user (`f_bavail`) on the
   filesystem holding `$HOME`, the one holding the state directory (the temp directory where
-  builds and agents keep scratch files), or `~/cpuq-spill`, where spilled jobs land, which a spill
+  builds and agents keep scratch files), or `~/cpuq`, where jobs sent here keep their copies and caches, which a
   host may give its own filesystem (burst's is a ZFS dataset with a quota); status names the
   fullest. It is on by default
   because a full disk breaks everything at once: on 2026-10-11 one session's scratch copies of a

@@ -353,10 +353,10 @@ public struct Job: Decodable, Sendable, Equatable {
     }
 }
 
-/// The spill hosts cpuq's config names (`spill = HOST, ...`), in order, each with the command that
-/// starts it when it is stopped (`spill_start.HOST = COMMAND`), if any: the machines the window
+/// The remotes cpuq's config names (`remotes = HOST, ...`), in order, each with the command that
+/// starts it when it is stopped (`remote_start.HOST = COMMAND`), if any: the machines the window
 /// shows beside this Mac.
-public func spillHosts(config text: String) -> [(host: String, start: String?)] {
+public func remoteHosts(config text: String) -> [(host: String, start: String?)] {
     var hosts: [String] = []
     var starts: [String: String] = [:]
     for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
@@ -364,10 +364,10 @@ public func spillHosts(config text: String) -> [(host: String, start: String?)] 
         guard let eq = line.firstIndex(of: "=") else { continue }
         let key = line[..<eq].trimmingCharacters(in: .whitespaces)
         let value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
-        if key == "spill" {
+        if key == "remotes" {
             hosts = value.split(whereSeparator: { $0 == "," || $0 == " " || $0 == "\t" }).map(String.init)
-        } else if key.hasPrefix("spill_start."), key.count > "spill_start.".count {
-            starts[String(key.dropFirst("spill_start.".count))] = value
+        } else if key.hasPrefix("remote_start."), key.count > "remote_start.".count {
+            starts[String(key.dropFirst("remote_start.".count))] = value
         }
     }
     return hosts.map { ($0, starts[$0]) }

@@ -2,7 +2,7 @@ import Charts
 import CpuqCore
 import SwiftUI
 
-/// A machine whose cpuq the window shows: this Mac, or a spill host reached over ssh.
+/// A machine whose cpuq the window shows: this Mac, or one of its remotes, reached over ssh.
 struct Machine: Hashable, Identifiable {
     /// Where the window's "cleared before" mark is kept for it.
     var clearedKey: String { isLocal ? "clearedBefore" : "clearedBefore.\(id)" }
@@ -20,7 +20,7 @@ struct Machine: Hashable, Identifiable {
         let host = full.split(separator: ".").first.map(String.init) ?? ""
         return host.isEmpty || host == "localhost" ? "This Mac" : host
     }
-    /// How to start it when it is stopped (`spill_start.HOST` in cpuq's config), if it can be.
+    /// How to start it when it is stopped (`remote_start.HOST` in cpuq's config), if it can be.
     var start: String? = nil
 
     static let local = Machine(id: "local")
@@ -450,13 +450,13 @@ final class GraphModel {
 }
 
 struct GraphsView: View {
-    /// This Mac first, then the spill hosts in cpuq's config.
+    /// This Mac first, then the remotes in cpuq's config.
     let models: [GraphModel]
     /// Runs a job action (`cpuq ACTION PID` on its machine), asking first where it costs something.
     var control: ((Machine, String, Int, String) -> Void)? = nil
-    /// Starts a stopped machine with its `spill_start` command.
+    /// Starts a stopped machine with its `remote_start` command.
     var start: ((GraphModel) -> Void)? = nil
-    /// The machine shown: ⌘1 for this Mac, ⌘2 and on for the spill hosts.
+    /// The machine shown: ⌘1 for this Mac, ⌘2 and on for the remotes.
     @AppStorage("machine") private var shown = "local"
 
     private var model: GraphModel { models.first { $0.machine.id == shown } ?? models[0] }
@@ -501,7 +501,7 @@ struct GraphsView: View {
             }
         }
         .pickerStyle(.segmented).labelsHidden().fixedSize()
-        .help("The machine shown: this Mac, then the spill hosts in cpuq's config")
+        .help("The machine shown: this Mac, then the remotes in cpuq's config")
         .background {
             ZStack {
                 ForEach(Array(models.prefix(9).enumerated()), id: \.element.machine.id) { i, m in
@@ -525,7 +525,7 @@ struct GraphsView: View {
                     Button(model.starting ? "Starting \(model.machine.name)…" : "Start \(model.machine.name)") { start(model) }
                         .disabled(model.starting)
                         .padding(.top, 6)
-                        .help("Runs its start command (spill_start.\(model.machine.id) in cpuq's config); it bills from now until it stops.")
+                        .help("Runs its start command (remote_start.\(model.machine.id) in cpuq's config); it bills from now until it stops.")
                 }
                 if let note = model.startNote { Text(note).font(.caption).foregroundStyle(Alive.ink2).multilineTextAlignment(.center).frame(maxWidth: 420) }
             }

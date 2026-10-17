@@ -51,54 +51,34 @@ branch names: history sizes jobs and estimates waits by label.
 
 ## Another machine
 
-Where `spill` is configured (`grep spill ~/.config/cpuq/config`), add `--spill` to any job
-that doesn't need this OS (builds, test suites of portable code), and `--local` to one that does
-(macOS behaviour or timing, a path outside the repo, or a quick local check that decides whether
-work is worth sending elsewhere at all):
+`cpuq run` always runs here. `--on HOST` sends it to HOST, one of this machine's remotes
+(`grep remotes ~/.config/cpuq/config`), for work too big for this machine, not to skip its queue:
 
-    cpuq run --spill --label app:build --cores 2-6 -- sh -c 'zig build -j"$CPUQ_CORES" test'
-    cpuq run --local --label app:mac  --cores 2-4 -- ./test/macos
+    cpuq run --on burst --label app:build --cores 8-32 -- sh -c 'zig build -j"$CPUQ_CORES" test'
 
-While this machine is full, the hook refuses a `cpuq run` that says neither. With
-`spill_default = on`, a run that says neither spills when cpuq sees nothing tying it here (a path
-outside the repo, a macOS tool, --opaque): say `--local` for this OS's own work.
+The repo is copied there by rsync, the job waits in HOST's own queue, a stopped cloud machine is
+started first, and its output and exit status come back as usual. The command must stay inside
+the repo: absolute paths here (a scratchpad file) don't exist there. `--return zig-out` copies a
+build's output back. Gitignored inputs the job needs (a vendored tree, `.git` for `git ls-files`)
+go in the repo's `.cpuqinclude` (beside `.gitignore`, a path a line), or `--include PATH`. `.git`
+goes trimmed to git's own parts, a worktree's included. Environment variables set here don't
+travel, so set them inside the command.
 
-`--local` always runs here: nothing moves it and the hook never refuses it. Use it only for
-that, not for speed or habit. A fixed `--cores 2` for a full suite starves it;
-give a range, or none. A full suite of a repo with `cpuq/*.json` goes through `cpuq submit`
-(below), and the hook refuses it as a `cpuq run` when it is long here and quicker there.
-
-It runs where it should finish first, by its own past runs: short or new work here while there's
-room; long work on a spill host when that is clearly sooner, starting a stopped cloud machine for
-work of ten minutes or more, with the repo copied there by rsync. Its output and
-exit status come back as usual. The command must stay inside the repo: absolute paths here (a
-scratchpad file) don't exist there. `--return zig-out` copies a build's output back. Gitignored
-inputs the job needs (a vendored tree, `.git` for `git ls-files`) go in the repo's `.cpuq-spill`,
-a path a line, or `--ship PATH`. `.git` ships trimmed to git's own parts, a worktree's included.
-Environment variables set here don't travel, so set them inside the command. To send a job to a
-given machine whatever the state here, use `--spill-to HOST` instead (it starts a stopped cloud
-machine): for work too big for this one, not to skip its queue.
-
-Without `spill` configured, send work by hand when this machine is full (anyone waiting, or the
-1-minute load above its CPU count) and another has room (`cpuq status --host HOST`), through
-that machine's own cpuq:
-
-    ssh HOST 'cd repo && cpuq run --label app:build --cores 2-8 -- sh -c "make -j\"\$CPUQ_CORES\""'
-
-Never run it there outside cpuq: its queue can't share what it doesn't see.
+Never run work on another machine outside cpuq (`ssh HOST 'make'`): its queue can't share what it
+doesn't see.
 
 A big job for a cloud host, run in the background:
 
-    cpuq run --spill-to burst --label proj:matrix --cores 8-32 --return .zig-cache/gate.log -- sh -c '
-      : >.zig-cache/gate.log; mkdir -p "$HOME/cpuq-spill/c/proj/results"
+    cpuq run --on burst --label proj:matrix --cores 8-32 --return .zig-cache/gate.log -- sh -c '
+      : >.zig-cache/gate.log; mkdir -p "$HOME/cpuq/caches/proj/results"
       zig build -j"$CPUQ_CORES" >>.zig-cache/gate.log 2>&1 &&
-      PROJ_RESULTS_CACHE=$HOME/cpuq-spill/c/proj/results timeout 90m ./test/run -j "$CPUQ_CORES" >>.zig-cache/gate.log 2>&1
+      PROJ_RESULTS_CACHE=$HOME/cpuq/caches/proj/results timeout 90m ./test/run -j "$CPUQ_CORES" >>.zig-cache/gate.log 2>&1
       rc=$?; grep -E "^(fail|FAIL)" .zig-cache/gate.log | head -20; tail -2 .zig-cache/gate.log
       rm -rf .zig-cache/proj-test; exit $rc'
 
 - **The label** stays the same on every run, never a branch name.
 - **The cores:** at most a third of the host's CPUs.
-- **Caches** go under `$HOME/cpuq-spill/c/PROJECT/`, outside the per-worktree copy, so every
+- **Caches** go under `$HOME/cpuq/caches/PROJECT/`, outside the per-worktree copy, so every
   branch shares them.
 - **A time limit** inside the command.
 - **Scratch** is deleted at the end, with relative paths.
@@ -110,10 +90,12 @@ More: README's "Big jobs on a cloud host".
 
 Where a repo keeps specs in `cpuq/*.json`, heavy work goes through them:
 
-    cpuq submit cpuq/suite.json [--note "#PR branch"] [-- TEST FILTER]
+    cpuq submit cpuq/suite.json [--on HOST] [--note "#PR branch"] [-- TEST FILTER]
 
 - **Run it in the background.** You're notified when it ends.
 - **The spec comes from your own worktree** (`cpuq/*.json` there): it ships the repo it sits in.
+- **The host:** this machine's remotes, where it should finish first; `--on HOST` picks one
+  (or this machine). A spec names no host.
 - **`--note "#PR branch"`** shows beside the label everywhere; without it, the branch.
 - **The last line is the verdict, and the exit status matches it:**
   - PASS 0 and FAIL 1 are your code; the failures are printed above the verdict.

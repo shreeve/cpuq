@@ -1,20 +1,21 @@
 //! `cpuq clean`: what jobs left on a host and no longer use, removed once unused for
 //! `clean_after` (3 days by default):
 //!
-//! - spilled jobs' copies (~/cpuq-spill/s/NAME-HASH), by when a job last ran in one (its
-//!   `.cpuq-used`), and copies in the older layout that mirrored the path they came from;
-//! - submitted jobs' copies (~/cpuq-spill/w/PROJECT/ID), by their last sync, never while a job
-//!   holds one's lock;
+//! - copies of repos sent from other machines (~/cpuq/worktrees/PROJECT/NAME), by when a job
+//!   last ran in one (`.cpuq-used`, a `cpuq run --on`'s) or last synced it (`.cpuq-generation`, a
+//!   submitted job's), never while a job holds one's lock;
+//! - submitted jobs' scratch (~/cpuq/tmp/ID) that outlived them;
 //! - pack versions (~/cpuq/packs/NAME/VERSION), by when a job last used one, never one that
 //!   `latest` or `stable` names;
 //! - submitted jobs' records (~/.local/state/cpuq/jobs/ID), a week after they ended.
 //!
-//! Never anything a process is working in. Caches (~/cpuq-spill/c) are the jobs' own to bound.
+//! Never anything a process is working in. Caches (~/cpuq/caches) are the jobs' own to bound.
 //! `cpuq record` runs it hourly; `cpuq clean --dry-run` says what it would remove.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const layout = @import("layout.zig");
 
 pub const Options = struct {
     /// Unused this long (seconds) and it goes.
@@ -39,12 +40,10 @@ const Cx = struct {
 pub fn run(a: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, now: i64, o: Options, out: *Io.Writer) u32 {
     const home = env.get("HOME") orelse return 0;
     var cx: Cx = .{ .a = a, .io = io, .now = now, .o = o, .out = out, .cwds = workingDirs(a, io) };
-    const spill = a.print("{s}/cpuq-spill", .{home}) catch return 0;
-    spilled(&cx, a.print("{s}/s", .{spill}) catch return 0);
-    submitted(&cx, a.print("{s}/w", .{spill}) catch return 0);
-    legacy(&cx, spill);
-    packs(&cx, a.print("{s}/cpuq/packs", .{home}) catch return 0);
     const state = if (env.get("XDG_STATE_HOME")) |x| a.print("{s}/cpuq/jobs", .{x}) catch return 0 else a.print("{s}/.local/state/cpuq/jobs", .{home}) catch return 0;
+    worktrees(&cx, a.print("{s}/{s}", .{ home, layout.worktrees }) catch return 0);
+    scratch(&cx, a.print("{s}/{s}", .{ home, layout.tmp }) catch return 0, state);
+    packs(&cx, a.print("{s}/{s}", .{ home, layout.packs }) catch return 0);
     records(&cx, state);
     if (cx.removed != 0 or o.dry_run)
         out.print("cpuq clean: {s} {d} ({s}){s}\n", .{ if (o.dry_run) "would remove" else "removed", cx.removed, size(a, cx.bytes), if (cx.kept != 0) a.print("; {d} kept in use", .{cx.kept}) catch "" else "" }) catch {};
@@ -52,16 +51,10 @@ pub fn run(a: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, no
     return cx.removed;
 }
 
-/// ~/cpuq-spill/s/NAME: by its `.cpuq-used`, which each spilled job touches.
-fn spilled(cx: *Cx, root: []const u8) void {
-    for (children(cx, root, .directory)) |name| {
-        const dir = cx.a.print("{s}/{s}", .{ root, name }) catch continue;
-        consider(cx, dir, lastUse(cx, dir, ".cpuq-used"), &.{});
-    }
-}
-
-/// ~/cpuq-spill/w/PROJECT/ID: by its last sync (`.cpuq-generation`), never while its lock is held.
-fn submitted(cx: *Cx, root: []const u8) void {
+/// ~/cpuq/worktrees/PROJECT/NAME: by the later of its markers, `.cpuq-used` (each `cpuq run --on`
+/// touches it) and `.cpuq-generation` (each submitted job's sync writes it), else by when it
+/// changed; never while its lock (NAME.lock, a submitted job's) is held.
+fn worktrees(cx: *Cx, root: []const u8) void {
     for (children(cx, root, .directory)) |project| {
         const pdir = cx.a.print("{s}/{s}", .{ root, project }) catch continue;
         for (children(cx, pdir, .directory)) |name| {
@@ -71,38 +64,21 @@ fn submitted(cx: *Cx, root: []const u8) void {
                 cx.kept += 1;
                 continue;
             }
-            consider(cx, dir, lastUse(cx, dir, ".cpuq-generation"), &.{lock});
+            const used = @max(touched(cx, dir, ".cpuq-used"), touched(cx, dir, ".cpuq-generation"));
+            consider(cx, dir, if (used != 0) used else changed(cx, dir), &.{lock});
         }
         removeIfEmpty(cx, pdir);
     }
 }
 
-/// The older layout: a copy at ~/cpuq-spill/<the path it came from>. A copy is the first
-/// directory down that holds a file; its age, its own change time (each sync sets its times).
-fn legacy(cx: *Cx, spill: []const u8) void {
-    for (children(cx, spill, .directory)) |name| {
-        // s, w and c are cpuq's own (spilled, submitted, caches); t holds running jobs' TMPDIRs.
-        if (std.mem.eql(u8, name, "s") or std.mem.eql(u8, name, "w") or std.mem.eql(u8, name, "c") or std.mem.eql(u8, name, "t") or name[0] == '.') continue;
-        mirror(cx, cx.a.print("{s}/{s}", .{ spill, name }) catch continue, 0);
-    }
-}
-
-fn mirror(cx: *Cx, dir: []const u8, depth: u32) void {
-    if (depth > 12) return;
-    var d = Io.Dir.cwd().openDir(cx.io, dir, .{ .iterate = true }) catch return;
-    defer d.close(cx.io);
-    var subdirs: std.ArrayList([]const u8) = .empty;
-    var files = false;
-    var it = d.iterate();
-    while (it.next(cx.io) catch null) |e| {
-        if (e.kind == .directory) subdirs.append(cx.a, cx.a.dupe(u8, e.name) catch continue) catch {} else files = true;
-    }
-    if (files) {
+/// ~/cpuq/tmp/ID: a submitted job's TMPDIR, which it removes when it ends; one left by a job
+/// that was killed goes by when it changed, never while that job's record says it runs.
+fn scratch(cx: *Cx, root: []const u8, jobs: []const u8) void {
+    for (children(cx, root, .directory)) |id| {
+        if (locked(cx, cx.a.print("{s}/{s}/running.lock", .{ jobs, id }) catch continue)) continue;
+        const dir = cx.a.print("{s}/{s}", .{ root, id }) catch continue;
         consider(cx, dir, changed(cx, dir), &.{});
-        return;
     }
-    for (subdirs.items) |s| mirror(cx, cx.a.print("{s}/{s}", .{ dir, s }) catch continue, depth + 1);
-    removeIfEmpty(cx, dir);
 }
 
 /// ~/cpuq/packs/NAME/VERSION: by its `.cpuq-used` (each job using it touches it), else when it
@@ -174,9 +150,15 @@ fn children(cx: *Cx, dir: []const u8, kind: Io.File.Kind) []const []const u8 {
 
 /// When a marker inside `dir` was last touched (seconds), else when `dir` itself changed.
 fn lastUse(cx: *Cx, dir: []const u8, marker: []const u8) i64 {
+    const t = touched(cx, dir, marker);
+    return if (t != 0) t else changed(cx, dir);
+}
+
+/// When a marker inside `dir` was last touched (seconds); 0 when it isn't there.
+fn touched(cx: *Cx, dir: []const u8, marker: []const u8) i64 {
     const path = cx.a.print("{s}/{s}", .{ dir, marker }) catch return 0;
-    if (Io.Dir.cwd().statFile(cx.io, path, .{})) |st| return @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s)) else |_| {}
-    return changed(cx, dir);
+    const st = Io.Dir.cwd().statFile(cx.io, path, .{}) catch return 0;
+    return @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
 }
 
 /// When `dir` itself last changed (its ctime: a sync setting its times, an entry added).

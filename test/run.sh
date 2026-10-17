@@ -1266,13 +1266,38 @@ t_submit_slots() {
   unset XDG_STATE_HOME
 }
 
+t_submit_on() {
+  # A spec names no host: one with "on" is refused, saying why. --on HOST is one of this
+  # machine's remotes, and --on this machine runs the job here.
+  setup submit-on
+  local was_home=$HOME
+  export HOME=$T/home XDG_STATE_HOME=$T/xdg
+  mkdir -p "$HOME" "$T/roots/repo/cpuq"
+  printf 'submit_roots = %s\n' "$T/roots" >> "$CPUQ_CONFIG"
+  (
+    cd "$T/roots/repo" || exit 1
+    git init -q && git config user.email t@t && git config user.name t
+    printf '%s\n' '{ "label": "t:on", "run": "true", "cores": "1", "on": ["burst"] }' > cpuq/on.json
+    printf '%s\n' '{ "label": "t:here", "run": "true", "cores": "1" }' > cpuq/here.json
+    git add -A && git commit -qm init
+    "$CPUQ" submit cpuq/on.json >"$T/spec" 2>&1; echo "spec=$?"
+    "$CPUQ" submit --on cheese cpuq/here.json >"$T/unknown" 2>&1; echo "unknown=$?"
+    "$CPUQ" submit --on "$(hostname -s)" cpuq/here.json >/dev/null 2>&1; echo "self=$?"
+  ) >"$T/out" 2>&1
+  local got; got=$(tr '\n' ' ' <"$T/out")
+  check "submit: a spec with \"on\" is refused ($(head -1 "$T/spec")); --on a host not among the remotes is refused; --on this machine runs here (got $got)" \
+    "[[ \"\$got\" == 'spec=2 unknown=2 self=0 ' ]] && grep -q 'is gone' '$T/spec' && grep -q 'not one of this machine' '$T/unknown'"
+  export HOME=$was_home
+  unset XDG_STATE_HOME
+}
+
 t_submit_tmp() {
-  # job_tmp: a submitted job's TMPDIR is a directory of its own there, gone when the job ends.
+  # A submitted job's TMPDIR is a directory of its own under ~/cpuq/tmp, gone when the job ends.
   setup submit-tmp
   local was_home=$HOME
   export HOME=$T/home XDG_STATE_HOME=$T/xdg
-  mkdir -p "$HOME" "$T/roots/repo/cpuq" "$T/jt"
-  printf 'submit_roots = %s\njob_tmp = %s\n' "$T/roots" "$T/jt" >> "$CPUQ_CONFIG"
+  mkdir -p "$HOME" "$T/roots/repo/cpuq"
+  printf 'submit_roots = %s\n' "$T/roots" >> "$CPUQ_CONFIG"
   (
     cd "$T/roots/repo" || exit 1
     git init -q && git config user.email t@t && git config user.name t
@@ -1281,8 +1306,8 @@ t_submit_tmp() {
     "$CPUQ" submit cpuq/tmp.json >/dev/null 2>&1; echo "rc=$?"
   ) >"$T/out" 2>&1
   local saw; saw=$(cat "$T/roots/repo/saw" 2>/dev/null)
-  local left; left=$(ls "$T/jt" | wc -l | tr -d ' ')
-  check "job_tmp: the job's TMPDIR was under it ($saw), and is gone after (left $left)" "[[ '$(cat "$T/out")' == 'rc=0' && '$saw' == '$T/jt/'* && $left = 0 ]]"
+  local left; left=$(ls "$HOME/cpuq/tmp" | wc -l | tr -d ' ')
+  check "a submitted job's TMPDIR was under ~/cpuq/tmp ($saw), and is gone after (left $left)" "[[ '$(cat "$T/out")' == 'rc=0' && '$saw' == '$HOME/cpuq/tmp/'* && $left = 0 ]]"
   export HOME=$was_home
   unset XDG_STATE_HOME
 }
@@ -1418,21 +1443,21 @@ t_clean() {
   setup clean
   local was_home=$HOME
   export HOME=$T/home
-  local sp=$HOME/cpuq-spill pk=$HOME/cpuq/packs
-  mkdir -p "$sp/s/old-1" "$sp/s/new-2" "$sp/w/p/oldcopy" "$sp/w/p/heldcopy" "$sp/w/p/newcopy" "$pk/tool/aaa" "$pk/tool/bbb" "$pk/tool/ccc"
-  touch -t 202601010000 "$sp/s/old-1/.cpuq-used" "$sp/w/p/oldcopy/.cpuq-generation" "$sp/w/p/heldcopy/.cpuq-generation" "$pk/tool/aaa/.cpuq-used" "$pk/tool/bbb/.cpuq-used"
-  touch "$sp/s/new-2/.cpuq-used" "$sp/w/p/newcopy/.cpuq-generation" "$pk/tool/ccc/.cpuq-used"
+  local sp=$HOME/cpuq/worktrees pk=$HOME/cpuq/packs
+  mkdir -p "$sp/p/old-1" "$sp/p/new-2" "$sp/p/oldcopy" "$sp/p/heldcopy" "$sp/p/newcopy" "$pk/tool/aaa" "$pk/tool/bbb" "$pk/tool/ccc"
+  touch -t 202601010000 "$sp/p/old-1/.cpuq-used" "$sp/p/oldcopy/.cpuq-generation" "$sp/p/heldcopy/.cpuq-generation" "$pk/tool/aaa/.cpuq-used" "$pk/tool/bbb/.cpuq-used"
+  touch "$sp/p/new-2/.cpuq-used" "$sp/p/newcopy/.cpuq-generation" "$pk/tool/ccc/.cpuq-used"
   ln -s bbb "$pk/tool/latest"
-  touch "$sp/w/p/heldcopy.lock"
+  touch "$sp/p/heldcopy.lock"
   # A job holding its copy's lock.
   python3 -c 'import fcntl, sys, time
-f = open(sys.argv[1]); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$sp/w/p/heldcopy.lock" & local holder=$!
+f = open(sys.argv[1]); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$sp/p/heldcopy.lock" & local holder=$!
   sleep 0.5
   "$CPUQ" clean --dry-run --older 1h >"$T/dry"
-  local after_dry; after_dry=$(ls "$sp/s" "$sp/w/p" "$pk/tool" | tr '\n' ' ')
+  local after_dry; after_dry=$(ls "$sp/p" "$pk/tool" | tr '\n' ' ')
   "$CPUQ" clean --older 1h >"$T/out"
   wait $holder
-  local left; left=$(cd "$HOME" && find cpuq-spill cpuq -mindepth 2 -maxdepth 3 -type d | sort | tr '\n' ' ')
+  local left; left=$(cd "$HOME" && find cpuq -mindepth 2 -maxdepth 3 -type d | sort | tr '\n' ' ')
   echo "  left: $left"
   check "clean: old copies and an unnamed old pack version go, fresh ones, a named one and a locked copy stay; --dry-run removes nothing ($(tail -1 "$T/dry"))" \
     "[[ '$after_dry' == *old-1* && '$left' != *old-1* && '$left' != *oldcopy* && '$left' != *tool/aaa* && '$left' == *new-2* && '$left' == *newcopy* && '$left' == *heldcopy* && '$left' == *tool/bbb* && '$left' == *tool/ccc* ]] && grep -q 'removed 3' '$T/out'"
@@ -1952,38 +1977,45 @@ t_min_available() {
   check "under min_available nothing starts (rc $rc, gate $state); above it, it does (rc $rc2)" "[ $rc = 75 ] && [ '$state' = 'low_memory with-available' ] && [ $rc2 = 0 ]"
 }
 
-t_spill() {
-  # A machine with room runs a --spill job itself; a full one tries each
-  # spill host, and with none answering it queues here, saying so.
-  setup spill "spill = cpuq-test-nohost.invalid"
-  local here; here=$("$CPUQ" run --spill --cores 1 -- echo ran-here 2>&1)
-  setup spill-full "spill = cpuq-test-nohost.invalid" "min_available = 1000000G"
-  local full rc
-  full=$("$CPUQ" run --spill --max-wait 1 --cores 1 -- echo ran 2>&1); rc=$?
-  setup spill-none
-  local none; none=$("$CPUQ" run --spill --cores 1 -- echo ran-anyway 2>&1)
-  check "--spill runs here with room ('$here'); full with no host answering, it queues here (rc $rc: '$full'); with no spill hosts, it says so and runs ('$none')" \
-    "[[ '$here' == ran-here && $rc = 75 && '$full' == *'no spill host has room'*'unreachable'* && '$none' == *'no spill hosts configured'*ran-anyway* ]]"
+t_gone() {
+  # --spill, --local and --ship are gone: cpuq run runs here, and --on HOST sends it; each old
+  # word is a usage error that names the new way, and so are the old spill config keys.
+  setup gone
+  local spill local_ ship cfg src lrc hrc crc
+  "$CPUQ" run --spill --cores 1 -- echo ran >/dev/null 2>"$T/spill"; src=$?
+  "$CPUQ" run --local --cores 1 -- echo ran >/dev/null 2>"$T/local"; lrc=$?
+  "$CPUQ" run --ship x --cores 1 -- echo ran >/dev/null 2>"$T/ship"; hrc=$?
+  spill=$(head -1 "$T/spill"); local_=$(head -1 "$T/local"); ship=$(head -1 "$T/ship")
+  setup gone-config "spill = far"
+  "$CPUQ" run --cores 1 -- echo ran >/dev/null 2>"$T/cfg"; crc=$?; cfg=$(head -1 "$T/cfg")
+  check "--spill (rc $src), --local (rc $lrc), --ship (rc $hrc) and config spill (rc $crc) are refused, naming what replaced them" \
+    "[[ \$src = 2 && \"\$spill\" == *'--on HOST'* && \$lrc = 2 && \"\$local_\" == *'always runs here'* && \$hrc = 2 && \"\$ship\" == *'--include'* && \$crc = 2 && \"\$cfg\" == *'remotes = '* ]]"
 }
 
-t_spill_to() {
-  # --spill-to HOST runs there whatever this machine's state; a host that neither answers nor
-  # has a spill_start command is an error, not a quiet run here.
-  setup spill-to
+t_on() {
+  # --on HOST runs there whatever this machine's state; a host that neither answers nor has a
+  # remote_start command is an error, not a quiet run here. HOST is one of this machine's
+  # remotes, or this machine itself (which runs here); --spill-to is gone.
+  setup on "remotes = cpuq-test-nohost.invalid, x"
   local out rc
-  out=$("$CPUQ" run --spill-to cpuq-test-nohost.invalid --cores 1 -- echo ran-here 2>&1); rc=$?
-  "$CPUQ" run --spill --spill-to x --cores 1 -- true 2>/dev/null; local both=$?
-  "$CPUQ" run --spill-to x --ship ../out --cores 1 -- true 2>/dev/null; local outside=$?
-  "$CPUQ" run --ship vendor --cores 1 -- true 2>/dev/null; local alone=$?
-  [ $outside = 2 ] && [ $alone = 2 ] || both=fail
-  check "--spill-to an unreachable host without spill_start fails (rc $rc: '$out'), never running here; --spill with --spill-to is refused (rc $both)" \
-    "[[ $rc = 125 && '$out' == *'does not answer'* && '$out' != *ran-here* && $both = 2 ]]"
+  out=$("$CPUQ" run --on cpuq-test-nohost.invalid --cores 1 -- echo ran-here 2>&1); rc=$?
+  "$CPUQ" run --on x --include ../out --cores 1 -- true 2>/dev/null; local outside=$?
+  "$CPUQ" run --include vendor --cores 1 -- true 2>/dev/null; local alone=$?
+  check "--on an unreachable host without remote_start fails (rc $rc: '$out'), never running here; --include outside the repo (rc $outside) or without --on (rc $alone) is refused" \
+    "[[ $rc = 125 && '$out' == *'does not answer'* && '$out' != *ran-here* && $outside = 2 && $alone = 2 ]]"
+  local unknown urc self src old orc
+  unknown=$("$CPUQ" run --on cheese --cores 1 -- echo ran 2>&1); urc=$?
+  self=$("$CPUQ" run --on "$(hostname -s)" --cores 1 -- echo ran-here 2>&1); src=$?
+  old=$("$CPUQ" run --spill-to x --cores 1 -- echo ran 2>&1); orc=$?
+  unknown=$(printf '%s\n' "$unknown" | head -1); old=$(printf '%s\n' "$old" | head -1)
+  check "--on a host not among this machine's remotes is refused (rc $urc: '$unknown'); --on this machine runs here (rc $src: '$self'); --spill-to is refused (rc $orc: '$old')" \
+    "[[ \$urc = 2 && \"\$unknown\" == *'not one of this machine'* && \$src = 0 && \$self = ran-here && \$orc = 2 ]]"
 }
 
-t_ship_git() {
-  # `.git` in .cpuq-spill ships a standalone git: a worktree's commit and index, git's own parts,
+t_include_git() {
+  # `.git` in .cpuqinclude ships a standalone git: a worktree's commit and index, git's own parts,
   # and none of what else the repo keeps under .git.
-  setup ship-git
+  setup include-git "remotes = far"
   local bin=$T/bin far=$T/far
   mkdir -p "$bin" "$far"
   printf '#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done\nshift\ncd "%s" && exec sh -c "$*"\n' "$far" >"$bin/ssh"
@@ -1994,18 +2026,18 @@ t_ship_git() {
     echo a > a.txt && echo b > b.txt && git add -A && git commit -qm one
     mkdir .git/big-cache && echo junk > .git/big-cache/x
     git worktree add -q "$T/wt" -b wt && cd "$T/wt" && echo c > c.txt && git add c.txt && git commit -qm two
-    echo .git > .cpuq-spill
+    echo .git > .cpuqinclude
   ) >/dev/null 2>&1
   local want; want=$(git -C "$T/wt" rev-parse HEAD)
-  local got; got=$(cd "$T/wt" && PATH="$bin:$PATH" "$CPUQ" run --spill-to far --cores 1 -- sh -c 'test -d .git && echo dir; git rev-parse HEAD; git ls-files | tr "\n" " "; test -e .git/big-cache && echo junk || echo clean' 2>/dev/null | tr '\n' ' ')
+  local got; got=$(cd "$T/wt" && PATH="$bin:$PATH" "$CPUQ" run --on far --cores 1 -- sh -c 'test -d .git && echo dir; git rev-parse HEAD; git ls-files | tr "\n" " "; test -e .git/big-cache && echo junk || echo clean' 2>/dev/null | tr '\n' ' ')
   check "a worktree's .git ships as a git of its own (got '$got')" "[ '$got' = 'dir $want a.txt b.txt c.txt clean ' ]"
 }
 
-t_spill_check() {
-  # A spilled copy is read back by checksum: a file damaged there that kept its size and mtime
+t_on_check() {
+  # A copy sent with --on is read back by checksum: a file damaged there that kept its size and mtime
   # (rsync's quick check would never send it again) is sent again, and a copy that stays damaged
   # fails the run without running the job.
-  setup spill-check
+  setup on-check "remotes = far"
   local bin=$T/bin far=$T/far
   mkdir -p "$bin" "$far"
   # The far side, damaging a.txt after every connection while $T/rot exists.
@@ -2013,21 +2045,21 @@ t_spill_check() {
   chmod +x "$bin/ssh"
   ln -sf "$CPUQ" "$bin/cpuq"
   (cd "$T" && git init -q repo && cd repo && echo a > a.txt && git add a.txt) >/dev/null 2>&1
-  (cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --spill-to far --cores 1 -- true) >/dev/null 2>&1
+  (cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --on far --cores 1 -- true) >/dev/null 2>&1
   local copy; copy=$(find "$far" -name a.txt)
   cp -p "$copy" "$T/ref"; printf X | dd of="$copy" conv=notrunc 2>/dev/null; touch -r "$T/ref" "$copy"
-  local mended; mended=$(cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --spill-to far --cores 1 -- cat a.txt 2>&1)
+  local mended; mended=$(cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --on far --cores 1 -- cat a.txt 2>&1)
   touch "$T/rot"
-  local bad rc; bad=$(cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --spill-to far --cores 1 -- echo ran 2>&1); rc=$?
+  local bad rc; bad=$(cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --on far --cores 1 -- echo ran 2>&1); rc=$?
   check "a copy damaged there is sent again ('$mended'); one that stays damaged fails, never running (rc $rc: '$bad')" \
     "[[ '$mended' == *'differed from here (a.txt)'*a && $rc = 125 && '$bad' == *'still differs from here'*a.txt* && '$bad' != *ran* ]]"
 }
 
-t_spill_gitignore() {
-  # A spilled copy leaves out what git ignores, as git reads .gitignore: a file its `!` line
+t_on_gitignore() {
+  # A copy sent with --on leaves out what git ignores, as git reads .gitignore: a file its `!` line
   # brings back ships (rsync's own .gitignore filter dropped it), and a tracked file ships though
   # a pattern matches it; ignored files and folders stay behind.
-  setup spill-gitignore
+  setup on-gitignore "remotes = far"
   local bin=$T/bin far=$T/far
   mkdir -p "$bin" "$far"
   printf '#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done\nshift\ncd "%s" && exec sh -c "$*"\n' "$far" >"$bin/ssh"
@@ -2040,35 +2072,15 @@ t_spill_gitignore() {
     echo p > plain.txt && echo t > tracked.log && echo n > notes.log
     git add .gitignore plain.txt && git add -f tracked.log && git commit -qm one
   ) >/dev/null 2>&1
-  local got; got=$(cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --spill-to far --cores 1 -- sh -c 'find . -type f ! -path "./.git*" ! -name .cpuq-used | sort | tr "\n" " "' 2>/dev/null)
-  check "a spilled copy ships what git ships: a \`!\` re-included file and a tracked one, none of the ignored (got '$got')" "[ '$got' = './data/keep.txt ./plain.txt ./tracked.log ' ]"
-  # One file shipped from inside an ignored folder: it alone, not the rest of the folder.
-  got=$(cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --spill-to far --ship build/ship.sh --cores 1 -- sh -c 'find ./build -type f | sort | tr "\n" " "' 2>/dev/null)
-  check "--ship of one file in an ignored folder ships it alone (got '$got')" "[ '$got' = './build/ship.sh ' ]"
-}
-
-t_spill_default() {
-  # spill_default: with this machine full, a plain cpuq run in a repo spills; one naming a path
-  # that exists only here, or saying --local, stays (and here, full, waits).
-  setup spill-default "spill = far" "spill_default = on" "min_available = 1000000G"
-  local bin=$T/bin far=$T/far
-  mkdir -p "$bin" "$far/state"
-  printf 'pressure_check = off\nmin_disk = off\nload_check = off\n' >"$far/config"
-  printf '#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done\nshift\ncd "%s" && CPUQ_DIR="%s/state" CPUQ_CONFIG="%s/config" exec sh -c "$*"\n' "$far" "$far" "$far" >"$bin/ssh"
-  chmod +x "$bin/ssh"
-  ln -sf "$CPUQ" "$bin/cpuq"
-  ( cd "$T" && git init -q repo && cd repo && git config user.email t@t && git config user.name t && echo x > x && git add x && git commit -qm one ) >/dev/null 2>&1
-  far=$(cd "$far" && pwd)
-  local plain pinned local_rc
-  plain=$(cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --max-wait 1 --cores 1 -- sh -c 'pwd' 2>/dev/null)
-  (cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --max-wait 1 --cores 1 -- sh -c "cat $T/repo/x" >/dev/null 2>&1); pinned=$?
-  (cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --local --max-wait 1 --cores 1 -- true >/dev/null 2>&1); local_rc=$?
-  check "spill_default: a plain run spills when this machine is full (ran in '$plain'); one naming a path here (rc $pinned) or --local (rc $local_rc) stays and waits" \
-    "[[ \"\$plain\" == \"\$far\"/cpuq-spill/s/repo-* && \$pinned = 75 && \$local_rc = 75 ]]"
+  local got; got=$(cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --on far --cores 1 -- sh -c 'find . -type f ! -path "./.git*" ! -name .cpuq-used | sort | tr "\n" " "' 2>/dev/null)
+  check "a copy sent with --on takes what git ships: a \`!\` re-included file and a tracked one, none of the ignored (got '$got')" "[ '$got' = './data/keep.txt ./plain.txt ./tracked.log ' ]"
+  # One file included from inside an ignored folder: it alone, not the rest of the folder.
+  got=$(cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --on far --include build/ship.sh --cores 1 -- sh -c 'find ./build -type f | sort | tr "\n" " "' 2>/dev/null)
+  check "--include of one file in an ignored folder takes it alone (got '$got')" "[ '$got' = './build/ship.sh ' ]"
 }
 
 t_tethered() {
-  # --tethered (what --spill runs on the spill host): the command gets
+  # --tethered (what --on runs on HOST): the command gets
   # /dev/null for stdin, which carries the caller's heartbeats, and is
   # stopped when the caller goes (stdin closes).
   setup tethered
@@ -2126,7 +2138,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git spill_check spill_gitignore spill_default tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk gone on include_git on_check on_gitignore tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

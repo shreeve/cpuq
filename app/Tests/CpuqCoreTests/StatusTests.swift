@@ -120,15 +120,15 @@ import Testing
     #expect(older.capacity == 8)
 }
 
-@Test func readsSpillHostsFromTheConfig() {
-    let hosts = spillHosts(config: """
+@Test func readsRemotesFromTheConfig() {
+    let hosts = remoteHosts(config: """
     admit = measured
-    spill = pup, burst   # in order
-    spill_start.burst = ~/runbooks/host-gcp-burst/start
+    remotes = pup, burst   # in order
+    remote_start.burst = ~/runbooks/host-gcp-burst/start
     """)
     #expect(hosts.map(\.host) == ["pup", "burst"])
     #expect(hosts[0].start == nil && hosts[1].start == "~/runbooks/host-gcp-burst/start")
-    #expect(spillHosts(config: "budget = 8\n").isEmpty)
+    #expect(remoteHosts(config: "budget = 8\nspill = pup\n").isEmpty)
 }
 
 @Test func decodesAnotherMachinesCPUTicks() throws {

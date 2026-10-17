@@ -56,7 +56,6 @@ never write them.
   "setup": "(cd deps/nexus && zig build -Doptimize=safe -p \"$NEXUS_OUT\") && zig build -j$CPUQ_CORES -Dnexus=$NEXUS_OUT/bin/nexus",
   "run": "python3 test/matrix.py -j $CPUQ_CORES --delta \"$@\"",
   "cores": "8-32",
-  "on": ["burst", "pup"],
   "time": "90m",
   "mem": "96G",
   "tools": { "zig": "0.17.0" },
@@ -75,14 +74,13 @@ never write them.
 | `run` | `sh -c RUN cpuq ARGS...` at the copy's top, with `$CPUQ_CORES`; `-- ARGS` become `"$@"` | required |
 | `setup` | run first, in the same job | none |
 | `cores` | `N` or `MIN-MAX` | that host's history, else 2 |
-| `on` | hosts in order: `"here"` or host names. A host with `spill_start` is started only when named here | `["here"]` |
-| `time` | wall time from admission, enforced by `cpuq cap --time` around setup and run; required on a host with `spill_start` | 2h there, none here |
+| `time` | wall time from admission, enforced by `cpuq cap --time` around setup and run; required on a host with `remote_start` | 2h there, none here |
 | `mem` | memory of the whole job, by `cpuq cap --mem` (the kernel's memory.max inside a Linux job) | none |
 | `tools` | `{"zig": "0.17.0"}`: `zig version` etc. checked on the host before the run; a mismatch is NOT RUN | none |
 | `env` | variables for setup and run, written to the job's own files on the host, never on a command line | none |
 | `exclude` | path prefixes in the directory that never travel | none |
 | `deps` | `"target in copy": "source outside"`: a source directory's tracked files (`git ls-files`), with mtimes. Binaries are built on the host by `setup` | none |
-| `caches` | `"ENV": "name"`: `~/cpuq-spill/c/PROJECT/name` on the host, created, exported as `ENV`, never synced or deleted by a sync | none |
+| `caches` | `"ENV": "name"`: `~/cpuq/caches/PROJECT/name` on the host, created, exported as `ENV`, never synced or deleted by a sync | none |
 | `report` | JSON lines the job appends: `{"id", "ok", "status", "reason", "artifact"}`. Truncated at each attempt's start. It drives progress counts and the failure list | none |
 | `return` | paths copied back into the directory when the job ends; excluded from the sync | none |
 | `packs` | `{"zig": "0.17.0", "rig": "latest"}`: tool versions from the host's store, `~/cpuq/packs/NAME/VERSION`, installed by the first job that needs one (README, "Packs"). Each is on PATH and in `$NAME`. Versions: `latest`, `stable`, `X.Y.Z` (a tag) or a commit | none |
@@ -148,10 +146,18 @@ never write them.
 
 ## How a job runs
 
-1. **Place.** Take the first host in `on` that is reachable, has room (nobody waiting, load under
-   its CPUs, gate open), and has the RAM for `mem`.
-   - If none has room, queue at the first one that's reachable.
-   - If none is reachable, start the first one named with a `spill_start` command.
+1. **Place.** A spec names no host: the submitting machine's `remotes` are the choices (none:
+   here), or the one `--on HOST` names (one of them, or this machine, which is `here`). Hosts
+   without the RAM for `mem` drop out. With more than one left:
+   - Each host's expected finish is the label's past runs there (else its runs on another host,
+     scaled by their CPUs, at most 4 times either way), plus a wait: 2 minutes in a full host's
+     queue, 2 to start a stopped one that has a `remote_start` command.
+   - A stopped host is started only for work that would take 10 minutes or more on one that's up.
+     A paid host (one with `remote_start`: a cloud machine) is taken over a free one only when it
+     is sooner by a minute and by 30%, so short work stays on the free host and heavy work goes
+     to the big one.
+   - Work no host's runs know goes to the first host with room (nobody waiting, load under its
+     CPUs, gate open), else the first stopped one, started, else the first that answers.
    - A host whose cpuq is older than this one is refused, with the install command.
 2. **Start, owned by the host.** The spec, env, ARGS and the job's identity go to
    `~/.local/state/cpuq/jobs/ID/` on the host, by ssh stdin. Then:
@@ -160,7 +166,7 @@ never write them.
      a retry) refuse instead of doubling the job.
    - **macOS** (`here` on the Mac): `cpuq _job ID` in its own session.
 3. **Lock and sync.**
-   - `_job` takes the copy's lock: `~/cpuq-spill/w/PROJECT/ID12`, where ID12 is a hash of the
+   - `_job` takes the copy's lock: `~/cpuq/worktrees/PROJECT/ID12`, where ID12 is a hash of the
      origin machine and the directory's realpath.
    - It says "ready". The supervisor rsyncs the snapshot (`-a --delete`, less `exclude`,
      `return`, the `deps` targets and `.cpuq-generation`), then each dep's tracked files, then
@@ -185,7 +191,7 @@ never write them.
 7. **Host lost.**
    - The supervisor owns retries. When the host stops answering, it checks three times, 5
      seconds apart.
-   - It then starts the host again (`spill_start`), and reruns `_job ID` once, but only if the copy
+   - It then starts the host again (`remote_start`), and reruns `_job ID` once, but only if the copy
      still holds the job's generation.
    - Otherwise, or after a second loss, the job is LOST.
    - With no supervisor left, the next `cpuq job` reconciles: it finds the result on the host, or
@@ -227,7 +233,7 @@ never write them.
 | Cache size budgets and eviction | later | `cpuq copies --clean` and the dataset quota until then |
 | Auto-installing cpuq on hosts | **no** | refused with the install command instead |
 | Placement scoring and cost weights | **no** | `on` order, for three machines |
-| `spill_budget` hours | later (0.18.x) | the 6h VM backstop and `time` cover it until then |
+| `remote_budget` hours | later (0.18.x) | the 6h VM backstop and `time` cover it until then |
 | The hook reading `replaces` | later | the brief says it until then |
 | Preemption marker unit on the host | later (runbook) | until then any lost host counts as lost, with one retry |
 | ZFS dedup on burst | **kept**, measured | 1.40× on new writes at about zero kernel CPU so far; revisit if write latency shows |

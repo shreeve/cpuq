@@ -74,7 +74,7 @@ pub fn scales(cmd: []const u8) bool {
 /// One kind of work's finished runs in one place.
 pub const Stats = struct {
     runs: u32 = 0,
-    /// The middle run's seconds (for a spilled run, the whole trip: copy and queue too).
+    /// The middle run's seconds (for a run sent with --on, the whole trip: copy and queue too).
     ran: f64 = 0,
     /// The 75th percentile of the cores it kept busy (its peak over 2 s, else its average).
     used: f64 = 0,
@@ -129,7 +129,7 @@ pub fn runTime(there: Stats, here: Stats, cores: u32, scaling: bool) ?f64 {
     return if (wider > here.cores) here.ran * here.cores / wider else here.ran;
 }
 
-/// A place a job could run: this machine or a spill host.
+/// A place a job could run: this machine or one of its remotes.
 pub const Place = struct {
     name: []const u8,
     /// Expected seconds to its start: the queue there, and starting the machine when it is
@@ -145,7 +145,7 @@ pub const Place = struct {
     }
 };
 
-/// Seconds to start a stopped spill host: a cloud machine's boot and its cpuq answering.
+/// Seconds to start a stopped remote: a cloud machine's boot and its cpuq answering.
 pub const start_s: f64 = 120;
 /// Seconds a first copy of a repo takes (Rig, 15k files: 33 s), and a repeat one.
 pub const copy_first_s: f64 = 35;
