@@ -203,8 +203,8 @@ final class GraphModel {
     /// A cloud machine (one cpuq can start) that is up, and so costing money.
     var isCloudRunning: Bool { machine.start != nil && problem == nil && upSince != nil }
 
-    /// How long it has been up: since it booted (cpuq 0.14 says when), else since the app first
-    /// saw it answer. "23m", "1h 05m".
+    /// How long it has been up: since it booted, else since the app first saw it answer. "23m",
+    /// "1h 05m".
     var upFor: String {
         let since = status?.bootTime.map { Date(timeIntervalSince1970: $0) } ?? upSince ?? Date()
         let s = Int(Date().timeIntervalSince(since))
@@ -216,10 +216,7 @@ final class GraphModel {
     var startNote: String?
     /// Each project's palette slot, assigned the first time it is seen and kept across launches,
     /// so a project's color never changes as others come and go.
-    private var slots: [String: Int] = {
-        migratePalette()
-        return (UserDefaults.standard.dictionary(forKey: "projectPalette") as? [String: Int]) ?? [:]
-    }()
+    private var slots = (UserDefaults.standard.dictionary(forKey: "projectPalette") as? [String: Int]) ?? [:]
 
     var budget: Int { max(status?.capacity ?? 8, 1) }
 
@@ -304,7 +301,7 @@ final class GraphModel {
     }
 
     /// The hour before the app started watching, from `cpuq history`: each finished job on the
-    /// cores it took (or, from a cpuq older than 0.4.5, the lowest that were free), with its
+    /// cores it took (or the lowest that were free, when it names none), with its
     /// average active cores, and each wait from queueing to starting.
     private func seed(_ jobs: [Job], now: Date = Date()) {
         seeded = true
@@ -369,20 +366,6 @@ final class GraphModel {
     /// Project colors, in the stacking order. The first six come from the theme (Theme.swift);
     /// the rest are the same in every theme. No grey: that is work outside cpuq.
     static let palette: [Color] = (0..<6).map { Alive.slot($0) } + [.mint, Color(red: 0.62, green: 0.82, blue: 0.08), .indigo, .teal]
-
-    /// Slots saved by an app older than the design's palette moved to it: each keeps its color
-    /// where the palette still has it, and the projects the design shows take its colors.
-    private static func migratePalette() {
-        let d = UserDefaults.standard
-        guard d.integer(forKey: "paletteVersion") < 2 else { return }
-        var slots = (d.dictionary(forKey: "projectPalette") as? [String: Int]) ?? [:]
-        // Old order: blue, orange, green, purple, yellow, teal, mint, lime, indigo, system teal.
-        let moved = [0: 0, 1: 3, 2: 1, 3: 2, 4: 5, 5: 4, 6: 6, 7: 7, 8: 8, 9: 9]
-        slots = slots.mapValues { moved[$0 % 10] ?? $0 }
-        for (project, slot) in ["em": 0, "nexis": 1, "emdb": 2, "rig": 3, "cpuq": 4] { slots[project] = slot }
-        d.set(slots, forKey: "projectPalette")
-        d.set(2, forKey: "paletteVersion")
-    }
 
     func color(_ project: String) -> Color {
         Self.palette[(slots[project] ?? 0) % Self.palette.count]

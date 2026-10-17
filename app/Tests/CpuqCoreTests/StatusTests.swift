@@ -34,8 +34,8 @@ import Testing
     #expect(s.outside.first?.name == "Python")
 }
 
-@Test func decodesAnOlderStatusWithFieldsMissing() throws {
-    // cpuq 0.1.0's status had no using, max, eta, leases or outside, and its gate was text.
+@Test func decodesAStatusWithFieldsMissing() throws {
+    // Each field left out keeps its default.
     let json = """
     {"budget": 8, "held": 2, "holders": [{"pid": 1, "cores": 2, "label": "x"}], "waiters": [{"order": 1, "cores": 3}]}
     """
@@ -59,17 +59,8 @@ import Testing
     #expect(age(7800) == "2h10m")
 }
 
-@Test func watchArrivesInCpuq040() {
-    #expect(!supportsWatch(version: "0.2.0"))
-    #expect(!supportsWatch(version: "0.3.0"))
-    #expect(supportsWatch(version: "0.4.0"))
-    #expect(supportsWatch(version: "0.10.1"))
-    #expect(supportsWatch(version: "1.0.0"))
-    #expect(!supportsWatch(version: ""))
-}
-
 @Test func decodesEachHoldersCoresAndAHistoryJob() throws {
-    // cpuq 0.4.5 names the cores each holder took; an older cpuq leaves them out.
+    // The cores each holder took, when it names them.
     let s = try Status.decode(Data(#"{"budget": 8, "held": 3, "holders": [{"pid": 7, "cores": 3, "slots": [2, 3, 4]}, {"pid": 8, "cores": 1}]}"#.utf8))
     #expect(s.holders[0].slots == [2, 3, 4])
     #expect(s.holders[1].slots.isEmpty)
@@ -77,14 +68,6 @@ import Testing
     #expect(jobs[0].pid == 4321)
     #expect(jobs[0].slots == [0, 1])
     #expect(jobs[0].queued == 1700000000.5)
-}
-
-@Test func jobActionsNeedCpuq071() {
-    #expect(supportsControls(version: "0.7.1"))
-    #expect(supportsControls(version: "0.8.0"))
-    #expect(!supportsControls(version: "0.7.0"))
-    #expect(!supportsControls(version: "0.6.2"))
-    #expect(!supportsControls(version: ""))
 }
 
 @Test func gateCarriesTheValveThresholds() throws {

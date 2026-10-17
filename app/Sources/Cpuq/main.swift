@@ -219,7 +219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     /// The last hour from the machine's recorder (`cpuq samples`), once: nothing when it records
-    /// nothing, or its cpuq is older than 0.15.
+    /// nothing.
     private func backfill(_ m: GraphModel) {
         m.backfilled = true
         let host: String? = m.machine.isLocal ? nil : m.machine.id
@@ -1036,11 +1036,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     @objc private func openLiveView() {
         guard let path = findCpuq() else { return }
-        // `status --watch` is cpuq 0.4.0's; an older cpuq gets the same view
-        // redrawn by the shell.
-        let command = supportsWatch(version: status?.version ?? "")
-            ? "\(path) status --watch"
-            : "while :; do clear; \(path) status; sleep 2; done"
+        // The path quoted for the shell (a space in it), then the line for AppleScript (a quote or
+        // a backslash in it would end the string early).
+        let shell = "'" + path.replacingOccurrences(of: "'", with: #"'\''"#) + "' status --watch"
+        let command = shell.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let script = "tell application \"Terminal\"\nactivate\ndo script \"\(command)\"\nend tell"
         NSAppleScript(source: script)?.executeAndReturnError(nil)
     }

@@ -10,19 +10,19 @@ public struct Status: Decodable, Sendable, Equatable {
     public var free = 0
     public var load: [Double] = [0, 0, 0]
     public var memoryPressure = ""
-    /// How cpuq admits jobs (0.8 and later): "measured" (by the CPU they use, up to `target`
-    /// CPUs) or "cores" (by the cores they hold, up to `budget`); empty from older cpuq.
+    /// How cpuq admits jobs: "measured" (by the CPU they use, up to `target` CPUs) or "cores" (by
+    /// the cores they hold, up to `budget`).
     public var admit = ""
     public var target: Double?
-    /// The CPUs online (`active_cores`, cpuq 0.8 and later); 0 from older cpuq.
+    /// The CPUs online (`active_cores`).
     public var activeCores = 0
-    /// Each CPU's time so far, `[busy, total]`, cumulative (`cpu_ticks`, cpuq 0.12.1 and later):
+    /// Each CPU's time so far, `[busy, total]`, cumulative (`cpu_ticks`):
     /// another machine's CPUs, drawn from the difference between two statuses.
     public var cpuTicks: [[UInt64]]?
-    /// When the machine booted, Unix seconds (`boot_time`, cpuq 0.14 and later): how long a cloud
+    /// When the machine booted, Unix seconds (`boot_time`): how long a cloud
     /// machine has been up.
     public var bootTime: Double?
-    /// Memory and swap in bytes (cpuq 0.16 and later): `used` is Activity Monitor's Memory Used on
+    /// Memory and swap in bytes: `used` is Activity Monitor's Memory Used on
     /// macOS, the total less MemAvailable on Linux.
     public var memory: Memory?
     public var gate = Gate()
@@ -30,7 +30,7 @@ public struct Status: Decodable, Sendable, Equatable {
     public var waiters: [Waiter] = []
     public var leases: [Lease] = []
     public var outside: [Outside] = []
-    /// CPUs busy outside every cpuq job, in all (cpuq 0.24 and later; else the listed ones' sum).
+    /// CPUs busy outside every cpuq job, in all.
     public var outsideTotal: Double?
 
     public struct Gate: Decodable, Sendable, Equatable {
@@ -38,7 +38,7 @@ public struct Status: Decodable, Sendable, Equatable {
         public var state = "open"
         public var load: Double?
         public var text = "open"
-        /// The load valve's thresholds (cpuq 0.7.7 and later, with the load check on): it trips
+        /// The load valve's thresholds (with the load check on): it trips
         /// above `trip` while the CPUs are at least `busyTrip` busy, and reopens at `reopen`.
         public var trip: Double?
         public var reopen: Double?
@@ -48,9 +48,9 @@ public struct Status: Decodable, Sendable, Equatable {
     public struct Holder: Decodable, Sendable, Equatable {
         public var pid = 0
         public var cores = 0
-        /// Which of the budget's cores it holds, by number from 0 (cpuq 0.4.5 and later).
+        /// Which of the budget's cores it holds, by number from 0.
         public var slots: [Int] = []
-        /// Paused by hand (cpuq 0.7.1 and later).
+        /// Paused by hand.
         public var paused = false
         public var using: Double?
         public var priority = ""
@@ -62,7 +62,7 @@ public struct Status: Decodable, Sendable, Equatable {
         public var note = ""
         public var command = ""
         public var since = 0
-        /// How far it is, as it reports through `CPUQ_PROGRESS` (cpuq 0.19 and later).
+        /// How far it is, as it reports through `CPUQ_PROGRESS`.
         public var progress: Progress?
         /// Seconds left: from its progress, or else from its label's usual time.
         public var left: Double?
@@ -103,7 +103,7 @@ public struct Status: Decodable, Sendable, Equatable {
         public var pid = 0
         public var name = ""
         public var using = 0.0
-        /// Its command line and working directory (cpuq 0.24 and later): who started it.
+        /// Its command line and working directory: who started it.
         public var command: String?
         public var cwd: String?
 
@@ -290,21 +290,6 @@ public func age(_ seconds: Double) -> String {
     return String(format: "%dh%02dm", s / 3600, (s % 3600) / 60)
 }
 
-/// Whether a cpuq of this version has `status --watch` (0.4.0 and later).
-public func supportsWatch(version: String) -> Bool {
-    let parts = version.split(separator: ".").compactMap { Int($0) }
-    guard parts.count >= 2 else { return false }
-    return parts[0] > 0 || parts[1] >= 4
-}
-
-/// Whether a cpuq of this version takes `first`, `start`, `cancel`, `pause`, `resume` and `stop`
-/// (0.7.1 and later).
-public func supportsControls(version: String) -> Bool {
-    let p = version.split(separator: ".").compactMap { Int($0) }
-    guard p.count >= 3 else { return false }
-    return (p[0], p[1], p[2]) >= (0, 7, 1)
-}
-
 /// One job from `cpuq history --json`.
 public struct Job: Decodable, Sendable, Equatable {
     public var state = ""
@@ -391,7 +376,7 @@ public func runningSeconds(boots data: Data, since: Date, now: Date = Date()) ->
     }
 }
 
-/// One of `cpuq record`'s samples, as `cpuq samples` prints them (cpuq 0.15 and later): when, each
+/// One of `cpuq record`'s samples, as `cpuq samples` prints them: when, each
 /// CPU's busy share since the sample before (percent), the 1-minute load, cores held, jobs
 /// waiting, and the gate.
 public struct RecordedSample: Decodable, Sendable, Equatable {

@@ -571,7 +571,7 @@ struct WaiterActions: View {
     let model: GraphModel
     var control: ((String, Int, String) -> Void)?
     var body: some View {
-        if let control, pid > 0, supportsControls(version: model.status?.version ?? "") {
+        if let control, pid > 0 {
             Button("Move to Front") { control("first", pid, label) }
             Button("Start Now…") { control("start", pid, label) }
             Button("Cancel…") { control("cancel", pid, label) }
@@ -1342,7 +1342,7 @@ struct JobsCard: View {
         .frame(height: 21)
         .contentShape(Rectangle())
         .contextMenu {
-            if let control, supportsControls(version: model.status?.version ?? "") {
+            if let control {
                 let name = GraphModel.label(h.label, h.command)
                 Button(h.paused ? "Resume \(name)" : "Pause \(name)") { control(h.paused ? "resume" : "pause", h.pid, name) }
                 Button("Stop \(name)…") { control("stop", h.pid, name) }
