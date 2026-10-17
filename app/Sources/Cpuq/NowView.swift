@@ -950,9 +950,8 @@ struct HourCard: View {
         (hour.columns.first?.from ?? Date())...(hour.columns.last?.to ?? Date())
     }
 
-    /// Ticks at quarters of the span, the oldest labelled with how long ago.
     /// Ticks at round times back from now: now, round minutes between, the oldest a whole span
-    /// ago, each in minutes ("60 min"), with "now" at the other end, whatever second the clock-pinned columns start on.
+    /// ago, each in minutes ("60 min"), whatever second the clock-pinned columns start on.
     private var ticks: [Date] {
         guard let a = hour.columns.first?.from else { return [] }
         // Between them, round minutes: every 15 over an hour, every 5 over 25 minutes, about

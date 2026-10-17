@@ -263,8 +263,8 @@ public struct Job: Decodable, Sendable, Equatable {
     public var state = ""
     public var pool = ""
     public var label = ""
-        /// What the job is for (`--note`): shown beside the label, a band of its own in the charts.
-        public var note = ""
+    /// What the job is for (`--note`): shown beside the label, a band of its own in the charts.
+    public var note = ""
     /// The job's cpuq pid and the moment it queued, as "PID-TIME".
     public var id = ""
     public var cores: Int?
