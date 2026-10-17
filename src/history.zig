@@ -79,30 +79,71 @@ const rotate_bytes = 4 << 20;
 /// fails the job, so errors are dropped.
 pub fn append(io: Io, path: []const u8, ev: Event) void {
     var e = ev;
-    if (e.cmd.len > max_cmd) e.cmd = e.cmd[0..max_cmd];
+    e.cmd = cut(e.cmd, max_cmd);
     var buf: [4000]u8 = undefined;
-    var w: Io.Writer = .fixed(&buf);
-    std.json.Stringify.value(e, .{ .emit_null_optional_fields = false }, &w) catch return;
-    w.writeByte('\n') catch return;
+    // A command of quotes and backslashes escapes to several times its length: halve it, then
+    // the note, until the line fits.
+    const line = while (true) {
+        var w: Io.Writer = .fixed(&buf);
+        if (std.json.Stringify.value(e, .{ .emit_null_optional_fields = false }, &w)) |_| {
+            if (w.writeByte('\n')) |_| break w.buffered() else |_| {}
+        } else |_| {}
+        if (e.cmd.len != 0) {
+            e.cmd = cut(e.cmd, e.cmd.len / 2);
+        } else if (e.note.len != 0) {
+            e.note = cut(e.note, e.note.len / 2);
+        } else return;
+    };
+    if (std.fs.path.dirname(path)) |dir| Io.Dir.cwd().createDirPath(io, dir) catch {};
+    appendLine(io, path, line, rotate_bytes);
+}
 
-    const cwd = Io.Dir.cwd();
-    if (std.fs.path.dirname(path)) |dir| cwd.createDirPath(io, dir) catch {};
-    if (cwd.statFile(io, path, .{})) |st| {
-        if (st.size > rotate_bytes) {
-            var old_buf: [1024]u8 = undefined;
-            const old = std.mem.print(&old_buf, "{s}.1", .{path}) catch return;
-            cwd.rename(path, cwd, old, io) catch {};
-        }
-    } else |_| {}
+/// `s` cut to at most `n` bytes, never inside a UTF-8 sequence.
+fn cut(s: []const u8, n: usize) []const u8 {
+    if (s.len <= n) return s;
+    var i = n;
+    while (i > 0 and s[i] & 0xC0 == 0x80) i -= 1;
+    return s[0..i];
+}
 
+/// Appends `line` to `path` in one write, so it lands whole beside other writers', then rotates
+/// the file to `path.1` once it is past `rotate` bytes. Of the writers that find it past, only
+/// the one holding its flock while it is still `path` renames it: the rest find it renamed, so
+/// none moves a fresh file over the rotated one.
+pub fn appendLine(io: Io, path: []const u8, line: []const u8, rotate: u64) void {
     var path_buf: [1024]u8 = undefined;
-    if (path.len >= path_buf.len) return;
-    @memcpy(path_buf[0..path.len], path);
-    path_buf[path.len] = 0;
-    const fd = c.open(path_buf[0..path.len :0], .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c.mode_t, 0o644));
+    const p = std.mem.printSentinel(&path_buf, "{s}", .{path}, 0) catch return;
+    const fd = c.open(p, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c.mode_t, 0o644));
     if (fd < 0) return;
-    defer _ = c.close(fd);
-    _ = c.write(fd, w.buffered().ptr, w.buffered().len);
+    const f: Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    defer f.close(io);
+    _ = c.write(fd, line.ptr, line.len);
+    const st = f.stat(io) catch return;
+    if (st.size <= rotate) return;
+    if (!(f.tryLock(io, .exclusive) catch return)) return;
+    const now = Io.Dir.cwd().statFile(io, path, .{}) catch return;
+    if (now.inode != st.inode) return;
+    var old_buf: [1030]u8 = undefined;
+    const old = std.mem.print(&old_buf, "{s}.1", .{path}) catch return;
+    Io.Dir.cwd().rename(path, Io.Dir.cwd(), old, io) catch {};
+}
+
+test "a command that escapes past the line is cut to fit, at a character" {
+    try std.testing.expectEqualStrings("ab", cut("ab\xe2\x82\xac", 4));
+    try std.testing.expectEqualStrings("ab\xe2\x82\xac", cut("ab\xe2\x82\xac", 5));
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const n = try tmp.dir.realPathFile(io, ".", &dir_buf);
+    var path_buf: [300]u8 = undefined;
+    const path = try std.mem.print(&path_buf, "{s}/history.jsonl", .{dir_buf[0..n]});
+    // Control characters escape to six bytes each: 1024 of them would not fit in 4000.
+    const controls: [1024]u8 = @splat(1);
+    append(io, path, .{ .event = "queued", .id = "1-2", .label = "x:y", .cmd = &controls });
+    const text = try Io.Dir.cwd().readFileAlloc(io, path, std.testing.allocator, .limited(1 << 20));
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(text.len > 1000 and text.len < 4000 and text[text.len - 1] == '\n');
 }
 
 pub const State = enum { done, gave_up, lost, active };
