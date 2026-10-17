@@ -7,8 +7,8 @@ import UserNotifications
 
 /// Cpuq.app: a window with a page per machine, and a chip in the menu bar that stays calm while
 /// all is well. While the window is open it is an ordinary app (Dock icon, menu bar, ⌘Tab); closed,
-/// only the chip remains (Settings can keep the Dock icon, or drop the chip). It only reads
-/// `cpuq status --json`; cpuq itself needs no app.
+/// only the chip remains (Settings can keep the Dock icon, or drop the chip). It reads cpuq's
+/// status and runs its job actions; cpuq itself needs no app.
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
