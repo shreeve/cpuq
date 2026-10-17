@@ -158,7 +158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                     self.status = s
                     self.problem = nil
                     self.graphs.add(s)
-                    if !self.graphs.backfilled { self.backfill(self.graphs) }
+                    if s.recorder && !self.graphs.backfilled { self.backfill(self.graphs) }
                     Liveliness.shared.observe(load: s.load.first, cpus: Double(ProcessInfo.processInfo.activeProcessorCount))
                 case .failure(let e):
                     self.status = nil
@@ -208,7 +208,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 case .success(let data):
                     if let s = try? Status.decode(data) {
                         m.add(s)
-                        if !m.backfilled { self.backfill(m) }
+                        if s.recorder && !m.backfilled { self.backfill(m) }
                     } else { m.failed("its cpuq answered in a form this app cannot read") }
                 case .failure(let e): m.failed(e.message)
                 }
@@ -218,8 +218,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
     }
 
-    /// The last hour from the machine's recorder (`cpuq samples`), once: nothing when it records
-    /// nothing.
+    /// The last hour from the machine's recorder (`cpuq samples`), once, when one is running.
     private func backfill(_ m: GraphModel) {
         m.backfilled = true
         let host: String? = m.machine.isLocal ? nil : m.machine.id
@@ -992,10 +991,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 await MainActor.run { m.setHistory(jobs) }
             }
         }
-    }
-
-    private func name(_ label: String, _ command: String) -> String {
-        label.isEmpty ? String(command.split(separator: " ").first ?? "job") : label
     }
 
     func perform(_ action: String, pid: String, who: String, on machine: Machine = .local) {

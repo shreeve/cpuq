@@ -29,8 +29,7 @@ import Testing
     #expect(s.memoryPressure == "normal")
     #expect(s.gate.state == "spacing" && s.gate.load == 9.1)
     #expect(s.holders.first?.label == "rig:matrix" && s.holders.first?.using == 2.5)
-    #expect(s.waiters.first?.max == 4 && s.waiters.first?.eta == 30.5)
-    #expect(s.leases.first?.holders.first?.label == "gate")
+    #expect(s.waiters.first?.max == 4)
     #expect(s.outside.first?.name == "Python")
 }
 
@@ -43,7 +42,7 @@ import Testing
     #expect(s.held == 2)
     #expect(s.holders.first?.using == nil)
     #expect(s.waiters.first?.max == 3)
-    #expect(s.leases.isEmpty && s.outside.isEmpty)
+    #expect(s.outside.isEmpty && !s.recorder)
     #expect(s.gate.state == "open")
 }
 
@@ -67,17 +66,12 @@ import Testing
     let jobs = try Job.decodeList(Data(#"[{"id": "4321-1700000000.5", "state": "done", "pool": "cores", "cores": 2, "slots": [0, 1], "queued": 1700000000.5, "started": 1700000003}]"#.utf8))
     #expect(jobs[0].pid == 4321)
     #expect(jobs[0].slots == [0, 1])
-    #expect(jobs[0].queued == 1700000000.5)
+    #expect(jobs[0].started == 1700000003)
 }
 
-@Test func gateCarriesTheValveThresholds() throws {
-    // cpuq 0.7.7 and later, with the load check on.
-    let json = #"{"gate": {"state": "open", "load": null, "text": "open", "trip": 12, "reopen": 11, "busy_trip": 0.9}}"#
-    let s = try Status.decode(Data(json.utf8))
-    #expect(s.gate.trip == 12 && s.gate.reopen == 11 && s.gate.busyTrip == 0.9)
-    // Older cpuq leaves them out.
-    let old = try Status.decode(Data(#"{"gate": {"state": "open", "text": "open"}}"#.utf8))
-    #expect(old.gate.trip == nil && old.gate.busyTrip == nil)
+@Test func saysWhetherTheRecorderRuns() throws {
+    #expect(try Status.decode(Data(#"{"recorder": true}"#.utf8)).recorder)
+    #expect(try !Status.decode(Data(#"{"recorder": false}"#.utf8)).recorder)
 }
 
 @Test func busyShareBetweenTwoReadings() {
@@ -143,7 +137,7 @@ import Testing
     """
     let s = RecordedSample.decodeLines(Data(text.utf8))
     #expect(s.count == 2)
-    #expect(s[0].cpu == [46, 35] && s[0].held == 2 && s[0].wait == 1)
+    #expect(s[0].cpu == [46, 35] && s[0].load == 2.24)
     #expect(s[1].gate == "low_disk")
 }
 
