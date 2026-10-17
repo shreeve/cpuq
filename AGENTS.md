@@ -62,8 +62,13 @@ While this machine is full, the hook refuses a `cpuq run` that says neither. Wit
 `spill_default = on`, a run that says neither spills when cpuq sees nothing tying it here (a path
 outside the repo, a macOS tool, --opaque): say `--local` for this OS's own work.
 
-It runs here while there's room; when this machine is full it runs on a spill host with room,
-starting a stopped cloud machine if need be, with the repo copied there by rsync. Its output and
+`--local` only for that: not for speed or habit. A fixed `--cores 2` for a full suite starves it;
+give a range, or none. A full suite of a repo with `cpuq/*.json` goes through `cpuq submit`
+(below), and the hook refuses it as a `cpuq run` when it is long here and quicker there.
+
+It runs where it should finish first, by its own past runs: short or new work here while there's
+room; long work on a spill host when that is clearly sooner, starting a stopped cloud machine for
+work of ten minutes or more, with the repo copied there by rsync. Its output and
 exit status come back as usual. The command must stay inside the repo: absolute paths here (a
 scratchpad file) don't exist there. `--return zig-out` copies a build's output back. Gitignored
 inputs the job needs (a vendored tree, `.git` for `git ls-files`) go in the repo's `.cpuq-spill`,

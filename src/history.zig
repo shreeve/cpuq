@@ -21,10 +21,14 @@ pub const Event = struct {
     /// Unix time in seconds.
     t: f64 = 0,
     pid: i32 = 0,
-    /// "cores", or the lease's name for a named lease.
+    /// "cores"; the lease's name for a named lease; "spill" for a job this machine sent to
+    /// another (`host`), its run there timed from here, copy and queue included.
     pool: []const u8 = "cores",
-    /// The host a `--host` lease is held on.
+    /// The host a `--host` lease is held on; for pool "spill", the host the job was sent to.
     host: ?[]const u8 = null,
+    /// The repository it ran in, by name: the same for each of its worktrees and its copies on
+    /// other machines.
+    repo: ?[]const u8 = null,
     label: []const u8 = "",
     /// What the job was for (`--note`), shown, never matched or sized by.
     note: []const u8 = "",
@@ -109,6 +113,7 @@ pub const Job = struct {
     pid: i32,
     pool: []const u8,
     host: ?[]const u8,
+    repo: ?[]const u8 = null,
     label: []const u8,
     note: []const u8 = "",
     cmd: []const u8,
@@ -182,6 +187,7 @@ pub fn load(io: Io, a: std.mem.Allocator, path: []const u8, boot: f64, alive: *c
                     .pid = ev.pid,
                     .pool = ev.pool,
                     .host = ev.host,
+                    .repo = ev.repo,
                     .label = ev.label,
                     .note = ev.note,
                     .cmd = ev.cmd,

@@ -21,6 +21,8 @@ const policy = @import("policy.zig");
 const sys = @import("sys.zig");
 const gitship = @import("gitship.zig");
 const packs = @import("packs.zig");
+const place_mod = @import("place.zig");
+const history = @import("history.zig");
 
 pub const Cx = struct {
     io: Io,
@@ -751,6 +753,68 @@ fn listJobs(cx: Cx) []Known {
     return out.items;
 }
 
+/// A spec of a repo whose `run` a command runs (place.specMatch): what `cpuq run` and the hook
+/// point to, as `cpuq submit` brings the spec's packs, caches and setup, and a copy alone doesn't.
+pub const Found = struct {
+    /// From the repo's top: cpuq/suite.json.
+    path: []const u8,
+    label: []const u8,
+    /// The command's own words, for the spec's `"$@"`; "" when none.
+    rest: []const u8,
+    /// It needs more than a copy of the repo: packs, caches, deps, a setup or git.
+    needs: bool,
+};
+
+/// The spec in `root`/cpuq/*.json that `cmd` runs, the closest match first; null when none does.
+pub fn specFor(a: std.mem.Allocator, io: Io, root: []const u8, cmd: []const u8) ?Found {
+    const dir_path = a.print("{s}/cpuq", .{root}) catch return null;
+    var d = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return null;
+    defer d.close(io);
+    var best: ?Found = null;
+    var best_words: usize = 0;
+    var it = d.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".json")) continue;
+        const text = d.readFileAlloc(io, e.name, a, .limited(1 << 20)) catch continue;
+        const spec = std.json.parseFromSliceLeaky(Spec, a, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch continue;
+        const m = place_mod.specMatch(a, cmd, spec.run) orelse continue;
+        if (best != null and m.words <= best_words) continue;
+        best_words = m.words;
+        best = .{
+            .path = a.print("cpuq/{s}", .{e.name}) catch continue,
+            .label = spec.label,
+            .rest = m.rest,
+            .needs = spec.packs != null or spec.caches != null or spec.deps != null or spec.setup != null or spec.git,
+        };
+    }
+    return best;
+}
+
+/// How long a spec's jobs took on one host: the middle of its finished runs (passed or failed).
+pub const HostTime = struct { host: []const u8, seconds: f64, runs: u32 };
+
+/// Each host's time for jobs labelled `label`, by their results here.
+pub fn specTimes(cx: Cx, label: []const u8) []HostTime {
+    var by_host: std.StringArrayHashMapUnmanaged(std.ArrayList(f64)) = .empty;
+    const jd = cx.a.print("{s}/jobs", .{stateRoot(cx)}) catch return &.{};
+    var d = Io.Dir.cwd().openDir(cx.io, jd, .{ .iterate = true }) catch return &.{};
+    defer d.close(cx.io);
+    var it = d.iterate();
+    while (it.next(cx.io) catch null) |e| {
+        if (e.kind != .directory or !validId(e.name)) continue;
+        const r = loadResult(cx, e.name) orelse continue;
+        if (!std.mem.eql(u8, r.label, label) or r.host.len == 0 or r.seconds <= 0) continue;
+        if (!std.mem.eql(u8, r.verdict, "pass") and !std.mem.eql(u8, r.verdict, "fail")) continue;
+        const gop = by_host.getOrPut(cx.a, cx.a.dupe(u8, r.host) catch continue) catch continue;
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        gop.value_ptr.append(cx.a, r.seconds) catch {};
+    }
+    var out: std.ArrayList(HostTime) = .empty;
+    var hi = by_host.iterator();
+    while (hi.next()) |kv| out.append(cx.a, .{ .host = kv.key_ptr.*, .seconds = history.median(kv.value_ptr.items), .runs = @intCast(kv.value_ptr.items.len) }) catch {};
+    return out.items;
+}
+
 fn loadResult(cx: Cx, id: []const u8) ?Result {
     const text = readFile(cx, jobFile(cx, id, "result.json")) orelse return null;
     return std.json.parseFromSliceLeaky(Result, cx.a, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch null;
@@ -1322,6 +1386,8 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
 
     // The environment: the job's own variables, its caches, a TMPDIR of its own.
     var env = cx.env.clone(cx.a) catch return 125;
+    // Its history's repo: the copy's folder is named by the job, not the repo.
+    env.put("CPUQ_REPO", p.project) catch {};
     if (p.env) |e| {
         var it = e.map.iterator();
         while (it.next()) |kv| env.put(kv.key_ptr.*, kv.value_ptr.*) catch {};

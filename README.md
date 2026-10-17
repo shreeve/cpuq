@@ -425,12 +425,28 @@ window's work. It needs measured admission.
     cpuq run --spill-to HOST [run options] [--return PATH]... -- CMD ARGS...
     (either with --ship PATH... to copy gitignored paths, or .git, too)
 
-`--spill` runs the job here while this machine has room. When it is full (anyone waiting, the
-1-minute load above its CPUs, or a gate shut), it tries the machines named by `spill` in the
-config, in order, and runs the job on the first one with room by the same test, through that
-machine's own cpuq. If none has room but one is stopped and has a `spill_start` command (a cloud
-machine that bills only while it runs), it starts that one and runs there. Failing all that, the
-job waits its turn here. It says on stderr which it chose and why.
+`--spill` runs the job where it should finish first. Work that is short here (under two minutes
+by its past runs) or never seen stays here while this machine has room, so nothing is asked of
+other machines for it. Longer work is placed by each place's expected finish: its wait (none with
+room, a couple of minutes on a full machine, two to start a stopped one), the copy of the repo
+(half a minute the first time, seconds after), and its run time there. Run times come from the
+work's own history, kept by repo and command (counts and `$CPUQ_CORES` aside), not by label: its
+runs here, and its trips to each spill host, timed here from before the copy to the end. A host
+it has never run on is judged by its time here, shortened by the host's extra cores when the
+command takes its width from cpuq and kept every core it had busy. It leaves here only when
+another place is sooner by a minute and by 30%; a stopped host is started only for work of ten
+minutes or more. Work never seen goes as before: here while there is room, else the first spill
+host with room, else a stopped one started, else it waits here. It says on stderr which it chose
+and why (`~41 min here, ~6 min on burst`).
+
+A command that is a spec's work (it matches the `run` of a `cpuq/*.json` that needs packs, caches,
+deps, a setup or git) is never spilled bare, as the copy would lack them: it runs here, and
+stderr gives the `cpuq submit` line that runs it with them.
+
+A small fixed `--cores N` (2 or more) for a command that takes its width from cpuq (`"$CPUQ_CORES"` inside
+it) is widened once its runs show it used what it had: to twice N when it kept all N busy, else
+to what it used, never past half the CPUs. stderr says so. Jobs are sized by their work's own
+measured use when it has three runs or more, else by their label's.
 
     spill = pup, burst
     spill_start.burst = ~/Data/Code/runbooks/host-gcp-burst/start
@@ -444,6 +460,12 @@ uses no macOS-only tool (`xcodebuild`, `xcrun`, `swift`, `codesign`, ...); and i
 travel, so a job that needs one sets it inside its command. And while this machine is full, `cpuq
 hook` refuses a `cpuq run` that says neither, so an agent chooses: `--spill`, or `--local` for
 work that needs this OS.
+
+The hook also refuses long work (ten minutes or more here) that would finish in half the time
+elsewhere: a spec's work, with each host's time by the spec's results and the `cpuq submit` line;
+and `--local` work whose own trips to a spill host took half its time here (it ran there, so it
+needs nothing of this machine), with "drop --local". Heavy work typed over `ssh HOST` is pointed to
+`cpuq run --spill-to HOST`.
 
 Before the job runs there, the repo (git's top level, else the working directory) is copied to
 `HOST:cpuq-spill/s/NAME-HASH` (NAME the repo's directory, one copy per repo or worktree here)

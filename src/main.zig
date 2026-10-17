@@ -15,6 +15,7 @@ const hook = @import("hook.zig");
 const table = @import("table.zig");
 const cap = @import("cap.zig");
 const submit = @import("submit.zig");
+const place = @import("place.zig");
 
 test {
     _ = cap;
@@ -27,6 +28,7 @@ test {
     _ = gitship;
     _ = packs_mod;
     _ = clean;
+    _ = place;
 }
 
 const version = @import("build_options").version;
@@ -385,6 +387,9 @@ const RunOptions = struct {
     /// `--tethered` (internal, what --spill runs on the spill host): stdin
     /// carries the caller's heartbeats; when they stop, the job stops.
     tethered: bool = false,
+    /// `--repo NAME` (internal, what --spill passes on): the repository the job's copy came
+    /// from, for its history.
+    repo: ?[]const u8 = null,
 };
 
 const max_returns = 8;
@@ -408,7 +413,7 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             name = kv[0];
             inline_value = kv[1];
         }
-        const takes_value = for ([_][]const u8{ "--cores", "--priority", "--label", "--note", "--max-wait", "--qos", "--host", "--slots", "--return", "--spill-to", "--ship" }) |v| {
+        const takes_value = for ([_][]const u8{ "--cores", "--priority", "--label", "--note", "--max-wait", "--qos", "--host", "--slots", "--return", "--spill-to", "--ship", "--repo" }) |v| {
             if (std.mem.eql(u8, name, v)) break true;
         } else false;
         var value: []const u8 = "";
@@ -425,7 +430,7 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             _ = usageError("{s} takes no value", .{name});
             return null;
         }
-        for ([_][]const u8{ "--cores", "--no-load-check", "--qos", "--opaque", "--spill", "--local", "--return", "--tethered", "--spill-to", "--ship" }) |r| {
+        for ([_][]const u8{ "--cores", "--no-load-check", "--qos", "--opaque", "--spill", "--local", "--return", "--tethered", "--spill-to", "--ship", "--repo" }) |r| {
             if (std.mem.eql(u8, name, r)) o.run_only = r;
         }
         if (std.mem.eql(u8, name, "--cores")) {
@@ -480,6 +485,8 @@ fn parseRun(args: []const [:0]const u8) ?RunOptions {
             o.spill_to = value;
         } else if (std.mem.eql(u8, name, "--tethered")) {
             o.tethered = true;
+        } else if (std.mem.eql(u8, name, "--repo")) {
+            o.repo = value;
         } else if (std.mem.eql(u8, name, "--ship")) {
             if (!repoPath(value)) {
                 _ = usageError("--ship needs a path inside the repo, not '{s}'", .{value});
@@ -646,30 +653,113 @@ fn tether() void {
     sys.StdinWatch.startAside();
 }
 
-/// `cpuq run --spill`: runs here unless this machine is full; else on the
-/// first spill host (config `spill`) with room; failing that, it starts the
-/// first stopped one that has a `spill_start` command and runs there;
-/// failing that, it queues here. Full means anyone waiting, the 1-minute
-/// load above the CPUs, or a gate shut, here and on each host alike. The
-/// repo (git's top level, else the working directory) is copied to
-/// HOST:cpuq-spill/s/NAME-HASH with rsync, honoring .gitignore and
-/// leaving .git behind, and the job runs there through HOST's cpuq,
-/// tethered to this one, which streams its output and returns its status.
+/// `cpuq run --spill`: runs where it should finish first. Work this machine's history knows
+/// (place.zig: its repo and command, whatever its label) goes by each place's expected finish:
+/// the queue, starting a stopped host, the copy, and its run time there (by its runs there, else
+/// by its runs here, faster where it has more cores if it takes its width from cpuq). It leaves
+/// only for a clear win (a minute and 30% sooner), starts a stopped host only for work over ten
+/// minutes here, and asks no host about work that takes under two. Work not seen before runs
+/// here while there's room, else on the first spill host with room, else on the first stopped
+/// one with a `spill_start` command, else in the queue here. Full means anyone waiting, the
+/// 1-minute load above the CPUs, or a gate shut, here and on each host alike. Work a spec of the
+/// repo runs, needing its packs or caches, stays here and names the `cpuq submit` that sends it.
+/// The repo (git's top level, else the working directory) is copied to HOST:cpuq-spill/s/NAME-HASH
+/// with rsync, honoring .gitignore and leaving .git behind, and the job runs there through HOST's
+/// cpuq, tethered to this one, which streams its output and returns its status.
 fn runSpill(ctx: *Ctx, o: RunOptions) u8 {
+    const a = ctx.arena;
     var hosts = ctx.cfg.spillHosts();
     if (hosts.peek() == null) {
         std.debug.print("cpuq: --spill: no spill hosts configured (`spill = HOST, ...` in {s}); running here\n", .{ctx.cfg_path});
         return runHere(ctx, o);
     }
     var why_buf: [96]u8 = undefined;
-    const why = localFull(ctx, &why_buf) orelse return runHere(ctx, o);
+    const full = localFull(ctx, &why_buf);
+    var rt = RunTimes.load(ctx, a);
+    const key = jobWorkKey(ctx, o);
+    const here = rt.workStats(a, null, key);
+    if (full == null and (here.runs == 0 or here.ran < place.short_s)) return runHere(ctx, o);
+    if (gitTop(ctx)) |root| if (submit.specFor(a, ctx.io, root, joinCommand(ctx, o.cmd))) |spec| if (spec.needs) {
+        var b: [32]u8 = undefined;
+        std.debug.print("cpuq: this is {s}'s work{s}{s}{s}, which needs the spec's packs or caches: `cpuq submit {s}{s}{s}` runs it on a spill host with them; running here\n", .{
+            spec.path, if (here.runs != 0) " (" else "",       if (here.runs != 0) place.approx(&b, here.ran) else "", if (here.runs != 0) " here)" else "",
+            spec.path, if (spec.rest.len != 0) " -- " else "", spec.rest,
+        });
+        return runHere(ctx, o);
+    };
+    if (here.runs == 0) return spillFirstFree(ctx, o, full.?);
+
+    // Known work: each place's expected finish.
+    const scaling = place.scales(joinCommand(ctx, o.cmd));
+    const here_place: place.Place = .{ .name = "here", .wait = if (full != null) busy_wait_s else 0, .run = here.ran };
+    const here_s = here_place.finish().?;
+    var best: ?place.Place = null;
+    var best_stopped = false;
+    var seen: std.ArrayList(u8) = .empty;
+    while (hosts.next()) |h| {
+        const there = rt.workStats(a, h, key);
+        var p: place.Place = .{ .name = h, .copy = if (there.runs != 0) 0 else place.copy_first_s };
+        var stopped = false;
+        switch (probeHost(ctx, h)) {
+            .room => |cpus| p.run = place.runTime(there, here, coresThere(o, cpus, scaling), scaling),
+            .full => |f| {
+                p.run = place.runTime(there, here, coresThere(o, f.cpus, scaling), scaling);
+                p.wait = busy_wait_s;
+                seen.print(a, "{s}{s} {s}", .{ if (seen.items.len == 0) "" else ", ", h, f.why }) catch {};
+            },
+            .gone => {
+                if (ctx.cfg.spillStart(h) == null or here_s < place.start_worth_s) continue;
+                stopped = true;
+                p.wait = place.start_s;
+                p.run = place.runTime(there, here, coresThere(o, 96, scaling), scaling);
+            },
+        }
+        const f = p.finish() orelse continue;
+        if (best == null or f < best.?.finish().?) {
+            best = p;
+            best_stopped = stopped;
+        }
+    }
+    var b1: [32]u8 = undefined;
+    var b2: [32]u8 = undefined;
+    if (best) |p| if (place.better(here_s, p.finish().?)) {
+        const why = a.print("{s}{s}{s} here, {s} on {s}", .{ if (full) |w| w else "", if (full != null) ", " else "", place.approx(&b1, here_s), place.approx(&b2, p.finish().?), p.name }) catch "faster there";
+        if (best_stopped) {
+            std.debug.print("cpuq: {s}; starting {s}\n", .{ why, p.name });
+            if (!startHost(ctx, p.name)) {
+                std.debug.print("cpuq: could not start {s}; running here\n", .{p.name});
+                return runHere(ctx, o);
+            }
+        }
+        return spillTo(ctx, o, p.name, why);
+    };
+    if (full) |w| std.debug.print("cpuq: here {s}, but no spill host would finish it sooner ({s} here{s}{s}); queueing here\n", .{ w, place.approx(&b1, here_s), if (seen.items.len == 0) "" else "; ", seen.items });
+    return runHere(ctx, o);
+}
+
+/// The most cores a job would get on a host with `cpus`: what it asked for (a small fixed count
+/// that takes its width from cpuq widened to twice itself, as `place.widen` may), at most half the
+/// host's CPUs.
+fn coresThere(o: RunOptions, cpus: u32, scaling: bool) u32 {
+    const half = @max(cpus / 2, 1);
+    if (!o.cores_given) return half;
+    const asked = if (o.request.fixed() and scaling) 2 * o.request.max else o.request.max;
+    return @min(asked, half);
+}
+
+/// Seconds a job is taken to wait in a queue that has others waiting, for placement.
+const busy_wait_s: f64 = 120;
+
+/// Work no machine's history knows, with this machine full (`why`): the first spill host with
+/// room, else the first stopped one with a `spill_start` command, else the queue here.
+fn spillFirstFree(ctx: *Ctx, o: RunOptions, why: []const u8) u8 {
+    var hosts = ctx.cfg.spillHosts();
     var stopped: ?[]const u8 = null;
     var seen: std.ArrayList(u8) = .empty;
     while (hosts.next()) |h| {
-        const p = probeHost(ctx, h);
-        switch (p) {
+        switch (probeHost(ctx, h)) {
             .room => return spillTo(ctx, o, h, a2(ctx, "here {s}", why)),
-            .full => |text| seen.print(ctx.arena, "{s}{s} {s}", .{ if (seen.items.len == 0) "" else ", ", h, text }) catch {},
+            .full => |f| seen.print(ctx.arena, "{s}{s} {s}", .{ if (seen.items.len == 0) "" else ", ", h, f.why }) catch {},
             .gone => if (stopped == null and ctx.cfg.spillStart(h) != null) {
                 stopped = h;
             } else {
@@ -687,6 +777,12 @@ fn runSpill(ctx: *Ctx, o: RunOptions) u8 {
     return runHere(ctx, o);
 }
 
+/// This job's work, for history (place.workKey): its repo, else its label's project, and its
+/// command.
+fn jobWorkKey(ctx: *Ctx, o: RunOptions) []const u8 {
+    return place.workKey(ctx.arena, repoOf(ctx, o) orelse std.mem.sliceTo(o.label, ':'), joinCommand(ctx, o.cmd));
+}
+
 /// `cpuq run --spill-to HOST`: runs on HOST whatever this machine's state: there at once
 /// when it has room, else in its queue; started first if it is stopped and has a `spill_start`
 /// command. A host that cannot be reached or started is an error (exit 125), not a quiet run
@@ -694,7 +790,7 @@ fn runSpill(ctx: *Ctx, o: RunOptions) u8 {
 fn runSpillTo(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
     switch (probeHost(ctx, host)) {
         .room => return spillTo(ctx, o, host, a2(ctx, "--spill-to {s}", host)),
-        .full => |why| return spillTo(ctx, o, host, a2(ctx, "--spill-to: it {s}, so the job queues there", why)),
+        .full => |f| return spillTo(ctx, o, host, a2(ctx, "--spill-to: it {s}, so the job queues there", f.why)),
         .gone => {
             if (ctx.cfg.spillStart(host) == null) {
                 std.debug.print("cpuq: --spill-to {s}: it does not answer, and the config has no spill_start.{s} to start it\n", .{ host, host });
@@ -736,9 +832,10 @@ fn localFull(ctx: *Ctx, buf: []u8) ?[]const u8 {
 
 /// A spill host as `cpuq status` there describes it.
 const Probe = union(enum) {
-    room,
-    /// Why not: someone waiting, its load, its gate.
-    full: []const u8,
+    /// Its CPUs.
+    room: u32,
+    /// Why not (someone waiting, its load, its gate), and its CPUs.
+    full: struct { why: []const u8, cpus: u32 },
     /// No answer: down, stopped, or an older cpuq.
     gone,
 };
@@ -749,10 +846,11 @@ fn probeHost(ctx: *Ctx, host: []const u8) Probe {
     const result = std.process.run(a, ctx.io, .{ .argv = &argv }) catch return .gone;
     if (!result.term.success()) return .gone;
     const st = std.json.parseFromSliceLeaky(JsonStatus, a, result.stdout, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return .gone;
-    if (st.waiters.len != 0) return .{ .full = a.print("has {d} waiting", .{st.waiters.len}) catch "is full" };
-    if (st.load_check and st.load[0] > @as(f64, @floatFromInt(st.active_cores))) return .{ .full = a.print("is at load {d:.1} on {d} CPUs", .{ st.load[0], st.active_cores }) catch "is full" };
-    if (!std.mem.eql(u8, st.gate.state, "open")) return .{ .full = "has its gate shut" };
-    return .room;
+    const cpus = st.active_cores;
+    if (st.waiters.len != 0) return .{ .full = .{ .why = a.print("has {d} waiting", .{st.waiters.len}) catch "is full", .cpus = cpus } };
+    if (st.load_check and st.load[0] > @as(f64, @floatFromInt(st.active_cores))) return .{ .full = .{ .why = a.print("is at load {d:.1} on {d} CPUs", .{ st.load[0], st.active_cores }) catch "is full", .cpus = cpus } };
+    if (!std.mem.eql(u8, st.gate.state, "open")) return .{ .full = .{ .why = "has its gate shut", .cpus = cpus } };
+    return .{ .room = cpus };
 }
 
 /// Runs `host`'s `spill_start` command, one start at a time: a second
@@ -779,6 +877,7 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     const cwd = std.process.currentPathAlloc(io, a) catch fail("current directory: cannot read it", .{});
     const root = gitTop(ctx) orelse cwd;
     const rel = if (std.mem.startsWith(u8, cwd, root)) cwd[root.len..] else "";
+    const trip_t = nowFloat(io);
     // The copy's place on the host: one per repo (and worktree) here, named by it, so each keeps
     // its own build caches between runs, and `cpuq clean` finds them all in one directory.
     const dir = a.print("cpuq-spill/s/{s}-{x:0>8}", .{ std.fs.path.basename(root), @as(u32, @truncate(std.hash.Wyhash.hash(0, a.print("{s}\x00{s}", .{ shortHost(a), root }) catch root))) }) catch fail("out of memory", .{});
@@ -838,6 +937,9 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     // `spill_env.HOST`: the user's own shell assignments, expanded there (an ssh command's
     // shell reads no login profile, so ~/.local tools are off its PATH).
     if (ctx.cfg.spillEnv(host)) |env| remote.print(a, "export {s} && ", .{env}) catch {};
+    // The repo's name for its history there (the copy's folder is named by the worktree).
+    const repo = repoOf(ctx, o);
+    if (repo) |r| remote.print(a, "export CPUQ_REPO={s} && ", .{shellQuote(a, r)}) catch {};
     remote.print(a, "exec cpuq run --tethered --priority {t}", .{o.priority}) catch fail("out of memory", .{});
     if (o.label.len != 0) remote.print(a, " --label {s}", .{shellQuote(a, o.label)}) catch {};
     // Without --note, the worktree it came from: every job on another machine says what it's for.
@@ -850,6 +952,14 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     if (o.hidden) remote.appendSlice(a, " --opaque") catch {};
     remote.appendSlice(a, " --") catch {};
     for (o.cmd) |arg| remote.print(a, " {s}", .{shellQuote(a, arg)}) catch {};
+    // Kept here too, as pool "spill": how long the trip took (copy, queue and run), which
+    // placement goes by next time.
+    var job = newJobLog(ctx, o);
+    job.base.pool = "spill";
+    job.base.host = host;
+    job.base.repo = repo;
+    logSpill(ctx, job, "queued", trip_t, null);
+    logSpill(ctx, job, "started", trip_t, null);
     const argv = [_][]const u8{ "ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4", host, remote.items };
     var child = std.process.spawn(io, .{ .argv = &argv, .stdin = .pipe, .stdout = .inherit, .stderr = .inherit }) catch |err|
         fail("ssh {s}: {t}", .{ host, err });
@@ -863,6 +973,8 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
         .exited => |c| c,
         else => exit_failure,
     };
+    // Its own status is the command's; 75, 125 and 255 are cpuq's or ssh's, not a run.
+    logSpill(ctx, job, if (code == exit_timeout or code == exit_failure or code == 255) "gave_up" else "ended", nowFloat(io), code);
     // 255 is ssh's own failure; a death by signal can be the host shutting
     // down under the job (a Spot reclaim powers the VM off gracefully, and
     // the shutdown kills the job before the connection drops). Either way,
@@ -891,6 +1003,18 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
         if (r == null or !gitship.copied(r.?.term)) std.debug.print("cpuq: could not copy {s} back from {s}\n", .{ path, host });
     }
     return code;
+}
+
+/// One event of a spilled job's record here, at `t`.
+fn logSpill(ctx: *Ctx, job: JobLog, event: []const u8, t: f64, code: ?u8) void {
+    const path = historyPath(ctx);
+    if (path.len == 0) return;
+    var ev = job.base;
+    ev.event = event;
+    ev.id = job.id;
+    ev.t = t;
+    if (std.mem.eql(u8, event, "ended")) ev.exit = code;
+    history.append(ctx.io, path, ev);
 }
 
 /// Whether `host` stopped answering after a job there ended badly: looked
@@ -982,8 +1106,40 @@ fn gitIgnored(ctx: *Ctx, root: []const u8) ?[]const u8 {
     return file;
 }
 
+/// The repository a job runs in, by name (its history's `repo`): `--repo`, else CPUQ_REPO, else
+/// the folder holding the main `.git` above the working directory, so each worktree of a repo
+/// has the repo's name. Null outside a repo. No git is run: a job's start stays quick.
+fn repoOf(ctx: *Ctx, o: RunOptions) ?[]const u8 {
+    if (o.repo) |r| return r;
+    if (ctx.env.get("CPUQ_REPO")) |r| if (r.len != 0) return r;
+    return repoAt(ctx, std.process.currentPathAlloc(ctx.io, ctx.arena) catch return null);
+}
+
+/// The name of the repo `start` is in (a worktree's, its main repo's), by the `.git` above it.
+fn repoAt(ctx: *Ctx, start: []const u8) ?[]const u8 {
+    const a = ctx.arena;
+    var dir = start;
+    while (true) {
+        const git = a.print("{s}/.git", .{dir}) catch return null;
+        if (Io.Dir.cwd().statFile(ctx.io, git, .{})) |st| {
+            if (st.kind == .directory) return std.fs.path.basename(dir);
+            // A worktree's `.git` file: `gitdir: /path/repo/.git/worktrees/NAME`.
+            const text = Io.Dir.cwd().readFileAlloc(ctx.io, git, a, .limited(4096)) catch return std.fs.path.basename(dir);
+            const at = std.mem.find(u8, text, "/.git/") orelse return std.fs.path.basename(dir);
+            const top = std.mem.trim(u8, text[0..at], " \t\n");
+            const name = std.fs.path.basename(if (std.mem.startsWith(u8, top, "gitdir:")) std.mem.trim(u8, top["gitdir:".len..], " ") else top);
+            return if (name.len != 0 and !std.mem.eql(u8, name, "..") and !std.mem.eql(u8, name, ".")) name else std.fs.path.basename(dir);
+        } else |_| {}
+        dir = std.fs.path.dirname(dir) orelse return null;
+    }
+}
+
 fn gitTop(ctx: *Ctx) ?[]const u8 {
-    const r = std.process.run(ctx.arena, ctx.io, .{ .argv = &.{ "git", "rev-parse", "--show-toplevel" } }) catch return null;
+    return gitTopAt(ctx, ".");
+}
+
+fn gitTopAt(ctx: *Ctx, dir: []const u8) ?[]const u8 {
+    const r = std.process.run(ctx.arena, ctx.io, .{ .argv = &.{ "git", "-C", dir, "rev-parse", "--show-toplevel" } }) catch return null;
     if (!r.term.success()) return null;
     const top = std.mem.trim(u8, r.stdout, " \n");
     return if (top.len == 0) null else top;
@@ -1044,6 +1200,7 @@ fn newJobLog(ctx: *Ctx, o: RunOptions) JobLog {
             .pid = pid,
             .pool = o.lease orelse "cores",
             .host = o.host,
+            .repo = repoOf(ctx, o),
             .label = o.label,
             .note = o.note,
             .cmd = joinCommand(ctx, o.cmd),
@@ -1186,6 +1343,19 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             }
         }
     }
+    // A small fixed count for work that takes its width from cpuq and used all it had: widened
+    // (place.widen), as a count written in for a small machine starves it on any other.
+    // The job's work, as history keys it: found once, not on every poll.
+    const work_key = jobWorkKey(ctx, o);
+    if (!named and !o.exclusive and !o.hidden and o.cores_given and o.request.fixed() and place.scales(joinCommand(ctx, o.cmd))) {
+        if (run_times == null) run_times = RunTimes.load(ctx, ctx.arena);
+        const work = run_times.?.workStats(ctx.arena, null, work_key);
+        const w = place.widen(o.request.max, true, work, sys.totalCpus(io));
+        if (w.max > o.request.max) {
+            std.debug.print("cpuq: asked for {d} cores; this work has kept {d:.1} busy, so {d}-{d}\n", .{ o.request.max, work.used, w.min, w.max });
+            o.request = .{ .min = w.min, .max = w.max };
+        }
+    }
     // The CPUs' busy share is measured between polls.
     var ticks = sys.cpuTicks(io);
     const cores: u32 = if (named) o.slots else sys.totalCpus(io);
@@ -1326,7 +1496,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
                 // Work cpuq cannot freeze never starts in a lending window.
                 if (!m.exclusive and !(o.hidden and m.lent)) {
                     const room = targetCpus(ctx) - m.charged;
-                    const req = policy.measuredGrant(o.request, o.cores_given, if (o.hidden) &.{} else labelUses(run_times.?, o.label), room, cores);
+                    const req = policy.measuredGrant(o.request, o.cores_given, if (o.hidden) &.{} else jobUses(ctx, run_times.?, work_key, o), room, cores);
                     const mine = policy.charge(useOf(run_times.?, o.label), null, 0, 1, req.max);
                     const head = queue[0].record;
                     const head_need = policy.charge(useOf(run_times.?, head.label), null, 0, 1, @max(head.cores, 1));
@@ -1379,7 +1549,7 @@ fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             const m = measuredLoad(ctx, st, a, &run_times.?, mach.busy, mach.active);
             const target = targetCpus(ctx);
             const room = target - m.charged;
-            const req = policy.measuredGrant(o.request, o.cores_given, if (o.hidden) &.{} else labelUses(run_times.?, o.label), room, cores);
+            const req = policy.measuredGrant(o.request, o.cores_given, if (o.hidden) &.{} else jobUses(ctx, run_times.?, work_key, o), room, cores);
             const mine = policy.charge(useOf(run_times.?, o.label), null, 0, 1, req.max);
             // `load_check = off` (or --no-load-check) ignores the machine's load here too.
             const saturated = ctx.cfg.load_check and o.load_check and if (mach.busy) |b| b >= 0.97 else false;
@@ -1458,6 +1628,13 @@ fn poolCap(ctx: *Ctx) u32 {
 }
 
 /// A label's last runs' average active cores (`history.used`).
+/// What sizes a job: its own work's runs here (place.workKey), when three or more, else its
+/// label's.
+fn jobUses(ctx: *Ctx, rt: RunTimes, key: []const u8, o: RunOptions) []const f64 {
+    const uses = rt.workUses(ctx.arena, key);
+    return if (uses.len >= 3) uses else labelUses(rt, o.label);
+}
+
 fn labelUses(rt: RunTimes, label: []const u8) []const f64 {
     if (label.len == 0) return &.{};
     return if (rt.uses.get(label)) |u| u.items else &.{};
@@ -3222,10 +3399,73 @@ fn cmdHook(ctx: *Ctx) u8 {
             if (localFull(ctx, &why_buf)) |why| full = a.dupe(u8, why) catch null;
         }
     }
-    const r = hook.check(a, call.tool_input.command, sys.totalCpus(ctx.io), project, full) orelse return 0;
+    var advisor: HookAdvisor = .{ .ctx = ctx, .cwd = call.cwd };
+    const r = hook.check(a, call.tool_input.command, sys.totalCpus(ctx.io), project, full, advisor.it()) orelse return 0;
     std.debug.print("cpuq: {s}.\nRun instead: {s}\n(See AGENTS.md in the cpuq repo. A command that must run as it is can end with `# cpuq: skip`.)\n", .{ r.reason, r.instead });
     return 2;
 }
+
+/// What the hook knows of a `cpuq run`'s work: its runs here and elsewhere, and the repo's specs.
+/// Long work (over place.long_s here) is refused when another place runs it in half the time:
+/// a spec's work (one needing its packs or caches) through `cpuq submit`, other work said to stay
+/// here (--local) by dropping --local, its runs on a spill host proving it needs nothing of here.
+const HookAdvisor = struct {
+    ctx: *Ctx,
+    cwd: []const u8,
+
+    fn it(h: *HookAdvisor) hook.Advisor {
+        return .{ .ctx = h, .advise = advise };
+    }
+
+    fn advise(p: *anyopaque, cmd: []const u8, local: bool) ?hook.Refusal {
+        const h: *HookAdvisor = @ptrCast(@alignCast(p));
+        const ctx = h.ctx;
+        const a = ctx.arena;
+        if (h.cwd.len == 0) return null;
+        const repo = repoAt(ctx, h.cwd) orelse return null;
+        const top = gitTopAt(ctx, h.cwd);
+        const found = if (top) |root| submit.specFor(a, ctx.io, root, cmd) else null;
+        const needs = if (found) |f| f.needs else false;
+        // Neither a spec's work nor said to stay here: placement sends it where it finishes first.
+        if (!needs and !local) return null;
+        const rt = RunTimes.load(ctx, a);
+        const key = place.workKey(a, repo, cmd);
+        const here = rt.workStats(a, null, key);
+        if (here.runs == 0 or here.ran < place.long_s) return null;
+        var hb: [32]u8 = undefined;
+        const here_txt = place.approx(&hb, here.ran);
+        if (found) |spec| if (spec.needs) {
+            const self = std.process.executablePathAlloc(ctx.io, a) catch "cpuq";
+            const cx: submit.Cx = .{ .io = ctx.io, .a = a, .env = ctx.env, .out = ctx.out, .version = version, .cfg = &ctx.cfg, .self = self };
+            var times: std.ArrayList(u8) = .empty;
+            var fastest: ?f64 = null;
+            for (submit.specTimes(cx, spec.label)) |t| {
+                var b: [32]u8 = undefined;
+                times.print(a, ", {s} on {s}", .{ place.approx(&b, t.seconds), t.host }) catch {};
+                fastest = @min(fastest orelse t.seconds, t.seconds);
+            }
+            const f = fastest orelse return null;
+            if (f * 2 > here.ran) return null;
+            return .{
+                .reason = a.print("this is {s}'s work: {s} here{s}", .{ spec.path, here_txt, times.items }) catch "this is a spec's work",
+                .instead = a.print("cpuq submit {s}{s}{s} (in the background: it ends with a verdict line){s}", .{ spec.path, if (spec.rest.len != 0) " -- " else "", spec.rest, if (local) "; if it must run on this OS, end the command with `# cpuq: skip`" else "" }) catch "cpuq submit",
+            };
+        };
+        if (!local) return null;
+        loadConfig(ctx);
+        var hosts = ctx.cfg.spillHosts();
+        while (hosts.next()) |host| {
+            const there = rt.workStats(a, host, key);
+            if (there.runs == 0 or there.ran * 2 > here.ran) continue;
+            var b: [32]u8 = undefined;
+            return .{
+                .reason = a.print("--local keeps this here, {s}; its runs on {s} took {s}, copy and queue included", .{ here_txt, host, place.approx(&b, there.ran) }) catch "it runs faster elsewhere",
+                .instead = "drop --local (or say --spill): cpuq sends it where it finishes first",
+            };
+        }
+        return null;
+    }
+};
 
 /// `cpuq doctor [--host HOST]`: what goes wrong that cpuq can see but not
 /// stop. Heavy work outside cpuq, jobs using far more CPU than they were
@@ -3920,6 +4160,9 @@ const RunTimes = struct {
     uses: std.StringHashMapUnmanaged(std.ArrayList(f64)) = .empty,
     /// Each command's median run time, by label and the command's shape (`shape`).
     by_command: std.StringHashMapUnmanaged(f64) = .empty,
+    /// Each kind of work's runs (place.workKey: repo and command, whatever its label), here and
+    /// on each host it was sent to, by `workAt`'s key.
+    work: std.StringHashMapUnmanaged(place.Runs) = .empty,
 
     fn load(ctx: *Ctx, a: std.mem.Allocator) RunTimes {
         var rt: RunTimes = .{};
@@ -3929,6 +4172,16 @@ const RunTimes = struct {
         var command_runs: std.StringHashMapUnmanaged(std.ArrayList(f64)) = .empty;
         for (jobs) |j| {
             const r = j.ran() orelse continue;
+            const spilled = std.mem.eql(u8, j.pool, "spill");
+            // A work's times are its runs that did it: one that failed early (a missing input on
+            // another OS, a compile error) would make the place it failed look quick.
+            const did = j.signal == null and (j.exit orelse 1) == 0;
+            if (did and (spilled or std.mem.eql(u8, j.pool, "cores"))) {
+                const key = workAt(a, if (spilled) j.host orelse continue else "", workKeyOf(a, j));
+                const gop = rt.work.getOrPut(a, key) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = .{};
+                gop.value_ptr.add(a, r, if (spilled) null else j.cpu_peak orelse j.used(), if (spilled) null else j.cores);
+            }
             if (j.label.len == 0 or !std.mem.eql(u8, j.pool, "cores")) continue;
             {
                 const gop = command_runs.getOrPut(a, shape(a, j.label, j.cmd)) catch continue;
@@ -3956,6 +4209,27 @@ const RunTimes = struct {
         var it3 = command_runs.iterator();
         while (it3.next()) |e| rt.by_command.put(a, e.key_ptr.*, history.median(e.value_ptr.items)) catch {};
         return rt;
+    }
+
+    /// The last 20 runs of one kind of work (`workKey`): here (`host` null) or sent to `host`.
+    fn workStats(rt: RunTimes, a: std.mem.Allocator, host: ?[]const u8, key: []const u8) place.Stats {
+        const runs = rt.work.getPtr(workAt(a, host orelse "", key)) orelse return .{};
+        return runs.stats(a, 20);
+    }
+
+    /// The cores one kind of work's runs here kept busy, oldest first.
+    fn workUses(rt: RunTimes, a: std.mem.Allocator, key: []const u8) []const f64 {
+        const runs = rt.work.getPtr(workAt(a, "", key)) orelse return &.{};
+        return runs.used.items;
+    }
+
+    fn workAt(a: std.mem.Allocator, host: []const u8, key: []const u8) []const u8 {
+        return std.mem.concat(a, u8, &.{ host, "\x01", key }) catch key;
+    }
+
+    /// A past job's work key: older history has no repo, and its label's project stands in.
+    fn workKeyOf(a: std.mem.Allocator, j: history.Job) []const u8 {
+        return place.workKey(a, j.repo orelse std.mem.sliceTo(j.label, ':'), j.cmd);
     }
 
     /// A job's usual run time by earlier runs of its own command: what a running job's time is

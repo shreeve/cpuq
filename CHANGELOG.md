@@ -2,6 +2,28 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.27.0 — 2026-10-17
+
+- `--spill` (and `spill_default = on`) places work by when it should finish, not only when this
+  machine is full. Long work goes to a spill host when that is sooner by a minute and by 30%,
+  counting the wait, the copy of the repo and the run there; a stopped cloud host is started for
+  work of ten minutes or more. Short and never-seen work stays here while there is room, as
+  before. stderr gives both times (`~41 min here, ~6 min on burst`).
+- History keeps each job's repo, and judges work by repo and command (counts and `$CPUQ_CORES`
+  aside) rather than by label, so runs under different labels count as the same work. Each spilled
+  trip is recorded here (pool `spill`, with its host), timed from before the copy to the end:
+  what placement compares a host by. Only runs that succeeded count, so a run that failed early
+  never makes a place look quick.
+- A small fixed `--cores N` (2 or more) for a command that passes `$CPUQ_CORES` on is widened once its runs
+  show it kept all N busy (to 2N) or used more than N, never past half the CPUs; stderr says so.
+  Jobs are sized by their own command's measured use when it has three runs or more.
+- A spec's work (a command matching a `cpuq/*.json` run, its words and flags, that needs packs, caches, deps, a setup
+  or git) is never spilled bare: it runs here, and stderr gives the `cpuq submit` line.
+- `cpuq hook` refuses long work that would finish in half the time elsewhere: a spec's work as a
+  `cpuq run` (with each host's time and the `cpuq submit` line), and `--local` work whose trips
+  to a spill host took half its time here ("drop --local"). Heavy work typed over `ssh HOST` is
+  pointed to `cpuq run --spill-to HOST`.
+
 ## 0.26.6 — 2026-10-16
 
 - A spilled job's copy (`--spill`, `--spill-to`, and `cpuq submit`) is read back by each file's
