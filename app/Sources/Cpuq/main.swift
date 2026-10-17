@@ -55,6 +55,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
     private let sizeGuard = MinimumSize()
     private var historyTimer: Timer?
+    /// The open window's watchers, removed as it closes.
+    private var graphsMonitor: Any?
+    private var graphsObservers: [NSObjectProtocol] = []
     /// Sparkle, running only in a Cpuq.app bundle: a binary run from the build folder never offers
     /// to replace itself.
     private let updater = SPUStandardUpdaterController(
@@ -848,70 +851,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     // MARK: - The graphs window
 
     @objc private func showGraphs() {
-        if graphsWindow == nil {
-            let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 960, height: 780),
-                styleMask: [.titled, .closable, .resizable, .miniaturizable],
-                backing: .buffered, defer: false)
-            window.title = "cpuq"
-            window.isReleasedWhenClosed = false
-            // The cells animate smoothly only while the mouse moves in the window or it is
-            // resized (Liveliness); otherwise once a second.
-            window.acceptsMouseMovedEvents = true
-            NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .scrollWheel]) { [weak window] event in
-                if let window, event.window === window { Liveliness.shared.poke() }
-                return event
-            }
-            NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: window, queue: .main) { _ in
-                MainActor.assumeIsolated { Liveliness.shared.poke() }
-            }
-            // Covered, minimized or on another space: no frames for effects nobody sees.
-            NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main) { [weak window] _ in
-                MainActor.assumeIsolated { Liveliness.shared.visible = window?.occlusionState.contains(.visible) ?? false }
-            }
-            window.appearance = Theme.appearance
-            // The window is the size it is given and no other: what is in it never grows or
-            // shrinks it, and everything in it fits, the charts sharing what height there is.
-            let host = NSHostingView(rootView: GraphsView(models: [graphs] + remotes, control: { [weak self] machine, action, pid, who in
-                self?.perform(action, pid: String(pid), who: who, on: machine)
-            }, start: { [weak self] model in self?.startMachine(model) }))
-            host.sizingOptions = []
-            // The minimum as constraints the window cannot break: contentMinSize alone let a
-            // drag, a tile or an accessibility resize take the window down to a sliver.
-            let content = NSView()
-            host.translatesAutoresizingMaskIntoConstraints = false
-            content.addSubview(host)
-            NSLayoutConstraint.activate([
-                host.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-                host.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-                host.topAnchor.constraint(equalTo: content.topAnchor),
-                host.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-                content.widthAnchor.constraint(greaterThanOrEqualToConstant: GraphsView.minimumSize.width),
-                content.heightAnchor.constraint(greaterThanOrEqualToConstant: GraphsView.minimumSize.height),
-            ])
-            window.contentView = content
-            window.contentMinSize = GraphsView.minimumSize
-            window.minSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: GraphsView.minimumSize)).size
-            window.delegate = sizeGuard
-            window.center()
-            // Where it was and how big, kept from one opening to the next; a frame saved smaller
-            // than the minimum grows to it.
-            window.setFrameAutosaveName("cpuq graphs")
-            var frame = window.frame
-            if frame.width < window.minSize.width || frame.height < window.minSize.height {
-                frame.size = NSSize(width: max(frame.width, window.minSize.width), height: max(frame.height, window.minSize.height))
-                window.setFrame(frame, display: false)
-            }
-            graphsWindow = window
-            // Closed, the app goes back to being the chip (unless Settings keeps the Dock icon).
-            NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in
-                DispatchQueue.main.async { MainActor.assumeIsolated { self?.applyShape() } }
-            }
-            // History changes slowly: read it now and each minute while the window is open.
-            historyTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-                MainActor.assumeIsolated { self?.refreshHistory() }
-            }
-        }
+        if graphsWindow == nil { buildGraphs() }
         NSApp.activate()
         graphsWindow?.makeKeyAndOrderFront(nil)
         applyShape()
@@ -919,6 +859,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         // this, the history waited a minute for the next refresh.
         refreshHistory()
         pollRemotes()
+    }
+
+    /// The window and all it shows, built afresh each time it opens.
+    private func buildGraphs() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 960, height: 780),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            backing: .buffered, defer: false)
+        window.title = "cpuq"
+        window.isReleasedWhenClosed = false
+        // The cells animate smoothly only while the mouse moves in the window or it is
+        // resized (Liveliness); otherwise once a second.
+        window.acceptsMouseMovedEvents = true
+        graphsMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .scrollWheel]) { [weak window] event in
+            if let window, event.window === window { Liveliness.shared.poke() }
+            return event
+        }
+        let center = NotificationCenter.default
+        graphsObservers = [
+            center.addObserver(forName: NSWindow.didResizeNotification, object: window, queue: .main) { _ in
+                MainActor.assumeIsolated { Liveliness.shared.poke() }
+            },
+            // Covered, minimized or on another space: no frames for effects nobody sees.
+            center.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main) { [weak window] _ in
+                MainActor.assumeIsolated { Liveliness.shared.visible = window?.occlusionState.contains(.visible) ?? false }
+            },
+            center.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.dropGraphs() }
+            },
+        ]
+        window.appearance = Theme.appearance
+        // The window is the size it is given and no other: what is in it never grows or
+        // shrinks it, and everything in it fits, the charts sharing what height there is.
+        let host = NSHostingView(rootView: GraphsView(models: [graphs] + remotes, control: { [weak self] machine, action, pid, who in
+            self?.perform(action, pid: String(pid), who: who, on: machine)
+        }, start: { [weak self] model in self?.startMachine(model) }))
+        host.sizingOptions = []
+        // The minimum as constraints the window cannot break: contentMinSize alone let a
+        // drag, a tile or an accessibility resize take the window down to a sliver.
+        let content = NSView()
+        host.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(host)
+        NSLayoutConstraint.activate([
+            host.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            host.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            host.topAnchor.constraint(equalTo: content.topAnchor),
+            host.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            content.widthAnchor.constraint(greaterThanOrEqualToConstant: GraphsView.minimumSize.width),
+            content.heightAnchor.constraint(greaterThanOrEqualToConstant: GraphsView.minimumSize.height),
+        ])
+        window.contentView = content
+        window.contentMinSize = GraphsView.minimumSize
+        window.minSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: GraphsView.minimumSize)).size
+        window.delegate = sizeGuard
+        window.center()
+        // Where it was and how big, kept from one opening to the next; a frame saved smaller
+        // than the minimum grows to it.
+        window.setFrameAutosaveName("cpuq graphs")
+        var frame = window.frame
+        if frame.width < window.minSize.width || frame.height < window.minSize.height {
+            frame.size = NSSize(width: max(frame.width, window.minSize.width), height: max(frame.height, window.minSize.height))
+            window.setFrame(frame, display: false)
+        }
+        graphsWindow = window
+        // History changes slowly: read it now and each minute while the window is open.
+        historyTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshHistory() }
+        }
+    }
+
+    /// The window closing: it goes with all it shows, so nothing draws or redraws until it opens
+    /// again, and the app goes back to being the chip (unless Settings keeps the Dock icon).
+    private func dropGraphs() {
+        if let graphsMonitor { NSEvent.removeMonitor(graphsMonitor) }
+        graphsMonitor = nil
+        graphsObservers.forEach(NotificationCenter.default.removeObserver)
+        graphsObservers = []
+        historyTimer?.invalidate()
+        historyTimer = nil
+        // The name is free for the next window, the frame already saved.
+        graphsWindow?.setFrameAutosaveName("")
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                self.graphsWindow?.contentView = nil
+                self.graphsWindow = nil
+                self.applyShape()
+            }
+        }
     }
 
     private func refreshHistory() {
