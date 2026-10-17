@@ -516,16 +516,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
             opaqueIdle[id] = e
         }
-        // A machine overloaded (1-minute load over 1.5 times its CPUs) for 10 minutes while
-        // another watched from here has room: portable work belongs there.
+        // A machine overloaded (1-minute load over 1.5 times its CPUs, with jobs waiting) for 10
+        // minutes while another watched from here has room: portable work belongs there. Load
+        // alone is no sign: Linux counts processes waiting on the disk in it, and burst ran at
+        // load 234 on 96 CPUs with a fifth of them idle and nothing waiting.
         for (id, name, s) in machines {
             let cpus = Double(max(s.activeCores > 0 ? s.activeCores : s.budget, 1))
             let load = s.load.first ?? 0
             let roomy = machines.filter { $0.id != id && $0.s.waiters.isEmpty && ($0.s.load.first ?? 0) < 0.5 * Double(max($0.s.activeCores, 1)) }.map(\.name)
             var e = overloaded[id] ?? Episode()
-            track(&e, load > 1.5 * cpus && !roomy.isEmpty, after: 600, now) {
-                notify("overload-\(id)", String(format: "%@: load %.0f on %.0f CPUs", name, load, cpus),
-                       "For 10 minutes, while \(roomy.joined(separator: " and ")) \(roomy.count == 1 ? "has" : "have") room: send portable work there (cpuq run --spill).", text: true)
+            track(&e, load > 1.5 * cpus && !s.waiters.isEmpty && !roomy.isEmpty, after: 600, now) {
+                notify("overload-\(id)", String(format: "%@ overloaded: %d waiting at load %.0f on %.0f CPUs", name, s.waiters.count, load, cpus),
+                       "For 10 minutes, while \(roomy.joined(separator: " and ")) \(roomy.count == 1 ? "has" : "have") room: portable jobs can go there (cpuq run --spill).", text: true)
             }
             overloaded[id] = e
         }
@@ -600,8 +602,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
     }
 
-    /// Texts the owner what needs them, at most once every 30 minutes: Apple's on-device model
-    /// writes the note from the rules' lines where the Mac has it, else the lines themselves.
+    /// Texts the owner what needs them, at most once every 30 minutes, in the rules' own words.
+    /// Not Apple's on-device model's: rewording them, it swapped which machine was loaded and
+    /// which had room, and said the one thing twice.
     private func sendTexts(_ now: Date) {
         guard !toText.isEmpty else { return }
         guard Prefs.text else { toText.removeAll(); return }
@@ -610,32 +613,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         toText.removeAll()
         textedAt = now
         let command = (Prefs.textCommand as NSString).expandingTildeInPath
-        Task {
-            let body = await Insight.note(lines) ?? lines.joined(separator: "\n")
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: command)
-            p.arguments = ["From Cpuq.app: " + body]
-            try? p.run()
-        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: command)
+        p.arguments = ["From Cpuq.app: " + Self.unique(lines).joined(separator: "\n")]
+        try? p.run()
     }
 
-    /// What's Happening?: what is wrong now and what the rules found in the last hour, in a few
-    /// plain lines (Apple's on-device model writes them where the Mac has it).
+    /// What's Happening?: what is wrong now, then what the rules found in the last hour, each
+    /// with how long ago, so an hour-old finding never reads as the present.
     @objc private func whatsHappening() {
-        let lines = alerts() + found.map(\.line)
-        Task {
-            let text: String
-            if lines.isEmpty {
-                text = "All clear: nothing wrong now, and nothing found in the last hour."
-            } else {
-                text = await Insight.note(lines) ?? lines.joined(separator: "\n")
-            }
-            let alert = NSAlert()
-            alert.messageText = "What's happening"
-            alert.informativeText = text
-            NSApp.activate(ignoringOtherApps: true)
-            alert.runModal()
+        let alert = NSAlert()
+        alert.messageText = "What's happening"
+        alert.informativeText = Self.happening(now: alerts(), found: found, at: Date())
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    /// The text of What's Happening?: the present, then the last hour's findings, newest first,
+    /// each once, with its age.
+    static func happening(now: [String], found: [(at: Date, line: String)], at: Date) -> String {
+        var seen = Set<String>()
+        let earlier = found.reversed().filter { seen.insert($0.line).inserted }.map { f in
+            let m = Int(at.timeIntervalSince(f.at) / 60)
+            return (m < 1 ? "just now" : "\(m) min ago") + ": " + f.line
         }
+        if now.isEmpty && earlier.isEmpty { return "All clear: nothing wrong now, and nothing found in the last hour." }
+        var parts = ["Now: " + (now.isEmpty ? "nothing wrong." : now.joined(separator: "\n"))]
+        if !earlier.isEmpty { parts.append("Earlier this hour (over unless it says so above):\n" + earlier.joined(separator: "\n")) }
+        return parts.joined(separator: "\n\n")
+    }
+
+    /// Lines in order, each once.
+    static func unique(_ lines: [String]) -> [String] {
+        var seen = Set<String>()
+        return lines.filter { seen.insert($0).inserted }
     }
 
     /// Shown even while Cpuq is in front.

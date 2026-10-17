@@ -48,7 +48,7 @@ struct SettingsView: View {
                 Toggle("Text me what needs me", isOn: $text)
                     .disabled(!FileManager.default.isExecutableFile(atPath: (Prefs.textCommand as NSString).expandingTildeInPath))
             } footer: {
-                Text("At most once every 30 minutes, with \(Prefs.textCommand): a machine overloaded while another has room, a job that looks stuck, a cloud machine billing with nothing to do, or --opaque jobs holding cores while others wait.\(Insight.available ? " Apple's on-device model writes the note." : "")")
+                Text("At most once every 30 minutes, with \(Prefs.textCommand): a machine overloaded while another has room, a job that looks stuck, a cloud machine billing with nothing to do, or --opaque jobs holding cores while others wait.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {

@@ -3,6 +3,17 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.20.1 — 2026-10-16
+
+- **What's Happening?** says what is wrong now, then what was found earlier in the hour, each with
+  its age ("44 min ago: …"), each once. It showed an hour-old finding as if it were the present.
+- Its lines and the texts are the rules' own words, no longer Apple's on-device model's: rewording
+  "burst overloaded while pop and pup have room", it told you burst was the place to send work,
+  twice.
+- A machine counts as overloaded only with jobs waiting there, not on load alone: Linux counts
+  processes waiting on the disk in its load, and burst read 234 on 96 CPUs with a fifth of them
+  idle and nothing waiting.
+
 ## 0.20.0 — 2026-10-16
 
 - **What's Happening?** in the menu: what is wrong now and what the app found in the last hour, in
