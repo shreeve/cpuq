@@ -33,10 +33,8 @@ const records = @import("records.zig");
 const runtimes = @import("runtimes.zig");
 const statusjson = @import("statusjson.zig");
 const status = @import("status.zig");
-const pool = @import("pool.zig");
 const jobs = @import("jobs.zig");
-const base = @import("base.zig");
-const driver = @import("driver.zig");
+const lines = @import("lines.zig");
 
 const cmdRun = runner.cmdRun;
 const cmdJob = runner.cmdJob;
@@ -53,10 +51,8 @@ const cmdHistory = records.cmdHistory;
 const cmdStatus = status.cmdStatus;
 
 test {
-    _ = pool;
     _ = jobs;
-    _ = base;
-    _ = driver;
+    _ = lines;
     _ = cap;
     _ = submit;
     _ = hook;
@@ -100,13 +96,13 @@ const usage =
     \\       cpuq doctor [--host HOST]
     \\       cpuq clean [--dry-run] [--older AGE] [--host HOST]
     \\       cpuq record [--interval SECONDS] | --install | --uninstall
-    \\       cpuq driver [--load CORES] [--until-done] | --install | --uninstall
     \\       cpuq samples [--since UNIX-SECONDS]
     \\       cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] -- PROGRAM [ARGS...]
     \\       cpuq note PID|LABEL TEXT [--all] [--host HOST]
     \\       cpuq submit SPEC [--note TEXT] [--env K=V]... [--replace | --again] [-- ARGS]
     \\       cpuq packs [--host HOST] | cpuq packs install NAME@VERSION... [--host HOST]
-    \\       cpuq jobs [--all]
+    \\       cpuq jobs [run [--workers N] [--weight W] [--gap MS] | status | watch | reset]
+    \\       cpuq jobs set workers N | weight W | gap MS | cpuq jobs pause | resume | stop
     \\       cpuq job [ID|last] [--wait [--max-wait S]] [--tail N] [--json] [--cancel]
     \\       cpuq hook                (an agent harness's pre-command hook)
     \\       cpuq budget | qos | --version | --help
@@ -233,20 +229,18 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
     }
     if (std.mem.eql(u8, cmd, "hook")) return cmdHook(ctx);
     if (std.mem.eql(u8, cmd, "_job")) return cmdJob(ctx, args[1..]);
-    if (std.mem.eql(u8, cmd, "_base")) return base.main(ctx.arena, ctx.io, args[1..]);
     if (std.mem.eql(u8, cmd, "cap")) return cap.main(ctx.arena, args[1..], ctx.env.get("CPUQ_CGROUP"), ctx.env.get("PATH"));
     if (std.mem.eql(u8, cmd, "run")) return cmdRun(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "lease")) return cmdLease(ctx, args[1..]);
     loadConfig(ctx);
     if (std.mem.eql(u8, cmd, "status")) return cmdStatus(ctx, args[1..]);
-    if (std.mem.eql(u8, cmd, "driver")) return driver.cmdDriver(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "jobs")) return jobs.cmdJobs(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "wait")) return cmdWait(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "history")) return cmdHistory(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "doctor")) return cmdDoctor(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "record")) return cmdRecord(ctx, args[1..]);
     inline for (.{
         .{ "submit", submit.cmdSubmit },
-        .{ "jobs", submit.cmdJobs },
         .{ "job", submit.cmdJob },
         .{ "_supervise", submit.cmdSupervise },
         .{ "_start", submit.cmdStart },

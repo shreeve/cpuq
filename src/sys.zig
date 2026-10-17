@@ -428,6 +428,8 @@ pub const SpawnOpts = struct {
     dups: []const [2]c.fd_t = &.{},
     /// Where it starts; null: here.
     dir: ?[*:0]const u8 = null,
+    /// In a process group of its own, out of reach of the terminal's ^C.
+    group: bool = false,
 };
 
 /// Starts `path` with an empty signal mask, in the given scheduling class.
@@ -449,7 +451,8 @@ pub fn spawn(
         if (o.dir) |dir| _ = c.posix_spawn_file_actions_addchdir_np(&acts, dir);
         const empty: c.sigset_t = 0;
         _ = posix_spawnattr_setsigmask(&attr, &empty);
-        _ = c.posix_spawnattr_setflags(&attr, .{ .SETSIGMASK = true });
+        if (o.group) _ = c.posix_spawnattr_setpgroup(&attr, 0);
+        _ = c.posix_spawnattr_setflags(&attr, .{ .SETSIGMASK = true, .SETPGROUP = o.group });
         switch (qos) {
             .unchanged => {},
             .utility => _ = posix_spawnattr_set_qos_class_np(&attr, QOS_CLASS_UTILITY),
@@ -484,6 +487,7 @@ pub fn spawn(
     if (pid < 0) return error.SpawnFailed;
     if (pid == 0) {
         // Before exec, so the command's first thread, and all it starts, see only these.
+        if (o.group) _ = c.setpgid(0, 0);
         if (o.cpus.len != 0) _ = std.os.linux.syscall3(.sched_setaffinity, 0, @sizeOf(std.os.linux.cpu_set_t), @intFromPtr(&set));
         for (o.dups) |d| _ = if (d[0] == d[1]) c.fcntl(d[0], c.F.SETFD, @as(c_int, 0)) else c.dup2(d[0], d[1]);
         if (o.dir) |dir| if (c.chdir(dir) != 0) c._exit(126);

@@ -213,17 +213,17 @@ pub fn cmdSamples(ctx: *Ctx, args: []const [:0]const u8) u8 {
 /// at login (and at boot, where systemd allows lingering), restarted if it exits.
 pub const Service = enum {
     record,
-    driver,
+    agent,
 
     fn about(sv: Service) []const u8 {
         return switch (sv) {
             .record => "samples this machine for cpuq samples and Cpuq.app",
-            .driver => "runs this machine's jobs folder",
+            .agent => "keeps this machine at its target load, shared among its jobs by weight",
         };
     }
 };
 
-/// Installs (or removes) `cpuq record` or `cpuq driver` as a launchd agent or a systemd user
+/// Installs (or removes) `cpuq record` or `cpuq agent` as a launchd agent or a systemd user
 /// service, which keeps one running and starts the next only after the last has exited.
 pub fn installService(ctx: *Ctx, sv: Service, install: bool) u8 {
     const io = ctx.io;
@@ -243,7 +243,7 @@ pub fn installService(ctx: *Ctx, sv: Service, install: bool) u8 {
             return 0;
         }
         cwd.createDirPath(io, std.fs.path.dirname(plist).?) catch {};
-        // The recorder is Background; the driver Standard, since what it starts inherits its role.
+        // The recorder is Background; the agent Standard, since what it starts inherits its role.
         const body = a.print(
             \\<?xml version="1.0" encoding="UTF-8"?>
             \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
