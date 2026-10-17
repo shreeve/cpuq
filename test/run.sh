@@ -1027,12 +1027,30 @@ t_cap() {
   "$CPUQ" cap --mem 64M -- python3 -c 'import time; x = bytearray(256 << 20); time.sleep(10)' 2>/dev/null; local rc_mem=$?
   # A grandchild that leaves the group (": " keeps sh as its parent, not a group leader it became).
   "$CPUQ" cap --mem 64M -- sh -c 'python3 -c "import os, time; os.setsid(); x = bytearray(256 << 20); time.sleep(10)"; :' 2>/dev/null; local rc_escaped=$?
+  t0=$(now)
   "$CPUQ" cap --output 1K -- sh -c 'head -c 100000 /dev/zero; sleep 10' >"$T/out" 2>"$T/err"; local rc_out=$?
+  local dt_out; dt_out=$(python3 -c "print('%.2f' % ($(now) - $t0))")
+  "$CPUQ" cap --mem 0 -- true 2>/dev/null; local rc_zero=$?
+  "$CPUQ" cap --pids off -- true 2>/dev/null; [ $? = 2 ] || rc_zero="$rc_zero, --pids off $?"
   "$CPUQ" cap --output 1K -- true 2>/dev/null | cat; local rc_pipe=${PIPESTATUS[0]}
   "$CPUQ" cap -- sh -c 'kill -TERM $$'; local rc_sig=$?
   "$CPUQ" cap --mem 1G -- sh -c 'sleep 77 & echo $! >"$1"; exit 0' sh "$T/bg"; sleep 0.3
   local left=0; alive "$T/bg" && left=1
-  check "cap passes the exit on (7: $rc_exit), not found 127 ($rc_missing), time 124 ($rc_time after ${dt}s), memory 122 ($rc_mem; escaped the group: $rc_escaped), output 121 ($rc_out), a pipe refused 2 ($rc_pipe), a signal as itself 143 ($rc_sig), nothing left behind ($left)" "[ $rc_exit = 7 ] && [ $rc_missing = 127 ] && [ $rc_time = 124 ] && python3 -c 'import sys; sys.exit(0 if $dt < 3 else 1)' && [ $rc_mem = 122 ] && [ $rc_escaped = 122 ] && [ $rc_out = 121 ] && [ $rc_pipe = 2 ] && [ $rc_sig = 143 ] && [ $left = 0 ]"
+  check "cap passes the exit on (7: $rc_exit), not found 127 ($rc_missing), time 124 ($rc_time after ${dt}s), memory 122 ($rc_mem; escaped the group: $rc_escaped), output 121 within 0.1 s or so ($rc_out after ${dt_out}s), a limit of 0 refused 2 ($rc_zero), a pipe refused 2 ($rc_pipe), a signal as itself 143 ($rc_sig), nothing left behind ($left)" "[ $rc_exit = 7 ] && [ $rc_missing = 127 ] && [ $rc_time = 124 ] && python3 -c 'import sys; sys.exit(0 if $dt < 3 else 1)' && [ $rc_mem = 122 ] && [ $rc_escaped = 122 ] && [ $rc_out = 121 ] && python3 -c 'import sys; sys.exit(0 if $dt_out < 0.6 else 1)' && [ $rc_zero = 2 ] && [ $rc_pipe = 2 ] && [ $rc_sig = 143 ] && [ $left = 0 ]"
+  # Linux: cap is its tree's subreaper, so even an orphan that left the session goes with it
+  # (macOS has none: that orphan is out of reach there, as cap's header says). A cap that was
+  # meant to have a cgroup and couldn't says what that costs.
+  [ "$(uname)" = Linux ] || return 0
+  "$CPUQ" cap -- python3 -c 'import os, sys, time
+if os.fork() == 0:
+    os.setsid()
+    if os.fork() == 0:
+        open(sys.argv[1], "w").write(str(os.getpid())); time.sleep(77)
+    os._exit(0)
+os.wait(); time.sleep(0.3)' "$T/orphan"; sleep 0.3
+  local orphan=0; alive "$T/orphan" && orphan=1
+  local warn; warn=$(CPUQ_CGROUP=/sys/fs/cgroup/cpuq-none.scope "$CPUQ" cap --pids 5 -- true 2>&1)
+  check "Linux: a setsid orphan goes with cap (left: $orphan); no cgroup is said ($warn)" "[ $orphan = 0 ] && [[ '$warn' == *'--pids is not enforced'* ]]"
 }
 
 t_cap_quiet_crash() {
@@ -1075,6 +1093,30 @@ t_cgroups() {
   "$CPUQ" run --cores 1 --label capped -- "$CPUQ" cap --mem 64M -- python3 -c 'import time; x = bytearray(256 << 20); time.sleep(10)' 2>/dev/null; local rc=$?
   local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
   check "a job runs in its scope's job/ with CPUQ_CGROUP and memory for its children (got $got); a cap there is stopped by the kernel ($rc after ${dt}s)" "[[ '$got' == *'.scope/job /sys/fs/cgroup/'*'.scope '*memory* ]] && [ $rc = 122 ] && python3 -c 'import sys; sys.exit(0 if $dt < 0.9 else 1)'"
+  # --pids holds the program's tree to N tasks: python and 4 children of 20 asked for.
+  local forks; forks=$("$CPUQ" run --cores 1 --label pids -- "$CPUQ" cap --pids 5 -- python3 -c 'import os, time
+n = 0
+for i in range(20):
+    try:
+        if os.fork() == 0:
+            time.sleep(1); os._exit(0)
+        n += 1
+    except OSError:
+        pass
+print(n)')
+  # A cap SIGKILLed (a runner's own timeout) leaves its cgroup and what its program started; the
+  # next cap in the job removes both.
+  cat >"$T/sweep" <<'EOF2'
+"$1" cap --mem 64M -- sh -c 'sleep 66 & echo $! >"$1"; sleep 66' sh "$2" & cap=$!
+sleep 0.5; kill -9 $cap; wait $cap 2>/dev/null
+before=$(ls -d "$CPUQ_CGROUP"/cap-$cap-* 2>/dev/null | wc -l)
+"$1" cap --mem 64M -- true
+after=$(ls -d "$CPUQ_CGROUP"/cap-$cap-* 2>/dev/null | wc -l)
+kill -0 "$(cat "$2")" 2>/dev/null && left=left || left=gone
+echo "$before $after $left"
+EOF2
+  local swept; swept=$("$CPUQ" run --cores 1 --label sweep -- sh "$T/sweep" "$CPUQ" "$T/stale")
+  check "--pids 5 lets python start 4 of 20 (got $forks); a killed cap's cgroup and its sleep are swept by the next cap (got $swept)" "[ '$forks' = 4 ] && [ '$swept' = '1 0 gone' ]"
   # What a job leaves running in its scope is stopped when its command ends.
   "$CPUQ" run --cores 1 --label leaver -- sh -c 'sleep 88 >/dev/null 2>&1 & echo $! >"$1"; exit 0' sh "$T/bg"; sleep 0.5
   local left=0; alive "$T/bg" && left=1

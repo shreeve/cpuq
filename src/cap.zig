@@ -9,10 +9,13 @@
 //!
 //! Elsewhere (macOS, or Linux outside a job) the program gets its own process group, its memory is
 //! read once a second from its own process tree, never from a list of every process on the
-//! machine, and stopping it freezes, walks and kills that tree until nothing is left.
+//! machine, and stopping it freezes, walks and kills that tree, then the program's process group.
+//! On Linux cap is the tree's subreaper, so orphans stay in it. macOS has no subreaper: a process
+//! that leaves both the tree and the group (a double fork with setsid) is out of cap's reach.
 //!
 //! Either way the program's end wakes cpuq at once (SIGCHLD through a pipe), the time limit is a
-//! timer, and a program that ends quickly costs a fork and an exec.
+//! timer, output is checked about every 0.1 s, and a program that ends quickly costs a fork and an
+//! exec.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -37,12 +40,14 @@ pub const usage =
     \\  --time DURATION   stop it after this long (120, 120s, 2m, 1h, 500ms)
     \\  --output SIZE     stop it when it has written more than this to stdout and stderr, which
     \\                    must be files or /dev/null (1M)
-    \\  --pids N          at most N processes and threads at once (inside a cpuq job on Linux)
+    \\  --pids N          at most N processes and threads at once (inside a cpuq job on Linux;
+    \\                    elsewhere it is not enforced)
     \\  --no-crash-report no crash report when PROGRAM, or anything it starts, crashes on
     \\                    purpose (a test that panics): no .ips on macOS, no apport on Linux;
     \\                    it still dies by its signal
     \\exit: PROGRAM's own (death by a signal passed on as one); stopped by cpuq: 122 memory,
-    \\124 time, 121 output, each with a line on stderr; 125 cpuq failed; 127 PROGRAM not found
+    \\124 time, 121 output, each with a line on stderr; 2 usage, 125 cpuq failed, 126 PROGRAM
+    \\can't be run, 127 PROGRAM not found. PROGRAM may exit with these too: the stderr line tells.
     \\
 ;
 
@@ -86,6 +91,11 @@ test "durations" {
     try std.testing.expectEqual(@as(?u64, null), parseDuration("soon"));
     try std.testing.expectEqual(@as(?u64, null), parseDuration("0"));
     try std.testing.expectEqual(@as(?u64, null), parseDuration("s"));
+}
+
+/// A limit of 0 (or `off`) would be no limit at all: refused, so a typo can't turn one off.
+fn nonzero(v: ?u64) ?u64 {
+    return if (v == 0) null else v;
 }
 
 fn bad(comptime fmt: []const u8, args: anytype) u8 {
@@ -217,15 +227,17 @@ const Cgroup = struct {
     }
 
     /// A cgroup for one program beside the job's own `job/`, limited as `limits` say. Null when
-    /// it can't have one: no parent, this process not inside it, or the memory controller not
-    /// enabled for the parent's children.
+    /// it can't have one: no parent, this process not inside it, or a controller a limit needs
+    /// (memory, pids) not enabled for the parent's children.
     fn make(parent: []const u8, limits: Limits) ?Cgroup {
         if (!is_linux or parent.len == 0) return null;
         if (!insideOf(parent)) return null;
         var b: [600]u8 = undefined;
         var ctl_buf: [256]u8 = undefined;
         const control = readInto(pathZ(&b, "{s}/cgroup.subtree_control", .{parent}) orelse return null, &ctl_buf) orelse return null;
-        if (std.mem.find(u8, control, "memory") == null) return null;
+        if (limits.mem != 0 and !hasWord(control, "memory")) return null;
+        if (limits.pids != 0 and !hasWord(control, "pids")) return null;
+        sweep(parent);
         var cg: Cgroup = .{};
         // The pid and the start time: a cgroup left by an earlier cap with this pid, which was
         // never removed, can't make this one fail.
@@ -252,6 +264,25 @@ const Cgroup = struct {
         return cg;
     }
 
+    /// Removes the cgroups of caps that died without removing theirs (SIGKILLed: the job's own
+    /// time limit, a runner's), with whatever their programs left running in them.
+    fn sweep(parent: []const u8) void {
+        var b: [600]u8 = undefined;
+        const dir = c.opendir(pathZ(&b, "{s}", .{parent}) orelse return) orelse return;
+        defer _ = c.closedir(dir);
+        while (c.readdir(dir)) |entry| {
+            const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.name)), 0);
+            if (!std.mem.startsWith(u8, name, "cap-")) continue;
+            const end = std.mem.findScalarPos(u8, name, 4, '-') orelse continue;
+            const pid = std.fmt.parseInt(c.pid_t, name[4..end], 10) catch continue;
+            // A cap still running (or a pid since reused) keeps its cgroup.
+            if (c.kill(pid, @fromBackingInt(@intCast(0))) == 0 or c.errno(-1) != .SRCH) continue;
+            var stale: Cgroup = .{};
+            stale.len = (std.mem.print(&stale.path_buf, "{s}/{s}", .{ parent, name }) catch continue).len;
+            stale.remove();
+        }
+    }
+
     /// Kills everything still in it, waits until it is empty, and removes it.
     fn remove(cg: *const Cgroup) void {
         if (cg.fd >= 0) _ = c.close(cg.fd);
@@ -266,6 +297,13 @@ const Cgroup = struct {
         }
     }
 };
+
+/// Whether `word` is one of the space-separated words of `text` (a cgroup controller list).
+fn hasWord(text: []const u8, word: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, text, " \n");
+    while (it.next()) |w| if (std.mem.eql(u8, w, word)) return true;
+    return false;
+}
 
 /// Whether `parent` is the cpuq job this process runs in: a cpuq job's scope
 /// (`cpuq-….scope`) whose `job/` this process is in. A stale or stray
@@ -316,7 +354,6 @@ fn forkInto(cg_fd: c.fd_t) isize {
 
 extern "c" fn proc_listchildpids(ppid: c_int, buffer: ?*anyopaque, size: c_int) c_int;
 extern "c" fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *anyopaque) c_int;
-extern "c" fn prctl(option: c_int, ...) c_int;
 
 /// The tree below `root`, `root` excluded, into `out`; returns how many. Linux reads each
 /// process's own children (/proc/PID/task/TID/children); macOS asks for them
@@ -408,7 +445,7 @@ fn killTree(pgid: c.pid_t) void {
 /// Reaps every child that has ended, without waiting.
 fn reapAll() void {
     var status: c_int = 0;
-    while (c.waitpid(-1, &status, 1) > 0) {} // WNOHANG = 1
+    while (c.waitpid(-1, &status, c.W.NOHANG) > 0) {}
 }
 
 // --- File facts: stat where libc has it (macOS), statx where Zig's Linux libc doesn't --------
@@ -509,8 +546,10 @@ const Stop = enum { none, memory, time, output };
 /// 1: --mem/--time/--output/--pids, exits 122/124/121, cgroups inside a job on Linux;
 /// 2: --no-crash-report (macOS ports; Linux core limit 1);
 /// 3: --no-crash-report on macOS answers PROGRAM's crashes (no user or system report) and exits
-/// 128+N for a death by signal N.
-pub const protocol = 3;
+/// 128+N for a death by signal N;
+/// 4: --output checked about every 0.1 s, a limit of 0 refused, 122 only for a program the
+/// kernel killed at --mem.
+pub const protocol = 4;
 
 pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]const u8, path_env: ?[]const u8) u8 {
     if (args.len == 1 and std.mem.eql(u8, args[0], "--protocol")) {
@@ -545,13 +584,13 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
             break :blk args[i];
         };
         if (std.mem.eql(u8, name, "--mem")) {
-            limits.mem = policy.parseBytes(value) orelse return bad("--mem needs a size like 2G or 512M, not '{s}'", .{value});
+            limits.mem = nonzero(policy.parseBytes(value)) orelse return bad("--mem needs a size like 2G or 512M, not '{s}'", .{value});
         } else if (std.mem.eql(u8, name, "--time")) {
             limits.time_ms = parseDuration(value) orelse return bad("--time needs a duration like 120s or 2m, not '{s}'", .{value});
         } else if (std.mem.eql(u8, name, "--output")) {
-            limits.output = policy.parseBytes(value) orelse return bad("--output needs a size like 1M, not '{s}'", .{value});
+            limits.output = nonzero(policy.parseBytes(value)) orelse return bad("--output needs a size like 1M, not '{s}'", .{value});
         } else if (std.mem.eql(u8, name, "--pids")) {
-            limits.pids = std.fmt.parseInt(u64, value, 10) catch return bad("--pids needs a whole number, not '{s}'", .{value});
+            limits.pids = nonzero(std.fmt.parseInt(u64, value, 10) catch null) orelse return bad("--pids needs a whole number above 0, not '{s}'", .{value});
         } else return bad("unknown option '{s}'", .{name});
     }
     if (i >= args.len) return bad("no PROGRAM given", .{});
@@ -574,7 +613,7 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
     }
     // Linux: orphans of the program become this process's children, so the tree still holds
     // them for the memory sum and the final kill.
-    if (is_linux) _ = prctl(36, @as(c_ulong, 1)); // PR_SET_CHILD_SUBREAPER
+    if (is_linux) _ = c.prctl(@backingInt(linux.PR.SET_CHILD_SUBREAPER), @as(c_ulong, 1));
     // Only memory and process limits need a cgroup; a time limit alone is a timer.
     var cgroup: ?Cgroup = if (limits.mem != 0 or limits.pids != 0) Cgroup.make(cgroup_parent orelse "", limits) else null;
 
@@ -622,7 +661,7 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
         // Without a cgroup, its own process group, so the group can be killed whole.
         if (cgroup == null) _ = c.setpgid(0, 0);
         if (is_linux) {
-            _ = prctl(1, @as(c_ulong, 9)); // PR_SET_PDEATHSIG, SIGKILL: dies with cpuq
+            _ = c.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @as(c_ulong, @backingInt(c.SIG.KILL))); // dies with cpuq
             if (c.getppid() != parent) c._exit(exit_failure); // cpuq died before that was armed
         }
         // An expected crash (a test that panics on purpose) files no crash report, nor does anything
@@ -642,6 +681,9 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
     }
     child_pid.store(child, .release);
     _ = c.sigprocmask(c.SIG.SETMASK, &before, null);
+    // Inside a job that should have given the program a cgroup but couldn't: say what that costs.
+    if (is_linux and cgroup == null and (limits.mem != 0 or limits.pids != 0) and cgroup_parent != null and cgroup_parent.?.len != 0)
+        std.debug.print("cpuq cap: no cgroup for {s}: {s}\n", .{ cmd[0], if (limits.pids != 0) "--pids is not enforced" else "--mem is read once a second" });
     _ = c.close(report[1]);
     var note: [2]u8 = .{ 0, 0 };
     var got: usize = 0;
@@ -664,11 +706,15 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
         return 126;
     }
 
-    // Wait for the end, waking for the deadline and, when something must be read, once a second.
+    // Wait for the end, waking for the deadline and for what must be read: the output files'
+    // sizes (two fstats) about every 0.1 s, the tree's memory (a walk) about once a second.
     const start = sys.monoMs();
-    const sample_mem = limits.mem != 0 and cgroup == null;
-    const sample = sample_mem or limits.output != 0;
-    var next_sample = start + 1000;
+    const watch_out = limits.output != 0;
+    const watch_mem = limits.mem != 0 and cgroup == null;
+    const out_ms = 100;
+    const mem_ms = 1000;
+    var next_out = start + out_ms;
+    var next_mem = start + mem_ms;
     var stop: Stop = .none;
     var status: c_int = 0;
     var ended = false;
@@ -676,7 +722,7 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
         // Reap everything that has ended: the program, and orphans adopted as subreaper.
         while (true) {
             var s: c_int = 0;
-            const r = c.waitpid(-1, &s, 1); // WNOHANG
+            const r = c.waitpid(-1, &s, c.W.NOHANG);
             if (r <= 0) break;
             if (r == child) {
                 status = s;
@@ -685,15 +731,14 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
         }
         if (ended) break;
         const now = sys.monoMs();
-        if (limits.time_ms != 0 and now - start >= @as(i64, @intCast(limits.time_ms))) {
-            stop = .time;
-        } else if (sample and now >= next_sample) {
-            next_sample = now + 1000;
-            if (limits.output != 0 and output.written() > limits.output) {
-                stop = .output;
-            } else if (sample_mem and treeMem() > limits.mem) {
-                stop = .memory;
-            }
+        if (limits.time_ms != 0 and now - start >= @as(i64, @intCast(limits.time_ms))) stop = .time;
+        if (stop == .none and watch_out and now >= next_out) {
+            next_out = now + out_ms;
+            if (output.written() > limits.output) stop = .output;
+        }
+        if (stop == .none and watch_mem and now >= next_mem) {
+            next_mem = now + mem_ms;
+            if (treeMem() > limits.mem) stop = .memory;
         }
         if (stop != .none) {
             if (cgroup) |cg| _ = cg.set("cgroup.kill", "1") else killTree(child);
@@ -702,7 +747,8 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
         }
         var timeout: i64 = -1;
         if (limits.time_ms != 0) timeout = start + @as(i64, @intCast(limits.time_ms)) - now;
-        if (sample) timeout = if (timeout < 0) next_sample - now else @min(timeout, next_sample - now);
+        if (watch_out) timeout = if (timeout < 0) next_out - now else @min(timeout, next_out - now);
+        if (watch_mem) timeout = if (timeout < 0) next_mem - now else @min(timeout, next_mem - now);
         var fds = [_]c.pollfd{.{ .fd = wake[0], .events = c.POLL.IN, .revents = 0 }};
         _ = c.poll(&fds, 1, @intCast(std.math.clamp(timeout, -1, 60_000)));
         drainWake();
@@ -710,16 +756,18 @@ pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]
     child_pid.store(0, .release);
 
     // Whatever the program left running goes with it.
+    const s: u32 = @bitCast(status);
     if (cgroup) |cg| {
-        // The cap's own limit: `oom` in its local events counts only memory.max reached here.
-        // `oom_kill` would also count a program killed for the job's limit or the machine's.
-        if (stop == .none and cg.field("memory.events.local", "oom") != 0) stop = .memory;
+        // The cap's own limit: `oom` in its local events counts only memory.max reached here
+        // (`oom_kill` would also count a kill for the job's limit or the machine's), and only a
+        // program that died by SIGKILL was stopped for it: one that outlived a killed child and
+        // exited on its own keeps its own status.
+        if (stop == .none and c.W.IFSIGNALED(s) and c.W.TERMSIG(s) == .KILL and cg.field("memory.events.local", "oom") != 0) stop = .memory;
         cg.remove();
     }
     killTree(if (cgroup == null) child else 0);
     reapAll();
 
-    const s: u32 = @bitCast(status);
     switch (stop) {
         .memory => {
             std.debug.print("cpuq cap: stopped {s}: it used more than {s} (--mem)\n", .{ cmd[0], sizeText(a, limits.mem) });

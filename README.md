@@ -294,24 +294,31 @@ can spend a large part of a big machine doing nothing else: one did, about 17 of
 |---|---|
 | `--mem SIZE` | PROGRAM and everything it started are stopped above SIZE (`2G`, `512M`) |
 | `--time DURATION` | stopped after DURATION (`120`, `120s`, `2m`, `500ms`) |
-| `--output SIZE` | stopped once it has written more than SIZE to stdout and stderr, which must be files or `/dev/null`; a pipe is refused |
-| `--pids N` | at most N processes and threads at once (inside a job on Linux) |
+| `--output SIZE` | stopped once it has written more than SIZE to stdout and stderr, which must be files or `/dev/null`; a pipe is refused. Checked about every 0.1 s |
+| `--pids N` | at most N processes and threads at once, inside a job on Linux; elsewhere not enforced, and a job that can't give it a cgroup says so on stderr |
 | `--no-crash-report` | no crash report when PROGRAM crashes on purpose, a test that panics. macOS: cap answers PROGRAM's crashes itself, so neither the user's ReportCrash (~/Library/Logs/DiagnosticReports) nor the system's (/Library/Logs/DiagnosticReports) files one, and cap exits 128+N for a death by signal N rather than dying by it (a shell sees the same status). Linux: a core limit of exactly 1, so the kernel passes it to no `core_pattern` handler (Ubuntu's apport, seconds per crash); it still dies by its signal. What PROGRAM starts inherits it, so wrap the program meant to crash, never a compiler before it |
 
 `cpuq cap --protocol` prints what cap does as a number that changes only when that does (its
 limits, how it stops a program, its exit statuses, `--no-crash-report`): a test runner that caches
 results keys them on it, not on cpuq's version, so a release that leaves cap alone keeps them.
 
+A limit of 0 is refused: no limit is the option left out.
+
 - **Exit status:** PROGRAM's own, or death by its signal. When cpuq stopped it, it's 122 for
-  memory, 124 for time and 121 for output, each with one line on stderr. 127 means PROGRAM
-  wasn't found.
+  memory, 124 for time and 121 for output, each with one line on stderr. 2 is a usage error,
+  125 cap's own failure, 126 PROGRAM can't be run, 127 PROGRAM wasn't found. PROGRAM can exit
+  with any of these itself; the stderr line is what tells them apart.
 - **Inside a cpuq job on Linux:** PROGRAM is born in a cgroup of its own beside the job's
   (`clone3` into it, with no write to `cgroup.procs`, which would stall every fork on the
   machine). The cgroup has `memory.max`, no swap and `memory.oom.group`, so the kernel stops it
   at the limit: within milliseconds, with nothing polling. Everything it started is stopped with
-  it, even what left its process group.
+  it, even what left its process group. A cap killed before it could clean up (SIGKILL) leaves
+  its cgroup; the job's next cap removes it, with whatever is still running in it.
 - **Elsewhere** (macOS, or Linux outside a job): PROGRAM gets its own process group, and its
   memory is read once a second from its own process tree, never from a list of every process.
+  Stopping it kills that tree, then the group. On Linux cap is the tree's subreaper, so orphans
+  stay in it; macOS has none, so a process that leaves both the tree and the group (a double
+  fork with `setsid`) is out of cap's reach, its memory uncounted and left running.
 - **Either way:** PROGRAM's end wakes cpuq at once, and anything PROGRAM left running is stopped.
   It costs about half a millisecond a call.
 

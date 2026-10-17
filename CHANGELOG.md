@@ -33,6 +33,18 @@ User-visible changes to cpuq. Each version's section is its release notes.
 - Copies from `cpuq run --on` and from `cpuq submit` share one folder per project, so a new copy
   of either starts as a clone of the project's most recently used one.
 - Cpuq.app 0.20.2 reads its machines from `remotes` and `remote_start.HOST`.
+- **`cpuq hook`** sees through more: commands after `if`/`while`/`!`, inside `$(...)` and
+  backquotes (quoted or not), and behind wrappers by their own options (`nice -n 5`, `timeout 30m`,
+  `env -u X`, `sudo -u U`, `xargs -P 4`, `uv run`, `poetry run`, …); `cargo +nightly`, `zig test`,
+  `meson`, `ctest`, `tox` and `python3.N -m pytest` count as heavy. Inside `cpuq run`, a fixed jobs
+  count above the grant (`-j16`, `-n 8`, `-j` with no number, `-n auto`) is refused with the
+  `$CPUQ_CORES` form. `# cpuq: skip` counts only as a comment of its own, and its suggestions run
+  as typed (quotes kept, the tool's own `-j` replaced).
+- **`cpuq cap`** (protocol 4): `--output` is checked about every 0.1 s rather than once a second;
+  a limit of 0 (`--mem 0`, `--pids off`) is refused rather than meaning none; exit 122 means the
+  kernel killed PROGRAM itself at `--mem`; a cap SIGKILLed inside a job leaves its cgroup only
+  until the job's next cap removes it and what is left in it; a job that can't give PROGRAM a
+  cgroup says on stderr what that costs; `--pids` needs only the pids controller.
 
 ## 0.27.1 — 2026-10-17
 
