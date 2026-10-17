@@ -3,6 +3,13 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.21.1 — 2026-10-17
+
+- The menu is ordered like a Mac app's own: **Cpuq • app X • cli Y** in bold on top, then
+  Settings… and Check for Updates…, then Show Activity (⌘G, once Open Cpuq), then Quit.
+- The "N of M cores in use" line and What's Happening? are gone. Lines for what is wrong still
+  show under the top line, and a text that fails to go is a notification of its own.
+
 ## 0.21.0 — 2026-10-17
 
 - Needs cpuq 0.28.0 or later: job actions and Live View are always offered, with no check of
