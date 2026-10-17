@@ -1342,6 +1342,56 @@ t_submit_on() {
   unset XDG_STATE_HOME
 }
 
+t_submit_needs() {
+  # A spec's "needs" names caches that must hold files on a host: a host where one is empty is
+  # passed over (NOT RUN when it's the only one, the reason given), and a "needs" that isn't one
+  # of the spec's caches is refused.
+  setup submit-needs
+  local was_home=$HOME
+  export HOME=$T/home XDG_STATE_HOME=$T/xdg
+  mkdir -p "$HOME" "$T/roots/repo/cpuq"
+  printf 'submit_roots = %s\n' "$T/roots" >> "$CPUQ_CONFIG"
+  (
+    cd "$T/roots/repo" || exit 1
+    git init -q && git config user.email t@t && git config user.name t
+    printf '%s\n' '{ "label": "t:needs", "run": "cat \"$DATA/x\" > saw", "caches": { "DATA": "data" }, "needs": ["DATA"], "return": ["saw"], "cores": "1" }' > cpuq/needs.json
+    printf '%s\n' '{ "label": "t:bad", "run": "true", "needs": ["DATA"], "cores": "1" }' > cpuq/bad.json
+    git add -A && git commit -qm init
+    "$CPUQ" submit cpuq/bad.json >"$T/bad" 2>&1; echo "bad=$?"
+    "$CPUQ" submit cpuq/needs.json >"$T/empty" 2>&1; echo "empty=$?"
+    mkdir -p "$HOME/cpuq/caches/t/data" && echo filled > "$HOME/cpuq/caches/t/data/x"
+    "$CPUQ" submit cpuq/needs.json >/dev/null 2>&1; echo "filled=$?"; cat saw
+  ) >"$T/out" 2>&1
+  local got; got=$(tr '\n' ' ' <"$T/out")
+  check "submit: a \"needs\" outside the caches is refused, an empty one is NOT RUN with its reason ($(grep -o 'cpuq/caches/t/data is empty' "$T/empty" | head -1)), a filled one runs (got $got)" \
+    "[[ \"\$got\" == 'bad=2 empty=75 filled=0 filled ' ]] && grep -q 'has no DATA' '$T/bad' && grep -q 'cpuq/caches/t/data is empty' '$T/empty'"
+  export HOME=$was_home
+  unset XDG_STATE_HOME
+}
+
+t_submit_mem() {
+  # A host with less RAM than the spec's "mem" is passed over, unless --on names it: a run's
+  # arguments can make the job far smaller than its spec's limit.
+  setup submit-mem
+  local was_home=$HOME
+  export HOME=$T/home XDG_STATE_HOME=$T/xdg
+  mkdir -p "$HOME" "$T/roots/repo/cpuq"
+  printf 'submit_roots = %s\n' "$T/roots" >> "$CPUQ_CONFIG"
+  (
+    cd "$T/roots/repo" || exit 1
+    git init -q && git config user.email t@t && git config user.name t
+    printf '%s\n' '{ "label": "t:mem", "run": "true", "mem": "100000G", "cores": "1" }' > cpuq/mem.json
+    git add -A && git commit -qm init
+    "$CPUQ" submit cpuq/mem.json >"$T/big" 2>&1; echo "placed=$?"
+    "$CPUQ" submit --on here cpuq/mem.json >/dev/null 2>&1; echo "named=$?"
+  ) >"$T/out" 2>&1
+  local got; got=$(tr '\n' ' ' <"$T/out")
+  check "submit: a host short of \"mem\" is passed over, but runs it when --on names it (got $got)" \
+    "[[ \"\$got\" == 'placed=75 named=0 ' ]] && grep -q 'GB of RAM, the job wants 100000' '$T/big'"
+  export HOME=$was_home
+  unset XDG_STATE_HOME
+}
+
 t_submit_tmp() {
   # A submitted job's TMPDIR is a directory of its own under ~/cpuq/tmp, gone when the job ends.
   setup submit-tmp
@@ -2173,7 +2223,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_needs submit_mem submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
 for t in $TESTS; do
   if declare -F "t_$t" >/dev/null; then "t_$t"; else echo "no such test: $t"; FAIL=$((FAIL+1)); FAILED+=" $t?"; fi
 done

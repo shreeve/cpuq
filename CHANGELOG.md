@@ -2,6 +2,12 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.29.0 — unreleased
+
+- **`needs`** in a spec names caches (from its `caches`) that must already hold files on a host:
+  inputs filled by hand on some hosts only. `cpuq submit` passes over a host where one is missing
+  or empty, `--on`'s too, with a line saying which; none left is NOT RUN.
+
 ## 0.28.0 — 2026-10-17
 
 - **One layout on every machine,** with no links back to the old one:

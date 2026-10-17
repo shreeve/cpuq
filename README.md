@@ -517,8 +517,9 @@ that submits it picks the host. cpuq does the rest:
   first, by the spec's past results on each (another host's scaled by its cores when it has none
   there): a host that's up and free before a paid one that must be started, which is started only
   for work of ten minutes or more and only when clearly sooner. Work never seen goes to the first
-  host with room, else the first stopped one, started. `--on HOST` names the host (one of the
-  remotes, or this machine); a full host queues it;
+  host with room, else the first stopped one, started. A host is passed over when it has too
+  little memory for the job, or when a cache the spec `needs` is empty there. `--on HOST` names
+  the host (one of the remotes, or this machine); a full host queues it;
 - **syncs a snapshot** of the work there with rsync, moving only what changed, then reads the copy
   back by checksum (as `cpuq run --on` does);
 - **runs it, owned by that host,** so the agent's session, or this machine sleeping, doesn't stop
@@ -582,7 +583,8 @@ that submits it picks the host. cpuq does the rest:
   - `"git": true` ships the repo's git, git's own parts only (a worktree's too), for a job that
     runs `git ls-files` and the like;
   - a directory holding something like a credential (`.env`, `*.pem`, `id_*`) is refused;
-  - `caches` live on the host, outside the copy, shared by all of a project's runs;
+  - `caches` live on the host, outside the copy, shared by all of a project's runs; `needs`
+    names those that must already hold files there;
   - `deps` ship a sibling repo's tracked files.
 
 #### Packs: tool versions on each host
