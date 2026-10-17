@@ -750,7 +750,7 @@ fn probeHost(ctx: *Ctx, host: []const u8) Probe {
     if (!result.term.success()) return .gone;
     const st = std.json.parseFromSliceLeaky(JsonStatus, a, result.stdout, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return .gone;
     if (st.waiters.len != 0) return .{ .full = a.print("has {d} waiting", .{st.waiters.len}) catch "is full" };
-    if (st.load[0] > @as(f64, @floatFromInt(st.active_cores))) return .{ .full = a.print("is at load {d:.1} on {d} CPUs", .{ st.load[0], st.active_cores }) catch "is full" };
+    if (st.load_check and st.load[0] > @as(f64, @floatFromInt(st.active_cores))) return .{ .full = a.print("is at load {d:.1} on {d} CPUs", .{ st.load[0], st.active_cores }) catch "is full" };
     if (!std.mem.eql(u8, st.gate.state, "open")) return .{ .full = "has its gate shut" };
     return .room;
 }
@@ -4148,6 +4148,9 @@ const JsonStatus = struct {
     held: u32 = 0,
     free: u32 = 0,
     load: [3]f64 = .{ 0, 0, 0 },
+    /// Whether this machine counts its load against admitting work (config `load_check`): a
+    /// --spill sending work here judges it by its load only when it does.
+    load_check: bool = true,
     memory_pressure: []const u8 = "",
     /// Memory and swap in bytes: `used` is what Activity Monitor calls Memory
     /// Used on macOS, the total less MemAvailable on Linux.
@@ -4797,6 +4800,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
             .held = held,
             .free = budget -| held,
             .load = load,
+            .load_check = ctx.cfg.load_check,
             .memory_pressure = pressure,
             .memory = sys.memory(ctx.io),
             .gate = .{

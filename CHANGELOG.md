@@ -2,12 +2,16 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
-## 0.26.3 — 2026-10-16
+## 0.26.4 — 2026-10-16
+
+(0.26.3 was tagged, never released: its release build failed on the fix below.)
 
 - **`window_backfill`** (default on): off, nothing starts ahead of a timing window (an
   `--exclusive` run or lease) waiting at the front, not even a job history says is quick, so the
   window waits only for what already runs. pup sets it off: a 1-second job slipped in ahead of a
   waiting pup-bench window and ran 30 s and more.
+- `--spill` judges a spill host by its load only when that host counts load itself (its
+  `load_check`, now in `cpuq status --json`), as it judges this machine.
 
 ## 0.26.2 — 2026-10-16
 
