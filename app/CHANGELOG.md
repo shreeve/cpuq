@@ -3,6 +3,20 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.20.0 — 2026-10-16
+
+- **What's Happening?** in the menu: what is wrong now and what the app found in the last hour, in
+  a few plain lines. On a Mac with Apple Intelligence, Apple's on-device model writes them; the
+  rules decide what is wrong, since a small model misreads numbers.
+- **Texts you what needs you** (Settings ▸ Text me what needs me, on when ~/bin/send-imessage is
+  there): a job that looks stuck, a cloud machine billing with nothing to do, a machine
+  overloaded while another has room, and --opaque jobs holding cores while others wait. At most
+  one text every 30 minutes; Apple's model writes it where it can.
+- Jobs waiting beside idle CPUs are noticed on every machine the app watches, not only this Mac
+  (pup queued behind 20 idle CPUs this afternoon, unnoticed).
+- New: a notification when --opaque jobs hold cores they don't use while others wait, and when a
+  machine stays overloaded (load over 1.5× its CPUs for 10 minutes) while another has room.
+
 ## 0.19.7 — 2026-10-15
 
 - A timing window says which machine it waits for or holds ("waits for pup to empty"), not

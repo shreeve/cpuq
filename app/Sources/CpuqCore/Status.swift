@@ -55,6 +55,8 @@ public struct Status: Decodable, Sendable, Equatable {
         public var using: Double?
         public var priority = ""
         public var exclusive = false
+        /// Its work runs where cpuq can't see it (`--opaque`: a container, a VM).
+        public var opaque = false
         public var label = ""
         /// What the job is for (`--note`): shown beside the label, a band of its own in the charts.
         public var note = ""
@@ -189,7 +191,7 @@ extension Status.Gate {
 }
 
 extension Status.Holder {
-    private enum Keys: String, CodingKey { case pid, cores, slots, paused, using, priority, exclusive, label, note, command, since, progress, left, typical, leftFrom }
+    private enum Keys: String, CodingKey { case pid, cores, slots, paused, using, priority, exclusive, opaque, label, note, command, since, progress, left, typical, leftFrom }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         pid = try c.decodeIfPresent(Int.self, forKey: .pid) ?? 0
@@ -199,6 +201,7 @@ extension Status.Holder {
         using = try c.decodeIfPresent(Double.self, forKey: .using)
         priority = try c.decodeIfPresent(String.self, forKey: .priority) ?? ""
         exclusive = try c.decodeIfPresent(Bool.self, forKey: .exclusive) ?? false
+        opaque = try c.decodeIfPresent(Bool.self, forKey: .opaque) ?? false
         label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
         note = try c.decodeIfPresent(String.self, forKey: .note) ?? ""
         command = try c.decodeIfPresent(String.self, forKey: .command) ?? ""

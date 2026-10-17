@@ -33,6 +33,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var idleWait = Episode()
     private var cloudIdle: [String: Episode] = [:]
     private var outsideHeavy: [String: Episode] = [:]
+    /// Per machine watched from here: jobs waiting beside idle CPUs, --opaque jobs holding cores
+    /// unused while others wait, and a machine overloaded while another has room.
+    private var idleWaitThere: [String: Episode] = [:]
+    private var opaqueIdle: [String: Episode] = [:]
+    private var overloaded: [String: Episode] = [:]
+    /// What the rules found lately, for What's Happening? and the owner's texts: the last hour's.
+    private var found: [(at: Date, line: String)] = []
+    /// Lines waiting to be texted, and when the last text went: at most one every 30 minutes.
+    private var toText: [String] = []
+    private var textedAt: Date?
     /// Running jobs being watched for a hang, by machine, pid and start.
     private var hung: [String: Hang] = [:]
 
@@ -356,6 +366,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         for line in alerts() { m.addItem(text(line, bold: false)) }
         m.addItem(.separator())
         m.addItem(withTitle: "Open Cpuq", action: #selector(showGraphs), keyEquivalent: "g").target = self
+        m.addItem(withTitle: "What's Happening?", action: #selector(whatsHappening), keyEquivalent: "").target = self
         m.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",").target = self
         if Bundle.main.bundleURL.pathExtension == "app" {
             let check = NSMenuItem(title: "Check for Updates…", action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)), keyEquivalent: "")
@@ -470,7 +481,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                         let what = h.label + (h.note.isEmpty ? "" : " " + h.note)
                         let count = h.progress.map { " Its count has stood at \($0.done) of \($0.total) for 10 minutes." } ?? ""
                         notify("hung-\(key)", "\(name): \(what) looks stuck",
-                               String(format: "Almost no CPU (%.1f of %d reserved) for 10 minutes.%@ Running %@; its owner can stop it with cpuq stop %d.", h.using ?? 0, h.cores, count, duration(now.timeIntervalSince1970 - Double(h.since)), h.pid))
+                               String(format: "Almost no CPU (%.1f of %d reserved) for 10 minutes.%@ Running %@; its owner can stop it with cpuq stop %d.", h.using ?? 0, h.cores, count, duration(now.timeIntervalSince1970 - Double(h.since)), h.pid), text: true)
                     }
                 } else {
                     t.still = nil
@@ -480,12 +491,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
         }
         hung = hung.filter { seen.contains($0.key) }
+        // The same idle-CPU check on each machine watched from here (the Mac's is above).
+        for c in remotes where c.status != nil {
+            let m = Moment.now(c)
+            var e = idleWaitThere[c.machine.id] ?? Episode()
+            track(&e, m.needless, after: 60, now) {
+                notify("idle-\(c.machine.id)", "\(c.machine.name): \(m.waiters.count) waiting beside idle CPUs",
+                       String(format: "%.1f of %.0f CPUs free, and nothing starts: a job may be stuck, or holding cores it doesn't use (an --opaque job whose work cpuq could see).", m.free, m.cpus))
+            }
+            idleWaitThere[c.machine.id] = e
+        }
+        // --opaque jobs holding cores they don't use while others wait: counted whole until the
+        // machine's own busy time shows otherwise, a job marked --opaque whose work cpuq can see
+        // anyway (a VM it starts itself) holds the queue.
+        for (id, name, s) in machines {
+            let idleOpaque = s.holders.filter { $0.opaque && !$0.paused && now.timeIntervalSince1970 - Double($0.since) >= 180 && ($0.using ?? 1) < 0.1 * Double($0.cores) }
+            var e = opaqueIdle[id] ?? Episode()
+            track(&e, !idleOpaque.isEmpty && !s.waiters.isEmpty, after: 120, now) {
+                let held = idleOpaque.reduce(0) { $0 + $1.cores }
+                let used = idleOpaque.reduce(0.0) { $0 + ($1.using ?? 0) }
+                let who = Set(idleOpaque.map(\.label)).sorted().prefix(3).joined(separator: ", ")
+                notify("opaque-\(id)", "\(name): --opaque jobs hold \(held) cores, using \(String(format: "%.1f", used))",
+                       "\(s.waiters.count) waiting meanwhile. \(who): if cpuq can see their work (a VM they start themselves), --opaque is wrong for them.", text: true)
+            }
+            opaqueIdle[id] = e
+        }
+        // A machine overloaded (1-minute load over 1.5 times its CPUs) for 10 minutes while
+        // another watched from here has room: portable work belongs there.
+        for (id, name, s) in machines {
+            let cpus = Double(max(s.activeCores > 0 ? s.activeCores : s.budget, 1))
+            let load = s.load.first ?? 0
+            let roomy = machines.filter { $0.id != id && $0.s.waiters.isEmpty && ($0.s.load.first ?? 0) < 0.5 * Double(max($0.s.activeCores, 1)) }.map(\.name)
+            var e = overloaded[id] ?? Episode()
+            track(&e, load > 1.5 * cpus && !roomy.isEmpty, after: 600, now) {
+                notify("overload-\(id)", String(format: "%@: load %.0f on %.0f CPUs", name, load, cpus),
+                       "For 10 minutes, while \(roomy.joined(separator: " and ")) \(roomy.count == 1 ? "has" : "have") room: send portable work there (cpuq run --spill).", text: true)
+            }
+            overloaded[id] = e
+        }
+        sendTexts(now)
         for c in remotes where c.machine.start != nil {
             let idle = c.isCloudRunning && (c.status.map { $0.holders.isEmpty && $0.waiters.isEmpty } ?? false)
             var e = cloudIdle[c.machine.id] ?? Episode()
             track(&e, idle, after: 15 * 60, now) {
                 notify("cloud-\(c.machine.id)", "\(c.machine.name) is running with nothing to do",
-                       "Idle 15 minutes and still billing; it should have stopped itself after 10.", stop: stopCommand(for: c.machine))
+                       "Idle 15 minutes and still billing; it should have stopped itself after 10.", stop: stopCommand(for: c.machine), text: true)
             }
             cloudIdle[c.machine.id] = e
         }
@@ -534,7 +584,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         return FileManager.default.isExecutableFile(atPath: path) ? stop : nil
     }
 
-    private func notify(_ id: String, _ title: String, _ body: String, stop: String? = nil) {
+    private func notify(_ id: String, _ title: String, _ body: String, stop: String? = nil, text: Bool = false) {
+        let line = title + ". " + body
+        found.append((Date(), line))
+        found.removeAll { Date().timeIntervalSince($0.at) > 3600 }
+        if text { toText.append(line) }
         guard Bundle.main.bundleIdentifier != nil else { return }
         let content = UNMutableNotificationContent()
         content.title = title
@@ -544,6 +598,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             content.userInfo = ["stop": stop]
         }
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
+    }
+
+    /// Texts the owner what needs them, at most once every 30 minutes: Apple's on-device model
+    /// writes the note from the rules' lines where the Mac has it, else the lines themselves.
+    private func sendTexts(_ now: Date) {
+        guard !toText.isEmpty else { return }
+        guard Prefs.text else { toText.removeAll(); return }
+        if let at = textedAt, now.timeIntervalSince(at) < 30 * 60 { return }
+        let lines = toText
+        toText.removeAll()
+        textedAt = now
+        let command = (Prefs.textCommand as NSString).expandingTildeInPath
+        Task {
+            let body = await Insight.note(lines) ?? lines.joined(separator: "\n")
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: command)
+            p.arguments = ["From Cpuq.app: " + body]
+            try? p.run()
+        }
+    }
+
+    /// What's Happening?: what is wrong now and what the rules found in the last hour, in a few
+    /// plain lines (Apple's on-device model writes them where the Mac has it).
+    @objc private func whatsHappening() {
+        let lines = alerts() + found.map(\.line)
+        Task {
+            let text: String
+            if lines.isEmpty {
+                text = "All clear: nothing wrong now, and nothing found in the last hour."
+            } else {
+                text = await Insight.note(lines) ?? lines.joined(separator: "\n")
+            }
+            let alert = NSAlert()
+            alert.messageText = "What's happening"
+            alert.informativeText = text
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+        }
     }
 
     /// Shown even while Cpuq is in front.

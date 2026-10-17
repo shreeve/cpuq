@@ -9,6 +9,13 @@ enum Prefs {
     static var dockAlways: Bool { UserDefaults.standard.bool(forKey: "dockAlways") }
     /// Notifications when something goes wrong and stays so (default on).
     static var notify: Bool { UserDefaults.standard.object(forKey: "notify") as? Bool ?? true }
+    /// The command that texts the owner a line (default ~/bin/send-imessage, when it is there).
+    static var textCommand: String { UserDefaults.standard.string(forKey: "textCommand") ?? "~/bin/send-imessage" }
+    /// Text the owner what needs them (default on, when the text command is there).
+    static var text: Bool {
+        (UserDefaults.standard.object(forKey: "text") as? Bool ?? true)
+            && FileManager.default.isExecutableFile(atPath: (textCommand as NSString).expandingTildeInPath)
+    }
 }
 
 /// Cpuq ▸ Settings: where the app shows itself, and whether it opens at login.
@@ -16,6 +23,7 @@ struct SettingsView: View {
     @AppStorage("showInMenuBar") private var showInMenuBar = true
     @AppStorage("dockAlways") private var dockAlways = false
     @AppStorage("notify") private var notify = true
+    @AppStorage("text") private var text = true
     @State private var openAtLogin = SMAppService.mainApp.status == .enabled
     @State private var loginProblem: String?
 
@@ -34,6 +42,13 @@ struct SettingsView: View {
                 }
             } footer: {
                 Text("The menu bar item stays calm while all is well. It turns orange when jobs wait beside idle CPUs or cpuq's gate is shut, and shows ☁ while a cloud machine runs, and for how long.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
+                Toggle("Text me what needs me", isOn: $text)
+                    .disabled(!FileManager.default.isExecutableFile(atPath: (Prefs.textCommand as NSString).expandingTildeInPath))
+            } footer: {
+                Text("At most once every 30 minutes, with \(Prefs.textCommand): a machine overloaded while another has room, a job that looks stuck, a cloud machine billing with nothing to do, or --opaque jobs holding cores while others wait.\(Insight.available ? " Apple's on-device model writes the note." : "")")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
