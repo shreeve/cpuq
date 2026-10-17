@@ -81,7 +81,8 @@ fn submitted(cx: *Cx, root: []const u8) void {
 /// directory down that holds a file; its age, its own change time (each sync sets its times).
 fn legacy(cx: *Cx, spill: []const u8) void {
     for (children(cx, spill, .directory)) |name| {
-        if (std.mem.eql(u8, name, "s") or std.mem.eql(u8, name, "w") or std.mem.eql(u8, name, "c") or name[0] == '.') continue;
+        // s, w and c are cpuq's own (spilled, submitted, caches); t holds running jobs' TMPDIRs.
+        if (std.mem.eql(u8, name, "s") or std.mem.eql(u8, name, "w") or std.mem.eql(u8, name, "c") or std.mem.eql(u8, name, "t") or name[0] == '.') continue;
         mirror(cx, cx.a.print("{s}/{s}", .{ spill, name }) catch continue, 0);
     }
 }

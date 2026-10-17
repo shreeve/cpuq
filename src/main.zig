@@ -958,6 +958,9 @@ fn gitIgnored(ctx: *Ctx, root: []const u8) ?[]const u8 {
             if (wild and std.mem.findScalar(u8, "*?[\\", ch) != null) out.append(a, '\\') catch return null;
             out.append(a, ch) catch return null;
         }
+        // An ignored folder (git's `dir/`), with all it holds: a path shipped from inside it
+        // (--ship) is included by an earlier rule, and the rest stays behind.
+        if (path[path.len - 1] == '/') out.appendSlice(a, "***") catch return null;
         out.append(a, '\n') catch return null;
     }
     const tmp = ctx.env.get("TMPDIR") orelse "/tmp";

@@ -293,6 +293,10 @@ can spend a large part of a big machine doing nothing else: one did, about 17 of
 | `--pids N` | at most N processes and threads at once (inside a job on Linux) |
 | `--no-crash-report` | no crash report when PROGRAM crashes on purpose, a test that panics: on macOS no `.ips` in `~/Library/Logs/DiagnosticReports`; on Linux a core limit of exactly 1, so the kernel passes it to no `core_pattern` handler (Ubuntu's apport, seconds per crash). It still dies by its signal. What PROGRAM starts inherits it, so wrap the program meant to crash, never a compiler before it |
 
+`cpuq cap --protocol` prints what cap does as a number that changes only when that does (its
+limits, how it stops a program, its exit statuses, `--no-crash-report`): a test runner that caches
+results keys them on it, not on cpuq's version, so a release that leaves cap alone keeps them.
+
 - **Exit status:** PROGRAM's own, or death by its signal. When cpuq stopped it, it's 122 for
   memory, 124 for time and 121 for output, each with one line on stderr. 127 means PROGRAM
   wasn't found.
@@ -529,8 +533,23 @@ rest:
   A FAIL lists the report's first failures (or the output's last lines) above the verdict.
 - **Identity:** a resubmit of the same code, spec and arguments attaches to the job already
   running.
+- **A worktree's jobs at once:** a host keeps up to `submit_slots` (3) copies of a worktree, and
+  each job takes the first free one, so a gate's suite, corpus and matrix run side by side, not
+  one after another. A copy never synced is first seeded on the host from the project's most
+  recently synced copy (a free one if there is one; the filesystem's cheap copy where it has one),
+  so the sync sends only what differs and build caches start warm. `submit_slots = 1` runs a
+  worktree's jobs one after another on a single copy.
+- **Where the time goes:** each job's supervisor log (`~/.local/state/cpuq/jobs/ID/supervisor.log`)
+  has a line with each phase's seconds: start, waiting for a copy, packs, copy, check, marked.
 - **Supervised:** killing `cpuq submit` never stops the job. `cpuq job ID --wait` follows it
   again.
+- **Returned paths start empty:** each `return` path is emptied in the copy before the job runs, so
+  what comes back is this job's alone.
+- **What ran, by git:** once its copy is synced and checked unchanged, the job records `shipped`:
+  the worktree's `head`, the `tree` of its content as it was (HEAD's with its changes and the
+  untracked files git doesn't ignore), and `clean` (no changes, no untracked files: the tree is
+  HEAD's). `cpuq job ID --json` includes it, finished or not, so a tool can bind a verdict to
+  cpuq's own record of what ran.
 - **The note:** `--note`, or else the worktree's branch, shows beside the label everywhere.
   `cpuq note PID|LABEL TEXT [--host HOST]` changes a running job's note.
 - **What travels:**
@@ -805,6 +824,8 @@ re-reads the file when it changes; an invalid edit keeps the settings in force a
 | `max_memory` | off | stop a job whose processes together use more memory than this (e.g. `16G`) |
 | `spill` | none | ssh hosts `--spill` may send a job to, in order (commas or spaces) |
 | `spill_default` | off | a `cpuq run` with neither `--spill` nor `--local` spills when nothing ties it here |
+| `submit_slots` | 3 | copies of a worktree a submitted job may use on its host (1–8): so many of its jobs run at once |
+| `job_tmp` | none | where a submitted job's TMPDIR goes on this host (a directory per job, removed after); empty: beside its record |
 | `spill_start.HOST` | none | a command (run with sh) that starts HOST when it is stopped; it returns once ssh works |
 | `spill_env.HOST` | none | shell assignments a spilled job exports on HOST, e.g. `PATH=$HOME/.local/go/bin:$PATH` |
 | `exclusive` | on | grant `--exclusive`; off, it runs as an ordinary job |

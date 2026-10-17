@@ -1038,6 +1038,8 @@ t_cap_quiet_crash() {
   setup cap-quiet-crash
   local got; got=$(sh -c "\"$CPUQ\" cap --no-crash-report -- sh -c 'echo panic: on purpose >&2; kill -ABRT \$\$' 2>\"$T/err\"; echo \$?")
   check "cap --no-crash-report: PROGRAM still dies by its signal (status $got) with its stderr ($(cat "$T/err" | tr -d '\n'))" "[ '$got' = 134 ] && grep -q 'panic: on purpose' '$T/err'"
+  local proto; proto=$("$CPUQ" cap --protocol)
+  check "cap --protocol prints what cap does as a number (got '$proto')" "[[ '$proto' =~ ^[0-9]+\$ ]]"
   # Linux: PROGRAM's core limit is exactly 1, at which the kernel starts no core_pattern handler
   # (apport); without the flag it keeps the limit it was given.
   [ "$(uname)" = Linux ] || return 0
@@ -1132,8 +1134,19 @@ t_submit() {
     "$CPUQ" submit cpuq/fail.json >"$T/fail" 2>/dev/null; echo "fail=$?"
     "$CPUQ" submit cpuq/slow.json >/dev/null 2>&1; echo "slow=$?"
     "$CPUQ" submit cpuq/ret.json >/dev/null 2>&1; echo "ret=$?"; cat out/x 2>/dev/null
+    # A return path starts empty each job: an earlier job's file there doesn't come back.
+    printf '%s\n' '{ "label": "t:ret2", "run": "mkdir -p out && echo second > out/y", "return": ["out"], "cores": "1" }' > cpuq/ret2.json
+    rm -rf out; "$CPUQ" submit cpuq/ret2.json >/dev/null 2>&1; [ -f out/y ] && [ ! -f out/x ] && echo fresh
     "$CPUQ" submit cpuq/git.json >/dev/null 2>&1; echo "git=$?"
     [ "$(head -1 gitsaw 2>/dev/null)" = "$(git rev-parse HEAD)" ] && [ "$(tail -1 gitsaw | tr -d ' ')" = "$(git ls-files | wc -l | tr -d ' ')" ] && echo gitsaw
+    # What shipped, by git: the finished job's --json has HEAD, the worktree's tree (HEAD's when
+    # clean), and whether it was clean (here not: earlier jobs returned files into it).
+    "$CPUQ" job last --json | python3 -c 'import json, subprocess, sys
+s = json.load(sys.stdin).get("shipped") or {}
+git = lambda *a: subprocess.run(["git", *a], capture_output=True, text=True).stdout.strip()
+clean = git("status", "--porcelain") == ""
+ok = s.get("head") == git("rev-parse", "HEAD") and s.get("clean") is clean and len(s.get("tree") or "") == 40 and (s.get("tree") == git("rev-parse", "HEAD^{tree}")) == clean
+print("shipped" if ok else "shipped-wrong %s" % s)'
     "$CPUQ" submit cpuq/long.json >"$T/first" 2>/dev/null & local first=$!
     sleep 2
     "$CPUQ" submit cpuq/long.json --max-wait 1 2>/dev/null | head -1 | sed 's/^job [0-9a-f]* (attached.*/attached/'
@@ -1145,7 +1158,7 @@ t_submit() {
   ) >"$T/out" 2>&1
   local got; got=$(tr '\n' ' ' < "$T/out")
   local tail_ok=0; grep -q 'args=one two' "$HOME/.local/state/cpuq/jobs/"*/tail.log 2>/dev/null || grep -rq 'args=one two' "$T/xdg" && tail_ok=1
-  check "submit: pass 0, fail 1, timeout 124, return copied, a spec's git there, attach, changed code 2, --replace 0 and the old CANCELLED 76, a credential 2 (got: $got)" "[[ '$got' == 'pass=0 fail=1 slow=124 ret=0 made git=0 gitsaw attached changed=2 replace=0 replaced=76 secret=2 ' ]]"
+  check "submit: pass 0, fail 1, timeout 124, return copied (fresh each job), a spec's git there, what shipped by git, attach, changed code 2, --replace 0 and the old CANCELLED 76, a credential 2 (got: $got)" "[[ '$got' == 'pass=0 fail=1 slow=124 ret=0 made fresh git=0 gitsaw shipped attached changed=2 replace=0 replaced=76 secret=2 ' ]]"
   check "submit: the report's failure is listed, and the job got its arguments" "grep -q 'fail  t2  boom' '$T/fail' && [ $tail_ok = 1 ]"
   export HOME=$was_home
   unset XDG_STATE_HOME
@@ -1158,6 +1171,7 @@ t_submit_moved() {
   local was_home=$HOME
   export HOME=$T/home XDG_STATE_HOME=$T/xdg
   mkdir -p "$HOME" "$T/roots/repo/cpuq"
+  echo "submit_slots = 1" >> "$CPUQ_CONFIG"  # one copy: its jobs wait for it
   echo "submit_roots = $T/roots" >> "$CPUQ_CONFIG"
   (
     cd "$T/roots/repo" || exit 1
@@ -1188,6 +1202,7 @@ t_submit_abandon() {
   local was_home=$HOME
   export HOME=$T/home XDG_STATE_HOME=$T/xdg
   mkdir -p "$HOME" "$T/roots/repo/cpuq"
+  echo "submit_slots = 1" >> "$CPUQ_CONFIG"  # one copy: its jobs wait for it
   echo "submit_roots = $T/roots" >> "$CPUQ_CONFIG"
   (
     cd "$T/roots/repo" || exit 1
@@ -1211,6 +1226,59 @@ t_submit_abandon() {
   local got; got=$(tr '\n' ' ' < "$T/out")
   check "submit: a job given up before its sync frees its copy (the next runs at once), and a queued job ends when cancelled ($got)" \
     "[[ '$got' == 'broken=125 next=0 next_s='[0-9]' queued=76 ' || '$got' == 'broken=125 next=0 next_s=1'[0-9]' queued=76 ' ]]"
+  export HOME=$was_home
+  unset XDG_STATE_HOME
+}
+
+t_submit_slots() {
+  # A worktree's submitted jobs run at once, each on a copy of its own (submit_slots): the second
+  # starts while the first runs, on a copy seeded from the first's, which keeps what the first
+  # left there (a build's cache).
+  setup submit-slots
+  local was_home=$HOME
+  export HOME=$T/home XDG_STATE_HOME=$T/xdg
+  mkdir -p "$HOME" "$T/roots/repo/cpuq"
+  echo "submit_roots = $T/roots" >> "$CPUQ_CONFIG"
+  (
+    cd "$T/roots/repo" || exit 1
+    git init -q && git config user.email t@t && git config user.name t
+    printf '.cache\n' > .gitignore
+    printf '%s\n' '{ "label": "t:warm", "run": "mkdir -p .cache && echo built > .cache/x", "cores": "1" }' > cpuq/warm.json
+    printf '%s\n' '{ "label": "t:hold", "run": "sleep 15", "cores": "1", "exclude": [".cache"] }' > cpuq/hold.json
+    printf '%s\n' '{ "label": "t:peek", "run": "cat .cache/x", "cores": "1", "exclude": [".cache"] }' > cpuq/peek.json
+    git add -A && git commit -qm init
+    "$CPUQ" submit cpuq/warm.json >/dev/null 2>&1; echo "warm=$?"
+    rm -rf .cache
+    "$CPUQ" submit cpuq/hold.json >/dev/null 2>&1 & local h=$!
+    sleep 2
+    "$CPUQ" submit cpuq/peek.json >"$T/peek" 2>&1; echo "peek=$?"
+    kill -0 $h 2>/dev/null && echo "beside" || echo "after"
+    wait $h; echo "hold=$?"
+  ) >"$T/out" 2>&1
+  local got; got=$(tr '\n' ' ' < "$T/out")
+  check "submit: a worktree's second job runs at once on another copy, seeded warm from the first's (got $got)" \
+    "[[ '$got' == 'warm=0 peek=0 beside hold=0 ' ]]"
+  export HOME=$was_home
+  unset XDG_STATE_HOME
+}
+
+t_submit_tmp() {
+  # job_tmp: a submitted job's TMPDIR is a directory of its own there, gone when the job ends.
+  setup submit-tmp
+  local was_home=$HOME
+  export HOME=$T/home XDG_STATE_HOME=$T/xdg
+  mkdir -p "$HOME" "$T/roots/repo/cpuq" "$T/jt"
+  printf 'submit_roots = %s\njob_tmp = %s\n' "$T/roots" "$T/jt" >> "$CPUQ_CONFIG"
+  (
+    cd "$T/roots/repo" || exit 1
+    git init -q && git config user.email t@t && git config user.name t
+    printf '%s\n' '{ "label": "t:tmp", "run": "echo \"$TMPDIR\" > saw && touch \"$TMPDIR/x\"", "return": ["saw"], "cores": "1" }' > cpuq/tmp.json
+    git add -A && git commit -qm init
+    "$CPUQ" submit cpuq/tmp.json >/dev/null 2>&1; echo "rc=$?"
+  ) >"$T/out" 2>&1
+  local saw; saw=$(cat "$T/roots/repo/saw" 2>/dev/null)
+  local left; left=$(ls "$T/jt" | wc -l | tr -d ' ')
+  check "job_tmp: the job's TMPDIR was under it ($saw), and is gone after (left $left)" "[[ '$(cat "$T/out")' == 'rc=0' && '$saw' == '$T/jt/'* && $left = 0 ]]"
   export HOME=$was_home
   unset XDG_STATE_HOME
 }
@@ -1925,12 +1993,15 @@ t_spill_gitignore() {
   (
     cd "$T" && git init -q repo && cd repo && git config user.email t@t && git config user.name t
     printf 'data/*\n!data/keep.txt\nbuild/\n*.log\n' > .gitignore
-    mkdir -p data build && echo k > data/keep.txt && echo d > data/drop.txt && echo x > build/x
+    mkdir -p data build && echo k > data/keep.txt && echo d > data/drop.txt && echo x > build/x && echo s > build/ship.sh
     echo p > plain.txt && echo t > tracked.log && echo n > notes.log
     git add .gitignore plain.txt && git add -f tracked.log && git commit -qm one
   ) >/dev/null 2>&1
   local got; got=$(cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --spill-to far --cores 1 -- sh -c 'find . -type f ! -path "./.git*" ! -name .cpuq-used | sort | tr "\n" " "' 2>/dev/null)
   check "a spilled copy ships what git ships: a \`!\` re-included file and a tracked one, none of the ignored (got '$got')" "[ '$got' = './data/keep.txt ./plain.txt ./tracked.log ' ]"
+  # One file shipped from inside an ignored folder: it alone, not the rest of the folder.
+  got=$(cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --spill-to far --ship build/ship.sh --cores 1 -- sh -c 'find ./build -type f | sort | tr "\n" " "' 2>/dev/null)
+  check "--ship of one file in an ignored folder ships it alone (got '$got')" "[ '$got' = './build/ship.sh ' ]"
 }
 
 t_spill_default() {
@@ -2012,7 +2083,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git spill_gitignore spill_default tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git spill_gitignore spill_default tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

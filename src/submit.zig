@@ -14,6 +14,7 @@
 //! Every file lives under the state directory (`~/.local/state/cpuq/jobs/ID/`), on both sides.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const c = std.c;
 const policy = @import("policy.zig");
@@ -115,6 +116,9 @@ const Spec = struct {
 
 /// What goes to the host: the spec as this job runs it, resolved.
 const Payload = struct {
+    /// Copies of the worktree the host may use at once (the supervisor follows the one it takes,
+    /// `_peek`'s copy); 1 from a supervisor before 0.26.1, which syncs only `copy`.
+    slots: u32 = 1,
     id: []const u8,
     label: []const u8,
     note: []const u8 = "",
@@ -128,6 +132,9 @@ const Payload = struct {
     env: ?Map = null,
     caches: ?Map = null,
     report: ?[]const u8 = null,
+    /// The spec's `return` paths, emptied in the copy before the job runs, so what comes back is
+    /// this job's, not an earlier job's left on the copy (or on the copy this one was seeded from).
+    returns: []const []const u8 = &.{},
     args: []const []const u8 = &.{},
     /// The copy, relative to the host's home: cpuq-spill/w/PROJECT/ID12.
     copy: []const u8,
@@ -160,7 +167,37 @@ const Record = struct {
     packs: []const packs.Pack = &.{},
     on: []const []const u8 = &.{},
     payload: []const u8,
+    /// What shipped, by git, once its copy was synced (null outside git, or before the sync).
+    shipped: ?Shipped = null,
 };
+
+/// The code a job ran, by git's account, taken right after its copy was synced and checked
+/// unchanged: so a tool can bind a verdict to cpuq's own record of what ran.
+const Shipped = struct {
+    /// The worktree's HEAD commit.
+    head: []const u8,
+    /// The tree of the worktree as it was: HEAD's, with its changes and untracked files that git
+    /// doesn't ignore (`git add -A` into a scratch index, then `git write-tree`).
+    tree: []const u8,
+    /// No changes and no untracked files (`git status --porcelain` empty): the tree is HEAD's.
+    clean: bool,
+};
+
+/// `rec.dir`'s git state as `Shipped`; null outside git.
+fn shippedNow(cx: Cx, rec: *const Record) ?Shipped {
+    const head = run(cx, &.{ "git", "-C", rec.dir, "rev-parse", "HEAD" }, null);
+    if (!head.ok) return null;
+    const status = run(cx, &.{ "git", "-C", rec.dir, "status", "--porcelain" }, null);
+    const index = jobFile(cx, rec.id, "shipped.index");
+    defer Io.Dir.cwd().deleteFile(cx.io, index) catch {};
+    const tree = run(cx, &.{ "/bin/sh", "-c", cx.a.print("GIT_INDEX_FILE={s} git -C {s} read-tree HEAD && GIT_INDEX_FILE={s} git -C {s} add -A && GIT_INDEX_FILE={s} git -C {s} write-tree", .{ quote(cx, index), quote(cx, rec.dir), quote(cx, index), quote(cx, rec.dir), quote(cx, index), quote(cx, rec.dir) }) catch return null }, null);
+    if (!tree.ok or !status.ok) return null;
+    return .{
+        .head = std.mem.trim(u8, head.out, " \n"),
+        .tree = std.mem.trim(u8, tree.out, " \n"),
+        .clean = std.mem.trim(u8, status.out, " \n").len == 0,
+    };
+}
 
 const Failure = struct {
     id: []const u8 = "",
@@ -565,6 +602,7 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
         .env = env_map,
         .caches = spec.caches,
         .report = spec.report,
+        .returns = spec.@"return",
         .args = job_args,
         .copy = copy,
         .generation = snapshot_digest,
@@ -913,6 +951,8 @@ fn place(cx: Cx, rec: *const Record) ?[]const u8 {
 
 const Peeked = struct {
     state: []const u8 = "none",
+    /// The copy the host took for the job (one of its worktree's slots); empty from an older host.
+    copy: []const u8 = "",
     done: u64 = 0,
     total: u64 = 0,
     failing: u64 = 0,
@@ -925,35 +965,55 @@ fn peek(cx: Cx, host: []const u8, id: []const u8) ?Peeked {
     return std.json.parseFromSliceLeaky(Peeked, cx.a, r.out, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch null;
 }
 
+/// Adds "NAME S.Ss" to `phases`: the seconds since `at_ms`, which it moves to now.
+fn lap(cx: Cx, phases: *std.ArrayList(u8), at_ms: *i64, name: []const u8) void {
+    const t = sys.monoMs();
+    phases.print(cx.a, "{s}{s} {d:.1}s", .{ if (phases.items.len == 0) "" else ", ", name, @as(f64, @floatFromInt(t - at_ms.*)) / 1000 }) catch {};
+    at_ms.* = t;
+}
+
 fn startAndWatch(cx: Cx, rec: *Record, payload: *Payload, host: []const u8) u8 {
     const id = rec.id;
     if (host_has_time_rule(cx, host) and payload.time == null) payload.time = "2h";
     payload.attempt = rec.attempt;
     payload.host_env = cx.cfg.spillEnv(host) orelse "";
+    payload.slots = cx.cfg.submit_slots;
     setState(cx, id, "starting", cx.a.print("on {s}", .{host}) catch "");
+    // Where the time to a running job goes, in supervisor.log: each phase's seconds.
+    var phase_ms = sys.monoMs();
+    var phases: std.ArrayList(u8) = .empty;
     const b64 = base64(cx, jsonString(cx, payload.*));
     const started = onHost(cx, host, cx.a.print("{s} _start {s} {s}", .{ cpuqOn(cx, host), id, b64 }) catch "");
+    lap(cx, &phases, &phase_ms, "start");
     if (!started.ok) return done(cx, id, rec.*, .cpuq_error, null, cx.a.print("couldn't start it on {s}: {s}: not your code, report it", .{ host, std.mem.trim(u8, started.err, " \n") }) catch "", host);
 
     // The host's _job takes the copy's lock, then says "ready": sync while it holds it.
     var waited: u32 = 0;
     while (true) {
         const p = peek(cx, host, id) orelse return lostOrRetry(cx, rec, payload, host);
-        if (std.mem.eql(u8, p.state, "ready")) break;
+        if (std.mem.eql(u8, p.state, "ready")) {
+            // The host may have taken another of the worktree's copies: sync that one.
+            if (p.copy.len != 0 and inside(p.copy)) rec.copy = p.copy;
+            break;
+        }
         if (std.mem.eql(u8, p.state, "done")) return finish(cx, rec, host);
-        setState(cx, id, "queued", if (std.mem.eql(u8, p.state, "waiting-copy")) "waiting for its copy (another job of this worktree runs on it)" else "");
+        setState(cx, id, "queued", if (std.mem.eql(u8, p.state, "waiting-copy")) "waiting for a copy (the worktree's others are in use)" else if (std.mem.eql(u8, p.state, "seeding")) "seeding a copy from another of the project's" else "");
         waited += 1;
         sleepMs(cx.io, 1000);
     }
+    lap(cx, &phases, &phase_ms, "copy free");
     setState(cx, id, "syncing", cx.a.print("to {s}", .{host}) catch "");
     // Packs built from source: the source of each version the host lacks.
     for (rec.packs) |pk| if (packs.ship(cx.a, cx.io, if (std.mem.eql(u8, host, "here")) null else host, pk)) |e|
         return abandon(cx, id, rec.*, .cpuq_error, null, cx.a.print("{s}: not your code", .{e}) catch "", host);
+    lap(cx, &phases, &phase_ms, "packs");
     var tries: u32 = 0;
     while (true) : (tries += 1) {
         if (!sync(cx, rec, host)) return abandon(cx, id, rec.*, .cpuq_error, null, cx.a.print("rsync to {s} failed: not your code, report it", .{host}) catch "", host);
+        lap(cx, &phases, &phase_ms, "copy");
         // The worktree must not have changed while it was copied.
         const again = resnapshot(cx, rec);
+        lap(cx, &phases, &phase_ms, "check");
         if (std.mem.eql(u8, again, rec.snapshot)) break;
         // Changed since submit (or during the copy): it runs as it is now, copied again.
         setState(cx, id, "syncing", cx.a.print("to {s}: the worktree changed since submit, so it runs as it is now", .{host}) catch "");
@@ -963,6 +1023,9 @@ fn startAndWatch(cx: Cx, rec: *Record, payload: *Payload, host: []const u8) u8 {
     }
     const marked = onHost(cx, host, cx.a.print("{s} _synced {s} {s}", .{ cpuqOn(cx, host), id, rec.snapshot }) catch "");
     if (!marked.ok) return abandon(cx, id, rec.*, .cpuq_error, null, cx.a.print("couldn't mark the copy on {s}: not your code, report it", .{host}) catch "", host);
+    rec.shipped = shippedNow(cx, rec);
+    lap(cx, &phases, &phase_ms, "marked");
+    std.debug.print("cpuq: {s} {s}: {s}\n", .{ id, host, phases.items });
     writeFile(cx, jobFile(cx, id, "job.json"), jsonString(cx, rec.*));
     return watch(cx, rec, payload, host);
 }
@@ -1187,16 +1250,33 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
     const started = now(cx.io);
     hostState(cx, id, "waiting-copy");
 
-    // One job at a time on a copy.
-    const copy = cx.a.print("{s}/{s}", .{ home(cx), p.copy }) catch return 125;
-    Io.Dir.cwd().createDirPath(cx.io, copy) catch {};
-    // Waits its turn for the copy's lock without blocking in it, so a cancel is seen while queued.
-    const copy_lock = Io.Dir.cwd().createFile(cx.io, cx.a.print("{s}.lock", .{copy}) catch "", .{ .truncate = false }) catch
-        return hostDone(cx, id, p, .cpuq_error, null, "the copy's lock couldn't be opened: not your code, report it", started);
-    defer copy_lock.close(cx.io);
-    while (!(copy_lock.tryLock(cx.io, .exclusive) catch false)) {
+    // One job at a time on a copy, and a worktree has up to `slots` of them: the first free one.
+    // Waits for one without blocking in a lock, so a cancel is seen while queued.
+    const slots = std.math.clamp(p.slots, 1, copy_slots);
+    var rel: []const u8 = p.copy;
+    const copy_lock = while (true) {
+        const got = for (0..slots) |k| {
+            const r = slotName(cx, p.copy, k);
+            Io.Dir.cwd().createDirPath(cx.io, cx.a.print("{s}/{s}", .{ home(cx), r }) catch "") catch {};
+            const f = Io.Dir.cwd().createFile(cx.io, cx.a.print("{s}/{s}.lock", .{ home(cx), r }) catch "", .{ .truncate = false }) catch continue;
+            if (f.tryLock(cx.io, .exclusive) catch false) {
+                rel = r;
+                break f;
+            }
+            f.close(cx.io);
+        } else null;
+        if (got) |f| break f;
         if (cancelled(cx, id)) return hostDone(cx, id, p, .cancelled, null, "by cpuq job --cancel: not your code", started);
         sleepMs(cx.io, 500);
+    };
+    defer copy_lock.close(cx.io);
+    const copy = cx.a.print("{s}/{s}", .{ home(cx), rel }) catch return 125;
+    writeFile(cx, jobFile(cx, id, "copy"), rel);
+    // A copy never synced starts from the project's most recent free one, here on the host: the
+    // sync then sends only what differs, and its build caches come warm.
+    if (readFile(cx, cx.a.print("{s}/.cpuq-generation", .{copy}) catch "") == null) {
+        hostState(cx, id, "seeding");
+        seedCopy(cx, p.copy, copy);
     }
     hostState(cx, id, "ready");
 
@@ -1256,7 +1336,9 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
             prelude.print(cx.a, "{s} _pack {s} {s} {s} {s} {s} {s} || exit\n", .{ quote(cx, cx.self), quote(cx, pk.name), quote(cx, pk.version), quote(cx, if (pk.alias.len == 0) "-" else pk.alias), quote(cx, pk.kind), quote(cx, pk.bin), quote(cx, if (pk.build.len == 0) "-" else pk.build) }) catch {};
         }
     }
-    const tmp = jobFile(cx, id, "tmp");
+    // A TMPDIR of its own: under `job_tmp` where the host sets one (a filesystem that syncs
+    // fast), else beside the job's record.
+    const tmp = if (cx.cfg.job_tmp.len != 0) cx.a.print("{s}/{s}", .{ expandHome(cx, std.mem.trimEnd(u8, cx.cfg.job_tmp, "/")), id }) catch jobFile(cx, id, "tmp") else jobFile(cx, id, "tmp");
     Io.Dir.cwd().createDirPath(cx.io, tmp) catch {};
     env.put("TMPDIR", tmp) catch {};
     // The job's progress (`DONE TOTAL FAILING`), where _peek finds it; cpuq run keeps it.
@@ -1264,6 +1346,7 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
     // The progress file `cpuq run` gives the job: this job's own, which _peek reads.
     env.put("CPUQ_PROGRESS_AT", jobFile(cx, id, "progress")) catch {};
     if (p.report) |r| if (inside(r)) Io.Dir.cwd().deleteFile(cx.io, cx.a.print("{s}/{s}", .{ copy, r }) catch "") catch {};
+    for (p.returns) |r| if (inside(r)) Io.Dir.cwd().deleteTree(cx.io, cx.a.print("{s}/{s}", .{ copy, std.mem.trimEnd(u8, r, "/") }) catch "") catch {};
 
     // cpuq run takes the cores and the job's cgroup; cap enforces time from admission, and memory.
     var argv: std.ArrayList([]const u8) = .empty;
@@ -1478,7 +1561,7 @@ fn hostDone(cx: Cx, id: []const u8, p: Payload, v: Verdict, code: ?i64, detail: 
         .detail = detail,
     };
     if (p.report) |rp| if (inside(rp)) {
-        const path = cx.a.print("{s}/{s}/{s}", .{ home(cx), p.copy, rp }) catch "";
+        const path = cx.a.print("{s}/{s}/{s}", .{ home(cx), jobCopy(cx, id, p.copy), rp }) catch "";
         if (readFile(cx, path)) |text| {
             var fails: std.ArrayList(Failure) = .empty;
             var lines = std.mem.splitScalar(u8, text, '\n');
@@ -1509,6 +1592,7 @@ pub fn cmdPeek(cx: Cx, args: []const [:0]const u8) u8 {
     if (st) |s| p.state = std.mem.trim(u8, s, " \n");
     // A job that isn't done and whose _job no longer runs is gone (the host restarted under it).
     if (st != null and !std.mem.eql(u8, p.state, "done") and !jobRunning(cx, id)) p.state = "none";
+    if (readFile(cx, jobFile(cx, id, "copy"))) |taken| p.copy = std.mem.trim(u8, taken, " \n");
     if (std.mem.eql(u8, p.state, "running")) {
         p.last = lastLine(cx, jobFile(cx, id, "output.log"));
         // What the job reports, when it does (CPUQ_PROGRESS).
@@ -1527,7 +1611,7 @@ pub fn cmdPeek(cx: Cx, args: []const [:0]const u8) u8 {
         if (readFile(cx, jobFile(cx, id, "payload.json"))) |text| {
             if (std.json.parseFromSliceLeaky(Payload, cx.a, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always })) |pl| {
                 if (pl.report) |rp| if (inside(rp)) {
-                    if (readFile(cx, cx.a.print("{s}/{s}/{s}", .{ home(cx), pl.copy, rp }) catch "")) |rep| {
+                    if (readFile(cx, cx.a.print("{s}/{s}/{s}", .{ home(cx), jobCopy(cx, id, pl.copy), rp }) catch "")) |rep| {
                         var lines = std.mem.splitScalar(u8, rep, '\n');
                         while (lines.next()) |line| {
                             if (line.len == 0) continue;
@@ -1543,13 +1627,80 @@ pub fn cmdPeek(cx: Cx, args: []const [:0]const u8) u8 {
     return 0;
 }
 
+/// `~/x` as a path under this user's home.
+fn expandHome(cx: Cx, path: []const u8) []const u8 {
+    if (std.mem.eql(u8, path, "~")) return home(cx);
+    if (std.mem.startsWith(u8, path, "~/")) return cx.a.print("{s}/{s}", .{ home(cx), path[2..] }) catch path;
+    return path;
+}
+
+/// The most copies of one worktree a host keeps (`submit_slots` asks for up to this many).
+const copy_slots = 8;
+
+/// Slot `k` of the worktree copy `base`: `base` itself, then `base.2`, `base.3`.
+fn slotName(cx: Cx, base: []const u8, k: usize) []const u8 {
+    return if (k == 0) base else cx.a.print("{s}.{d}", .{ base, k + 1 }) catch base;
+}
+
+/// The copy the host took for job `id` (`base` before 0.26.1 took slots).
+fn jobCopy(cx: Cx, id: []const u8, base: []const u8) []const u8 {
+    const taken = std.mem.trim(u8, readFile(cx, jobFile(cx, id, "copy")) orelse "", " \n");
+    return if (taken.len != 0 and inside(taken)) taken else base;
+}
+
+/// Fills the new copy `dest` from the project's most recently synced copy, one no job holds if
+/// there is one (its lock taken while it's read), with the filesystem's own cheap copy where it
+/// has one (reflinks, APFS clones). Nothing to seed from: it stays empty, and the sync sends all.
+fn seedCopy(cx: Cx, base: []const u8, dest: []const u8) void {
+    const project = std.fs.path.dirname(base) orelse return;
+    const pdir = cx.a.print("{s}/{s}", .{ home(cx), project }) catch return;
+    var d = Io.Dir.cwd().openDir(cx.io, pdir, .{ .iterate = true }) catch return;
+    defer d.close(cx.io);
+    // The newest free copy, else the newest in use: a build in it writes its cache by renaming
+    // files into place, so what's read is whole, and the sync makes the code exact anyway.
+    var free: ?[]const u8 = null;
+    var free_t: i96 = 0;
+    var busy: ?[]const u8 = null;
+    var busy_t: i96 = 0;
+    var held: ?Io.File = null;
+    defer if (held) |f| f.close(cx.io);
+    var it = d.iterate();
+    while (it.next(cx.io) catch null) |e| {
+        if (e.kind != .directory) continue;
+        const dir = cx.a.print("{s}/{s}", .{ pdir, e.name }) catch continue;
+        if (std.mem.eql(u8, dir, dest)) continue;
+        const st = Io.Dir.cwd().statFile(cx.io, cx.a.print("{s}/.cpuq-generation", .{dir}) catch continue, .{}) catch continue;
+        const t = st.mtime.toNanoseconds();
+        const lock = Io.Dir.cwd().createFile(cx.io, cx.a.print("{s}.lock", .{dir}) catch continue, .{ .truncate = false }) catch continue;
+        if (lock.tryLock(cx.io, .exclusive) catch false) {
+            if (free == null or t > free_t) {
+                if (held) |f| f.close(cx.io);
+                held = lock;
+                free = dir;
+                free_t = t;
+                continue;
+            }
+        } else if (busy == null or t > busy_t) {
+            busy = dir;
+            busy_t = t;
+        }
+        lock.close(cx.io);
+    }
+    const src = free orelse busy orelse return;
+    const cp = if (builtin.os.tag == .linux) "cp -a --reflink=auto" else "cp -a -c";
+    // A seed that half fails is only a start: the sync makes the copy whole.
+    _ = run(cx, &.{ "/bin/sh", "-c", cx.a.print("{s} {s}/. {s}/ 2>/dev/null || cp -a {s}/. {s}/ 2>/dev/null", .{ cp, quote(cx, src), quote(cx, dest), quote(cx, src), quote(cx, dest) }) catch return }, null);
+    // Not the source's generation: the sync marks this copy's own.
+    Io.Dir.cwd().deleteFile(cx.io, cx.a.print("{s}/.cpuq-generation", .{dest}) catch return) catch {};
+}
+
 /// `_synced ID GEN`: the copy holds generation GEN; the waiting _job may run.
 pub fn cmdSynced(cx: Cx, args: []const [:0]const u8) u8 {
     if (args.len < 2 or !validId(args[0])) return 2;
     const id: []const u8 = args[0];
     const text = readFile(cx, jobFile(cx, id, "payload.json")) orelse return 2;
     const p = std.json.parseFromSliceLeaky(Payload, cx.a, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return 2;
-    writeFile(cx, cx.a.print("{s}/{s}/.cpuq-generation", .{ home(cx), p.copy }) catch return 2, args[1]);
+    writeFile(cx, cx.a.print("{s}/{s}/.cpuq-generation", .{ home(cx), jobCopy(cx, id, p.copy) }) catch return 2, args[1]);
     writeFile(cx, jobFile(cx, id, "synced"), args[1]);
     return 0;
 }
@@ -1668,7 +1819,16 @@ pub fn cmdJob(cx: Cx, args: []const [:0]const u8) u8 {
         return 0;
     }
     if (as_json) {
-        cx.out.print("{s}\n", .{readFile(cx, jobFile(cx, id, if (j.finished) "result.json" else "job.json")) orelse "{}"}) catch {};
+        const text = readFile(cx, jobFile(cx, id, if (j.finished) "result.json" else "job.json")) orelse "{}";
+        // A finished job's result, with what it ran (`shipped`, from its record).
+        if (j.finished) if (j.rec.shipped) |sh| {
+            const body = std.mem.trimEnd(u8, text, " \n");
+            if (body.len > 1 and body[body.len - 1] == '}') {
+                cx.out.print("{s}{s}\"shipped\":{s}}}\n", .{ body[0 .. body.len - 1], if (std.mem.trim(u8, body[0 .. body.len - 1], " \n{").len == 0) "" else ",", jsonString(cx, sh) }) catch {};
+                return 0;
+            }
+        };
+        cx.out.print("{s}\n", .{text}) catch {};
         return 0;
     }
     if (std.mem.eql(u8, which, "last") and others != 0) std.debug.print("(this worktree has {d} other job{s} running: cpuq jobs)\n", .{ others, if (others == 1) "" else "s" });

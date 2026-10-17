@@ -150,6 +150,13 @@ pub const Config = struct {
     /// repo, naming no path outside it, using no macOS-only tool, not --opaque, --exclusive or a
     /// hold. `--local` keeps one here.
     spill_default: bool = false,
+    /// Copies of one worktree a submitted job may use on its host (`submit_slots`, 1–8): so many
+    /// of a worktree's jobs run there at once; 1 runs them one after another on a single copy.
+    submit_slots: u32 = 3,
+    /// Where a submitted job's TMPDIR goes on this host, a directory of its own per job, removed
+    /// when it ends (`job_tmp`, `~` for home; empty: beside the job's record). On burst it is the
+    /// ZFS spill dataset: its root ext4 disk made an fsync wait ~0.36 s behind other jobs' writes.
+    job_tmp: []const u8 = "",
     /// How to start a spill host that is stopped, such as a cloud machine:
     /// `spill_start.HOST = COMMAND`, run with sh; it should return once
     /// `ssh HOST` works.
@@ -265,6 +272,12 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
             cfg.settle_s = parseCount(value) orelse return bad(diag, "settle must be a whole number of seconds, at least 1");
         } else if (std.mem.eql(u8, key, "spill")) {
             cfg.spill = value;
+        } else if (std.mem.eql(u8, key, "submit_slots")) {
+            const slots = parseCount(value) orelse return bad(diag, "submit_slots must be a whole number, 1 to 8");
+            if (slots > 8) return bad(diag, "submit_slots must be a whole number, 1 to 8");
+            cfg.submit_slots = slots;
+        } else if (std.mem.eql(u8, key, "job_tmp")) {
+            cfg.job_tmp = value;
         } else if (std.mem.eql(u8, key, "spill_default")) {
             cfg.spill_default = parseBool(value) orelse return bad(diag, "spill_default must be on or off");
         } else if (std.mem.startsWith(u8, key, "spill_start.")) {

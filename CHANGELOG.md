@@ -2,6 +2,31 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.26.1 — 2026-10-16
+
+- `cpuq cap --protocol` prints what cap does as a number that changes only when that does (now 2).
+  A test runner keys cached results on it rather than on cpuq's version: Rig's matrix keyed on
+  the version, and every cpuq release made its next run cold (24–36 min).
+- **A worktree's submitted jobs run at once**: a host keeps up to `submit_slots` (default 3) copies
+  of a worktree, each job on the first free one, so Rig's gate (suite, corpus, matrix) takes about
+  its slowest job, not the sum. A new copy is seeded on the host from the project's most recently
+  synced copy (reflinks or APFS clones where the filesystem has them), so its sync sends only what
+  differs and its build caches start warm: a cold first sync of a new worktree took 26 s and a
+  cold build about 90 s more. Both ends must be 0.26.1; an older supervisor keeps one copy.
+- Each submitted job's supervisor.log has a line with each phase's seconds (start, waiting for a
+  copy, packs, copy, check, marked): a warm job synced in 1.5 s and ran 5 s later.
+- A submitted job's `return` paths start empty in its copy: files an earlier job left there (or
+  the copy it was seeded from) no longer come back with its results.
+- **`job_tmp`** (host config): a submitted job's TMPDIR goes there, a directory per job, removed
+  when it ends. burst sets it to its ZFS spill dataset: under other jobs' bulk writes an fsync on
+  its root ext4 disk, where TMPDIR was, took 364 ms (ZFS: 0.43 ms), so database and fsync-heavy
+  tests ran 10–100× slow there and timed out.
+- `--spill` with `--ship` of a file inside a gitignored folder no longer copies the rest of the
+  folder (0.25.5 sent a whole .zig-cache along with one file in it).
+- A submitted job records what it ran, by git, once its copy is synced and checked unchanged:
+  `shipped` in `cpuq job ID --json`, with the worktree's `head`, the `tree` of its content, and
+  `clean`. Rig's gate binds its commit status to it.
+
 ## 0.26.0 — 2026-10-16
 
 - **`spill_default = on`**: a `cpuq run` with neither `--spill` nor `--local` acts as `--spill`

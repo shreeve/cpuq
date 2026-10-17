@@ -32,6 +32,7 @@ const exit_usage: u8 = 2;
 
 pub const usage =
     \\usage: cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] [--no-crash-report] [--] PROGRAM [ARGS...]
+    \\       cpuq cap --protocol   what cap does, as a number that changes only when that does
     \\  --mem SIZE        stop PROGRAM when it and everything it started use more memory (2G, 512M)
     \\  --time DURATION   stop it after this long (120, 120s, 2m, 1h, 500ms)
     \\  --output SIZE     stop it when it has written more than this to stdout and stderr, which
@@ -502,7 +503,20 @@ fn childEnv(a: std.mem.Allocator) ?[*:null]const ?[*:0]const u8 {
 
 const Stop = enum { none, memory, time, output };
 
+/// What cap does with a program, as a number that changes only when that does: its limits, how it
+/// stops a program, its exit statuses, `--no-crash-report`. A test runner keys cached results on it
+/// (`cpuq cap --protocol`), not on cpuq's version, so a release that leaves cap alone keeps them.
+/// 1: --mem/--time/--output/--pids, exits 122/124/121, cgroups inside a job on Linux;
+/// 2: --no-crash-report (macOS ports; Linux core limit 1).
+pub const protocol = 2;
+
 pub fn main(a: std.mem.Allocator, args: []const [:0]const u8, cgroup_parent: ?[]const u8, path_env: ?[]const u8) u8 {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "--protocol")) {
+        var buf: [16]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "{d}\n", .{protocol}) catch return 125;
+        _ = std.c.write(1, line.ptr, line.len);
+        return 0;
+    }
     var limits: Limits = .{};
     var quiet_crash = false;
     var i: usize = 0;
