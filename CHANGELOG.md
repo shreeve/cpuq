@@ -2,6 +2,16 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.26.6 — 2026-10-16
+
+- A spilled job's copy (`--spill`, `--spill-to`, and `cpuq submit`) is read back by each file's
+  checksum after rsync makes it. A file damaged on the host keeps its size and mtime, so rsync's
+  quick check never sent it again, and every later run there used the damaged copy. A file that
+  differs is now sent again and checked once more, and stderr says which. If the copy still
+  differs, the job doesn't run there: `--spill` runs it here, `--spill-to` fails with exit 125,
+  and a submitted job ends in CPUQ ERROR. Both cases name the files. Found on burst, whose
+  OpenZFS 2.4.1 with dedup zeroed the end of a shipped file (openzfs/zfs#18366).
+
 ## 0.26.5 — 2026-10-16
 
 - macOS: when a command under `cpuq run` or `cpuq cap` dies of a signal that makes a crash report

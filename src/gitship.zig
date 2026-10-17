@@ -58,6 +58,52 @@ pub fn copied(term: std.process.Child.Term) bool {
     };
 }
 
+/// A copy rsync made, read back file by file.
+pub const Checked = union(enum) {
+    /// Every file there is the same as here.
+    same,
+    /// These differed and were sent again; now they are the same.
+    repaired: []const u8,
+    /// These still differ after being sent again: the copy is bad.
+    differs: []const u8,
+};
+
+/// Checks a copy `argv` (an rsync, `argv[0]` its path) just made by each file's checksum, which
+/// rsync's own quick check (size and mtime) never does: a file damaged there keeps both, and no
+/// later copy would send it again. What differs is sent once more by checksum and checked again.
+pub fn check(a: std.mem.Allocator, io: Io, argv: []const []const u8) Checked {
+    const first = differing(a, io, argv, true) orelse return .{ .differs = "rsync could not compare the copy" };
+    if (first.len == 0) return .same;
+    if (differing(a, io, argv, false) == null) return .{ .differs = first };
+    const again = differing(a, io, argv, true) orelse return .{ .differs = first };
+    return if (again.len == 0) .{ .repaired = first } else .{ .differs = again };
+}
+
+/// With `dry`, the files whose checksums differ there, comma-separated ("" when none); without,
+/// sends those files. Null when rsync fails.
+fn differing(a: std.mem.Allocator, io: Io, argv: []const []const u8, dry: bool) ?[]const u8 {
+    var by_sum: std.ArrayList([]const u8) = .empty;
+    by_sum.append(a, argv[0]) catch return null;
+    by_sum.appendSlice(a, if (dry) &.{ "-c", "-n", "--out-format=%i %n" } else &.{"-c"}) catch return null;
+    by_sum.appendSlice(a, argv[1..]) catch return null;
+    const r = std.process.run(a, io, .{ .argv = by_sum.items }) catch return null;
+    if (!copied(r.term)) return null;
+    return if (dry) sent(a, r.stdout) else "";
+}
+
+/// The files an `--out-format=%i %n` listing sends, comma-separated: `<f` to another machine,
+/// `>f` to a path here.
+fn sent(a: std.mem.Allocator, listing: []const u8) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, listing, '\n');
+    while (lines.next()) |line| {
+        if (line.len < 2 or (line[0] != '<' and line[0] != '>') or line[1] != 'f') continue;
+        const name = line[(std.mem.findScalar(u8, line, ' ') orelse continue) + 1 ..];
+        out.print(a, "{s}{s}", .{ if (out.items.len == 0) "" else ", ", name }) catch break;
+    }
+    return out.items;
+}
+
 /// `s` in single quotes for a POSIX shell.
 fn quote(a: std.mem.Allocator, s: []const u8) []const u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -74,4 +120,14 @@ test "an rsync whose files vanished as it copied still copied" {
     try std.testing.expect(copied(.{ .exited = 24 }));
     try std.testing.expect(!copied(.{ .exited = 23 }));
     try std.testing.expect(!copied(.{ .exited = 255 }));
+}
+
+test "a checksum listing names the files it would send, not deletions or folders" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    // openrsync's flags, then rsync 3's wider ones.
+    try std.testing.expectEqualStrings("d/a, c", sent(arena.allocator(), "*deleting x\n.d..t.... d/\n>fc...... d/a\n>f+++++++ c\n"));
+    try std.testing.expectEqualStrings("d/my file", sent(arena.allocator(), "*deleting   x\n<fc........ d/my file\ncL+++++++++ l\n"));
+    try std.testing.expectEqualStrings("", sent(arena.allocator(), ""));
 }

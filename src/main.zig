@@ -818,7 +818,7 @@ fn spillTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
         a.print("{s}:{s}/", .{ host, dir }) catch "",
     }) catch fail("out of memory", .{});
     const copied = std.process.run(a, io, .{ .argv = sync.items }) catch |err| fail("rsync: {t}", .{err});
-    const failed: ?[]const u8 = if (!gitship.copied(copied.term)) std.mem.trim(u8, copied.stderr, " \n") else if (ship_git) shipGit(ctx, root, host, dir) else null;
+    const failed: ?[]const u8 = if (!gitship.copied(copied.term)) std.mem.trim(u8, copied.stderr, " \n") else if (shipChecked(ctx, sync.items, host)) |e| e else if (ship_git) shipGit(ctx, root, host, dir) else null;
     if (failed) |err_text| {
         // Sent there by name, a job never runs here: it was sized for that host.
         if (o.spill_to != null) {
@@ -907,6 +907,19 @@ fn hostWentAway(ctx: *Ctx, host: []const u8) bool {
 /// A path inside the repo: relative, with no `..`.
 fn repoPath(p: []const u8) bool {
     return p.len != 0 and p[0] != '/' and std.mem.find(u8, p, "..") == null;
+}
+
+/// The copy `sync` made on `host`, read back by checksum (gitship.check): the error text when it
+/// still differs from here, else null. A file that differed and was mended is said on stderr.
+fn shipChecked(ctx: *Ctx, sync: []const []const u8, host: []const u8) ?[]const u8 {
+    return switch (gitship.check(ctx.arena, ctx.io, sync)) {
+        .same => null,
+        .repaired => |names| {
+            std.debug.print("cpuq: the copy on {s} differed from here ({s}): sent again, and now the same\n", .{ host, names });
+            return null;
+        },
+        .differs => |names| ctx.arena.print("the copy there still differs from here after sending it again ({s}); its disk may be damaging files, not your code", .{names}) catch "the copy there differs from here",
+    };
 }
 
 /// `.git` shipped (`--ship .git`, or a `.git` line in `.cpuq-spill`): the copy gets a git of

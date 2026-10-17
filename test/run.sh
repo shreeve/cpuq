@@ -2001,6 +2001,28 @@ t_ship_git() {
   check "a worktree's .git ships as a git of its own (got '$got')" "[ '$got' = 'dir $want a.txt b.txt c.txt clean ' ]"
 }
 
+t_spill_check() {
+  # A spilled copy is read back by checksum: a file damaged there that kept its size and mtime
+  # (rsync's quick check would never send it again) is sent again, and a copy that stays damaged
+  # fails the run without running the job.
+  setup spill-check
+  local bin=$T/bin far=$T/far
+  mkdir -p "$bin" "$far"
+  # The far side, damaging a.txt after every connection while $T/rot exists.
+  printf '#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done\nshift\n(cd "%s" && sh -c "$*"); rc=$?\nif [ -e "%s/rot" ]; then for f in $(find "%s" -name a.txt); do cp -p "$f" "%s/ref"; printf X | dd of="$f" conv=notrunc 2>/dev/null; touch -r "%s/ref" "$f"; done; fi\nexit $rc\n' "$far" "$T" "$far" "$T" "$T" >"$bin/ssh"
+  chmod +x "$bin/ssh"
+  ln -sf "$CPUQ" "$bin/cpuq"
+  (cd "$T" && git init -q repo && cd repo && echo a > a.txt && git add a.txt) >/dev/null 2>&1
+  (cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --spill-to far --cores 1 -- true) >/dev/null 2>&1
+  local copy; copy=$(find "$far" -name a.txt)
+  cp -p "$copy" "$T/ref"; printf X | dd of="$copy" conv=notrunc 2>/dev/null; touch -r "$T/ref" "$copy"
+  local mended; mended=$(cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --spill-to far --cores 1 -- cat a.txt 2>&1)
+  touch "$T/rot"
+  local bad rc; bad=$(cd "$T/repo" && PATH="$bin:$PATH" "$CPUQ" run --spill-to far --cores 1 -- echo ran 2>&1); rc=$?
+  check "a copy damaged there is sent again ('$mended'); one that stays damaged fails, never running (rc $rc: '$bad')" \
+    "[[ '$mended' == *'differed from here (a.txt)'*a && $rc = 125 && '$bad' == *'still differs from here'*a.txt* && '$bad' != *ran* ]]"
+}
+
 t_spill_gitignore() {
   # A spilled copy leaves out what git ignores, as git reads .gitignore: a file its `!` line
   # brings back ships (rsync's own .gitignore filter dropped it), and a tracked file ships though
@@ -2104,7 +2126,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git spill_gitignore spill_default tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk spill spill_to ship_git spill_check spill_gitignore spill_default tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
 for t in $TESTS; do "t_$t"; done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"

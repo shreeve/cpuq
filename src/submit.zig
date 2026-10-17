@@ -1009,7 +1009,7 @@ fn startAndWatch(cx: Cx, rec: *Record, payload: *Payload, host: []const u8) u8 {
     lap(cx, &phases, &phase_ms, "packs");
     var tries: u32 = 0;
     while (true) : (tries += 1) {
-        if (!sync(cx, rec, host)) return abandon(cx, id, rec.*, .cpuq_error, null, cx.a.print("rsync to {s} failed: not your code, report it", .{host}) catch "", host);
+        if (!sync(cx, rec, host)) return abandon(cx, id, rec.*, .cpuq_error, null, cx.a.print("the copy to {s} failed or came out wrong: not your code, report it", .{host}) catch "", host);
         lap(cx, &phases, &phase_ms, "copy");
         // The worktree must not have changed while it was copied.
         const again = resnapshot(cx, rec);
@@ -1064,7 +1064,7 @@ fn sync(cx: Cx, rec: *const Record, host: []const u8) bool {
     argv.append(cx.a, cx.a.print("{s}/", .{rec.dir}) catch return false) catch return false;
     argv.append(cx.a, cx.a.print("{s}/", .{dest}) catch return false) catch return false;
     if (std.mem.eql(u8, host, "here")) Io.Dir.cwd().createDirPath(cx.io, cx.a.print("{s}/{s}", .{ home(cx), rec.copy }) catch "") catch {};
-    if (!rsynced(run(cx, argv.items, null))) return false;
+    if (!rsynced(run(cx, argv.items, null)) or !checked(cx, argv.items, host)) return false;
     if (rec.git) {
         const here = std.mem.eql(u8, host, "here");
         const git_dir = cx.a.print("{s}{s}{s}/.git", .{ if (here) home(cx) else "", if (here) "/" else "", rec.copy }) catch return false;
@@ -1090,10 +1090,26 @@ fn sync(cx: Cx, rec: *const Record, host: []const u8) bool {
             if (list.ok) dargv.append(cx.a, cx.a.print("--files-from={s}", .{files}) catch "") catch {};
             dargv.append(cx.a, cx.a.print("{s}/", .{src}) catch "") catch {};
             dargv.append(cx.a, target) catch {};
-            if (!rsynced(run(cx, dargv.items, null))) return false;
+            if (!rsynced(run(cx, dargv.items, null)) or !checked(cx, dargv.items, host)) return false;
         }
     }
     return true;
+}
+
+/// The copy `argv` made on `host`, read back by checksum (gitship.check): false when it still
+/// differs from here. A file that differed and was mended is said on stderr.
+fn checked(cx: Cx, argv: []const []const u8, host: []const u8) bool {
+    switch (gitship.check(cx.a, cx.io, argv)) {
+        .same => return true,
+        .repaired => |names| {
+            std.debug.print("cpuq: the copy on {s} differed from here ({s}): sent again, and now the same\n", .{ host, names });
+            return true;
+        },
+        .differs => |names| {
+            std.debug.print("cpuq: the copy on {s} still differs from here after sending it again ({s}); its disk may be damaging files\n", .{ host, names });
+            return false;
+        },
+    }
 }
 
 fn watch(cx: Cx, rec: *Record, payload: *Payload, host: []const u8) u8 {

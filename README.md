@@ -465,6 +465,11 @@ afterwards, for a build's output; it repeats.
   repo keeps under `.git` (build stores, caches, notes) stays here. After the first copy rsync
   sends only what changed. `git ls-files`, `diff` and `log` work there; the first `git status`
   rehashes the files once, as their times differ.
+- **The copy is read back** by each file's checksum after rsync makes it. rsync's own quick check
+  (size and mtime) never sends again a file damaged there that kept both, so a run would go on
+  using it. A file that differs is sent again and checked once more; if the copy still differs,
+  the job doesn't run there (`--spill` runs it here, `--spill-to` fails with exit 125), and
+  stderr names the files.
 - **Tools under `~/.local`** are off the PATH of a command run over ssh, whose shell reads no login
   profile. `spill_env.HOST = PATH=$HOME/.local/go/bin:$PATH` in the config is exported on HOST
   before the job: shell assignments, expanded there.
@@ -496,7 +501,8 @@ rest:
 
 - **places it:** on the first host in `on` that has room, else queues it there, starting a
   stopped cloud host if need be;
-- **syncs a snapshot** of the work there with rsync, moving only what changed;
+- **syncs a snapshot** of the work there with rsync, moving only what changed, then reads the copy
+  back by checksum (as `--spill` does);
 - **runs it, owned by that host,** so the agent's session, or this machine sleeping, doesn't stop
   it;
 - **reports:** progress while it runs, then a verdict that names the code it tested.
