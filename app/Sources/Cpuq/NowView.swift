@@ -571,20 +571,19 @@ struct WaiterActions: View {
     let model: GraphModel
     var control: ((String, Int, String) -> Void)?
     var body: some View {
-        if let control, pid > 0, supportsControls(version: model.status?.version ?? "") {
+        if let control, pid > 0 {
             Button("Move to Front") { control("first", pid, label) }
             Button("Start Now…") { control("start", pid, label) }
-            Button("Cancel") { control("cancel", pid, label) }
+            Button("Cancel…") { control("cancel", pid, label) }
         }
     }
 }
 
 /// How lively the cells are. One decision says whether the water moves and bubbles rise: effects
-/// are on and the Mac is not strained. Then they always do, at thirty frames a second while the
-/// window is on screen (measured: about 6% of one CPU; fewer frames look jerky, sixty costs two to
-/// five times as much). Otherwise they never do, hovering or not: the cells keep still, drawn once
-/// a second, and ease smoothly to new readings only while the mouse moves in the window or it is
-/// resized.
+/// are on and the Mac is not strained. Then they always do while the window is on screen, at ten
+/// frames a second, thirty while the mouse moves in the window or it is resized. Otherwise they
+/// never do: the cells keep still, drawn once a second, easing to new readings at thirty frames a
+/// second only while the mouse moves in the window or it is resized.
 @MainActor
 final class Liveliness: ObservableObject {
     static let shared = Liveliness()
@@ -604,7 +603,7 @@ final class Liveliness: ObservableObject {
     /// Effects run on their own while someone can see them.
     var ambient: Bool { showsEffects && visible }
     /// Seconds between frames.
-    var interval: Double { lively || ambient ? 1.0 / 30 : 1 }
+    var interval: Double { lively ? 1.0 / 30 : ambient ? 1.0 / 10 : 1 }
 
     private var until = Date.distantPast
     private var timer: Timer?
@@ -951,9 +950,8 @@ struct HourCard: View {
         (hour.columns.first?.from ?? Date())...(hour.columns.last?.to ?? Date())
     }
 
-    /// Ticks at quarters of the span, the oldest labelled with how long ago.
     /// Ticks at round times back from now: now, round minutes between, the oldest a whole span
-    /// ago, each in minutes ("60 min"), with "now" at the other end, whatever second the clock-pinned columns start on.
+    /// ago, each in minutes ("60 min"), whatever second the clock-pinned columns start on.
     private var ticks: [Date] {
         guard let a = hour.columns.first?.from else { return [] }
         // Between them, round minutes: every 15 over an hour, every 5 over 25 minutes, about
@@ -1343,7 +1341,7 @@ struct JobsCard: View {
         .frame(height: 21)
         .contentShape(Rectangle())
         .contextMenu {
-            if let control, supportsControls(version: model.status?.version ?? "") {
+            if let control {
                 let name = GraphModel.label(h.label, h.command)
                 Button(h.paused ? "Resume \(name)" : "Pause \(name)") { control(h.paused ? "resume" : "pause", h.pid, name) }
                 Button("Stop \(name)…") { control("stop", h.pid, name) }

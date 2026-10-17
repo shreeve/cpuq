@@ -3,11 +3,26 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
-## 0.20.2 — 2026-10-17
+## 0.21.0 — 2026-10-17
 
+- Needs cpuq 0.28.0 or later: job actions and Live View are always offered, with no check of
+  cpuq's version.
 - The window's pages for other machines come from cpuq 0.28's `remotes` and `remote_start.HOST`
   config keys, which replace `spill` and `spill_start.HOST`. The overload notice suggests
   `cpuq run --on HOST`, since `cpuq run --spill` is gone.
+- With the window closed the app uses next to no CPU (0.9% to 0.1%): the window and its views
+  are dropped on close and built again on open, at the same size and place. It polls cpuq every
+  10 seconds while closed, 3 while open.
+- The moving water and bubbles run at 10 frames a second, 30 while the mouse moves in the window
+  or it is resized: the open window uses about half the CPU it did.
+- Cancel asks first, as Stop and Start Now do. A poll that comes while one is running is not
+  dropped but runs after it.
+- A text that fails to go shows in What's Happening.
+- Settings' notification footer names every alert. Its toggles show or hide the chip and the Dock
+  icon at once, without watching every change to the app's defaults.
+- A remote whose name starts with `-` is skipped rather than handed to ssh, and ssh's error
+  output can no longer stall a remote's poll.
+- Open Live View works when cpuq's path has a quote or a backslash in it.
 
 ## 0.20.1 — 2026-10-16
 

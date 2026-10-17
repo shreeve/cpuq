@@ -5,7 +5,8 @@
 //! than asked for in AGENTS.md.
 //!
 //! It reads the command's text, and what the caller knows (through an Advisor): whether a `cpuq
-//! run`'s work goes faster elsewhere. Nothing it cannot parse is refused. A command marked `# cpuq: skip` runs as it is.
+//! run`'s work goes faster elsewhere. Nothing it cannot parse is refused. A line that ends in the
+//! comment `# cpuq: skip` runs as it is.
 
 const std = @import("std");
 
@@ -27,13 +28,63 @@ pub const Advisor = struct {
 /// Checks one shell command line. `cpus` is the machine's CPU count, for
 /// requests over half of it; `project` names the job in suggested labels.
 pub fn check(a: std.mem.Allocator, command: []const u8, cpus: u32, project: []const u8, advisor: ?Advisor) ?Refusal {
-    if (std.mem.find(u8, command, "# cpuq: skip") != null) return null;
-    advisor_now = advisor;
-    return checkScript(a, command, cpus, project, null, 0);
+    const ctx: Ctx = .{ .a = a, .cpus = cpus, .project = project, .advisor = advisor };
+    return ctx.script(command, null, 0);
 }
 
-/// `check`'s `advisor`, for the `cpuq run`s it finds on this machine.
-var advisor_now: ?Advisor = null;
+/// The largest fixed request (or minimum) that doesn't wait for a nearly empty machine: half the
+/// CPUs, and at least 2, which fits even a small machine.
+pub fn maxAsk(cpus: u32) u32 {
+    return @max(cpus / 2, 2);
+}
+
+/// The `cpuq run` and `cpuq lease` options that take a value (`--cores 2-6`, or `--cores=2-6`).
+pub const run_value_options = [_][]const u8{ "--cores", "--priority", "--label", "--note", "--max-wait", "--qos", "--host", "--slots", "--return", "--on", "--include", "--repo" };
+
+/// What one check knows: the machine, the project for suggested labels, and the advisor for the
+/// `cpuq run`s on this machine.
+const Ctx = struct {
+    a: std.mem.Allocator,
+    cpus: u32,
+    project: []const u8,
+    advisor: ?Advisor,
+
+    fn script(ctx: Ctx, text: []const u8, host: ?[]const u8, depth: u32) ?Refusal {
+        if (depth > 3) return null;
+        const cmds = split(ctx.a, text) catch return null;
+        for (cmds) |cmd| if (!cmd.skip) if (ctx.simple(cmd, host, depth)) |r| return r;
+        return null;
+    }
+
+    fn simple(ctx: Ctx, cmd: Simple, host: ?[]const u8, depth: u32) ?Refusal {
+        const a = ctx.a;
+        const w = stripWrappers(cmd.words);
+        if (w.len == 0) return null;
+        const prog = std.fs.path.basename(w[0]);
+        if (std.mem.eql(u8, prog, "cpuq")) return checkCpuq(a, cmd, w, ctx.cpus, if (host == null) ctx.advisor else null);
+        if (std.mem.eql(u8, prog, "ssh")) {
+            const remote = sshRemote(a, w) orelse return null;
+            // `ssh HOST <<EOF`: the heredoc is the script HOST runs.
+            const body = if (remote.command.len == 0) cmd.heredoc orelse return null else remote.command;
+            return ctx.script(body, remote.host, depth + 1);
+        }
+        if (isShell(prog)) {
+            if (shellScript(w)) |s| return ctx.script(s, host, depth + 1);
+            if (cmd.heredoc) |body| return ctx.script(body, host, depth + 1);
+        }
+        const heavy_prog = heavyName(w) orelse return null;
+        // "zig build", "cargo test": the program and its subcommand.
+        const heavy = if (std.mem.eql(u8, heavy_prog, prog) and w.len > 1 and w[1].len > 0 and w[1][0] != '-' and isSubTool(prog))
+            a.print("{s} {s}", .{ prog, w[1] }) catch heavy_prog
+        else
+            heavy_prog;
+        const where = if (host) |h| a.print(" on {s}, through {s}'s cpuq", .{ h, h }) catch "" else "";
+        return .{
+            .reason = a.print("`{s}` runs outside cpuq{s}, so the other sessions' work can't be scheduled around it, and it uses as many CPUs as it likes", .{ heavy, where }) catch "a heavy command runs outside cpuq",
+            .instead = suggest(a, w, ctx.project, host),
+        };
+    }
+};
 
 /// A simple command: its words, unquoted, and its text as written.
 const Simple = struct {
@@ -42,47 +93,14 @@ const Simple = struct {
     /// The body of a heredoc (`<<EOF` … `EOF`) on its line: data, checked only when a shell or
     /// ssh reads it as a script (`sh <<EOF`, `ssh host <<EOF`).
     heredoc: ?[]const u8 = null,
+    /// On a line that ends in the comment `# cpuq: skip`: not checked.
+    skip: bool = false,
 };
-
-fn checkScript(a: std.mem.Allocator, script: []const u8, cpus: u32, project: []const u8, host: ?[]const u8, depth: u32) ?Refusal {
-    if (depth > 3) return null;
-    const cmds = split(a, script) catch return null;
-    for (cmds) |cmd| if (checkSimple(a, cmd, cpus, project, host, depth)) |r| return r;
-    return null;
-}
-
-fn checkSimple(a: std.mem.Allocator, cmd: Simple, cpus: u32, project: []const u8, host: ?[]const u8, depth: u32) ?Refusal {
-    const w = stripWrappers(cmd.words);
-    if (w.len == 0) return null;
-    const prog = std.fs.path.basename(w[0]);
-    if (std.mem.eql(u8, prog, "cpuq")) return checkCpuq(a, cmd, w, cpus, project, if (host == null) advisor_now else null);
-    if (std.mem.eql(u8, prog, "ssh")) {
-        const remote = sshRemote(a, w) orelse return null;
-        // `ssh HOST <<EOF`: the heredoc is the script HOST runs.
-        const script = if (remote.command.len == 0) cmd.heredoc orelse return null else remote.command;
-        return checkScript(a, script, cpus, project, remote.host, depth + 1);
-    }
-    if (isShell(prog)) {
-        if (shellScript(w)) |s| return checkScript(a, s, cpus, project, host, depth + 1);
-        if (cmd.heredoc) |body| return checkScript(a, body, cpus, project, host, depth + 1);
-    }
-    const heavy_prog = heavyName(w) orelse return null;
-    // "zig build", "cargo test": the program and its subcommand.
-    const heavy = if (std.mem.eql(u8, heavy_prog, prog) and w.len > 1 and w[1].len > 0 and w[1][0] != '-' and isSubTool(prog))
-        a.print("{s} {s}", .{ prog, w[1] }) catch heavy_prog
-    else
-        heavy_prog;
-    const where = if (host) |h| a.print(" on {s}, through {s}'s cpuq", .{ h, h }) catch "" else "";
-    return .{
-        .reason = a.print("`{s}` runs outside cpuq{s}, so the other sessions' work can't be scheduled around it, and it uses as many CPUs as it likes", .{ heavy, where }) catch "a heavy command runs outside cpuq",
-        .instead = suggest(a, w, project, host),
-    };
-}
 
 /// A `cpuq run` (or lease): the grant must reach the command, not the shell
 /// that types it; a large fixed request waits for an empty machine; work in a
 /// container or simulator needs --opaque.
-fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32, project: []const u8, advisor: ?Advisor) ?Refusal {
+fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32, advisor: ?Advisor) ?Refusal {
     if (w.len < 2) return null;
     const sub = w[1];
     if (!std.mem.eql(u8, sub, "run") and !std.mem.eql(u8, sub, "lease")) return null;
@@ -111,17 +129,17 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32
         const value: ?[]const u8 = if (std.mem.startsWith(u8, o, "--cores=")) o["--cores=".len..] else if (std.mem.eql(u8, o, "--cores") and i + 1 < w.len) w[i + 1] else null;
         if (value) |v| min_cores = std.fmt.parseInt(u32, std.mem.sliceTo(v, '-'), 10) catch null;
         // Options that take a value skip it.
-        for ([_][]const u8{ "--cores", "--priority", "--label", "--max-wait", "--qos", "--host", "--slots", "--return", "--note", "--on", "--include" }) |takes| {
+        for (run_value_options) |takes| {
             if (std.mem.eql(u8, o, takes)) i += 1;
         }
     }
-    // Over half the CPUs, and more than 2: a minimum of 2 fits even a small machine.
-    if (min_cores) |m| if (!elsewhere and m > @max(cpus / 2, 2)) return .{
+    if (min_cores) |m| if (!elsewhere and m > maxAsk(cpus)) return .{
         .reason = a.print("asking for at least {d} cores on a {d}-CPU machine: a request over half the CPUs waits until the machine is nearly empty", .{ m, cpus }) catch "too many cores asked for",
         .instead = "ask for a range the job can shrink to, such as --cores 2-6, and pass \"$CPUQ_CORES\" on; run big jobs on the larger machine",
     };
     if (i >= w.len) return null;
-    const inner = w[i..];
+    const inner = stripWrappers(w[i..]);
+    if (inner.len == 0) return null;
     const script: []const u8 = if (isShell(std.fs.path.basename(inner[0]))) shellScript(inner) orelse "" else std.mem.join(a, " ", inner) catch "";
     const inner_cmds = split(a, script) catch return null;
     for (inner_cmds) |ic| {
@@ -136,8 +154,14 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32
             .reason = "`zig build` without -j starts a thread for every CPU, however few cores the job was granted",
             .instead = "cpuq run --label P:T --cores 2-6 -- sh -c 'zig build -j\"$CPUQ_CORES\" …' (single quotes)",
         };
+        if (heavyName(iw) != null) if (fixedJobs(iw, min_cores orelse 1)) |flag| return .{
+            .reason = a.print("`{s}` fixes its own parallelism, however few cores the job was granted", .{flag}) catch "a fixed jobs count",
+            .instead = if (std.mem.eql(u8, prog, "make") or std.mem.eql(u8, prog, "gmake"))
+                "drop the -j: make takes its slots from cpuq's jobserver"
+            else
+                "pass the grant on, inside single quotes: sh -c '… -j\"$CPUQ_CORES\"' (or -n, -p, -jobs for the tool)",
+        };
     }
-    _ = project;
     // Long work that finishes far sooner elsewhere, of a run that may move.
     if (advisor) |ad| if (std.mem.eql(u8, sub, "run") and !elsewhere and !pinned) {
         return ad.advise(ad.ctx, std.mem.join(a, " ", inner) catch return null);
@@ -194,6 +218,67 @@ fn hasJobs(w: []const []const u8) bool {
     return false;
 }
 
+/// The tool a heavy command runs: `pytest` for `python3 -m pytest`, else the program.
+fn toolOf(w: []const []const u8) []const u8 {
+    const prog = std.fs.path.basename(w[0]);
+    if (isPython(prog) and w.len >= 3 and std.mem.eql(u8, w[1], "-m")) return w[2];
+    return prog;
+}
+
+/// The words the tool's jobs option takes at `w[i]` (`-j8`: 1, `-j 8`: 2), with its value; null
+/// when `w[i]` is none. A bare `-j` (make's no limit) has the value "".
+const Jobs = struct { words: usize, value: []const u8 };
+
+fn jobsAt(tool: []const u8, w: []const []const u8, i: usize) ?Jobs {
+    const x = w[i];
+    const Flag = struct { tool: []const u8, flag: []const u8 };
+    const flags = [_]Flag{
+        .{ .tool = "go", .flag = "-p" },
+        .{ .tool = "pytest", .flag = "-n" },
+        .{ .tool = "pytest", .flag = "--numprocesses" },
+        .{ .tool = "xcodebuild", .flag = "-jobs" },
+        .{ .tool = "cmake", .flag = "--parallel" },
+        .{ .tool = "", .flag = "-j" },
+        .{ .tool = "", .flag = "--jobs" },
+    };
+    for (flags) |f| {
+        if (f.tool.len != 0 and !std.mem.eql(u8, f.tool, tool)) continue;
+        if (!std.mem.startsWith(u8, x, f.flag)) continue;
+        const rest = x[f.flag.len..];
+        if (rest.len != 0) {
+            // `-j8`, `--jobs=8`; a short flag's value may be attached, a long one's follows `=`.
+            if (rest[0] == '=') return .{ .words = 1, .value = rest[1..] };
+            if (f.flag[1] != '-' and f.flag.len == 2) return .{ .words = 1, .value = rest };
+            continue;
+        }
+        // The value in the next word, unless that is another option or (for -j) a target.
+        if (i + 1 < w.len and w[i + 1].len != 0 and w[i + 1][0] != '-') {
+            const v = w[i + 1];
+            const numeric = std.fmt.parseInt(u32, v, 10) catch null;
+            if (numeric != null or std.mem.find(u8, v, "CPUQ_CORES") != null or !std.mem.eql(u8, f.flag, "-j")) return .{ .words = 2, .value = v };
+        }
+        return .{ .words = 1, .value = "" };
+    }
+    return null;
+}
+
+/// A jobs option set to a fixed count over `allowed`, the least the job is granted (or to no
+/// limit: a bare `make -j`, `ninja -j0`, `pytest -n auto`), which overrides the grant: its text,
+/// else null.
+fn fixedJobs(w: []const []const u8, allowed: u32) ?[]const u8 {
+    const tool = toolOf(w);
+    var i: usize = 1;
+    while (i < w.len) : (i += 1) {
+        if (std.mem.eql(u8, w[i], "--")) return null;
+        const j = jobsAt(tool, w, i) orelse continue;
+        const v = j.value;
+        const fixed = if (std.fmt.parseInt(u32, v, 10)) |n| n == 0 or n > allowed else |_| v.len == 0 or std.mem.eql(u8, v, "auto") or std.mem.eql(u8, v, "logical");
+        if (fixed) return w[i];
+        i += j.words - 1;
+    }
+    return null;
+}
+
 /// Work done where cpuq's process-tree measurement can't see it.
 fn hidesWork(w: []const []const u8) bool {
     const prog = std.fs.path.basename(w[0]);
@@ -212,7 +297,9 @@ fn hidesWork(w: []const []const u8) bool {
 /// version or a dry run.
 fn heavyName(w: []const []const u8) ?[]const u8 {
     const prog = std.fs.path.basename(w[0]);
-    const sub = if (w.len >= 2) w[1] else "";
+    // `cargo +nightly build`: the toolchain comes before the subcommand.
+    const sub_at: usize = if (std.mem.eql(u8, prog, "cargo") and w.len >= 2 and std.mem.startsWith(u8, w[1], "+")) 2 else 1;
+    const sub = if (w.len > sub_at) w[sub_at] else "";
     // Help, a version, a dry run or a listing: no work.
     const make_like = std.mem.eql(u8, prog, "make") or std.mem.eql(u8, prog, "gmake");
     const no_work: []const []const u8 = if (make_like)
@@ -231,7 +318,7 @@ fn heavyName(w: []const []const u8) ?[]const u8 {
     }
     const Heavy = struct { prog: []const u8, subs: []const []const u8 };
     const table = [_]Heavy{
-        .{ .prog = "zig", .subs = &.{"build"} },
+        .{ .prog = "zig", .subs = &.{ "build", "test", "build-exe", "build-lib", "build-obj" } },
         .{ .prog = "cargo", .subs = &.{ "build", "b", "test", "t", "check", "c", "clippy", "run", "r", "bench", "nextest", "doc", "install", "miri" } },
         .{ .prog = "swift", .subs = &.{ "build", "test", "run" } },
         .{ .prog = "go", .subs = &.{ "build", "test", "install" } },
@@ -239,10 +326,12 @@ fn heavyName(w: []const []const u8) ?[]const u8 {
         .{ .prog = "bazelisk", .subs = &.{ "build", "test", "run", "coverage" } },
         .{ .prog = "buck2", .subs = &.{ "build", "test", "run" } },
         .{ .prog = "cmake", .subs = &.{"--build"} },
-        .{ .prog = "python3", .subs = &.{"-m"} },
+        .{ .prog = "meson", .subs = &.{ "compile", "test" } },
         .{ .prog = "python", .subs = &.{"-m"} },
     };
-    for (table) |h| if (std.mem.eql(u8, prog, h.prog)) {
+    // python, python3, python3.12: one entry.
+    const name = if (isPython(prog)) "python" else prog;
+    for (table) |h| if (std.mem.eql(u8, name, h.prog)) {
         for (h.subs) |s| if (std.mem.eql(u8, sub, s)) {
             if (std.mem.eql(u8, s, "-m")) {
                 if (w.len >= 3 and std.mem.eql(u8, w[2], "pytest")) return "python -m pytest";
@@ -252,23 +341,66 @@ fn heavyName(w: []const []const u8) ?[]const u8 {
         };
         return null;
     };
-    for ([_][]const u8{ "make", "gmake", "ninja", "xcodebuild", "pytest", "py.test", "gradle", "gradlew", "mvn", "mvnw" }) |p| {
+    for ([_][]const u8{ "make", "gmake", "ninja", "xcodebuild", "pytest", "py.test", "gradle", "gradlew", "mvn", "mvnw", "ctest", "tox" }) |p| {
         if (std.mem.eql(u8, prog, p)) return p;
     }
     return null;
 }
 
-/// Skips what only wraps a command: variable assignments, and nice, time,
-/// env, exec, command, nohup, caffeinate, stdbuf and timeout with their
-/// options.
+/// A program that runs the command after its options: its short options that take a value, its
+/// long ones that do, whether one more word (a duration, a CPU list) comes before the command,
+/// and the short options that only look a command up or report (`command -v`, `sudo -l`).
+const Wrapper = struct {
+    name: []const u8,
+    /// Only with this first word (`uv run`).
+    sub: []const u8 = "",
+    takes: []const u8 = "",
+    long: []const []const u8 = &.{},
+    positional: bool = false,
+    lookup: []const u8 = "",
+};
+
+const wrappers = [_]Wrapper{
+    .{ .name = "nice", .takes = "n", .long = &.{"--adjustment"} },
+    .{ .name = "time", .takes = "fo", .long = &.{ "--format", "--output" } },
+    .{ .name = "env", .takes = "uCPS", .long = &.{ "--unset", "--chdir", "--split-string" } },
+    .{ .name = "exec", .takes = "a" },
+    .{ .name = "command", .lookup = "vV" },
+    .{ .name = "nohup" },
+    .{ .name = "caffeinate", .takes = "tw" },
+    .{ .name = "stdbuf", .takes = "ioe", .long = &.{ "--input", "--output", "--error" } },
+    .{ .name = "timeout", .takes = "ks", .long = &.{ "--kill-after", "--signal" }, .positional = true },
+    .{ .name = "nocache" },
+    .{ .name = "ionice", .takes = "cnp", .long = &.{ "--class", "--classdata" } },
+    .{ .name = "chrt", .takes = "TPD", .positional = true, .lookup = "p" },
+    .{ .name = "taskset", .positional = true, .lookup = "p" },
+    .{ .name = "unbuffer" },
+    .{ .name = "sudo", .takes = "ugCDprtUT", .long = &.{ "--user", "--group", "--chdir", "--prompt", "--role", "--type", "--other-user" }, .lookup = "lvVK" },
+    .{ .name = "doas", .takes = "uC" },
+    .{ .name = "xargs", .takes = "IdELnPsa", .long = &.{ "--delimiter", "--max-args", "--max-procs", "--arg-file" } },
+    .{ .name = "xcrun", .long = &.{ "--sdk", "--toolchain" }, .lookup = "f" },
+    .{ .name = "uv", .sub = "run", .long = &.{ "--with", "--python", "--project", "--directory", "--package" } },
+    .{ .name = "poetry", .sub = "run" },
+    .{ .name = "pipenv", .sub = "run" },
+};
+
+/// Words that begin a command without being one: shell keywords and groupings.
+const keywords = [_][]const u8{ "if", "then", "elif", "else", "do", "while", "until", "!", "{" };
+
+/// Skips what only wraps a command: shell keywords (`if`, `{`, `!`), variable assignments, and
+/// the wrappers above with their options. A lookup (`command -v make`) leaves nothing.
 fn stripWrappers(words: []const []const u8) []const []const u8 {
     var w = words;
-    while (w.len > 0) {
+    outer: while (w.len > 0) {
         const x = w[0];
         if (isAssignment(x)) {
             w = w[1..];
             continue;
         }
+        for (keywords) |k| if (std.mem.eql(u8, x, k)) {
+            w = w[1..];
+            continue :outer;
+        };
         const prog = std.fs.path.basename(x);
         // `cpuq cap` limits one program but neither queues it nor takes cores:
         // what it runs is judged as if typed alone.
@@ -284,19 +416,36 @@ fn stripWrappers(words: []const []const u8) []const []const u8 {
             }
             continue;
         }
-        const wrapper = for ([_][]const u8{ "nice", "time", "env", "exec", "command", "nohup", "caffeinate", "stdbuf", "timeout", "nocache", "ionice", "chrt", "taskset", "unbuffer" }) |p| {
-            if (std.mem.eql(u8, prog, p)) break true;
-        } else false;
-        if (!wrapper) break;
-        w = w[1..];
-        // Their options, and timeout's duration, nice's -n N.
-        while (w.len > 0 and (w[0].len > 0 and (w[0][0] == '-' or isAssignment(w[0])))) {
+        const wr = for (wrappers) |wr| {
+            if (!std.mem.eql(u8, prog, wr.name)) continue;
+            if (wr.sub.len != 0 and !(w.len > 1 and std.mem.eql(u8, w[1], wr.sub))) continue;
+            break wr;
+        } else break;
+        w = w[if (wr.sub.len != 0) 2 else 1..];
+        while (w.len > 0 and w[0].len > 1 and (w[0][0] == '-' or (std.mem.eql(u8, wr.name, "env") and isAssignment(w[0])))) {
             const opt = w[0];
             w = w[1..];
-            if ((std.mem.eql(u8, opt, "-n") or std.mem.eql(u8, opt, "-c") or std.mem.eql(u8, opt, "-s") or std.mem.eql(u8, opt, "-k")) and w.len > 0) w = w[1..];
+            if (std.mem.eql(u8, opt, "--")) break;
+            if (opt[0] != '-') continue;
+            if (opt[1] == '-') {
+                for (wr.long) |l| if (std.mem.eql(u8, opt, l) and w.len > 0) {
+                    w = w[1..];
+                };
+                continue;
+            }
+            // A cluster of short options: one that takes a value ends it, with the value
+            // attached or in the next word.
+            for (opt[1..], 1..) |ch, k| {
+                if (std.mem.findScalar(u8, wr.lookup, ch) != null) return &.{};
+                if (std.mem.findScalar(u8, wr.takes, ch) != null) {
+                    if (k == opt.len - 1 and w.len > 0) w = w[1..];
+                    break;
+                }
+            }
         }
-        if (std.mem.eql(u8, prog, "timeout") and w.len > 0) w = w[1..];
-        if ((std.mem.eql(u8, prog, "taskset") or std.mem.eql(u8, prog, "chrt")) and w.len > 0) w = w[1..];
+        // env's assignments after its options.
+        while (w.len > 0 and isAssignment(w[0])) w = w[1..];
+        if (wr.positional and w.len > 0) w = w[1..];
     }
     return w;
 }
@@ -314,18 +463,28 @@ fn isAssignment(x: []const u8) bool {
     return !std.ascii.isDigit(x[0]);
 }
 
+fn isPython(prog: []const u8) bool {
+    if (!std.mem.startsWith(u8, prog, "python")) return false;
+    for (prog["python".len..]) |ch| if (!std.ascii.isDigit(ch) and ch != '.') return false;
+    return true;
+}
+
 fn isShell(prog: []const u8) bool {
     for ([_][]const u8{ "sh", "bash", "zsh", "dash" }) |s| if (std.mem.eql(u8, prog, s)) return true;
     return false;
 }
 
-/// The script of `sh -c SCRIPT` (or -lc, -ec …).
+/// The script of `sh -c SCRIPT` (or -lc, -ec, `-o pipefail -c` …).
 fn shellScript(w: []const []const u8) ?[]const u8 {
     var i: usize = 1;
     while (i < w.len) : (i += 1) {
         const x = w[i];
+        if (std.mem.eql(u8, x, "-o") or std.mem.eql(u8, x, "+o")) {
+            i += 1;
+            continue;
+        }
         if (x.len > 1 and x[0] == '-' and std.mem.findScalar(u8, x, 'c') != null and x[1] != '-') return if (i + 1 < w.len) w[i + 1] else null;
-        if (x.len == 0 or x[0] != '-') return null;
+        if (x.len == 0 or (x[0] != '-' and x[0] != '+')) return null;
     }
     return null;
 }
@@ -339,7 +498,7 @@ fn sshRemote(a: std.mem.Allocator, w: []const []const u8) ?Remote {
         const x = w[i];
         if (x.len > 1 and x[0] == '-') {
             // Options that take a value.
-            if (x.len == 2 and std.mem.findScalar(u8, "bcDEeFIiJLlmOoPpQRSWw", x[1]) != null) i += 1;
+            if (x.len == 2 and std.mem.findScalar(u8, "BbcDEeFIiJLlmOoPpQRSWw", x[1]) != null) i += 1;
             continue;
         }
         // No command: a login, or a script on stdin (a heredoc).
@@ -360,44 +519,86 @@ fn firstRedirect(w: []const []const u8) usize {
     return w.len;
 }
 
-/// The redirections, each with a space before it, less a last operator left
-/// without its target (`2>&1` reaches the hook as `2>`, cut at the `&`).
-fn redirections(a: std.mem.Allocator, w: []const []const u8) []const u8 {
-    var n = w.len;
-    if (n != 0) {
-        const last = w[n - 1];
-        if (last.len != 0 and (last[last.len - 1] == '>' or last[last.len - 1] == '<')) n -= 1;
-    }
+/// A word as the shell reads it back: bare when it needs no quotes, else in double quotes (or
+/// single, when it holds what double quotes expand).
+fn quoteWord(a: std.mem.Allocator, x: []const u8) []const u8 {
+    const plain = x.len != 0 and for (x) |ch| {
+        if (!(std.ascii.isAlphanumeric(ch) or std.mem.findScalar(u8, "_-./=:,+@%^~<>&", ch) != null)) break false;
+    } else true;
+    if (plain) return x;
+    if (std.mem.findAny(u8, x, "\"$`\\") == null) return a.print("\"{s}\"", .{x}) catch x;
+    return singleQuoted(a, x);
+}
+
+/// `text` in single quotes, each `'` in it written `'\''`.
+fn singleQuoted(a: std.mem.Allocator, text: []const u8) []const u8 {
     var out: std.ArrayList(u8) = .empty;
-    for (w[0..n]) |x| {
-        out.append(a, ' ') catch return "";
-        out.appendSlice(a, x) catch return "";
+    out.append(a, '\'') catch return text;
+    for (text) |ch| {
+        if (ch == '\'') out.appendSlice(a, "'\\''") catch return text else out.append(a, ch) catch return text;
     }
+    out.append(a, '\'') catch return text;
     return out.items;
 }
 
-/// What to run instead: the command under cpuq, the grant passed on.
+/// How a tool takes the grant: the option, and whether it goes right after the subcommand
+/// (`go build -p N ./...`) or at the end of the arguments.
+const Grant = struct { tool: []const u8, option: []const u8, after_sub: bool = false };
+
+const grants = [_]Grant{
+    .{ .tool = "zig", .option = "-j\"$CPUQ_CORES\"" },
+    .{ .tool = "cargo", .option = "-j \"$CPUQ_CORES\"", .after_sub = true },
+    .{ .tool = "swift", .option = "-j \"$CPUQ_CORES\"", .after_sub = true },
+    .{ .tool = "go", .option = "-p \"$CPUQ_CORES\"", .after_sub = true },
+    .{ .tool = "pytest", .option = "-n \"$CPUQ_CORES\"" },
+    .{ .tool = "ninja", .option = "-j \"$CPUQ_CORES\"" },
+    .{ .tool = "cmake", .option = "-j \"$CPUQ_CORES\"" },
+    .{ .tool = "xcodebuild", .option = "-jobs \"$CPUQ_CORES\"" },
+};
+
+/// What to run instead: the command under cpuq, its own jobs option replaced by the grant (make
+/// takes its slots from cpuq's jobserver and needs none).
 fn suggest(a: std.mem.Allocator, w: []const []const u8, project: []const u8, host: ?[]const u8) []const u8 {
-    const prog = std.fs.path.basename(w[0]);
-    const label = a.print("{s}:{s}", .{ if (project.len != 0) project else "proj", if (std.mem.eql(u8, prog, "pytest") or std.mem.eql(u8, prog, "xcodebuild")) "test" else "build" }) catch "proj:build";
-    const original = std.mem.join(a, " ", w) catch "CMD";
-    // A jobs flag goes before the redirections (`zig build >log 2>&1`), not after them.
-    const k = firstRedirect(w);
-    const args = std.mem.join(a, " ", w[0..k]) catch "CMD";
-    const redirs = redirections(a, w[k..]);
-    const inner = if (std.mem.eql(u8, prog, "zig") and !hasJobs(w))
-        a.print("sh -c '{s} -j\"$CPUQ_CORES\"{s}'", .{ args, redirs }) catch original
-    else if (std.mem.eql(u8, prog, "cargo"))
-        a.print("sh -c 'CARGO_BUILD_JOBS=\"$CPUQ_CORES\" {s}'", .{original}) catch original
-    else if (std.mem.eql(u8, prog, "xcodebuild"))
-        a.print("sh -c '{s} -jobs \"$CPUQ_CORES\"{s}'", .{ args, redirs }) catch original
-    else
-        original;
+    const tool = toolOf(w);
+    const testing = std.mem.eql(u8, tool, "pytest") or std.mem.eql(u8, tool, "py.test") or std.mem.eql(u8, tool, "ctest") or for (w[1..@min(w.len, 4)]) |x| {
+        if (std.mem.eql(u8, x, "test") or std.mem.eql(u8, x, "t") or std.mem.eql(u8, x, "nextest")) break true;
+    } else false;
+    const label = a.print("{s}:{s}", .{ if (project.len != 0) project else "proj", if (testing) "test" else "build" }) catch "proj:build";
+    // The words less their own jobs option.
+    var kept: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (i < w.len) : (i += 1) {
+        if (i > 0) if (jobsAt(tool, w, i)) |j| {
+            i += j.words - 1;
+            continue;
+        };
+        kept.append(a, w[i]) catch return "cpuq run --label P:T --cores 2-6 -- CMD";
+    }
+    const words = kept.items;
+    // The grant goes before the redirections (`zig build >log 2>&1`), not after them.
+    const k = firstRedirect(words);
+    const grant: ?Grant = for (grants) |g| {
+        if (std.mem.eql(u8, g.tool, tool)) break g;
+    } else null;
+    var line: std.ArrayList(u8) = .empty;
+    for (words, 0..) |x, n| {
+        if (grant) |g| if ((g.after_sub and n == 2) or (!g.after_sub and n == k)) {
+            line.appendSlice(a, " ") catch {};
+            line.appendSlice(a, g.option) catch {};
+        };
+        if (n != 0) line.appendSlice(a, " ") catch {};
+        line.appendSlice(a, quoteWord(a, x)) catch {};
+    }
+    if (grant) |g| if ((g.after_sub and words.len <= 2) or (!g.after_sub and k == words.len)) {
+        line.appendSlice(a, " ") catch {};
+        line.appendSlice(a, g.option) catch {};
+    };
+    const inner = if (grant != null) a.print("sh -c {s}", .{singleQuoted(a, line.items)}) catch line.items else line.items;
     const opaque_opt = if (hidesWork(w)) " --opaque" else "";
     const run = a.print("cpuq run --label {s} --cores 2-6{s} -- {s}", .{ label, opaque_opt, inner }) catch "cpuq run --label P:T --cores 2-6 -- CMD";
     // On another machine: sent there by cpuq, the repo copied over, or through that machine's own.
-    const spilled = a.print("cpuq run --on {s} --label {s} --cores 2-6{s} -- {s}", .{ host orelse "", label, opaque_opt, inner }) catch run;
-    return if (host) |h| a.print("{s} (it copies this repo to {s}; or ssh {s} 'cd … && {s}', the inner quotes as needed)", .{ spilled, h, h, run }) catch run else run;
+    const sent = a.print("cpuq run --on {s} --label {s} --cores 2-6{s} -- {s}", .{ host orelse "", label, opaque_opt, inner }) catch run;
+    return if (host) |h| a.print("{s} (it copies this repo to {s}; or ssh {s} 'cd … && {s}', the inner quotes as needed)", .{ sent, h, h, run }) catch run else run;
 }
 
 /// A heredoc opened on a line (`<<EOF`, `<<-EOF`, `<<'EOF'`, `<<"EOF"`): where its delimiter
@@ -428,12 +629,35 @@ fn heredocAt(script: []const u8, i: usize) ?Heredoc {
     return .{ .end = j, .delim = delim, .strip_tabs = strip };
 }
 
+/// The end of the command substitution whose text starts at `from` (just past `$(` or a
+/// backquote): the index of its `)` or closing backquote, or `script.len`.
+fn substitutionEnd(script: []const u8, from: usize, backquote: bool) usize {
+    var depth: usize = 0;
+    var i = from;
+    while (i < script.len) : (i += 1) {
+        switch (script[i]) {
+            '\\' => i += 1,
+            '`' => if (backquote) return i,
+            '(' => depth += 1,
+            ')' => if (!backquote) {
+                if (depth == 0) return i;
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return script.len;
+}
+
 /// Splits a script into simple commands: at unquoted ; & | && || newlines,
-/// ( ) and the edges of $( … ) and backquotes, with each word unquoted. A
+/// ( ) and the edges of $( … ) and backquotes, with each word unquoted. The
+/// commands of a `$( … )` or backquotes inside double quotes come too. A
 /// heredoc's body is set aside, never split: it is data (`python3 - <<EOF`),
-/// unless the command that reads it is a shell (checkSimple).
+/// unless the command that reads it is a shell (Ctx.simple).
 fn split(a: std.mem.Allocator, script: []const u8) ![]Simple {
     var out: std.ArrayList(Simple) = .empty;
+    // The commands on the current line start here: a `# cpuq: skip` at its end marks them.
+    var line_first: usize = 0;
     var pending: std.ArrayList(Heredoc) = .empty;
     var words: std.ArrayList([]const u8) = .empty;
     var word: std.ArrayList(u8) = .empty;
@@ -463,6 +687,16 @@ fn split(a: std.mem.Allocator, script: []const u8) ![]Simple {
                 in_word = true;
                 i += 1;
                 while (i < script.len and script[i] != '"') : (i += 1) {
+                    const backquote = script[i] == '`';
+                    if (backquote or (script[i] == '$' and i + 1 < script.len and script[i + 1] == '(')) {
+                        // A substitution runs its commands: they are checked, its text kept in the word.
+                        const from = i + @as(usize, if (backquote) 1 else 2);
+                        const end = substitutionEnd(script, from, backquote);
+                        try out.appendSlice(a, try split(a, script[from..end]));
+                        try word.appendSlice(a, script[i..@min(end + 1, script.len)]);
+                        i = @min(end, script.len - 1);
+                        continue;
+                    }
                     if (script[i] == '\\' and i + 1 < script.len) i += 1;
                     try word.append(a, script[i]);
                 }
@@ -475,10 +709,15 @@ fn split(a: std.mem.Allocator, script: []const u8) ![]Simple {
                 }
             },
             '#' => if (!in_word) {
-                while (i < script.len and script[i] != '\n') : (i += 1) {}
                 try flushWord(a, &words, &word, &in_word);
                 try flushCmd(a, &out, &words, script[start..i]);
-                start = i + 1;
+                const eol = std.mem.findScalarPos(u8, script, i, '\n') orelse script.len;
+                if (std.mem.eql(u8, std.mem.trim(u8, script[i..eol], " \t\r"), "# cpuq: skip")) {
+                    for (out.items[line_first..]) |*cmd| cmd.skip = true;
+                }
+                // The newline, if any, ends the line as ever: it starts the line's heredocs.
+                start = eol;
+                i = eol - 1;
             } else try word.append(a, ch),
             ' ', '\t' => try flushWord(a, &words, &word, &in_word),
             '<' => if (if (i + 1 < script.len and script[i + 1] == '<') heredocAt(script, i) else null) |h| {
@@ -492,7 +731,6 @@ fn split(a: std.mem.Allocator, script: []const u8) ![]Simple {
             },
             '\n' => {
                 try flushWord(a, &words, &word, &in_word);
-                const had = out.items.len;
                 try flushCmd(a, &out, &words, script[start..i]);
                 // The bodies of the line's heredocs follow it, each up to its delimiter line.
                 var p = i + 1;
@@ -516,13 +754,23 @@ fn split(a: std.mem.Allocator, script: []const u8) ![]Simple {
                 }
                 if (pending.items.len != 0) {
                     // The line's last command reads them (`cat <<EOF | sh`: sh).
-                    if (out.items.len > had) out.items[out.items.len - 1].heredoc = bodies.items;
+                    if (out.items.len > line_first) out.items[out.items.len - 1].heredoc = bodies.items;
                     pending.clearRetainingCapacity();
                     i = p - 1;
                 }
                 start = i + 1;
+                line_first = out.items.len;
             },
-            ';', '&', '|', '(', ')', '`' => {
+            // `2>&1`, `>&2`, `&>log`: a redirection, part of the word.
+            '&' => if ((in_word and word.items.len != 0 and word.items[word.items.len - 1] == '>') or (i + 1 < script.len and script[i + 1] == '>')) {
+                in_word = true;
+                try word.append(a, ch);
+            } else {
+                try flushWord(a, &words, &word, &in_word);
+                try flushCmd(a, &out, &words, script[start..i]);
+                start = i + 1;
+            },
+            ';', '|', '(', ')', '`' => {
                 try flushWord(a, &words, &word, &in_word);
                 try flushCmd(a, &out, &words, script[start..i]);
                 start = i + 1;
@@ -651,11 +899,11 @@ test "a suggested jobs flag goes before the redirections" {
     defer arena.deinit();
     const a = arena.allocator();
     try std.testing.expectEqualStrings(
-        "cpuq run --label app:build --cores 2-6 -- sh -c 'zig build -j\"$CPUQ_CORES\" >/dev/null'",
-        suggest(a, &.{ "zig", "build", ">/dev/null", "2>" }, "app", null),
+        "cpuq run --label app:build --cores 2-6 -- sh -c 'zig build -j\"$CPUQ_CORES\" >/dev/null 2>&1'",
+        suggest(a, &.{ "zig", "build", ">/dev/null", "2>&1" }, "app", null),
     );
     try std.testing.expectEqualStrings(
-        "cpuq run --label app:build --cores 2-6 -- sh -c 'zig build test -j\"$CPUQ_CORES\" 2>log'",
+        "cpuq run --label app:test --cores 2-6 -- sh -c 'zig build test -j\"$CPUQ_CORES\" 2>log'",
         suggest(a, &.{ "zig", "build", "test", "2>log" }, "app", null),
     );
 }
@@ -689,5 +937,72 @@ test "heavy work over ssh is pointed to --on" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const r = check(arena.allocator(), "ssh burst 'cd repo && zig build test'", 10, "app", null).?;
-    try std.testing.expect(std.mem.startsWith(u8, r.instead, "cpuq run --on burst --label app:build --cores 2-6 -- sh -c 'zig build test -j\"$CPUQ_CORES\"'"));
+    try std.testing.expect(std.mem.startsWith(u8, r.instead, "cpuq run --on burst --label app:test --cores 2-6 -- sh -c 'zig build test -j\"$CPUQ_CORES\"'"));
+}
+
+fn suggested(a: std.mem.Allocator, command: []const u8) []const u8 {
+    return (check(a, command, 10, "app", null) orelse return "").instead;
+}
+
+test "a suggestion runs as typed: redirections whole, quotes kept, the tool's own grant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("cpuq run --label app:test --cores 2-6 -- sh -c 'cargo test -j \"$CPUQ_CORES\" 2>&1'", suggested(a, "cargo test 2>&1"));
+    try std.testing.expectEqualStrings("cpuq run --label app:build --cores 2-6 -- sh -c 'go build -p \"$CPUQ_CORES\" ./...'", suggested(a, "go build ./..."));
+    try std.testing.expectEqualStrings("cpuq run --label app:test --cores 2-6 -- sh -c 'pytest -q -n \"$CPUQ_CORES\"'", suggested(a, "pytest -n 8 -q"));
+    try std.testing.expectEqualStrings("cpuq run --label app:build --cores 2-6 -- make all", suggested(a, "make -j8 all"));
+    try std.testing.expectEqualStrings("cpuq run --label app:build --cores 2-6 -- sh -c 'zig build \"-Dname=a b\" -j\"$CPUQ_CORES\"'", suggested(a, "zig build -Dname='a b'"));
+    try std.testing.expectEqualStrings("cpuq run --label app:build --cores 2-6 -- sh -c 'zig build '\\''-Dx=$HOME'\\'' -j\"$CPUQ_CORES\"'", suggested(a, "zig build '-Dx=$HOME'"));
+}
+
+test "shell keywords, groupings and substitutions in double quotes hide nothing" {
+    try std.testing.expect(refused("if true; then zig build; fi"));
+    try std.testing.expect(refused("{ zig build; }"));
+    try std.testing.expect(refused("! zig build"));
+    try std.testing.expect(refused("while true; do make; done"));
+    try std.testing.expect(refused("echo \"$(zig build)\""));
+    try std.testing.expect(refused("echo \"`make all`\""));
+    try std.testing.expect(!refused("echo \"$(git rev-parse HEAD)\" done"));
+}
+
+test "wrappers are read with their own options" {
+    try std.testing.expect(refused("taskset -c 0-3 make"));
+    try std.testing.expect(refused("taskset 0x3 make"));
+    try std.testing.expect(refused("env -u FOO make"));
+    try std.testing.expect(refused("sudo -u builder make"));
+    try std.testing.expect(refused("timeout -k 1 5 zig build"));
+    try std.testing.expect(refused("uv run pytest"));
+    try std.testing.expect(refused("cargo +nightly build"));
+    try std.testing.expect(refused("python3.12 -m pytest"));
+    try std.testing.expect(!refused("command -v make"));
+    try std.testing.expect(!refused("taskset -p 1234"));
+}
+
+test "a skip comment counts only as a comment, for its own line" {
+    try std.testing.expect(!refused("make && zig build # cpuq: skip"));
+    try std.testing.expect(!refused("zig build   # cpuq: skip  "));
+    try std.testing.expect(refused("echo '# cpuq: skip'; zig build"));
+    try std.testing.expect(refused("git log --grep='# cpuq: skip' && make"));
+    try std.testing.expect(refused("ls # cpuq: skip\nmake"));
+    // A comment on a heredoc's line still sets its body aside.
+    try std.testing.expect(!refused("cat <<EOF # note\nmake\nEOF"));
+    try std.testing.expect(refused("sh <<EOF # run it\nmake\nEOF"));
+}
+
+test "inside cpuq run, every option's value is skipped and a fixed jobs count is refused" {
+    try std.testing.expect(refused("cpuq run --repo X --cores 2 -- zig build"));
+    try std.testing.expect(refused("cpuq run --note x --label a:b -- zig build"));
+    try std.testing.expect(refused("cpuq run --cores 2 -- make -j16"));
+    try std.testing.expect(refused("cpuq run --cores 2 -- make -j"));
+    try std.testing.expect(refused("cpuq run --cores 2 -- sh -c 'zig build -j16 test'"));
+    try std.testing.expect(refused("cpuq run --cores 2 -- cargo build -j 16"));
+    try std.testing.expect(refused("cpuq run --cores 2 -- pytest -n auto"));
+    try std.testing.expect(refused("cpuq run --cores 2 -- env -u X sh -c 'zig build'"));
+    try std.testing.expect(!refused("cpuq run --cores 2 -- sh -c 'pytest -n \"$CPUQ_CORES\"'"));
+    try std.testing.expect(!refused("cpuq run --cores 1 -- make -j1"));
+    try std.testing.expect(refused("cpuq run --cores 2 -- make -j install"));
+    try std.testing.expect(refused("cpuq run --cores 2-6 -- make -j4"));
+    try std.testing.expect(!refused("cpuq run --cores 4 -- make -j4"));
+    try std.testing.expect(!refused("cpuq run --cores 2-6 -- sh -c 'go build -p \"$CPUQ_CORES\" ./...'"));
 }

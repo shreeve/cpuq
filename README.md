@@ -122,7 +122,7 @@ the `--opaque` jobs together count for the machine's busy CPUs that nothing meas
 where a container's work on this machine still shows, shared by their grants: each at least what
 its own processes are seen to use and at most its grant. Work outside cpuq counts there too, so it
 errs toward counting them whole; an idle container, or a job marked `--opaque` whose work cpuq
-can see anyway (a qemu it starts itself), no longer holds the queue behind idle CPUs. It is never
+can see anyway (a qemu it starts itself), doesn't hold the queue behind idle CPUs. It is never
 started inside a lending timing window (it couldn't be frozen), and `cpuq pause`/`stop` say they
 reach only the command cpuq started. A VM or program cpuq starts as a child is no container: leave
 `--opaque` off, and it is measured as it is.
@@ -183,11 +183,12 @@ can still use more. GNU make 4.x lets a `-j` on its own command line override th
 
 ### Labels
 
-Give every job a label, `project:task`, lowercase and the same on every run: `app:build`,
-`app:test`, `site:deploy`. History sizes jobs, sets their expected use and estimates waits by
-label, so a label with a run id, date or branch name in it never has a history. `cpuq status`
-sums the cores in use by project, the label up to its first `:`, and a new label's wait estimate
-uses its project's.
+Give every job a label, `project:task`, the same on every run: `app:build`, `app:test`,
+`site:deploy`. A label is parts split by `:`, each of lowercase letters, digits, `.`, `_` and `-`,
+none starting with `.`; anything else is a usage error. History sizes jobs, sets their expected
+use and estimates waits by label, so a label with a run id, date or branch name in it never has
+a history. `cpuq status` sums the cores in use by project, the label up to its first `:`, and a
+new label's wait estimate uses its project's.
 
 ### One job per phase
 
@@ -294,24 +295,31 @@ can spend a large part of a big machine doing nothing else: one did, about 17 of
 |---|---|
 | `--mem SIZE` | PROGRAM and everything it started are stopped above SIZE (`2G`, `512M`) |
 | `--time DURATION` | stopped after DURATION (`120`, `120s`, `2m`, `500ms`) |
-| `--output SIZE` | stopped once it has written more than SIZE to stdout and stderr, which must be files or `/dev/null`; a pipe is refused |
-| `--pids N` | at most N processes and threads at once (inside a job on Linux) |
+| `--output SIZE` | stopped once it has written more than SIZE to stdout and stderr, which must be files or `/dev/null`; a pipe is refused. Checked about every 0.1 s |
+| `--pids N` | at most N processes and threads at once, inside a job on Linux; elsewhere not enforced, and a job that can't give it a cgroup says so on stderr |
 | `--no-crash-report` | no crash report when PROGRAM crashes on purpose, a test that panics. macOS: cap answers PROGRAM's crashes itself, so neither the user's ReportCrash (~/Library/Logs/DiagnosticReports) nor the system's (/Library/Logs/DiagnosticReports) files one, and cap exits 128+N for a death by signal N rather than dying by it (a shell sees the same status). Linux: a core limit of exactly 1, so the kernel passes it to no `core_pattern` handler (Ubuntu's apport, seconds per crash); it still dies by its signal. What PROGRAM starts inherits it, so wrap the program meant to crash, never a compiler before it |
 
 `cpuq cap --protocol` prints what cap does as a number that changes only when that does (its
 limits, how it stops a program, its exit statuses, `--no-crash-report`): a test runner that caches
 results keys them on it, not on cpuq's version, so a release that leaves cap alone keeps them.
 
+A limit of 0 is refused: no limit is the option left out.
+
 - **Exit status:** PROGRAM's own, or death by its signal. When cpuq stopped it, it's 122 for
-  memory, 124 for time and 121 for output, each with one line on stderr. 127 means PROGRAM
-  wasn't found.
+  memory, 124 for time and 121 for output, each with one line on stderr. 2 is a usage error,
+  125 cap's own failure, 126 PROGRAM can't be run, 127 PROGRAM wasn't found. PROGRAM can exit
+  with any of these itself; the stderr line is what tells them apart.
 - **Inside a cpuq job on Linux:** PROGRAM is born in a cgroup of its own beside the job's
   (`clone3` into it, with no write to `cgroup.procs`, which would stall every fork on the
   machine). The cgroup has `memory.max`, no swap and `memory.oom.group`, so the kernel stops it
   at the limit: within milliseconds, with nothing polling. Everything it started is stopped with
-  it, even what left its process group.
+  it, even what left its process group. A cap killed before it could clean up (SIGKILL) leaves
+  its cgroup; the job's next cap removes it, with whatever is still running in it.
 - **Elsewhere** (macOS, or Linux outside a job): PROGRAM gets its own process group, and its
   memory is read once a second from its own process tree, never from a list of every process.
+  Stopping it kills that tree, then the group. On Linux cap is the tree's subreaper, so orphans
+  stay in it; macOS has none, so a process that leaves both the tree and the group (a double
+  fork with `setsid`) is out of cap's reach, its memory uncounted and left running.
 - **Either way:** PROGRAM's end wakes cpuq at once, and anything PROGRAM left running is stopped.
   It costs about half a millisecond a call.
 
@@ -344,8 +352,10 @@ their actions on right-click; and `cpuq history` summed by project. Every sectio
 While the window is open it is an ordinary app (Dock icon, menu bar, ⌘Tab); closed, only its
 menu bar chip remains, which stays calm while all is well, turns orange when the gate is shut or
 jobs wait beside idle CPUs, and shows ☁ with uptime and this month's hours while a cloud machine
-runs. It notifies, once each, when the gate stays shut, jobs keep waiting beside idle CPUs, or a
-cloud machine sits idle and billing. It only reads `cpuq status`, `history` and `samples`.
+runs. It notifies, once each, when the gate stays shut, jobs wait beside idle CPUs, `--opaque`
+jobs hold cores while others wait, heavy work runs outside cpuq, a job looks stuck, a machine is
+overloaded while another has room, or a cloud machine sits idle and billing; the urgent ones are
+also texted. It reads `cpuq status`, `history` and `samples`, and runs the job actions you pick.
 Install it with `brew install --cask shreeve/tap/cpuq-app`.
 
 ## Waiting and order
@@ -834,9 +844,12 @@ only what another machine sent it.
 
 ## Configuration
 
-The config file is `CPUQ_CONFIG`, default `~/.config/cpuq/config`: `key = value` lines, `#` for
-comments. An invalid line is an error naming the file and line (exit 2). A run already waiting
-re-reads the file when it changes; an invalid edit keeps the settings in force and says so.
+The config file is `CPUQ_CONFIG`, default `~/.config/cpuq/config`: `key = value` lines, each key
+at most once. `#` starts a comment at the start of a line or after a space or tab, so a value may
+hold one (`a#b`). Numbers are plain decimal digits, within a range the error gives. HOST in
+`remote_start.HOST` and `remote_env.HOST` is one of `remotes`. An invalid line is an error naming
+the file and line (exit 2). A run already waiting re-reads the file when it changes; an invalid
+edit keeps the settings in force and says so.
 
 | key | default | meaning |
 |---|---|---|
@@ -879,11 +892,11 @@ balloons would otherwise fill the swap and shut the memory gate on everyone.
 
 ## Reservation mode (admit = cores)
 
-With `admit = cores`, each job counts at the cores it holds, out of a fixed budget, as cpuq did
-before measured admission. The budget is `CPUQ_BUDGET`, else `budget` in the config, else the
-active CPUs minus 2 (8 on a 10-CPU Mac), leaving a reserve for the owner's own work; it is
-capped by the CPUs active now unless `active_cap = off`, which lets it oversubscribe the machine
-on purpose. `cpuq budget` prints it. A request is clamped to the budget.
+With `admit = cores`, each job counts at the cores it holds, out of a fixed budget. The budget
+is `CPUQ_BUDGET`, else `budget` in the config, else the active CPUs minus 2 (8 on a 10-CPU Mac),
+leaving a reserve for the owner's own work; it is capped by the CPUs active now unless
+`active_cap = off`, which lets it oversubscribe the machine on purpose. `cpuq budget` prints it.
+A request is clamped to the budget.
 
 In this mode a few things keep reserved cores from sitting idle:
 

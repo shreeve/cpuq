@@ -36,11 +36,6 @@ pub const Cx = struct {
     self: []const u8,
 };
 
-/// The oldest cpuq a host may run to take submitted jobs (it has _start, _job, _peek).
-const host_min = [3]u32{ 0, 18, 0 };
-/// The oldest that installs packs (_pack).
-const packs_min = [3]u32{ 0, 21, 0 };
-
 // --- Exit codes: verdicts, never the job's own ----------------------------------------------
 
 const Verdict = enum {
@@ -535,13 +530,12 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
     const spec_abs = realpath(cx, sp) orelse return fail2("{s}: not found", .{sp});
     const text = readFile(cx, spec_abs) orelse return fail2("{s}: can't be read", .{sp});
     const spec = std.json.parseFromSliceLeaky(Spec, cx.a, text, .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| {
-        if (err == error.UnknownField and std.mem.find(u8, text, "\"on\"") != null)
-            return fail2("spec {s}: \"on\" is gone: a spec says what a job needs, and the machine that submits it picks the host (its config's remotes, or --on HOST); remove the line", .{sp});
         return fail2("spec {s}: {t} (fields: label, run, setup, cores, time, mem, tools, env, exclude, deps, caches, report, return, git, packs)", .{ sp, err });
     };
     const top_run = run(cx, &.{ "git", "-C", std.fs.path.dirname(spec_abs) orelse ".", "rev-parse", "--show-toplevel" }, null);
     const dir = if (top_run.ok) std.mem.trim(u8, top_run.out, " \n") else (std.fs.path.dirname(spec_abs) orelse ".");
-    if (std.mem.findScalar(u8, spec.label, ':') == null) return fail2("spec {s}: \"label\" must be project:task, not '{s}'", .{ sp, spec.label });
+    if (std.mem.findScalar(u8, spec.label, ':') == null or !policy.validLabel(spec.label))
+        return fail2("spec {s}: \"label\" is project:task, of lowercase letters, digits, '.', '_' and '-', not '{s}'", .{ sp, spec.label });
     if (spec.cores) |cr| if (policy.Request.parse(cr) == null) return fail2("spec {s}: \"cores\" must be N or MIN-MAX, not '{s}'", .{ sp, cr });
     if (spec.time) |t| if (@import("cap.zig").parseDuration(t) == null) return fail2("spec {s}: \"time\" must be a duration like 90m, not '{s}'", .{ sp, t });
     if (spec.mem) |m| if (policy.parseBytes(m) == null) return fail2("spec {s}: \"mem\" must be a size like 64G, not '{s}'", .{ sp, m });
@@ -979,11 +973,10 @@ fn placeDetail(cx: Cx) []const u8 {
 
 const Probe = struct { reachable: bool, room: bool, mem_total: u64, note: []const u8, cpus: u32 = 0 };
 
-fn probe(cx: Cx, host: []const u8, min: [3]u32) Probe {
+fn probe(cx: Cx, host: []const u8) Probe {
     const r = onHost(cx, host, cx.a.print("{s} status --json --no-usage", .{cpuqOn(cx, host)}) catch "");
     if (!r.ok) return .{ .reachable = false, .room = false, .mem_total = 0, .note = cx.a.print("{s}: no answer", .{host}) catch "" };
     const St = struct {
-        version: []const u8 = "",
         waiters: []const std.json.Value = &.{},
         load: [3]f64 = .{ 0, 0, 0 },
         active_cores: u32 = 0,
@@ -992,19 +985,8 @@ fn probe(cx: Cx, host: []const u8, min: [3]u32) Probe {
     };
     const st = std.json.parseFromSliceLeaky(St, cx.a, r.out, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch
         return .{ .reachable = false, .room = false, .mem_total = 0, .note = cx.a.print("{s}: its cpuq answered in a form this one can't read", .{host}) catch "" };
-    if (!versionAtLeast(st.version, min)) return .{ .reachable = false, .room = false, .mem_total = 0, .note = cx.a.print("{s} runs cpuq {s}, and this job needs {d}.{d} (curl -fsSL https://raw.githubusercontent.com/shreeve/cpuq/main/install.sh | bash, on {s})", .{ host, st.version, min[0], min[1], host }) catch "" };
     const room = st.waiters.len == 0 and st.load[0] < @as(f64, @floatFromInt(st.active_cores)) and std.mem.eql(u8, st.gate.state, "open");
     return .{ .reachable = true, .room = room, .mem_total = if (st.memory) |m| m.total else 0, .note = "", .cpus = st.active_cores };
-}
-
-fn versionAtLeast(v: []const u8, min: [3]u32) bool {
-    var parts: [3]u32 = .{ 0, 0, 0 };
-    var it = std.mem.splitScalar(u8, v, '.');
-    for (&parts) |*p| p.* = std.fmt.parseInt(u32, it.next() orelse "0", 10) catch 0;
-    for (parts, min) |p, m| {
-        if (p != m) return p > m;
-    }
-    return true;
 }
 
 /// A host a job could go to, as `place` weighs it.
@@ -1030,10 +1012,9 @@ const Option = struct {
 fn place(cx: Cx, rec: *const Record) ?[]const u8 {
     const payload = std.json.parseFromSliceLeaky(Payload, cx.a, rec.payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return null;
     const need: u64 = if (payload.mem) |m| policy.parseBytes(m) orelse 0 else 0;
-    const min = if (rec.packs.len != 0) packs_min else host_min;
     var opts: std.ArrayList(Option) = .empty;
     for (rec.on) |host| {
-        const p = probe(cx, host, min);
+        const p = probe(cx, host);
         const paid = cx.cfg.remoteStart(host) != null;
         if (!p.reachable) {
             place_notes.append(cx.a, p.note) catch {};
@@ -1116,7 +1097,7 @@ fn startIfStopped(cx: Cx, rec: *const Record, o: Option) ?[]const u8 {
         place_notes.append(cx.a, cx.a.print("{s}: its start command failed", .{o.host}) catch "") catch {};
         return null;
     }
-    if (probe(cx, o.host, if (rec.packs.len != 0) packs_min else host_min).reachable) return o.host;
+    if (probe(cx, o.host).reachable) return o.host;
     place_notes.append(cx.a, cx.a.print("{s}: started, but no answer", .{o.host}) catch "") catch {};
     return null;
 }
@@ -1313,7 +1294,7 @@ fn watch(cx: Cx, rec: *Record, payload: *Payload, host: []const u8) u8 {
 fn lostOrRetry(cx: Cx, rec: *Record, payload: *Payload, host: []const u8) u8 {
     const id = rec.id;
     if (rec.attempt >= 2) return done(cx, id, rec.*, .lost, null, cx.a.print("{s} went away twice: not your code, resubmit once", .{host}) catch "", host);
-    if (!probe(cx, host, if (rec.packs.len != 0) packs_min else host_min).reachable) {
+    if (!probe(cx, host).reachable) {
         const start = cx.cfg.remoteStart(host) orelse return done(cx, id, rec.*, .lost, null, cx.a.print("{s} went away: not your code, resubmit once", .{host}) catch "", host);
         setState(cx, id, "starting", cx.a.print("{s} went away; starting it again", .{host}) catch "");
         if (!run(cx, &.{ "/bin/sh", "-c", cx.a.print("{s} 1>&2", .{start}) catch "" }, null).ok)

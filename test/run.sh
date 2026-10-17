@@ -11,6 +11,10 @@ ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cpuq-test.XXXXXX")
 # On exit, end every process the tests started, children's children
 # included, so none outlives the run holding its output open.
 killtree() { local p; for p in $(pgrep -P "$1"); do killtree "$p"; kill "$p" 2>/dev/null; done; }
+# The pids under $1, children's children included, to end by pid once $1 is gone.
+descendants() { local p; for p in $(pgrep -P "$1"); do echo "$p"; descendants "$p"; done; }
+# 0 if a pid in the file $1 still runs.
+alive() { kill -0 "$(cat "$1")" 2>/dev/null; }
 trap 'killtree $$; rm -rf "$ROOT"' EXIT
 PASS=0
 FAIL=0
@@ -27,13 +31,17 @@ setup() {
   mkdir -p "$T"
   export CPUQ_DIR=$T/state CPUQ_CONFIG=$T/config CPUQ_BUDGET=9
   unset CPUQ_TOKEN MAKEFLAGS
+  # Each key at most once: a line given here replaces the default for its key.
+  # min_disk: t_min_disk tests it; the rest must not hang on the host's disk.
+  # active_cap: a budget of 9 on a machine with fewer cores.
+  # admit: the reservation model; t_measured tests the default.
+  local line keys=" "
+  for line in "$@"; do keys="$keys${line%% *} "; done
   {
-    echo "load_check = off"
-    echo "pressure_check = off"
-    echo "min_disk = off" # t_min_disk tests it; the rest must not hang on the host's disk
-    echo "poll = 0.2"
-    echo "active_cap = off" # a budget of 9 on a machine with fewer cores
-    echo "admit = cores" # the reservation model; t_measured tests the default
+    for line in "load_check = off" "pressure_check = off" "min_disk = off" "poll = 0.2" \
+        "active_cap = off" "admit = cores"; do
+      case $keys in *" ${line%% *} "*) ;; *) echo "$line" ;; esac
+    done
     for line in "$@"; do echo "$line"; done
   } >"$CPUQ_CONFIG"
   echo "== $CUR"
@@ -183,15 +191,14 @@ t_kill_cpuq_only() {
 
 t_leaked_descendant() {
   setup leaked-descendant
-  # A distinctive duration, so the cleanup below can only match this one.
-  "$CPUQ" run --cores 9 -- sh -c 'sleep 30.417 >/dev/null 2>&1 & exit 0'
+  "$CPUQ" run --cores 9 -- sh -c 'sleep 30.417 >/dev/null 2>&1 & echo $! >"$1"; exit 0' sh "$T/bg"
   local h; h=$(held)
   local t0; t0=$(now)
   "$CPUQ" run --cores 9 -- true; local rc=$?
   local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
   echo "  after the command exits leaving 'sleep 30.417' behind: held $h; next run took ${dt}s"
   check "a background descendant does not keep the cores" "[ '$h' = 0 ] && [ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if $dt < 1 else 1)'"
-  pkill -f '^sleep 30.417$' 2>/dev/null
+  kill "$(cat "$T/bg")" 2>/dev/null
 }
 
 t_kill_waiter() {
@@ -217,6 +224,9 @@ t_exit_status() {
   check "exit 7 passes through as 7 (got $rc)" "[ $rc = 7 ]"
   "$CPUQ" run -- sh -c 'kill -TERM $$'; rc=$?
   check "a command killed by SIGTERM reports 143 (got $rc)" "[ $rc = 143 ]"
+  local bad
+  bad=$("$CPUQ" run --label ../../x:y -- echo ran 2>&1); rc=$?
+  check "a label outside project:task of [a-z0-9._-] is a usage error, never running (rc $rc: '$bad')" "[[ \$rc = 2 && \"\$bad\" == *'lowercase letters'* ]] && ! grep -qx ran <<<\"\$bad\""
   local how
   # SIGINT at its default first: a suite started as a `&` job hands it down
   # ignored, cpuq keeps it ignored for the command, and sh survives its kill.
@@ -622,12 +632,13 @@ t_lease_host() {
   check "a --host lease inside the same one starts at once (${dt}s, '$inner')" "[ '$inner' = inner ] && python3 -c 'import sys; sys.exit(0 if $dt < 2 else 1)'"
   PATH="$bin:$PATH" "$CPUQ" lease bench --host far -- sleep 30 & local p=$!
   wait_lease_holder bench
+  local kids; kids=$(descendants $p)
   t0=$(now)
   kill -9 $p
   "$CPUQ" lease bench --max-wait 5 -- true; local rc=$?
   dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
   check "a killed --host holder frees the remote lease at once (exit $rc after ${dt}s)" "[ $rc = 0 ] && python3 -c 'import sys; sys.exit(0 if $dt < 2 else 1)'"
-  pkill -f "$T" 2>/dev/null
+  kill $kids 2>/dev/null
   "$CPUQ" lease bench -- sleep 2 & wait_lease_holder bench
   PATH="$bin:$PATH" "$CPUQ" lease bench --host far --max-wait 1 -- true 2>/dev/null; rc=$?
   check "--max-wait on a --host lease gives 75 (got $rc)" "[ $rc = 75 ]"
@@ -666,7 +677,8 @@ spin(); os.wait()'
   wait
   "$CPUQ" run --label h:crash -- sleep 30.583 & local p=$!
   wait_held 2
-  kill -9 $p; pkill -f '^sleep 30.583$' 2>/dev/null; sleep 0.2
+  local kids; kids=$(descendants $p)
+  kill -9 $p; kill $kids 2>/dev/null; sleep 0.2
   local got; got=$("$CPUQ" history --json | python3 -c 'import json, sys
 j = {x["label"]: x for x in json.load(sys.stdin)}
 b = j["h:build"]
@@ -783,7 +795,7 @@ t_config_reload() {
   "$CPUQ" run --cores 2 -- true & local w=$!
   wait_waiters 1
   sleep 0.6
-  echo "budget = 11" >>"$CPUQ_CONFIG"
+  { grep -v '^budget' "$CPUQ_CONFIG"; echo "budget = 11"; } >"$CPUQ_CONFIG.new" && mv "$CPUQ_CONFIG.new" "$CPUQ_CONFIG"
   wait $w
   local dt; dt=$(python3 -c "print('%.1f' % ($(now) - $t0))")
   kill $h 2>/dev/null; wait $h 2>/dev/null
@@ -858,7 +870,7 @@ t_last_words() {
     if [ $((n % 2)) = 1 ]; then
       "$CPUQ" lease near --hold --label kit <"$T/k$n" >/dev/null & h1=$!
     else
-      PATH="$bin:$PATH" "$CPUQ" lease far --host far --hold --label kit@far <"$T/k$n" >/dev/null & h1=$!
+      PATH="$bin:$PATH" "$CPUQ" lease far --host far --hold --label kit-far <"$T/k$n" >/dev/null & h1=$!
     fi
     exec 7>"$T/k$n"
     if [ $((n % 2)) = 1 ]; then wait_lease_holder near; else wait_lease_holder far; fi
@@ -872,7 +884,7 @@ print(" ".join("%s%s:%s:%s" % (j["label"], "@" + j["host"] if j["host"] else "",
   echo "  exits $rc_w $rc_h1 $rc_h2; history: $got"
   check "killed while waiting, a run exits by the signal and gave up (not lost)" "[ $rc_w = 143 ] && [[ '$got' == *'waiter:gave_up:15'* ]]"
   check "killed while held, a --hold lease ends by the signal, here and on a host" "[ $rc_h1 = 129 ] && [ $rc_h2 = 143 ] && [[ '$got' == *'near:done:1 '* && '$got' == *'far@far:done:15'* ]]"
-  local kit; kit=$(echo "$got" | tr ' ' '\n' | grep -cE '^kit(@far@far)?:done:')
+  local kit; kit=$(echo "$got" | tr ' ' '\n' | grep -cE '^kit(-far@far)?:done:')
   check "closed and killed at once (the kit's release), a hold still ends, 5 of 5 (got $kit)" "[ '$kit' = 5 ]"
   check "nothing is lost" "[[ '$got' != *lost* ]]"
 }
@@ -1022,14 +1034,30 @@ t_cap() {
   "$CPUQ" cap --mem 64M -- python3 -c 'import time; x = bytearray(256 << 20); time.sleep(10)' 2>/dev/null; local rc_mem=$?
   # A grandchild that leaves the group (": " keeps sh as its parent, not a group leader it became).
   "$CPUQ" cap --mem 64M -- sh -c 'python3 -c "import os, time; os.setsid(); x = bytearray(256 << 20); time.sleep(10)"; :' 2>/dev/null; local rc_escaped=$?
+  t0=$(now)
   "$CPUQ" cap --output 1K -- sh -c 'head -c 100000 /dev/zero; sleep 10' >"$T/out" 2>"$T/err"; local rc_out=$?
+  local dt_out; dt_out=$(python3 -c "print('%.2f' % ($(now) - $t0))")
+  "$CPUQ" cap --mem 0 -- true 2>/dev/null; local rc_zero=$?
+  "$CPUQ" cap --pids off -- true 2>/dev/null; [ $? = 2 ] || rc_zero="$rc_zero, --pids off $?"
   "$CPUQ" cap --output 1K -- true 2>/dev/null | cat; local rc_pipe=${PIPESTATUS[0]}
   "$CPUQ" cap -- sh -c 'kill -TERM $$'; local rc_sig=$?
-  # A duration no other session's process has, so the check can't see theirs.
-  local nap="77.$$"
-  "$CPUQ" cap --mem 1G -- sh -c "sleep $nap & exit 0"; sleep 0.3
-  local left=0; pgrep -f "^sleep $nap\$" >/dev/null && left=1
-  check "cap passes the exit on (7: $rc_exit), not found 127 ($rc_missing), time 124 ($rc_time after ${dt}s), memory 122 ($rc_mem; escaped the group: $rc_escaped), output 121 ($rc_out), a pipe refused 2 ($rc_pipe), a signal as itself 143 ($rc_sig), nothing left behind ($left)" "[ $rc_exit = 7 ] && [ $rc_missing = 127 ] && [ $rc_time = 124 ] && python3 -c 'import sys; sys.exit(0 if $dt < 3 else 1)' && [ $rc_mem = 122 ] && [ $rc_escaped = 122 ] && [ $rc_out = 121 ] && [ $rc_pipe = 2 ] && [ $rc_sig = 143 ] && [ $left = 0 ]"
+  "$CPUQ" cap --mem 1G -- sh -c 'sleep 77 & echo $! >"$1"; exit 0' sh "$T/bg"; sleep 0.3
+  local left=0; alive "$T/bg" && left=1
+  check "cap passes the exit on (7: $rc_exit), not found 127 ($rc_missing), time 124 ($rc_time after ${dt}s), memory 122 ($rc_mem; escaped the group: $rc_escaped), output 121 within 0.1 s or so ($rc_out after ${dt_out}s), a limit of 0 refused 2 ($rc_zero), a pipe refused 2 ($rc_pipe), a signal as itself 143 ($rc_sig), nothing left behind ($left)" "[ $rc_exit = 7 ] && [ $rc_missing = 127 ] && [ $rc_time = 124 ] && python3 -c 'import sys; sys.exit(0 if $dt < 3 else 1)' && [ $rc_mem = 122 ] && [ $rc_escaped = 122 ] && [ $rc_out = 121 ] && python3 -c 'import sys; sys.exit(0 if $dt_out < 0.6 else 1)' && [ $rc_zero = 2 ] && [ $rc_pipe = 2 ] && [ $rc_sig = 143 ] && [ $left = 0 ]"
+  # Linux: cap is its tree's subreaper, so even an orphan that left the session goes with it
+  # (macOS has none: that orphan is out of reach there, as cap's header says). A cap that was
+  # meant to have a cgroup and couldn't says what that costs.
+  [ "$(uname)" = Linux ] || return 0
+  "$CPUQ" cap -- python3 -c 'import os, sys, time
+if os.fork() == 0:
+    os.setsid()
+    if os.fork() == 0:
+        open(sys.argv[1], "w").write(str(os.getpid())); time.sleep(77)
+    os._exit(0)
+os.wait(); time.sleep(0.3)' "$T/orphan"; sleep 0.3
+  local orphan=0; alive "$T/orphan" && orphan=1
+  local warn; warn=$(CPUQ_CGROUP=/sys/fs/cgroup/cpuq-none.scope "$CPUQ" cap --pids 5 -- true 2>&1)
+  check "Linux: a setsid orphan goes with cap (left: $orphan); no cgroup is said ($warn)" "[ $orphan = 0 ] && [[ '$warn' == *'--pids is not enforced'* ]]"
 }
 
 t_cap_quiet_crash() {
@@ -1072,10 +1100,33 @@ t_cgroups() {
   "$CPUQ" run --cores 1 --label capped -- "$CPUQ" cap --mem 64M -- python3 -c 'import time; x = bytearray(256 << 20); time.sleep(10)' 2>/dev/null; local rc=$?
   local dt; dt=$(python3 -c "print('%.2f' % ($(now) - $t0))")
   check "a job runs in its scope's job/ with CPUQ_CGROUP and memory for its children (got $got); a cap there is stopped by the kernel ($rc after ${dt}s)" "[[ '$got' == *'.scope/job /sys/fs/cgroup/'*'.scope '*memory* ]] && [ $rc = 122 ] && python3 -c 'import sys; sys.exit(0 if $dt < 0.9 else 1)'"
+  # --pids holds the program's tree to N tasks: python and 4 children of 20 asked for.
+  local forks; forks=$("$CPUQ" run --cores 1 --label pids -- "$CPUQ" cap --pids 5 -- python3 -c 'import os, time
+n = 0
+for i in range(20):
+    try:
+        if os.fork() == 0:
+            time.sleep(1); os._exit(0)
+        n += 1
+    except OSError:
+        pass
+print(n)')
+  # A cap SIGKILLed (a runner's own timeout) leaves its cgroup and what its program started; the
+  # next cap in the job removes both.
+  cat >"$T/sweep" <<'EOF2'
+"$1" cap --mem 64M -- sh -c 'sleep 66 & echo $! >"$1"; sleep 66' sh "$2" & cap=$!
+sleep 0.5; kill -9 $cap; wait $cap 2>/dev/null
+before=$(ls -d "$CPUQ_CGROUP"/cap-$cap-* 2>/dev/null | wc -l)
+"$1" cap --mem 64M -- true
+after=$(ls -d "$CPUQ_CGROUP"/cap-$cap-* 2>/dev/null | wc -l)
+kill -0 "$(cat "$2")" 2>/dev/null && left=left || left=gone
+echo "$before $after $left"
+EOF2
+  local swept; swept=$("$CPUQ" run --cores 1 --label sweep -- sh "$T/sweep" "$CPUQ" "$T/stale")
+  check "--pids 5 lets python start 4 of 20 (got $forks); a killed cap's cgroup and its sleep are swept by the next cap (got $swept)" "[ '$forks' = 4 ] && [ '$swept' = '1 0 gone' ]"
   # What a job leaves running in its scope is stopped when its command ends.
-  local nap="88.$$"
-  "$CPUQ" run --cores 1 --label leaver -- sh -c "sleep $nap >/dev/null 2>&1 & exit 0"; sleep 0.5
-  local left=0; pgrep -f "^sleep $nap\$" >/dev/null && left=1
+  "$CPUQ" run --cores 1 --label leaver -- sh -c 'sleep 88 >/dev/null 2>&1 & echo $! >"$1"; exit 0' sh "$T/bg"; sleep 0.5
+  local left=0; alive "$T/bg" && left=1
   check "what a job leaves running in its scope is stopped when it ends (left: $left)" "[ $left = 0 ]"
   # A command's own ${...} reaches its shell untouched: systemd-run (254 and later) would expand it.
   local lit; lit=$("$CPUQ" run --cores 1 --label literal -- sh -c 'x=abc/job; echo "${x%/job}"' 2>&1)
@@ -1267,8 +1318,8 @@ t_submit_slots() {
 }
 
 t_submit_on() {
-  # A spec names no host: one with "on" is refused, saying why. --on HOST is one of this
-  # machine's remotes, and --on this machine runs the job here.
+  # A spec with a field it doesn't know is refused. --on HOST is one of this machine's
+  # remotes, and --on this machine runs the job here.
   setup submit-on
   local was_home=$HOME
   export HOME=$T/home XDG_STATE_HOME=$T/xdg
@@ -1277,7 +1328,7 @@ t_submit_on() {
   (
     cd "$T/roots/repo" || exit 1
     git init -q && git config user.email t@t && git config user.name t
-    printf '%s\n' '{ "label": "t:on", "run": "true", "cores": "1", "on": ["burst"] }' > cpuq/on.json
+    printf '%s\n' '{ "label": "t:on", "run": "true", "cores": "1", "host": "burst" }' > cpuq/on.json
     printf '%s\n' '{ "label": "t:here", "run": "true", "cores": "1" }' > cpuq/here.json
     git add -A && git commit -qm init
     "$CPUQ" submit cpuq/on.json >"$T/spec" 2>&1; echo "spec=$?"
@@ -1285,8 +1336,8 @@ t_submit_on() {
     "$CPUQ" submit --on "$(hostname -s)" cpuq/here.json >/dev/null 2>&1; echo "self=$?"
   ) >"$T/out" 2>&1
   local got; got=$(tr '\n' ' ' <"$T/out")
-  check "submit: a spec with \"on\" is refused ($(head -1 "$T/spec")); --on a host not among the remotes is refused; --on this machine runs here (got $got)" \
-    "[[ \"\$got\" == 'spec=2 unknown=2 self=0 ' ]] && grep -q 'is gone' '$T/spec' && grep -q 'not one of this machine' '$T/unknown'"
+  check "submit: a spec with an unknown field is refused ($(head -1 "$T/spec")); --on a host not among the remotes is refused; --on this machine runs here (got $got)" \
+    "[[ \"\$got\" == 'spec=2 unknown=2 self=0 ' ]] && grep -q 'UnknownField' '$T/spec' && grep -q 'not one of this machine' '$T/unknown'"
   export HOME=$was_home
   unset XDG_STATE_HOME
 }
@@ -1977,25 +2028,10 @@ t_min_available() {
   check "under min_available nothing starts (rc $rc, gate $state); above it, it does (rc $rc2)" "[ $rc = 75 ] && [ '$state' = 'low_memory with-available' ] && [ $rc2 = 0 ]"
 }
 
-t_gone() {
-  # --spill, --local and --ship are gone: cpuq run runs here, and --on HOST sends it; each old
-  # word is a usage error that names the new way, and so are the old spill config keys.
-  setup gone
-  local spill local_ ship cfg src lrc hrc crc
-  "$CPUQ" run --spill --cores 1 -- echo ran >/dev/null 2>"$T/spill"; src=$?
-  "$CPUQ" run --local --cores 1 -- echo ran >/dev/null 2>"$T/local"; lrc=$?
-  "$CPUQ" run --ship x --cores 1 -- echo ran >/dev/null 2>"$T/ship"; hrc=$?
-  spill=$(head -1 "$T/spill"); local_=$(head -1 "$T/local"); ship=$(head -1 "$T/ship")
-  setup gone-config "spill = far"
-  "$CPUQ" run --cores 1 -- echo ran >/dev/null 2>"$T/cfg"; crc=$?; cfg=$(head -1 "$T/cfg")
-  check "--spill (rc $src), --local (rc $lrc), --ship (rc $hrc) and config spill (rc $crc) are refused, naming what replaced them" \
-    "[[ \$src = 2 && \"\$spill\" == *'--on HOST'* && \$lrc = 2 && \"\$local_\" == *'always runs here'* && \$hrc = 2 && \"\$ship\" == *'--include'* && \$crc = 2 && \"\$cfg\" == *'remotes = '* ]]"
-}
-
 t_on() {
   # --on HOST runs there whatever this machine's state; a host that neither answers nor has a
   # remote_start command is an error, not a quiet run here. HOST is one of this machine's
-  # remotes, or this machine itself (which runs here); --spill-to is gone.
+  # remotes, or this machine itself (which runs here).
   setup on "remotes = cpuq-test-nohost.invalid, x"
   local out rc
   out=$("$CPUQ" run --on cpuq-test-nohost.invalid --cores 1 -- echo ran-here 2>&1); rc=$?
@@ -2003,13 +2039,12 @@ t_on() {
   "$CPUQ" run --include vendor --cores 1 -- true 2>/dev/null; local alone=$?
   check "--on an unreachable host without remote_start fails (rc $rc: '$out'), never running here; --include outside the repo (rc $outside) or without --on (rc $alone) is refused" \
     "[[ $rc = 125 && '$out' == *'does not answer'* && '$out' != *ran-here* && $outside = 2 && $alone = 2 ]]"
-  local unknown urc self src old orc
+  local unknown urc self src
   unknown=$("$CPUQ" run --on cheese --cores 1 -- echo ran 2>&1); urc=$?
   self=$("$CPUQ" run --on "$(hostname -s)" --cores 1 -- echo ran-here 2>&1); src=$?
-  old=$("$CPUQ" run --spill-to x --cores 1 -- echo ran 2>&1); orc=$?
-  unknown=$(printf '%s\n' "$unknown" | head -1); old=$(printf '%s\n' "$old" | head -1)
-  check "--on a host not among this machine's remotes is refused (rc $urc: '$unknown'); --on this machine runs here (rc $src: '$self'); --spill-to is refused (rc $orc: '$old')" \
-    "[[ \$urc = 2 && \"\$unknown\" == *'not one of this machine'* && \$src = 0 && \$self = ran-here && \$orc = 2 ]]"
+  unknown=$(printf '%s\n' "$unknown" | head -1)
+  check "--on a host not among this machine's remotes is refused (rc $urc: '$unknown'); --on this machine runs here (rc $src: '$self')" \
+    "[[ \$urc = 2 && \"\$unknown\" == *'not one of this machine'* && \$src = 0 && \$self = ran-here ]]"
 }
 
 t_include_git() {
@@ -2138,8 +2173,10 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk gone on include_git on_check on_gitignore tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
-for t in $TESTS; do "t_$t"; done
+TESTS=${*:-budget affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean status}
+for t in $TESTS; do
+  if declare -F "t_$t" >/dev/null; then "t_$t"; else echo "no such test: $t"; FAIL=$((FAIL+1)); FAILED+=" $t?"; fi
+done
 echo
 echo "$PASS passed, $FAIL failed${FAILED:+:$FAILED}"
-[ $FAIL = 0 ]
+[ $FAIL = 0 ] && [ $PASS != 0 ]

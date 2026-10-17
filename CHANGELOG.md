@@ -11,11 +11,11 @@ User-visible changes to cpuq. Each version's section is its release notes.
   no longer read: move its contents, or let the next jobs rebuild them. `job_tmp` is gone from
   the config (an unknown key is an error).
 - **`cpuq run` always runs here.** `--spill`, `--local` and `spill_default` are gone, and so is
-  placing a run on another machine by itself: each is a usage error saying what to use instead.
+  placing a run on another machine by itself: each is an unknown option or key.
   `--on HOST` sends a run to HOST, one of this machine's remotes, for work too big for this one.
 - **`remotes = HOST, ...`** in the config names the machines this one sends work to, with
   `remote_start.HOST` (how to start a stopped one) and `remote_env.HOST`. They replace `spill`,
-  `spill_start.HOST` and `spill_env.HOST`, which are errors that give the new names. Each machine
+  `spill_start.HOST` and `spill_env.HOST`, which are unknown keys. Each machine
   lists its own: the Mac may list burst and pup, pup only burst, and burst none.
 - **`--on HOST`** on `cpuq run` and `cpuq submit` runs here when HOST is this machine, and is
   refused when HOST isn't one of this machine's remotes. `--spill-to` is gone: use `--on`.
@@ -26,13 +26,34 @@ User-visible changes to cpuq. Each version's section is its release notes.
   the caller's to say. It still sends long spec work to `cpuq submit`, and heavy work over
   `ssh HOST` to `cpuq run --on HOST`.
 - **A spec names no host.** `"on"` is gone from `cpuq/*.json`, and a spec that has it is refused
-  with a line saying to remove it. `cpuq submit` without `--on` places a job among this machine's
+  as having an unknown field. `cpuq submit` without `--on` places a job among this machine's
   remotes (here when it has none) where it should finish first by the spec's past results: a free
   host that's up before a cloud host that must be started, which is started only for work of ten
   minutes or more and taken only when clearly sooner.
 - Copies from `cpuq run --on` and from `cpuq submit` share one folder per project, so a new copy
   of either starts as a clone of the project's most recently used one.
-- Cpuq.app 0.20.2 reads its machines from `remotes` and `remote_start.HOST`.
+- Cpuq.app 0.21.0 reads its machines from `remotes` and `remote_start.HOST`.
+- **Labels** are parts split by `:` of lowercase letters, digits, `.`, `_` and `-`, none starting
+  with `.`; anything else is a usage error from `run`, `lease` and `submit`. A label's project
+  names folders on the hosts a job is sent to, so `../../x:y` could reach outside them.
+- **The config** gives each key at most once: a key set twice is an error, not the last one
+  winning. `remote_start.HOST` and `remote_env.HOST` must name a host in `remotes`.
+- Removed options and keys are plain unknown ones, with no hint naming a replacement, and
+  `cpuq submit` no longer checks a host's cpuq or packs version: every machine runs one release.
+- A job sent to another machine is kept in this one's history as pool `remote` (was `spill`);
+  earlier `spill` records no longer count toward placement.
+- **`cpuq hook`** sees through more: commands after `if`/`while`/`!`, inside `$(...)` and
+  backquotes (quoted or not), and behind wrappers by their own options (`nice -n 5`, `timeout 30m`,
+  `env -u X`, `sudo -u U`, `xargs -P 4`, `uv run`, `poetry run`, …); `cargo +nightly`, `zig test`,
+  `meson`, `ctest`, `tox` and `python3.N -m pytest` count as heavy. Inside `cpuq run`, a fixed jobs
+  count above the grant (`-j16`, `-n 8`, `-j` with no number, `-n auto`) is refused with the
+  `$CPUQ_CORES` form. `# cpuq: skip` counts only as a comment of its own, and its suggestions run
+  as typed (quotes kept, the tool's own `-j` replaced).
+- **`cpuq cap`** (protocol 4): `--output` is checked about every 0.1 s rather than once a second;
+  a limit of 0 (`--mem 0`, `--pids off`) is refused rather than meaning none; exit 122 means the
+  kernel killed PROGRAM itself at `--mem`; a cap SIGKILLed inside a job leaves its cgroup only
+  until the job's next cap removes it and what is left in it; a job that can't give PROGRAM a
+  cgroup says on stderr what that costs; `--pids` needs only the pids controller.
 
 ## 0.27.1 — 2026-10-17
 
