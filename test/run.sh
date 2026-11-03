@@ -2409,11 +2409,12 @@ t_agent() {
   local listed; for i in $(seq 1 60); do listed=$(echo jobs | "$CPUQ" attach | grep -c '^job '); [ "$listed" = 2 ] && break; sleep 0.1; done
   sleep 4
   local wl wh; wl=$(cd "$lo" && "$CPUQ" jobs status | sed -n 2p); wh=$(cd "$hi" && "$CPUQ" jobs status | sed -n 2p)
-  # Each job's share (the last field of its `job` line): three times as much for weight 3.
+  # Each job's share (the last field of its `job` line, to two places): three times as much for
+  # weight 3.
   local ratio; ratio=$(echo jobs | "$CPUQ" attach | awk '$1 == "job" { s[$4] = $NF } END { if (s[1] > 0) printf "%.2f", s[3] / s[1]; else print "none" }')
   check "attach lists both jobs ($listed)" "[ '$listed' = 2 ]"
   check "the agent shares by weight, 3 to 1 (got $ratio), and gives weight 3 at least the workers of weight 1 ('$wl' / '$wh')" \
-    "[ '$ratio' = 3.00 ] && [ \$(echo '$wh' | awk '{print \$2}') -ge \$(echo '$wl' | awk '{print \$2}') ]"
+    "awk -v r='$ratio' 'BEGIN { exit !(r >= 2.95 && r <= 3.05) }' && [ \$(echo '$wh' | awk '{print \$2}') -ge \$(echo '$wl' | awk '{print \$2}') ]"
   local r; r=$(printf 'to %s set workers 1\nto /nowhere pause\n' "$hi" | "$CPUQ" attach | tr '\n' ' ')
   sleep 2.5
   wh=$(cd "$hi" && "$CPUQ" jobs status | sed -n 2p)
