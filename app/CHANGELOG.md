@@ -7,7 +7,7 @@ notes, shown by the update dialog too.
 
 - **Jobs** (`cpuq jobs`) show in the jobs list beside the queue's, their workers what they
   reserve. Click a job's **CPUS** to choose its workers and its new **WEIGHT** column to choose its
-  weight; right-click to pause, resume or stop it (its running tasks go back to `todo/`).
+  weight (1 to 10); right-click to pause, resume or stop it (its running tasks go back to `todo/`).
 - The column **CPU OF RESERVED** is **CPUS**.
 
 ## 0.21.1 — 2026-10-17

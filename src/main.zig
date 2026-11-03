@@ -34,6 +34,7 @@ const runtimes = @import("runtimes.zig");
 const statusjson = @import("statusjson.zig");
 const status = @import("status.zig");
 const jobs = @import("jobs.zig");
+const agent = @import("agent.zig");
 const lines = @import("lines.zig");
 
 const cmdRun = runner.cmdRun;
@@ -52,6 +53,7 @@ const cmdStatus = status.cmdStatus;
 
 test {
     _ = jobs;
+    _ = agent;
     _ = lines;
     _ = cap;
     _ = submit;
@@ -96,6 +98,7 @@ const usage =
     \\       cpuq doctor [--host HOST]
     \\       cpuq clean [--dry-run] [--older AGE] [--host HOST]
     \\       cpuq record [--interval SECONDS] | --install | --uninstall
+    \\       cpuq agent [--install | --uninstall] | cpuq attach
     \\       cpuq samples [--since UNIX-SECONDS]
     \\       cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] -- PROGRAM [ARGS...]
     \\       cpuq note PID|LABEL TEXT [--all] [--host HOST]
@@ -234,6 +237,8 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
     if (std.mem.eql(u8, cmd, "lease")) return cmdLease(ctx, args[1..]);
     loadConfig(ctx);
     if (std.mem.eql(u8, cmd, "status")) return cmdStatus(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "agent")) return agent.cmdAgent(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "attach")) return agent.cmdAttach(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "jobs")) {
         const rest = args[1..];
         if (rest.len != 0 and !std.mem.eql(u8, rest[0], "--all")) return jobs.cmdJobs(ctx, rest);

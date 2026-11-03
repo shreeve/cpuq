@@ -65,7 +65,7 @@ public struct Status: Decodable, Sendable, Equatable {
         /// A job's folder (`cpuq jobs`): its actions run there, and its cores are its workers.
         public var job: String?
         /// A job's weight: its share of the machine against the other jobs'.
-        public var weight: Double?
+        public var weight: Int?
     }
 
     /// A job's own count: `DONE TOTAL FAILING`.
@@ -97,7 +97,7 @@ public struct Status: Decodable, Sendable, Equatable {
         public var pid = 0
         public var state = ""
         public var workers = 0
-        public var weight = 1.0
+        public var weight = 1
         public var todo = 0
         public var live = 0
         public var done = 0

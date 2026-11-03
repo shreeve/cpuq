@@ -2349,6 +2349,35 @@ print(len(j), j[0]["name"], j[0]["workers"], j[0]["workers_from"], j[0]["live"],
   unset CPUQ_STATE
 }
 
+t_agent() {
+  # The agent shares the machine among the jobs by weight, pushing their workers; a count set
+  # through `cpuq attach` holds, and the rest goes to the other job. One agent at a time.
+  setup agent; export CPUQ_STATE=$T/state
+  "$CPUQ" agent 2>"$T/agent.err" & local a=$!
+  local i; for i in $(seq 1 50); do [ -S "$CPUQ_STATE/host.sock" ] && break; sleep 0.1; done
+  local second; second=$("$CPUQ" agent 2>&1); local src=$?
+  check "a second agent is refused (rc $src, '$second')" "[ $src = 125 ] && [[ '$second' == *'an agent already runs'* ]]"
+  local n pids=""
+  for n in lo:1 hi:3; do
+    mkjob "ag.${n%%:*}"; for i in $(seq 1 300); do task t$i 'i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done'; done
+    (cd "$J" && exec "$CPUQ" jobs run --workers 1 --weight "${n##*:}" >/dev/null 2>&1) & pids="$pids $!"
+  done
+  local lo=$CPUQ_STATE/jobs/ag.lo/20261017-120000 hi=$CPUQ_STATE/jobs/ag.hi/20261017-120000
+  local listed; for i in $(seq 1 60); do listed=$(echo jobs | "$CPUQ" attach | grep -c '^job '); [ "$listed" = 2 ] && break; sleep 0.1; done
+  sleep 4
+  local wl wh; wl=$(cd "$lo" && "$CPUQ" jobs status | sed -n 2p); wh=$(cd "$hi" && "$CPUQ" jobs status | sed -n 2p)
+  check "attach lists both jobs ($listed)" "[ '$listed' = 2 ]"
+  check "the agent sets both jobs' workers, more for weight 3 ('$wl' / '$wh')" \
+    "[[ '$wl' == *'(agent)'* && '$wh' == *'(agent)'* ]] && [ \$(echo '$wh' | awk '{print \$2}') -gt \$(echo '$wl' | awk '{print \$2}') ]"
+  local r; r=$(printf 'to %s set workers 1\nto /nowhere pause\n' "$hi" | "$CPUQ" attach | tr '\n' ' ')
+  sleep 2.5
+  wh=$(cd "$hi" && "$CPUQ" jobs status | sed -n 2p)
+  check "a count set through attach holds ('$r', '$wh')" "[ '$r' = 'ok error no job runs in /nowhere ' ] && [[ '$wh' == 'workers 1 (set)'* ]]"
+  for J in "$lo" "$hi"; do (cd "$J" && "$CPUQ" jobs stop >/dev/null); done
+  wait $pids 2>/dev/null; kill $a; wait $a 2>/dev/null
+  unset CPUQ_STATE
+}
+
 t_status() {
   setup status
   "$CPUQ" run --cores 4 --label build -- sleep 1.5 & wait_held 4
@@ -2365,7 +2394,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity job_affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cap_link cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_needs submit_mem submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean jobs jobs_qos jobs_kill jobs_control status}
+TESTS=${*:-budget affinity job_affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cap_link cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_needs submit_mem submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean jobs jobs_qos jobs_kill jobs_control agent status}
 for t in $TESTS; do
   if declare -F "t_$t" >/dev/null; then "t_$t"; else echo "no such test: $t"; FAIL=$((FAIL+1)); FAILED+=" $t?"; fi
 done

@@ -10,6 +10,10 @@ User-visible changes to cpuq. Each version's section is its release notes.
   death (the third fails it). `status`, `watch`, `set workers|weight|gap`, `pause`, `resume`,
   `stop` and `reset` act on the folder they run in. `cpuq jobs` lists the job folders, then the
   submitted jobs as before.
+- **`cpuq agent`** keeps the machine at its target load and shares it among the running jobs by
+  weight, setting each job's workers and gap each second from what its workers cost; a count a
+  user set holds. `cpuq agent --install` keeps it running. `cpuq attach` joins stdin and stdout to
+  it: `jobs` lists the jobs, `to FOLDER COMMAND` steers one. Weights are whole numbers.
 - **`cpuq status --json` lists the running jobs** (`jobs`): workers and who set them, weight,
   counts, and the CPU each uses; their processes are not counted outside cpuq.
 - **`cpuq cap --link FD`** stops the program's tree at once, exit 123, when the pipe's other end

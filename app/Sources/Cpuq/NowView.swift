@@ -1362,15 +1362,14 @@ struct JobsCard: View {
     /// machine against the other jobs'. Nothing for a job of the queue.
     @ViewBuilder private func weight(_ h: Status.Holder) -> some View {
         if let folder = h.job, let w = h.weight {
-            let text = w == w.rounded() ? String(format: "%.0f", w) : String(format: "%.1f", w)
+            let text = "\(w)"
             if let jobControl {
                 let name = GraphModel.label(h.label, h.command)
                 Menu {
                     Section("Weight") {
-                        ForEach([0.5, 1, 2, 3, 4, 5, 6, 8, 10], id: \.self) { (n: Double) in
-                            let shown = n == n.rounded() ? String(format: "%.0f", n) : String(format: "%.1f", n)
-                            Button { jobControl(folder, ["set", "weight", shown], name) } label: {
-                                if n == w { Label(shown, systemImage: "checkmark") } else { Text(shown) }
+                        ForEach(Array(Set(Array(1...10) + [w])).sorted(), id: \.self) { n in
+                            Button { jobControl(folder, ["set", "weight", "\(n)"], name) } label: {
+                                if n == w { Label("\(n)", systemImage: "checkmark") } else { Text("\(n)") }
                             }
                         }
                     }
