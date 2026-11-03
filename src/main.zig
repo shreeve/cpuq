@@ -33,6 +33,8 @@ const records = @import("records.zig");
 const runtimes = @import("runtimes.zig");
 const statusjson = @import("statusjson.zig");
 const status = @import("status.zig");
+const jobs = @import("jobs.zig");
+const lines = @import("lines.zig");
 
 const cmdRun = runner.cmdRun;
 const cmdJob = runner.cmdJob;
@@ -49,6 +51,8 @@ const cmdHistory = records.cmdHistory;
 const cmdStatus = status.cmdStatus;
 
 test {
+    _ = jobs;
+    _ = lines;
     _ = cap;
     _ = submit;
     _ = hook;
@@ -97,7 +101,8 @@ const usage =
     \\       cpuq note PID|LABEL TEXT [--all] [--host HOST]
     \\       cpuq submit SPEC [--note TEXT] [--env K=V]... [--replace | --again] [-- ARGS]
     \\       cpuq packs [--host HOST] | cpuq packs install NAME@VERSION... [--host HOST]
-    \\       cpuq jobs [--all]
+    \\       cpuq jobs [--all] | run [--workers N] [--weight W] [--gap MS] | status | watch | reset
+    \\       cpuq jobs set workers N | weight W | gap MS | cpuq jobs pause | resume | stop
     \\       cpuq job [ID|last] [--wait [--max-wait S]] [--tail N] [--json] [--cancel]
     \\       cpuq hook                (an agent harness's pre-command hook)
     \\       cpuq budget | qos | --version | --help
@@ -229,13 +234,19 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
     if (std.mem.eql(u8, cmd, "lease")) return cmdLease(ctx, args[1..]);
     loadConfig(ctx);
     if (std.mem.eql(u8, cmd, "status")) return cmdStatus(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "jobs")) {
+        const rest = args[1..];
+        if (rest.len != 0 and !std.mem.eql(u8, rest[0], "--all")) return jobs.cmdJobs(ctx, rest);
+        // Every job here: the job folders, then the submitted jobs (this worktree's, or --all).
+        _ = jobs.cmdJobs(ctx, &.{});
+        return submit.cmdJobs(submitCx(ctx), rest);
+    }
     if (std.mem.eql(u8, cmd, "wait")) return cmdWait(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "history")) return cmdHistory(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "doctor")) return cmdDoctor(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "record")) return cmdRecord(ctx, args[1..]);
     inline for (.{
         .{ "submit", submit.cmdSubmit },
-        .{ "jobs", submit.cmdJobs },
         .{ "job", submit.cmdJob },
         .{ "_supervise", submit.cmdSupervise },
         .{ "_start", submit.cmdStart },
@@ -247,9 +258,7 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
         .{ "packs", submit.cmdPacks },
     }) |entry| {
         if (std.mem.eql(u8, cmd, entry[0])) {
-            const self = std.process.executablePathAlloc(ctx.io, ctx.arena) catch fail("can't find this binary's path", .{});
-            const cx: submit.Cx = .{ .io = ctx.io, .a = ctx.arena, .env = ctx.env, .out = ctx.out, .version = version, .cfg = &ctx.cfg, .self = self };
-            return entry[1](cx, args[1..]);
+            return entry[1](submitCx(ctx), args[1..]);
         }
     }
     if (std.mem.eql(u8, cmd, "samples")) return cmdSamples(ctx, args[1..]);
@@ -269,6 +278,11 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
         return 0;
     }
     return usageError("unknown command '{s}'", .{cmd});
+}
+
+fn submitCx(ctx: *Ctx) submit.Cx {
+    const self = std.process.executablePathAlloc(ctx.io, ctx.arena) catch fail("can't find this binary's path", .{});
+    return .{ .io = ctx.io, .a = ctx.arena, .env = ctx.env, .out = ctx.out, .version = version, .cfg = &ctx.cfg, .self = self };
 }
 
 pub fn fail(comptime fmt: []const u8, args: anytype) noreturn {
@@ -347,7 +361,7 @@ pub fn openState(ctx: *Ctx) state.State {
 
 pub fn machine(ctx: *Ctx) policy.Machine {
     return .{
-        .active = sys.activeCpus(),
+        .active = sys.activeCpus(ctx.io),
         .load1 = sys.loadAverage()[0],
         .pressure = if (ctx.cfg.pressure_check) sys.memoryPressure(ctx.io, ctx.cfg.pressure_psi) else .off,
         .available = if (ctx.cfg.min_available > 0) sys.memAvailable(ctx.io) else null,

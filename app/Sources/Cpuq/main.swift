@@ -331,13 +331,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     /// Runs cpuq with `arguments` and returns what it printed.
-    nonisolated private static func run(_ arguments: [String]) -> Result<Data, Problem> {
+    nonisolated private static func run(_ arguments: [String], in folder: String? = nil) -> Result<Data, Problem> {
         guard let path = findCpuq() else {
             return .failure(Problem(message: "cpuq is not installed (~/.local/bin, /opt/homebrew/bin or /usr/local/bin)"))
         }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
         p.arguments = arguments
+        if let folder { p.currentDirectoryURL = URL(fileURLWithPath: folder) }
         let out = Pipe()
         p.standardOutput = out
         p.standardError = FileHandle.nullDevice
@@ -892,7 +893,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         // shrinks it, and everything in it fits, the charts sharing what height there is.
         let host = NSHostingView(rootView: GraphsView(models: [graphs] + remotes, control: { [weak self] machine, action, pid, who in
             self?.perform(action, pid: String(pid), who: who, on: machine)
-        }, start: { [weak self] model in self?.startMachine(model) }))
+        }, start: { [weak self] model in self?.startMachine(model) }, jobControl: { [weak self] machine, folder, args, who in
+            self?.performJob(args, in: folder, who: who, on: machine)
+        }))
         host.sizingOptions = []
         // The minimum as constraints the window cannot break: contentMinSize alone let a
         // drag, a tile or an accessibility resize take the window down to a sliver.
@@ -983,6 +986,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let host: String? = machine.isLocal ? nil : machine.id
         Task.detached(priority: .userInitiated) {
             if let host { _ = Self.remote(host, [action, pid]) } else { _ = Self.run([action, pid]) }
+            await MainActor.run {
+                self.poll()
+                self.pollRemotes()
+            }
+        }
+    }
+
+    /// `cpuq jobs ARGS...` in a job's folder: its knobs, pause, resume, and stop (asked first).
+    func performJob(_ args: [String], in folder: String, who: String, on machine: Machine = .local) {
+        if args.first == "stop" {
+            let alert = NSAlert()
+            alert.messageText = "Stop \(who)?"
+            alert.informativeText = "Its running tasks go back to todo/ and nothing else starts; run it again to finish."
+            alert.addButton(withTitle: "Stop")
+            alert.addButton(withTitle: "Cancel")
+            NSApp.activate()
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        let host: String? = machine.isLocal ? nil : machine.id
+        Task.detached(priority: .userInitiated) {
+            if let host {
+                let quoted = (["cd", folder, "&&", "cpuq", "jobs"] + args).map { $0 == "&&" ? $0 : "'" + $0.replacingOccurrences(of: "'", with: #"'\''"#) + "'" }
+                _ = Self.remoteCommand(host, quoted.joined(separator: " "))
+            } else {
+                _ = Self.run(["jobs"] + args, in: folder)
+            }
             await MainActor.run {
                 self.poll()
                 self.pollRemotes()

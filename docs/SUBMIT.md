@@ -81,6 +81,7 @@ never write them.
 | `exclude` | path prefixes in the directory that never travel | none |
 | `deps` | `"target in copy": "source outside"`: a source directory's tracked files (`git ls-files`), with mtimes. Binaries are built on the host by `setup` | none |
 | `caches` | `"ENV": "name"`: `~/cpuq/caches/PROJECT/name` on the host, created, exported as `ENV`, never synced or deleted by a sync | none |
+| `needs` | `["ENV"]`: caches (names in `caches`) that must already hold files on a host, for inputs filled by hand on some hosts only. A host where one is missing or empty is passed over, `--on`'s too; none left is NOT RUN | none |
 | `report` | JSON lines the job appends: `{"id", "ok", "status", "reason", "artifact"}`. Truncated at each attempt's start. It drives progress counts and the failure list | none |
 | `return` | paths copied back into the directory when the job ends; excluded from the sync | none |
 | `packs` | `{"zig": "0.17.0", "rig": "latest"}`: tool versions from the host's store, `~/cpuq/packs/NAME/VERSION`, installed by the first job that needs one (README, "Packs"). Each is on PATH and in `$NAME`. Versions: `latest`, `stable`, `X.Y.Z` (a tag) or a commit | none |

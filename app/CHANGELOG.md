@@ -3,6 +3,13 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.22.0 — unreleased
+
+- **Jobs** (`cpuq jobs`) show in the jobs list beside the queue's, their workers what they
+  reserve. Click a job's **CPUS** to choose its workers and its new **WEIGHT** column to choose its
+  weight; right-click to pause, resume or stop it (its running tasks go back to `todo/`).
+- The column **CPU OF RESERVED** is **CPUS**.
+
 ## 0.21.1 — 2026-10-17
 
 - The menu is ordered like a Mac app's own: **Cpuq • app X • cli Y** in bold on top, then

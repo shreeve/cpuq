@@ -140,7 +140,7 @@ pub fn cmdDoctor(ctx: *Ctx, args: []const [:0]const u8) u8 {
     const queue = state.scanQueue(&st, a, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{});
     const uses = st.readUsage(a);
     st.unlock();
-    const smp = sample(io, a, leases, true);
+    const smp = sample(io, a, leases, &.{}, true);
     // Threads ready to run show a job that starts more than its grant even
     // when a crowded machine gives them little CPU.
     const procs = sys.processes(io, a);

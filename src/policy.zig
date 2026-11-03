@@ -135,6 +135,10 @@ pub const Config = struct {
     /// on a crowded machine CPU time divides by grant, however many threads
     /// a job starts; on a quiet one it limits nothing (`cpu_weights`).
     cpu_weights: bool = false,
+    /// Linux: confine each job to as many CPUs as its grant, those the running jobs use least,
+    /// so a program that sizes its threads by the CPUs it may use (Zig, Go, Rust, nproc) starts
+    /// as many as its grant, not one per CPU of the machine (`affinity`).
+    affinity: bool = true,
     /// Linux: run each job in a delegated cgroup of its own (a systemd user
     /// scope), its command in the scope's `job/`, so `cpuq cap` can give each
     /// program a test runner starts a cgroup beside it, with limits the
@@ -259,6 +263,7 @@ const keys = [_]Key{
     .{ .name = "window_gap", .field = "window_gap_s", .kind = .whole, .min = 0, .max = day, .unit = "seconds" },
     .{ .name = "window_lend", .field = "window_lend_s", .kind = .whole, .min = 0, .max = day, .unit = "seconds" },
     .{ .name = "cpu_weights", .field = "cpu_weights", .kind = .on_off },
+    .{ .name = "affinity", .field = "affinity", .kind = .on_off },
     .{ .name = "cgroups", .field = "cgroups", .kind = .on_off },
     .{ .name = "submit_roots", .field = "submit_roots", .kind = .text },
     .{ .name = "clean_after", .field = "clean_after_s", .kind = .age },
@@ -581,6 +586,89 @@ pub fn cpuListCount(text: []const u8) ?u32 {
         }
     }
     return if (n > 0) n else null;
+}
+
+/// The CPUs in a Linux CPU list ("0-3,8"), in its order.
+pub fn cpuList(a: std.mem.Allocator, text: []const u8) ![]u32 {
+    var out: std.ArrayList(u32) = .empty;
+    var parts = std.mem.tokenizeAny(u8, text, ", \n");
+    while (parts.next()) |part| {
+        const lo_text, const hi_text = std.mem.cutScalar(u8, part, '-') orelse .{ part, part };
+        const lo = try std.fmt.parseInt(u32, lo_text, 10);
+        const hi = try std.fmt.parseInt(u32, hi_text, 10);
+        if (hi < lo or hi - lo > 4096) return error.InvalidCpuList;
+        for (lo..hi + 1) |cpu| try out.append(a, @intCast(cpu));
+    }
+    return out.items;
+}
+
+/// `cpus`, ascending, as a CPU list with runs as ranges ("0-3,8").
+pub fn cpuListText(a: std.mem.Allocator, cpus: []const u32) []const u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    var i: usize = 0;
+    while (i < cpus.len) {
+        var j = i;
+        while (j + 1 < cpus.len and cpus[j + 1] == cpus[j] + 1) j += 1;
+        const sep: []const u8 = if (i == 0) "" else ",";
+        if (j == i) out.writer.print("{s}{d}", .{ sep, cpus[i] }) catch return "" else out.writer.print("{s}{d}-{d}", .{ sep, cpus[i], cpus[j] }) catch return "";
+        i = j + 1;
+    }
+    return out.written();
+}
+
+/// A running job's CPUs and the CPUs' worth it uses, for `pickCpus`.
+pub const Placed = struct { cpus: []const u32, use: f64 };
+
+/// The `k` CPUs of `online` a starting job is confined to: those the running jobs load least,
+/// each job's use spread evenly over its own CPUs, the lowest-numbered among equals; ascending.
+/// While grants fit the CPUs, jobs get CPUs of their own; past that, a job lands beside those
+/// that use least of theirs.
+pub fn pickCpus(a: std.mem.Allocator, online: []const u32, placed: []const Placed, k: u32) ![]u32 {
+    const load = try a.alloc(f64, online.len);
+    @memset(load, 0);
+    for (placed) |p| {
+        if (p.cpus.len == 0) continue;
+        const share = p.use / @as(f64, @floatFromInt(p.cpus.len));
+        for (p.cpus) |cpu| if (std.mem.indexOfScalar(u32, online, cpu)) |i| {
+            load[i] += share;
+        };
+    }
+    const order = try a.alloc(u32, online.len);
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    std.mem.sort(u32, order, load, struct {
+        fn lessThan(l: []f64, x: u32, y: u32) bool {
+            return l[x] < l[y] or (l[x] == l[y] and x < y);
+        }
+    }.lessThan);
+    const out = try a.alloc(u32, @min(k, online.len));
+    for (out, order[0..out.len]) |*cpu, i| cpu.* = online[i];
+    std.mem.sort(u32, out, {}, std.sort.asc(u32));
+    return out;
+}
+
+test "CPU lists" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 8, 10, 11 }, try cpuList(a, "0-3,8,10-11\n"));
+    try testing.expectEqualStrings("0-3,8,10-11", cpuListText(a, &.{ 0, 1, 2, 3, 8, 10, 11 }));
+    try testing.expectEqualStrings("5", cpuListText(a, &.{5}));
+    try testing.expectError(error.InvalidCpuList, cpuList(a, "7-3"));
+}
+
+test "a job gets the CPUs the others use least" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const online = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    // Grants that fit: CPUs of its own, the lowest free.
+    const first = [_]Placed{.{ .cpus = &.{ 0, 1, 2 }, .use = 3 }};
+    try testing.expectEqualSlices(u32, &.{ 3, 4, 5 }, try pickCpus(a, &online, &first, 3));
+    // Every CPU held: beside the job using least of its CPUs.
+    const full = [_]Placed{ .{ .cpus = &.{ 0, 1, 2, 3 }, .use = 4 }, .{ .cpus = &.{ 4, 5, 6, 7 }, .use = 0.5 } };
+    try testing.expectEqualSlices(u32, &.{ 4, 5 }, try pickCpus(a, &online, &full, 2));
+    // More than the machine has: all of it.
+    try testing.expectEqualSlices(u32, &online, try pickCpus(a, &online, &.{}, 32));
 }
 
 /// What the machine looks like at the moment of an admission decision.

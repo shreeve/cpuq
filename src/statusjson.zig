@@ -3,6 +3,7 @@ const std = @import("std");
 const Io = std.Io;
 const state = @import("state.zig");
 const sys = @import("sys.zig");
+const jobs = @import("jobs.zig");
 
 const main = @import("main.zig");
 const texts = @import("texts.zig");
@@ -181,6 +182,8 @@ pub const JsonStatus = struct {
     gate: JsonGate = .{},
     holders: []const JsonHolder = &.{},
     waiters: []const JsonWaiter = &.{},
+    /// The jobs running here, each a folder of task files run by its own driver.
+    jobs: []const JsonJob = &.{},
     /// Named leases that are held or waited for.
     leases: []const JsonLease = &.{},
     /// The busiest processes outside every cpuq job (empty with --no-usage).
@@ -197,6 +200,63 @@ pub const JsonStatus = struct {
     /// Whether `cpuq record` is sampling this machine (`cpuq samples` has its past).
     recorder: bool = false,
 };
+
+/// A running job (`cpuq jobs run`): its folder, its knobs and its counts.
+pub const JsonJob = struct {
+    /// NAME/STAMP under the jobs folder.
+    name: []const u8 = "",
+    stamp: []const u8 = "",
+    path: []const u8 = "",
+    /// The driver's.
+    pid: i32 = 0,
+    /// running, paused or stopping.
+    state: []const u8 = "",
+    /// The tasks it runs at once: what it reserves.
+    workers: u32 = 0,
+    /// Who set `workers`: "start", "agent" or "set" (a user, which the agent keeps).
+    workers_from: []const u8 = "",
+    weight: f64 = 1,
+    gap_ms: u32 = 0,
+    todo: u64 = 0,
+    live: u64 = 0,
+    done: u64 = 0,
+    fail: u64 = 0,
+    died: u64 = 0,
+    /// CPUs its tasks keep busy (null without a sample).
+    using: ?f64 = null,
+    /// When it started, Unix seconds.
+    since: i64 = 0,
+    /// Seconds left at its rate so far; null until a task has finished.
+    left: ?f64 = null,
+};
+
+pub fn toJobs(a: std.mem.Allocator, running: []const jobs.Running, using: []const f64, now: i64) []JsonJob {
+    const out = a.alloc(JsonJob, running.len) catch return &.{};
+    for (running, out, 0..) |r, *j, i| {
+        const s = r.snap;
+        const elapsed: f64 = @as(f64, @floatFromInt(s.elapsed_ms)) / 1000;
+        j.* = .{
+            .name = s.name,
+            .stamp = s.stamp,
+            .path = r.path,
+            .pid = s.pid,
+            .state = s.state,
+            .workers = s.workers,
+            .workers_from = @tagName(s.wsrc),
+            .weight = s.weight,
+            .gap_ms = s.gap,
+            .todo = s.todo,
+            .live = s.live,
+            .done = s.done,
+            .fail = s.fail,
+            .died = s.died,
+            .using = if (i < using.len) using[i] else null,
+            .since = now - @as(i64, @intFromFloat(elapsed)),
+            .left = if (s.finished > 0) @as(f64, @floatFromInt(s.todo + s.live)) * elapsed / @as(f64, @floatFromInt(s.finished)) else null,
+        };
+    }
+    return out;
+}
 
 /// A busy process that is not part of any cpuq job.
 pub const JsonOutside = struct {

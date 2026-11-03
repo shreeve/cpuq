@@ -101,6 +101,9 @@ const Spec = struct {
     exclude: []const []const u8 = &.{},
     deps: ?Map = null,
     caches: ?Map = null,
+    /// Caches (names in `caches`) that must already hold files on a host for the job to go there:
+    /// inputs filled by hand on some hosts only, which a run can't make itself.
+    needs: []const []const u8 = &.{},
     report: ?[]const u8 = null,
     @"return": []const []const u8 = &.{},
     /// The repo's git, git's own parts only (gitship.zig), as the copy's `.git`: for a job that
@@ -162,9 +165,14 @@ const Record = struct {
     deps: ?Map = null,
     git: bool = false,
     packs: []const packs.Pack = &.{},
+    /// The spec's `needs`, as cache directories relative to the home directory.
+    needs: []const []const u8 = &.{},
     /// The hosts it may go to, in order: `--on`'s one, else this machine's remotes, else
     /// "here".
     on: []const []const u8 = &.{},
+    /// `--on` named the host: `mem` isn't held against its RAM there, since a run's arguments
+    /// (a shard, a filter) can make a job far smaller than the spec's limit.
+    named: bool = false,
     payload: []const u8,
     /// What shipped, by git, once its copy was synced (null outside git, or before the sync).
     shipped: ?Shipped = null,
@@ -530,7 +538,7 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
     const spec_abs = realpath(cx, sp) orelse return fail2("{s}: not found", .{sp});
     const text = readFile(cx, spec_abs) orelse return fail2("{s}: can't be read", .{sp});
     const spec = std.json.parseFromSliceLeaky(Spec, cx.a, text, .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| {
-        return fail2("spec {s}: {t} (fields: label, run, setup, cores, time, mem, tools, env, exclude, deps, caches, report, return, git, packs)", .{ sp, err });
+        return fail2("spec {s}: {t} (fields: label, run, setup, cores, time, mem, tools, env, exclude, deps, caches, needs, report, return, git, packs)", .{ sp, err });
     };
     const top_run = run(cx, &.{ "git", "-C", std.fs.path.dirname(spec_abs) orelse ".", "rev-parse", "--show-toplevel" }, null);
     const dir = if (top_run.ok) std.mem.trim(u8, top_run.out, " \n") else (std.fs.path.dirname(spec_abs) orelse ".");
@@ -596,6 +604,13 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
         }
     }
 
+    var needs: std.ArrayList([]const u8) = .empty;
+    for (spec.needs) |n| {
+        const name = if (spec.caches) |cs| cs.map.get(n) else null;
+        const sub = name orelse return fail2("spec {s}: \"needs\" names caches, and \"caches\" has no {s}", .{ sp, n });
+        needs.append(cx.a, cx.a.print("{s}/{s}/{s}", .{ layout.caches, project, sub }) catch return 125) catch {};
+    }
+
     // A new job.
     const id = sha(cx, &.{ job_digest, cx.a.print("{d} {d}", .{ Io.Clock.real.now(cx.io).toNanoseconds(), sys.getpid() }) catch "" })[0..8];
     const origin = sha(cx, &.{ hostname(cx), dir })[0..12];
@@ -647,7 +662,9 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
         .deps = spec.deps,
         .git = spec.git,
         .packs = wanted.packs,
+        .needs = needs.items,
         .on = hosts.items,
+        .named = on != null,
         .payload = jsonString(cx, payload),
     };
     writeFile(cx, jobFile(cx, id, "job.json"), jsonString(cx, rec));
@@ -1021,8 +1038,12 @@ fn place(cx: Cx, rec: *const Record) ?[]const u8 {
             if (paid and !std.mem.eql(u8, host, "here")) opts.append(cx.a, .{ .host = host, .up = false, .room = false, .cpus = 0, .paid = true }) catch {};
             continue;
         }
-        if (need != 0 and p.mem_total != 0 and need > p.mem_total) {
+        if (!rec.named and need != 0 and p.mem_total != 0 and need > p.mem_total) {
             place_notes.append(cx.a, cx.a.print("{s}: {d} GB of RAM, the job wants {d}", .{ host, p.mem_total >> 30, need >> 30 }) catch "") catch {};
+            continue;
+        }
+        if (lacking(cx, host, rec.needs)) |dir| {
+            place_notes.append(cx.a, cx.a.print("{s}: ~/{s} is empty, and the spec needs it", .{ host, dir }) catch "") catch {};
             continue;
         }
         opts.append(cx.a, .{ .host = host, .up = true, .room = p.room, .cpus = p.cpus, .paid = paid }) catch {};
@@ -1097,9 +1118,29 @@ fn startIfStopped(cx: Cx, rec: *const Record, o: Option) ?[]const u8 {
         place_notes.append(cx.a, cx.a.print("{s}: its start command failed", .{o.host}) catch "") catch {};
         return null;
     }
-    if (probe(cx, o.host).reachable) return o.host;
-    place_notes.append(cx.a, cx.a.print("{s}: started, but no answer", .{o.host}) catch "") catch {};
-    return null;
+    if (!probe(cx, o.host).reachable) {
+        place_notes.append(cx.a, cx.a.print("{s}: started, but no answer", .{o.host}) catch "") catch {};
+        return null;
+    }
+    if (lacking(cx, o.host, rec.needs)) |dir| {
+        place_notes.append(cx.a, cx.a.print("{s}: ~/{s} is empty, and the spec needs it", .{ o.host, dir }) catch "") catch {};
+        return null;
+    }
+    return o.host;
+}
+
+/// The first of `dirs` (relative to the home directory) that is missing or empty on `host`; null
+/// when each holds something, or when the host can't be asked (the job then finds out itself).
+fn lacking(cx: Cx, host: []const u8, dirs: []const []const u8) ?[]const u8 {
+    if (dirs.len == 0) return null;
+    var script: std.ArrayList(u8) = .empty;
+    script.appendSlice(cx.a, "for d in") catch return null;
+    for (dirs) |d| script.print(cx.a, " {s}", .{quote(cx, d)}) catch return null;
+    script.appendSlice(cx.a, "; do [ -n \"$(ls -A \"$HOME/$d\" 2>/dev/null)\" ] || { echo \"$d\"; break; }; done") catch return null;
+    const r = onHost(cx, host, script.items);
+    if (!r.ok) return null;
+    const out = std.mem.trim(u8, r.out, " \n");
+    return if (out.len == 0) null else out;
 }
 
 const Peeked = struct {

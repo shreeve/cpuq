@@ -10,6 +10,8 @@ struct NowView: View {
     let model: GraphModel
     /// Runs a job action (`cpuq ACTION PID`), asking first where it costs something.
     var control: ((String, Int, String) -> Void)? = nil
+    /// Runs `cpuq jobs ARGS...` in a job's folder (folder, args, its name).
+    var jobControl: ((String, [String], String) -> Void)? = nil
 
     /// The moment under the pointer in the hour chart; nil for now.
     @State private var scrub: Date?
@@ -29,7 +31,7 @@ struct NowView: View {
         return AnyView(SplitColumn(key: "page.splits", defaults: [0.24, 0.38, 0.19, 0.19], minimums: [196, 230, 64, 96], bleed: 10, sections: [
             AnyView(HeroCard(model: model, moment: shown, motion: motion, control: control)),
             AnyView(HourCard(model: model, hour: hour, scrub: $scrub)),
-            AnyView(JobsCard(model: model, control: control)),
+            AnyView(JobsCard(model: model, control: control, jobControl: jobControl)),
             AnyView(HistoryCard(model: model)),
         ]))
     }
@@ -1214,6 +1216,7 @@ struct JobsCard: View {
     let model: GraphModel
     private var cpus: Double { model.cpus }
     var control: ((String, Int, String) -> Void)?
+    var jobControl: ((String, [String], String) -> Void)?
     /// The list's visible height and how far it is scrolled: what's below the card's edge.
     @State private var listHeight: CGFloat = 0
     @State private var scrolled: CGFloat = 0
@@ -1285,7 +1288,8 @@ struct JobsCard: View {
             Text("JOB").frame(width: 230, alignment: .leading)
             Text("PROGRESS").frame(maxWidth: 362, alignment: .leading)
             Text("").frame(minWidth: 0, maxWidth: .infinity)
-            Text("CPU OF RESERVED").frame(width: 100, alignment: .trailing)
+            Text("WEIGHT").frame(width: 56, alignment: .trailing)
+            Text("CPUS").frame(width: 100, alignment: .trailing)
             Text("RUNNING").frame(width: 64, alignment: .trailing)
         }
         .font(.system(size: 9.5, weight: .semibold)).tracking(0.6).foregroundStyle(Alive.ink3)
@@ -1332,8 +1336,8 @@ struct JobsCard: View {
             }
             progressText(h).lineLimit(1).truncationMode(.tail)
                 .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading).padding(.leading, 6)
-            Text(h.exclusive ? "timing window" : h.using.map { String(format: "%.1f of %d", $0, h.cores) } ?? "\(h.cores) reserved").font(.system(size: 11.5))
-                .foregroundStyle(h.exclusive ? Alive.windowTint : Alive.ink3).frame(width: 100, alignment: .trailing)
+            weight(h)
+            reserved(h)
             Text(duration(Date().timeIntervalSince1970 - Double(h.since))).foregroundStyle(Alive.ink2).frame(width: 64, alignment: .trailing)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1341,11 +1345,73 @@ struct JobsCard: View {
         .frame(height: 21)
         .contentShape(Rectangle())
         .contextMenu {
-            if let control {
-                let name = GraphModel.label(h.label, h.command)
+            let name = GraphModel.label(h.label, h.command)
+            if let folder = h.job {
+                if let jobControl {
+                    Button(h.paused ? "Resume \(name)" : "Pause \(name)") { jobControl(folder, [h.paused ? "resume" : "pause"], name) }
+                    Button("Stop \(name)…") { jobControl(folder, ["stop"], name) }
+                }
+            } else if let control {
                 Button(h.paused ? "Resume \(name)" : "Pause \(name)") { control(h.paused ? "resume" : "pause", h.pid, name) }
                 Button("Stop \(name)…") { control("stop", h.pid, name) }
             }
+        }
+    }
+
+    /// A job's weight, a menu of weights to choose (`cpuq jobs set weight W`): its share of the
+    /// machine against the other jobs'. Nothing for a job of the queue.
+    @ViewBuilder private func weight(_ h: Status.Holder) -> some View {
+        if let folder = h.job, let w = h.weight {
+            let text = w == w.rounded() ? String(format: "%.0f", w) : String(format: "%.1f", w)
+            if let jobControl {
+                let name = GraphModel.label(h.label, h.command)
+                Menu {
+                    Section("Weight") {
+                        ForEach([0.5, 1, 2, 3, 4, 5, 6, 8, 10], id: \.self) { (n: Double) in
+                            let shown = n == n.rounded() ? String(format: "%.0f", n) : String(format: "%.1f", n)
+                            Button { jobControl(folder, ["set", "weight", shown], name) } label: {
+                                if n == w { Label(shown, systemImage: "checkmark") } else { Text(shown) }
+                            }
+                        }
+                    }
+                } label: {
+                    Text(text).font(.system(size: 11.5)).foregroundStyle(Alive.ink2).underline(pattern: .dot)
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .frame(width: 56, alignment: .trailing)
+                .help("Weight: \(name)'s share of the machine against the other jobs'")
+            } else {
+                Text(text).font(.system(size: 11.5)).foregroundStyle(Alive.ink3).frame(width: 56, alignment: .trailing)
+            }
+        } else {
+            Text("–").font(.system(size: 11.5)).foregroundStyle(Alive.ink3).frame(width: 56, alignment: .trailing)
+        }
+    }
+
+    /// What it uses of what it reserves. A job's is a menu of its workers: choosing a count sets
+    /// it (`cpuq jobs set workers N`), which holds against the agent's.
+    @ViewBuilder private func reserved(_ h: Status.Holder) -> some View {
+        let text = h.exclusive ? "timing window" : h.using.map { String(format: "%.1f of %d", $0, h.cores) } ?? "\(h.cores) reserved"
+        if let folder = h.job, let jobControl {
+            let name = GraphModel.label(h.label, h.command)
+            let most = max(Int(cpus.rounded(.up)) * 2, h.cores)
+            Menu {
+                Section("Workers") {
+                    ForEach(Array(1...most), id: \.self) { n in
+                        Button { jobControl(folder, ["set", "workers", String(n)], name) } label: {
+                            if n == h.cores { Label("\(n)", systemImage: "checkmark") } else { Text("\(n)") }
+                        }
+                    }
+                }
+            } label: {
+                Text(text).font(.system(size: 11.5)).foregroundStyle(Alive.ink2).underline(pattern: .dot)
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            .frame(width: 100, alignment: .trailing)
+            .help("Workers: how many tasks \(name) runs at once")
+        } else {
+            Text(text).font(.system(size: 11.5))
+                .foregroundStyle(h.exclusive ? Alive.windowTint : Alive.ink3).frame(width: 100, alignment: .trailing)
         }
     }
 

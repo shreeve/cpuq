@@ -380,6 +380,8 @@ struct GraphsView: View {
     var control: ((Machine, String, Int, String) -> Void)? = nil
     /// Starts a stopped machine with its `remote_start` command.
     var start: ((GraphModel) -> Void)? = nil
+    /// Runs `cpuq jobs ARGS...` in a job's folder on its machine.
+    var jobControl: ((Machine, String, [String], String) -> Void)? = nil
     /// The machine shown: ⌘1 for this Mac, ⌘2 and on for the remotes.
     @AppStorage("machine") private var shown = "local"
 
@@ -389,6 +391,12 @@ struct GraphsView: View {
         guard let control else { return nil }
         let machine = model.machine
         return { action, pid, who in control(machine, action, pid, who) }
+    }
+
+    private var jobAct: ((String, [String], String) -> Void)? {
+        guard let jobControl else { return nil }
+        let machine = model.machine
+        return { folder, args, who in jobControl(machine, folder, args, who) }
     }
     /// Read here so that a new theme draws the whole window again.
     @AppStorage("theme") private var theme = "alive"
@@ -407,7 +415,7 @@ struct GraphsView: View {
             if model.status == nil, let problem = model.problem {
                 unreachable(problem)
             } else {
-                NowView(model: model, control: act).id(model.machine.id)
+                NowView(model: model, control: act, jobControl: jobAct).id(model.machine.id)
             }
         }
         .padding(16)
