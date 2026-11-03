@@ -265,7 +265,7 @@ pub const Snap = struct {
     state: []const u8,
     workers: u32,
     wsrc: Src,
-    weight: f64,
+    weight: u32,
     gap: u32,
     gsrc: Src,
     elapsed_ms: u64,
@@ -309,7 +309,7 @@ pub const Snap = struct {
         s.state = f.next() orelse return null;
         s.workers = int(u32, f.next()) orelse return null;
         s.wsrc = std.meta.stringToEnum(Src, f.next() orelse "") orelse return null;
-        s.weight = std.fmt.parseFloat(f64, f.next() orelse "") catch return null;
+        s.weight = int(u32, f.next()) orelse return null;
         s.gap = int(u32, f.next()) orelse return null;
         s.gsrc = std.meta.stringToEnum(Src, f.next() orelse "") orelse return null;
         inline for (.{ "elapsed_ms", "todo", "live", "done", "fail", "died", "finished" }) |field| {
@@ -540,7 +540,7 @@ const Driver = struct {
 
     workers: u32,
     wsrc: Src = .start,
-    weight: f64,
+    weight: u32,
     gap: u32,
     gsrc: Src = .start,
     state: State = .running,
@@ -822,9 +822,9 @@ const Driver = struct {
                 if (n < 1 or n > 4096) return "workers must be 1 to 4096";
                 d.setWorkers(n, .set);
             } else if (std.mem.eql(u8, knob, "weight")) {
-                const w = std.fmt.parseFloat(f64, value) catch return "weight must be a number";
-                if (!(w >= 0 and w <= 1e6)) return "weight must be 0 to 1000000";
-                d.weight = if (w == 0) 1 else w;
+                const w = int(u32, value) orelse return "weight must be a whole number";
+                if (w > 1_000_000) return "weight must be 0 to 1000000";
+                d.weight = @max(w, 1);
             } else if (std.mem.eql(u8, knob, "gap")) {
                 const ms = int(u32, value) orelse return "gap must be whole milliseconds";
                 if (ms > 600_000) return "gap must be at most 600000 ms";
@@ -930,7 +930,7 @@ const Driver = struct {
         if (d.agent) |*ag| {
             var line: Io.Writer.Allocating = .init(scratch);
             const ended = d.done + d.fail;
-            line.writer.print("state {t} {d} {d} {d} {d} {d} {d} {d} {d}\n", .{ d.state, d.weight, d.workers, d.gap, d.queueLen(), d.tasks.count(), ended, d.fail, @as(u64, @intFromFloat(d.avg_ms)) }) catch {};
+            line.writer.print("state {t} {d} {d} {d} {d} {d} {d} {d} {d} {t} {t}\n", .{ d.state, d.weight, d.workers, d.gap, d.queueLen(), d.tasks.count(), ended, d.fail, @as(u64, @intFromFloat(d.avg_ms)), d.wsrc, d.gsrc }) catch {};
             if (!std.mem.eql(u8, line.written(), d.agent_line.items) and now - d.agent_sent >= 250) {
                 d.agent_line.clearRetainingCapacity();
                 d.agent_line.appendSlice(d.gpa, line.written()) catch {};
@@ -1051,7 +1051,7 @@ fn here(a: Allocator) struct { []const u8, []const u8, []const u8 } {
 fn run(ctx: *Ctx, args: []const [:0]const u8) u8 {
     const io = ctx.io;
     var workers: u32 = @max(1, sys.activeCpus(io) / 2);
-    var weight: f64 = 1;
+    var weight: u32 = 1;
     var gap: u32 = 0;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -1061,9 +1061,9 @@ fn run(ctx: *Ctx, args: []const [:0]const u8) u8 {
             workers = int(u32, v) orelse return usageError("--workers needs a whole number, not '{s}'", .{v});
             if (workers < 1 or workers > 4096) return usageError("--workers must be 1 to 4096", .{});
         } else if (std.mem.eql(u8, x, "--weight")) {
-            weight = std.fmt.parseFloat(f64, v) catch return usageError("--weight needs a number, not '{s}'", .{v});
-            if (!(weight >= 0 and weight <= 1e6)) return usageError("--weight must be 0 to 1000000", .{});
-            if (weight == 0) weight = 1;
+            weight = int(u32, v) orelse return usageError("--weight needs a whole number, not '{s}'", .{v});
+            if (weight > 1_000_000) return usageError("--weight must be 0 to 1000000", .{});
+            weight = @max(weight, 1);
         } else if (std.mem.eql(u8, x, "--gap")) {
             gap = int(u32, v) orelse return usageError("--gap needs whole milliseconds, not '{s}'", .{v});
             if (gap > 600_000) return usageError("--gap must be at most 600000 ms", .{});
@@ -1585,7 +1585,7 @@ test "a snapshot reads back as it was written, and renders" {
         .state = "running",
         .workers = 6,
         .wsrc = .agent,
-        .weight = 2.5,
+        .weight = 3,
         .gap = 40,
         .gsrc = .start,
         .elapsed_ms = 134_000,
@@ -1607,14 +1607,14 @@ test "a snapshot reads back as it was written, and renders" {
     const r = Snap.parse(a, got.items).?;
     try testing.expectEqualStrings("rig.t", r.name);
     try testing.expectEqual(Src.agent, r.wsrc);
-    try testing.expectEqual(2.5, r.weight);
+    try testing.expectEqual(3, r.weight);
     try testing.expectEqual(4201, r.finished);
     try testing.expectEqual(4242, r.pid);
     try testing.expectEqualStrings("t 0042", r.lives[0].name);
     try testing.expectEqualStrings("expected 3, got 4", r.fails[0].line);
     var view: Io.Writer.Allocating = .init(a);
     r.render(a, &view.writer, 80, 40, false);
-    try testing.expect(std.mem.find(u8, view.written(), "workers 6 (agent)  weight 2.5  gap 40ms") != null);
+    try testing.expect(std.mem.find(u8, view.written(), "workers 6 (agent)  weight 3  gap 40ms") != null);
     try testing.expect(std.mem.find(u8, view.written(), "4201/12203  34%") != null);
     try testing.expect(std.mem.find(u8, view.written(), "    12.3s  t 0042") != null);
 }

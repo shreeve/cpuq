@@ -455,7 +455,7 @@ and the third death goes to `fail/`. Retrying is running again: `mv fail/* todo/
 
 | in the folder | |
 |---|---|
-| `cpuq jobs run [--workers N] [--weight W] [--gap MS]` | runs `todo/`, N tasks at once (half the CPUs), each new worker 50 ms after the last and MS after its last task; live on a terminal. Exit 0 when all are done, 1 otherwise, after the failures' output |
+| `cpuq jobs run [--workers N] [--weight W] [--gap MS]` | runs `todo/`, N tasks at once (half the CPUs; the agent's count when one runs), W a whole number (1), each new worker 50 ms after the last and MS after its last task; live on a terminal. Exit 0 when all are done, 1 otherwise, after the failures' output |
 | `cpuq jobs status` / `watch` | the job once, or live until it ends with its result and exit status |
 | `cpuq jobs set workers N` / `weight W` / `gap MS` | changes the running job; a count you set holds |
 | `cpuq jobs pause` / `resume` / `stop` | `stop` puts the running tasks back in `todo/`, with no death |
@@ -467,6 +467,15 @@ normal job's priority, with its file (locked) as its stdout and stderr: every ta
 driver, and a driver started again files what a dead one left in `live/` as `died: lost`.
 `cpuq status` and Cpuq.app show a running job with its workers as what it reserves, and the app
 sets its workers and weight from its row.
+
+**The agent** (`cpuq agent`, kept running by `cpuq agent --install`) keeps the machine at its
+target load and shares it among the running jobs by weight: each second it measures what each
+job's workers cost in CPU and sets every job's workers and gap so the jobs together use what the
+work outside them leaves. A count you set with `cpuq jobs set workers N` holds; the others share
+the rest. Without an agent each job runs at the workers it was given. `cpuq attach` joins a
+terminal (or `ssh HOST cpuq attach`) to the agent: `jobs` lists the jobs, and
+`to FOLDER set workers 4` (or `pause`, `resume`, `stop`) steers one. How it decides is in
+[docs/DESIGN.md](docs/DESIGN.md), "The agent".
 
 ## Other machines: --on HOST
 

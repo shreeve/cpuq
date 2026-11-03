@@ -5,11 +5,13 @@ decision is made, for anyone changing the code or wondering why a job waited. Th
 are the code's own: a waiter holds a *ticket*, a running job holds a *lease* and *tokens*, and
 the waiter at the front of the queue is the *head*.
 
-## No daemon
+## No daemon in the queue
 
-Nothing admits, holds or decides but the `cpuq` processes of the jobs themselves. The optional
-recorder (`cpuq record`) only samples: no command waits on it or needs it, so a machine without
-one works the same, and one that dies takes nothing with it.
+Nothing admits, holds or decides for `cpuq run` but the `cpuq` processes of the jobs themselves.
+The optional recorder (`cpuq record`) only samples: no command waits on it or needs it, so a
+machine without one works the same, and one that dies takes nothing with it. Jobs of task files
+(`cpuq jobs`) have an optional agent of their own (below): without it each runs at the workers it
+was given.
 
 Every hold is a `flock(2)` on a file in a state directory, so the kernel releases it when the
 last process holding the descriptor exits, however it exits. Only `flock(2)` is used, never
@@ -361,3 +363,68 @@ a line per finding.
 newlines, parentheses and `$(…)`, unquotes words, skips assignments and wrappers (`nice`, `env`,
 `time`, `timeout`…), follows `sh -c` scripts and `ssh HOST CMD`, and checks each simple command;
 quoting is tracked for `$CPUQ_CORES` expanded outside single quotes.
+
+## Jobs of task files
+
+A job is a folder, `STATE/jobs/NAME/STAMP/` (`STATE` is `CPUQ_STATE`, else
+`~/.local/state/cpuq`), whose files move between `todo/`, `live/`, `done/` and `fail/`, and one
+driver, `cpuq jobs run`, the only process that moves them. It holds an flock on the folder while
+it runs, so a second driver is refused and `reset` waits for none.
+
+**A task's run.** The driver renames the oldest file in `todo/` into `live/`, opens it to append
+and takes its flock, reads its work (up to the first blank line, ending the work with one if it
+has none), and starts `cpuq cap --link FD -- /bin/sh -c WORK` in a process group of its own, at a
+normal job's class, with the file as stdout and stderr and FD the read end of a pipe whose write
+end only the driver holds. Every descriptor of the file is the task tree's, so the lock lasts as
+long as anything the task started: a file in `live/` whose lock is free runs nowhere. When the
+driver goes, however it goes, the pipe closes and every cap stops its tree (exit 123). When the
+cap ends, the driver appends `== TIME HOST OUTCOME SECS` and renames the file by its outcome.
+Deaths are counted from those lines, so a task dies at most three times across drivers.
+
+**Restart.** A new driver files each file in `live/` whose lock is free as `died: lost`; one still
+locked belongs to a tree still ending, and the driver waits for it before it finishes.
+
+**Pacing.** Each new worker starts 50 ms ± 25 after the last (`stagger`), so a rise of workers
+doesn't start a crowd of compilers at once; a worker waits `gap` after each task.
+
+**Its sockets.** `jobs.sock` in the folder serves `status`, `watch`, `set`, `pause`, `resume` and
+`stop`, each a line, answered by a snapshot or `ok`/`error`. The driver also connects to the
+agent's `host.sock` when one listens (retrying each second), says `hello PATH pid P`, then
+`state STATE WEIGHT WORKERS GAP TODO LIVE DONE FAIL AVG_MS WSRC GSRC` at most every 250 ms while
+anything changes, then `bye`. It takes `workers N` and `gap MS` from the agent unless a user set
+that knob (`set`, which holds), and relays any other line the agent sends as a command. Without
+an agent, or after losing it, it keeps the counts it has.
+
+## The agent
+
+`cpuq agent` keeps the machine at its target load (`target`, else the CPUs online) and shares it
+among the running jobs by weight. It keeps no state file: what it knows is what the drivers
+connected now told it, so one started late learns every job within a second.
+
+Each second it measures the machine's busy CPU (the kernel's CPU ticks), its run queue now (not
+the load average), and each job's CPU: the change in its driver's process tree's CPU time, which
+counts reaped children too, so tasks that end within the second count. Outside load is the busy
+CPU less the jobs'. Then:
+
+1. **Cost** is a job's CPU per busy worker, an EWMA over about 15 seconds, starting at 1.0. It is
+   not updated while the machine is over target, where a starved job would look cheap.
+2. **Budget** is the target less outside load. While the run queue stays over target (two seconds
+   running) it is cut by target ÷ run queue each second, and while memory is short (memory
+   pressure, or less available than `min_available`) by a quarter; otherwise it grows at most 1.5
+   times a second, by at least one CPU.
+3. **Shares.** A job whose workers a user set keeps them, and its cost times them comes off the
+   budget first. The rest is water-filled by weight (whole numbers, 0 counting as 1): each job
+   gets min(what it can use, λ × weight), what it can use being its cost × its todo and live
+   tasks, with λ as large as the budget allows. It is deterministic: no lottery.
+4. **Knobs.** Workers are the share ÷ the cost rounded up: at least one while the job has work,
+   at most twice its last count each second. The rounding is taken back as a gap after each task,
+   from its usual task time, so the job uses its share and no more. A new count is pushed when it
+   moves 10% or more (any move under 10), a gap likewise.
+
+A job's priority is fixed when each task starts and is never the agent's knob: two controllers
+would fight, and lowering priority is one-way without root. A build is a single task, sized once
+by `$CPUQ_CORES` when it starts.
+
+`cpuq attach` joins stdin and stdout to `host.sock`: `jobs` lists the jobs, and `to PATH COMMAND`
+relays a driver command to the job whose folder is PATH (its real path), which is how a remote
+Cpuq.app reaches a host's jobs over ssh.

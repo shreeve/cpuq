@@ -215,7 +215,7 @@ pub const JsonJob = struct {
     workers: u32 = 0,
     /// Who set `workers`: "start", "agent" or "set" (a user, which the agent keeps).
     workers_from: []const u8 = "",
-    weight: f64 = 1,
+    weight: u32 = 1,
     gap_ms: u32 = 0,
     todo: u64 = 0,
     live: u64 = 0,
