@@ -10,6 +10,10 @@ User-visible changes to cpuq. Each version's section is its release notes.
   death (the third fails it). `status`, `watch`, `set workers|weight|gap`, `pause`, `resume`,
   `stop` and `reset` act on the folder they run in. `cpuq jobs` lists the job folders, then the
   submitted jobs as before.
+- **`cpuq test SPEC`** runs a spec with `tasks` (instead of `run`): after `setup`, its tasks
+  command writes a file per task into `$CPUQ_TODO`, and the host runs them as a job with
+  `cpuq jobs run`, outside any grant, each with `$CPUQ_CODE`. One test per worktree: the same code
+  attaches, changed code replaces. Failures are listed by name and come back to `.cpuq/fail/`.
 - **`cpuq agent`** keeps the machine at its target load and shares it among the running jobs by
   weight, setting each job's workers and gap each second from what its workers cost; a count a
   user set holds. `cpuq agent --install` keeps it running. `cpuq attach` joins stdin and stdout to

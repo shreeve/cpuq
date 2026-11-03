@@ -71,7 +71,8 @@ never write them.
 | field | meaning | default |
 |---|---|---|
 | `label` | `project:task` | required |
-| `run` | `sh -c RUN cpuq ARGS...` at the copy's top, with `$CPUQ_CORES`; `-- ARGS` become `"$@"` | required |
+| `run` | `sh -c RUN cpuq ARGS...` at the copy's top, with `$CPUQ_CORES`; `-- ARGS` become `"$@"` (`cpuq submit`) | `run` or `tasks` |
+| `tasks` | `sh -c TASKS cpuq ARGS...` after `setup`, writing one task file per task into `$CPUQ_TODO` (its work up to the first blank line, run with `sh`); `cpuq jobs run` then runs them on the host, each with `$CPUQ_CODE`, the copy's path (`cpuq test`) | `run` or `tasks` |
 | `setup` | run first, in the same job | none |
 | `cores` | `N` or `MIN-MAX` | that host's history, else 2 |
 | `time` | wall time from admission, enforced by `cpuq cap --time` around setup and run; required on a host with `remote_start` | 2h there, none here |

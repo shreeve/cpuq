@@ -91,7 +91,11 @@ const Map = std.json.ArrayHashMap([]const u8);
 
 const Spec = struct {
     label: []const u8,
-    run: []const u8,
+    /// The job, one command (`cpuq submit`); a spec has this or `tasks`.
+    run: ?[]const u8 = null,
+    /// A command that writes the job's tasks, one file each, into `$CPUQ_TODO`, after `setup`
+    /// (`cpuq test`): `cpuq jobs run` then runs them, each with `$CPUQ_CODE`, the copy's path.
+    tasks: ?[]const u8 = null,
     setup: ?[]const u8 = null,
     cores: ?[]const u8 = null,
     time: ?[]const u8 = null,
@@ -124,7 +128,10 @@ const Payload = struct {
     note: []const u8 = "",
     project: []const u8,
     setup: ?[]const u8 = null,
-    run: []const u8,
+    run: []const u8 = "",
+    tasks: ?[]const u8 = null,
+    /// A `tasks` job's name under the host's jobs folder: one per worktree.
+    job: []const u8 = "",
     cores: ?[]const u8 = null,
     time: ?[]const u8 = null,
     mem: ?[]const u8 = null,
@@ -477,6 +484,17 @@ fn snapshot(cx: Cx, dir: []const u8, excludes: []const []const u8, tracked_only:
 // --- cpuq submit ----------------------------------------------------------------------------
 
 pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
+    return submit(cx, args, false);
+}
+
+/// `cpuq test SPEC`: a spec with `tasks`, run as a job of task files on its host. A worktree has
+/// one: the same code attaches to it, changed code replaces it.
+pub fn cmdTest(cx: Cx, args: []const [:0]const u8) u8 {
+    return submit(cx, args, true);
+}
+
+fn submit(cx: Cx, args: []const [:0]const u8, as_test: bool) u8 {
+    const verb = if (as_test) "test" else "submit";
     var spec_path: ?[]const u8 = null;
     var extra_env: std.ArrayList([]const u8) = .empty;
     var job_args: []const []const u8 = &.{};
@@ -517,7 +535,9 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
         } else return fail2("unknown option '{s}'", .{arg});
     }
     if (replace and again) return fail2("--replace and --again don't go together", .{});
-    const sp = spec_path orelse return fail2("usage: cpuq submit SPEC [-- ARGS] [--on HOST] [--env K=V]... [--note TEXT] [--replace | --again] [--max-wait S]", .{});
+    const sp = spec_path orelse return fail2("usage: cpuq {s} SPEC [-- ARGS] [--on HOST] [--env K=V]... [--note TEXT] [--replace | --again] [--max-wait S]", .{verb});
+    // A test's changed code replaces the worktree's running test.
+    if (as_test and !again) replace = true;
     // Where it may go: --on's host (this machine itself is "here"), else this machine's remotes
     // in order, else here.
     var hosts: std.ArrayList([]const u8) = .empty;
@@ -538,8 +558,10 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
     const spec_abs = realpath(cx, sp) orelse return fail2("{s}: not found", .{sp});
     const text = readFile(cx, spec_abs) orelse return fail2("{s}: can't be read", .{sp});
     const spec = std.json.parseFromSliceLeaky(Spec, cx.a, text, .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| {
-        return fail2("spec {s}: {t} (fields: label, run, setup, cores, time, mem, tools, env, exclude, deps, caches, needs, report, return, git, packs)", .{ sp, err });
+        return fail2("spec {s}: {t} (fields: label, run or tasks, setup, cores, time, mem, tools, env, exclude, deps, caches, needs, report, return, git, packs)", .{ sp, err });
     };
+    if (as_test and (spec.tasks == null or spec.run != null)) return fail2("spec {s}: cpuq test runs a spec with \"tasks\" and no \"run\" (cpuq submit runs one with \"run\")", .{sp});
+    if (!as_test and (spec.run == null or spec.tasks != null)) return fail2("spec {s}: cpuq submit runs a spec with \"run\" and no \"tasks\" (cpuq test runs one with \"tasks\")", .{sp});
     const top_run = run(cx, &.{ "git", "-C", std.fs.path.dirname(spec_abs) orelse ".", "rev-parse", "--show-toplevel" }, null);
     const dir = if (top_run.ok) std.mem.trim(u8, top_run.out, " \n") else (std.fs.path.dirname(spec_abs) orelse ".");
     if (std.mem.findScalar(u8, spec.label, ':') == null or !policy.validLabel(spec.label))
@@ -552,10 +574,19 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
     if (spec.report) |p| if (!inside(p)) return fail2("spec {s}: \"report\" is relative, without .., not '{s}'", .{ sp, p });
     if (!underRoots(cx, dir)) return fail2("{s} isn't under submit_roots ({s})", .{ dir, roots(cx) });
 
+    // A test's failures come back to .cpuq/fail/, which ignores itself in git.
+    var returns: std.ArrayList([]const u8) = .empty;
+    returns.appendSlice(cx.a, spec.@"return") catch {};
+    if (as_test) {
+        returns.append(cx.a, fail_back) catch {};
+        Io.Dir.cwd().createDirPath(cx.io, cx.a.print("{s}/.cpuq", .{dir}) catch "") catch {};
+        writeFile(cx, cx.a.print("{s}/.cpuq/.gitignore", .{dir}) catch "", "*\n");
+    }
+
     // Deps: sources under the roots, targets inside the copy.
     var excludes: std.ArrayList([]const u8) = .empty;
     excludes.appendSlice(cx.a, spec.exclude) catch {};
-    excludes.appendSlice(cx.a, spec.@"return") catch {};
+    excludes.appendSlice(cx.a, returns.items) catch {};
     excludes.append(cx.a, ".cpuq-generation") catch {};
     // `.git` never syncs as it is here (a worktree's is a path on this machine, a repo's can
     // hold far more than git): with "git", the sync ships git's own parts.
@@ -632,7 +663,9 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
         .note = why,
         .project = project,
         .setup = spec.setup,
-        .run = spec.run,
+        .run = spec.run orelse "",
+        .tasks = spec.tasks,
+        .job = if (as_test) jobName(cx, project, dir) else "",
         .cores = spec.cores,
         .time = spec.time,
         .mem = spec.mem,
@@ -640,7 +673,7 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
         .env = env_map,
         .caches = spec.caches,
         .report = spec.report,
-        .returns = spec.@"return",
+        .returns = returns.items,
         .args = job_args,
         .copy = copy,
         .generation = snapshot_digest,
@@ -658,7 +691,7 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
         .created = now(cx.io),
         .copy = copy,
         .exclude = excludes.items,
-        .@"return" = spec.@"return",
+        .@"return" = returns.items,
         .deps = spec.deps,
         .git = spec.git,
         .packs = wanted.packs,
@@ -670,12 +703,29 @@ pub fn cmdSubmit(cx: Cx, args: []const [:0]const u8) u8 {
     writeFile(cx, jobFile(cx, id, "job.json"), jsonString(cx, rec));
     setState(cx, id, "submitted", "");
     if (!spawnDetached(cx, &.{ cx.self, "_supervise", id }, jobFile(cx, id, "supervisor.log"))) {
-        std.debug.print("cpuq submit: could not start the supervisor\n", .{});
+        std.debug.print("cpuq {s}: could not start the supervisor\n", .{verb});
         return Verdict.cpuq_error.exit();
     }
     cx.out.print("job {s}\n", .{id}) catch {};
     cx.out.flush() catch {};
     return follow(cx, id, max_wait);
+}
+
+/// Where a test's failures come back to, in the worktree (and on the copy).
+const fail_back = ".cpuq/fail";
+
+/// A test's job name: its project, then its worktree's folder name when that differs
+/// (`rig.symbols`), in the letters a job's name allows.
+fn jobName(cx: Cx, project: []const u8, dir: []const u8) []const u8 {
+    const base = std.fs.path.basename(dir);
+    var name: std.ArrayList(u8) = .empty;
+    for (base) |ch| name.append(cx.a, switch (std.ascii.toLower(ch)) {
+        'a'...'z', '0'...'9', '.', '_', '-' => |l| l,
+        else => '-',
+    }) catch {};
+    const tail = std.mem.trimStart(u8, name.items, ".");
+    if (tail.len == 0 or std.mem.eql(u8, tail, project)) return project;
+    return cx.a.print("{s}.{s}", .{ project, tail }) catch project;
 }
 
 /// The worktree's branch, or its commit when detached.
@@ -815,7 +865,7 @@ pub fn specFor(a: std.mem.Allocator, io: Io, root: []const u8, cmd: []const u8) 
         if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".json")) continue;
         const text = d.readFileAlloc(io, e.name, a, .limited(1 << 20)) catch continue;
         const spec = std.json.parseFromSliceLeaky(Spec, a, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch continue;
-        const m = place_mod.specMatch(a, cmd, spec.run) orelse continue;
+        const m = place_mod.specMatch(a, cmd, spec.run orelse continue) orelse continue;
         if (best != null and m.words <= best_words) continue;
         best_words = m.words;
         best = .{
@@ -1456,7 +1506,7 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
     // Gone when it ends, so a later cancel can't signal a process that took the pid since.
     defer Io.Dir.cwd().deleteFile(cx.io, jobFile(cx, id, "job.pid")) catch {};
     const text = readFile(cx, jobFile(cx, id, "payload.json")) orelse return 2;
-    const p = std.json.parseFromSliceLeaky(Payload, cx.a, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return 2;
+    var p = std.json.parseFromSliceLeaky(Payload, cx.a, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return 2;
     const started = now(cx.io);
     hostState(cx, id, "waiting-copy");
 
@@ -1534,8 +1584,8 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
     // Packs: each one's bin directory on the job's PATH (go's has gofmt beside go), and NAME, its
     // binary; the job's first steps install any the store lacks, the packs a build needs first.
     var prelude: std.ArrayList(u8) = .empty;
+    var dirs: std.ArrayList(u8) = .empty;
     if (p.packs.len != 0) {
-        var dirs: std.ArrayList(u8) = .empty;
         for (p.packs) |pk| {
             if (!packs.validName(pk.name)) continue;
             const binary = cx.a.print("{s}/{s}/{s}/{s}", .{ packs.storeRoot(cx.a, cx.env), pk.name, pk.version, pk.bin }) catch continue;
@@ -1567,7 +1617,19 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
     argv.appendSlice(cx.a, &.{ "--", cx.self, "cap" }) catch {};
     if (p.time) |t| argv.appendSlice(cx.a, &.{ "--time", t }) catch {};
     if (p.mem) |m| argv.appendSlice(cx.a, &.{ "--mem", m }) catch {};
-    const body = if (p.setup) |s| cx.a.print("{{ {s}\n}} && {{ {s}\n}}", .{ s, p.run }) catch p.run else p.run;
+    // A test's tasks: setup, then its tasks command filling the job folder's todo/.
+    var folder: []const u8 = "";
+    if (p.tasks != null) {
+        const state = @import("jobs.zig").stateDir(cx.a, cx.env) orelse return hostDone(cx, id, p, .cpuq_error, null, "no HOME on the host: not your code", started);
+        var stamp_buf: [15]u8 = undefined;
+        folder = cx.a.print("{s}/jobs/{s}/{s}", .{ state, p.job, @import("jobs.zig").stampNow(&stamp_buf, now(cx.io)) }) catch return 125;
+        Io.Dir.cwd().createDirPath(cx.io, cx.a.print("{s}/todo", .{folder}) catch "") catch {};
+        writeFile(cx, jobFile(cx, id, "folder"), folder);
+        env.put("CPUQ_TODO", cx.a.print("{s}/todo", .{folder}) catch "") catch {};
+        env.put("CPUQ_CODE", copy) catch {};
+    }
+    const step = p.tasks orelse p.run;
+    const body = if (p.setup) |s| cx.a.print("{{ {s}\n}} && {{ {s}\n}}", .{ s, step }) catch step else step;
     const with_packs = cx.a.print("{s}{s}", .{ prelude.items, body }) catch body;
     const script = if (p.host_env.len != 0) cx.a.print("export {s}\n{s}", .{ p.host_env, with_packs }) catch with_packs else with_packs;
     argv.appendSlice(cx.a, &.{ "--", "/bin/sh", "-c", script, "cpuq" }) catch {};
@@ -1575,7 +1637,21 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
     hostState(cx, id, "running");
 
     const log = jobFile(cx, id, "output.log");
-    const code = runLogged(cx, id, argv.items, &env, copy, log);
+    var code = runLogged(cx, id, argv.items, &env, copy, log, false);
+    // The tasks, by their own driver: outside any grant (the agent shares the machine among
+    // jobs), under the spec's time and memory limits, the pack tools on PATH.
+    if (p.tasks != null and code != null and code.? == 0 and !cancelled(cx, id)) {
+        if (dirs.items.len != 0) env.put("PATH", cx.a.print("{s}{s}", .{ dirs.items, env.get("PATH") orelse "/usr/bin:/bin" }) catch "") catch {};
+        env.put("CPUQ_PROGRESS", jobFile(cx, id, "progress")) catch {};
+        var driver: std.ArrayList([]const u8) = .empty;
+        driver.appendSlice(cx.a, &.{ cx.self, "cap" }) catch {};
+        if (p.time) |t| driver.appendSlice(cx.a, &.{ "--time", t }) catch {};
+        if (p.mem) |m| driver.appendSlice(cx.a, &.{ "--mem", m }) catch {};
+        driver.appendSlice(cx.a, &.{ "--", cx.self, "jobs", "run" }) catch {};
+        code = runLogged(cx, id, driver.items, &env, folder, log, true);
+        bringFailures(cx, folder, copy);
+        p.report = report_back;
+    }
     Io.Dir.cwd().deleteTree(cx.io, tmp) catch {};
 
     // The verdict: cap's own last line says when it stopped the job; the exit code says the rest.
@@ -1590,6 +1666,42 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
         return hostDone(cx, id, p, .fail, x, "", started);
     }
     return hostDone(cx, id, p, .fail, null, "killed by a signal", started);
+}
+
+/// A test's report, in the copy: a line per task, `report`'s form.
+const report_back = ".cpuq/report.jsonl";
+
+/// A test's results, into the copy: fail/'s files under .cpuq/fail (which come back to the
+/// worktree), and a report line per task in done/ and fail/, each failure with its last line of
+/// output.
+fn bringFailures(cx: Cx, folder: []const u8, copy: []const u8) void {
+    const jobs_mod = @import("jobs.zig");
+    const back = cx.a.print("{s}/{s}", .{ copy, fail_back }) catch return;
+    Io.Dir.cwd().deleteTree(cx.io, back) catch {};
+    Io.Dir.cwd().createDirPath(cx.io, back) catch {};
+    var report: std.ArrayList(u8) = .empty;
+    for ([_][]const u8{ "done", "fail" }) |sub| {
+        var dir = Io.Dir.cwd().openDir(cx.io, cx.a.print("{s}/{s}", .{ folder, sub }) catch continue, .{ .iterate = true }) catch continue;
+        defer dir.close(cx.io);
+        var it = dir.iterate();
+        while (it.next(cx.io) catch null) |e| {
+            if (e.kind != .file or !jobs_mod.visible(e.name)) continue;
+            const ok = std.mem.eql(u8, sub, "done");
+            var reason: []const u8 = "";
+            if (!ok) {
+                const from = cx.a.print("{s}/fail/{s}", .{ folder, e.name }) catch continue;
+                const text = readFile(cx, from) orelse "";
+                writeFile(cx, cx.a.print("{s}/{s}", .{ back, e.name }) catch continue, text);
+                var t: jobs_mod.Tally = .{};
+                t.feed(text);
+                t.finish();
+                reason = t.lastLine();
+            }
+            const Line = struct { id: []const u8, ok: bool, reason: []const u8 };
+            report.print(cx.a, "{s}\n", .{jsonString(cx, Line{ .id = cx.a.dupe(u8, e.name) catch "", .ok = ok, .reason = cx.a.dupe(u8, reason) catch "" })}) catch {};
+        }
+    }
+    writeFile(cx, cx.a.print("{s}/{s}", .{ copy, report_back }) catch return, report.items);
 }
 
 /// `cpuq packs [--host HOST]`: the packs in a store, each version with the links naming it.
@@ -1724,7 +1836,7 @@ fn lastLine(cx: Cx, path: []const u8) []const u8 {
 
 /// Runs the job with its output in `log`, passing cpuq's termination on to it; its exit code,
 /// or null when a signal ended it.
-fn runLogged(cx: Cx, id: []const u8, argv: []const []const u8, env: *std.process.Environ.Map, cwd: []const u8, log: []const u8) ?i64 {
+fn runLogged(cx: Cx, id: []const u8, argv: []const []const u8, env: *std.process.Environ.Map, cwd: []const u8, log: []const u8, append: bool) ?i64 {
     const argz = cx.a.allocSentinel(?[*:0]const u8, argv.len, null) catch return null;
     for (argv, 0..) |x, k| argz[k] = (cx.a.dupeSentinel(u8, x, 0) catch return null).ptr;
     const envp = env.createPosixBlock(cx.a, .{}) catch return null;
@@ -1734,7 +1846,7 @@ fn runLogged(cx: Cx, id: []const u8, argv: []const []const u8, env: *std.process
     if (pid < 0) return null;
     if (pid == 0) {
         if (c.chdir(cwdz) != 0) c._exit(125);
-        const fd = c.open(logz, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c.mode_t, 0o600));
+        const fd = c.open(logz, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = !append, .APPEND = append }, @as(c.mode_t, 0o600));
         if (fd >= 0) {
             _ = c.dup2(fd, 1);
             _ = c.dup2(fd, 2);

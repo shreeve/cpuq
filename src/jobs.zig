@@ -569,6 +569,8 @@ const Driver = struct {
     agent_sent: i64 = 0,
 
     tty: bool,
+    /// Where to write `DONE TOTAL FAILING` (CPUQ_PROGRESS), as a runner does for `cpuq status`.
+    progress: ?[]const u8 = null,
     version: u64 = 1,
     shown: u64 = 0,
     shown_ms: i64 = 0,
@@ -923,6 +925,7 @@ const Driver = struct {
             d.resized = false;
             const s = d.snap(scratch, now);
             if (d.tty) draw(s, scratch, d.out);
+            if (d.progress) |path| writeProgress(scratch, path, s);
             var buf: Io.Writer.Allocating = .init(scratch);
             s.write(&buf.writer) catch {};
             for (d.clients.items) |cl| if (cl.watch) cl.conn.print(d.gpa, "{s}", .{buf.written()});
@@ -966,6 +969,18 @@ const Driver = struct {
         }
     }
 };
+
+/// `DONE TOTAL FAILING`, written whole (a temporary file renamed over it).
+fn writeProgress(a: Allocator, path: []const u8, s: Snap) void {
+    const tmp = std.fmt.allocPrintSentinel(a, "{s}.tmp", .{path}, 0) catch return;
+    const to = a.dupeSentinel(u8, path, 0) catch return;
+    const fd = c.open(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, @as(c.mode_t, 0o644));
+    if (fd < 0) return;
+    var buf: [64]u8 = undefined;
+    sys.writeAll(fd, std.fmt.bufPrint(&buf, "{d} {d} {d}\n", .{ s.done + s.fail, s.todo + s.live + s.done + s.fail, s.fail }) catch "");
+    _ = c.close(fd);
+    _ = c.rename(tmp, to);
+}
 
 fn draw(s: Snap, a: Allocator, out: *Io.Writer) void {
     var ws: c.winsize = undefined;
@@ -1124,6 +1139,7 @@ fn run(ctx: *Ctx, args: []const [:0]const u8) u8 {
         .weight = weight,
         .gap = gap,
         .tty = c.isatty(1) == 1,
+        .progress = ctx.env.get("CPUQ_PROGRESS"),
     };
     d.sweep();
     const n = countFolders(io);
