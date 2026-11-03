@@ -103,6 +103,7 @@ const usage =
     \\       cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] -- PROGRAM [ARGS...]
     \\       cpuq note PID|LABEL TEXT [--all] [--host HOST]
     \\       cpuq submit SPEC [--note TEXT] [--env K=V]... [--replace | --again] [-- ARGS]
+    \\       cpuq test SPEC [--on HOST] [--note TEXT] [--env K=V]... [--again] [-- ARGS]
     \\       cpuq packs [--host HOST] | cpuq packs install NAME@VERSION... [--host HOST]
     \\       cpuq jobs [--all] | run [--workers N] [--weight W] [--gap MS] | status | watch | reset
     \\       cpuq jobs set workers N | weight W | gap MS | cpuq jobs pause | resume | stop
@@ -252,6 +253,7 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
     if (std.mem.eql(u8, cmd, "record")) return cmdRecord(ctx, args[1..]);
     inline for (.{
         .{ "submit", submit.cmdSubmit },
+        .{ "test", submit.cmdTest },
         .{ "job", submit.cmdJob },
         .{ "_supervise", submit.cmdSupervise },
         .{ "_start", submit.cmdStart },

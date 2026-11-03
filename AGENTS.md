@@ -92,6 +92,9 @@ Where a repo keeps specs in `cpuq/*.json`, heavy work goes through them:
 
     cpuq submit cpuq/suite.json [--on HOST] [--note "#PR branch"] [-- TEST FILTER]
 
+- **A spec with `tasks`** (a test suite run as a job of task files) goes through
+  `cpuq test SPEC [--on HOST] [-- TEST FILTER]` instead; everything below holds for it too, and
+  its failed tests come back to `.cpuq/fail/`.
 - **Run it in the background.** You're notified when it ends.
 - **The spec comes from your own worktree** (`cpuq/*.json` there): it ships the repo it sits in.
 - **The host:** this machine's remotes, where it should finish first; `--on HOST` picks one

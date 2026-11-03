@@ -563,6 +563,12 @@ that submits it picks the host. cpuq does the rest:
   host with room, else the first stopped one, started. A host is passed over when it has too
   little memory for the job, or when a cache the spec `needs` is empty there. `--on HOST` names
   the host (one of the remotes, or this machine); a full host queues it;
+- **runs a test suite as a job of task files** with `cpuq test SPEC` and a spec whose `tasks`
+  command (after `setup`) writes a file per test into `$CPUQ_TODO`: the host runs them with
+  `cpuq jobs run` (README, "Jobs"), its agent sharing the machine, each task with `$CPUQ_CODE`,
+  the copy's path. A worktree has one test at a time: the same code attaches to it, changed code
+  replaces it. The failures are listed by name with their last line, and their files come back
+  to `.cpuq/fail/`, which git ignores;
 - **syncs a snapshot** of the work there with rsync, moving only what changed, then reads the copy
   back by checksum (as `cpuq run --on` does);
 - **runs it, owned by that host,** so the agent's session, or this machine sleeping, doesn't stop

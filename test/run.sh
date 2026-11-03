@@ -1266,6 +1266,48 @@ print("shipped" if ok else "shipped-wrong %s" % s)'
   unset XDG_STATE_HOME
 }
 
+t_test() {
+  # cpuq test, on "here": setup, then the spec's tasks command fills $CPUQ_TODO and cpuq jobs runs
+  # them with $CPUQ_CODE; a failure is named with its last line and comes back to .cpuq/fail/;
+  # changed code replaces the worktree's running test.
+  setup test
+  local was_home=$HOME
+  export HOME=$T/home XDG_STATE_HOME=$T/xdg
+  mkdir -p "$HOME" "$T/roots/repo/cpuq"
+  echo "submit_roots = $T/roots" >> "$CPUQ_CONFIG"
+  (
+    cd "$T/roots/repo" || exit 1
+    git init -q && git config user.email t@t && git config user.name t
+    echo hello > a.txt
+    cat > mk.sh <<'EOF'
+for i in 1 2 3 4; do echo 'cat "$CPUQ_CODE/a.txt"' > "$CPUQ_TODO/t$i"; done
+[ "$1" = fail ] && printf 'echo boom\nexit 1\n' > "$CPUQ_TODO/t5"
+[ "$1" = slow ] && for i in 1 2 3 4; do echo 'sleep 20' > "$CPUQ_TODO/s$i"; done
+exit 0
+EOF
+    printf '%s\n' '{ "label": "t:ok", "setup": "echo built", "tasks": "sh mk.sh ok", "cores": "1" }' > cpuq/ok.json
+    printf '%s\n' '{ "label": "t:bad", "tasks": "sh mk.sh fail", "cores": "1" }' > cpuq/bad.json
+    printf '%s\n' '{ "label": "t:slow", "tasks": "sh mk.sh slow", "cores": "1" }' > cpuq/slow.json
+    git add -A && git commit -qm init
+    "$CPUQ" test cpuq/bad.json >"$T/bad" 2>&1; echo "bad=$?"
+    [ -f .cpuq/fail/t5 ] && [ "$(cat .cpuq/.gitignore)" = '*' ] && [ -z "$(git status --porcelain)" ] && echo back
+    "$CPUQ" test cpuq/ok.json >"$T/ok" 2>&1; echo "ok=$?"
+    "$CPUQ" submit cpuq/ok.json >/dev/null 2>&1; echo "submit=$?"
+    "$CPUQ" test cpuq/slow.json >/dev/null 2>&1 & local first=$!
+    sleep 3
+    echo b > b.txt
+    "$CPUQ" test cpuq/slow.json --max-wait 1 >/dev/null 2>&1; echo "replace=$?"
+    wait $first; echo "replaced=$?"
+  ) >"$T/out" 2>&1
+  local got; got=$(tr '\n' ' ' < "$T/out")
+  check "test: a failure 1 and back in .cpuq/fail (ignored), a pass 0, submit refuses a tasks spec 2, changed code replaces the running test (got: $got)" \
+    "[[ '$got' == 'bad=1 back ok=0 submit=2 replace='*' replaced=76 ' ]]"
+  check "test: the failed task is named with its last line, and the tasks saw \$CPUQ_CODE" \
+    "grep -q 'fail  t5  boom' '$T/bad' && grep -q 'hello' \"\$(ls -d '$HOME'/.local/state/cpuq/jobs/t.repo/*/done | head -1)\"/t1"
+  export HOME=$was_home
+  unset XDG_STATE_HOME
+}
+
 t_submit_moved() {
   # A job waiting for its copy (another of the worktree's jobs on it) when the worktree changes
   # runs the worktree as it is when its copy syncs, not CPUQ ERROR.
@@ -2394,7 +2436,7 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity job_affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cap_link cgroups note progress submit submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_needs submit_mem submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean jobs jobs_qos jobs_kill jobs_control agent status}
+TESTS=${*:-budget affinity job_affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cap_link cgroups note progress submit test submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_needs submit_mem submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean jobs jobs_qos jobs_kill jobs_control agent status}
 for t in $TESTS; do
   if declare -F "t_$t" >/dev/null; then "t_$t"; else echo "no such test: $t"; FAIL=$((FAIL+1)); FAILED+=" $t?"; fi
 done
