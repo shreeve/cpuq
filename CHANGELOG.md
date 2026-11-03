@@ -2,7 +2,7 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
-## 0.29.0 — unreleased
+## 0.29.0 — 2026-11-03
 
 - **`cpuq jobs`: a job is a folder of task files run by a driver of its own** (README, "Jobs").
   `cpuq jobs run` in `jobs/NAME/STAMP/` runs `todo/` with N workers, each task's text up to its
