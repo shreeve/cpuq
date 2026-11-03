@@ -2394,7 +2394,8 @@ print(len(j), j[0]["name"], j[0]["workers"], j[0]["workers_from"], j[0]["live"],
 t_agent() {
   # The agent shares the machine among the jobs by weight, pushing their workers; a count set
   # through `cpuq attach` holds, and the rest goes to the other job. One agent at a time.
-  setup agent; export CPUQ_STATE=$T/state
+  # A target of its own, so a busy runner leaves the jobs a budget to share.
+  setup agent "target = 8"; export CPUQ_STATE=$T/state
   "$CPUQ" agent 2>"$T/agent.err" & local a=$!
   local i; for i in $(seq 1 50); do [ -S "$CPUQ_STATE/host.sock" ] && break; sleep 0.1; done
   local second; second=$("$CPUQ" agent 2>&1); local src=$?
@@ -2408,9 +2409,11 @@ t_agent() {
   local listed; for i in $(seq 1 60); do listed=$(echo jobs | "$CPUQ" attach | grep -c '^job '); [ "$listed" = 2 ] && break; sleep 0.1; done
   sleep 4
   local wl wh; wl=$(cd "$lo" && "$CPUQ" jobs status | sed -n 2p); wh=$(cd "$hi" && "$CPUQ" jobs status | sed -n 2p)
+  # Each job's share (the last field of its `job` line): three times as much for weight 3.
+  local ratio; ratio=$(echo jobs | "$CPUQ" attach | awk '$1 == "job" { s[$4] = $NF } END { if (s[1] > 0) printf "%.2f", s[3] / s[1]; else print "none" }')
   check "attach lists both jobs ($listed)" "[ '$listed' = 2 ]"
-  check "the agent sets both jobs' workers, more for weight 3 ('$wl' / '$wh')" \
-    "[[ '$wl' == *'(agent)'* && '$wh' == *'(agent)'* ]] && [ \$(echo '$wh' | awk '{print \$2}') -gt \$(echo '$wl' | awk '{print \$2}') ]"
+  check "the agent shares by weight, 3 to 1 (got $ratio), and gives weight 3 at least the workers of weight 1 ('$wl' / '$wh')" \
+    "[ '$ratio' = 3.00 ] && [ \$(echo '$wh' | awk '{print \$2}') -ge \$(echo '$wl' | awk '{print \$2}') ]"
   local r; r=$(printf 'to %s set workers 1\nto /nowhere pause\n' "$hi" | "$CPUQ" attach | tr '\n' ' ')
   sleep 2.5
   wh=$(cd "$hi" && "$CPUQ" jobs status | sed -n 2p)
