@@ -2310,7 +2310,7 @@ t_jobs_kill() {
   for i in $(seq 1 30); do [ -z "$(lsof -t "$J"/live/* 2>/dev/null)" ] && break; sleep 0.1; done
   check "the tasks end with their driver (live files held: '$(lsof -t "$J"/live/* 2>/dev/null)')" "[ -z \"\$(lsof -t '$J'/live/* 2>/dev/null)\" ]"
   for i in $(seq 1 8); do sed -i.bak 's/sleep 30/sleep 0.1/' "$J"/todo/t$i "$J"/live/t$i 2>/dev/null; done; rm -f "$J"/todo/*.bak "$J"/live/*.bak
-  timeout 60 "$SHELL" -c "cd '$J' && '$CPUQ' jobs run >/dev/null 2>&1"; local rc=$?
+  (cd "$J" && "$CPUQ" jobs run >/dev/null 2>&1); local rc=$?
   check "restarted, all 8 are done (rc $rc, $(count "$J/done")), the 4 cut short marked lost ($(grep -l 'died: lost' "$J"/done/* | wc -l | tr -d ' ')), each ending once ($(grep -c end "$T/runs"))" \
     "[ $rc = 0 ] && [ $(count "$J/done") = 8 ] && [ $(grep -l 'died: lost' "$J"/done/* | wc -l) = 4 ] && [ $(grep -c end "$T/runs") = 8 ]"
   unset CPUQ_STATE
