@@ -1,0 +1,7 @@
+name = "cpuq-formal"
+defaultTargets = ["CpuqModel"]
+
+[[lean_lib]]
+name = "CpuqModel"
+leanOptions = { warningAsError = true }
+precompileModules = true
