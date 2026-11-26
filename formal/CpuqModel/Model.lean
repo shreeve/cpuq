@@ -108,6 +108,22 @@ structure Rules where
   zeroFirst : Bool
   /-- An operation drains only if the waiter still ranks before it after the drain. -/
   giverBehind : Bool
+  /-- The giver's ticket is renewed when it gives a CPU back (release), not when it starts to
+  drain (`giveBackEmpty` in src/op.zig). -/
+  renewAtRelease : Bool := false
+  /-- `giverBehind` compares as if the giver already had its renewed ticket. -/
+  behindFresh : Bool := false
+  /-- A stopped operation stays in the line with what it wants, and a grant to it stays valid
+  (its file stays locked while it is stopped). -/
+  stoppedWaits : Bool := false
+  /-- The line counts only living (alive or stopped) operations; a dead one's leftovers don't
+  count (the pool's scan drops it). -/
+  liveCounts : Bool := false
+  /-- One giver, as src/pool.zig's `giver` picks it: the project holding the most for its
+  weight, then the operation keeping the most, then the newest ticket. -/
+  oneGiver : Bool := false
+  /-- A drain no longer owed is cancelled (`Act.undrain`). src/pool.zig never cancels one. -/
+  undrains : Bool := true
   deriving Repr
 
 namespace Rules
@@ -131,6 +147,16 @@ def planLoose : Rules := { plan with retryAtReap := false, releaseWaitsDying := 
 
 /-- FINAL-PLAN with the two fixes this model found it needs (README, "Findings"). -/
 def fixed : Rules := { plan with zeroFirst := true, giverBehind := true }
+
+/-- The rules of src/pool.zig and src/op.zig on branch `slots` (ba33a16). -/
+def pool : Rules :=
+  { fixed with renewAtRelease := true, stoppedWaits := true, liveCounts := true, oneGiver := true,
+               undrains := false }
+
+/-- `pool` with the two fixes this model proposes for it (README, "Findings" 4 and 5):
+`behindAfter` compares with the ticket the giver will have once it gives the CPU back, and a
+stopped operation is out of the line. -/
+def poolFixed : Rules := { pool with behindFresh := true, stoppedWaits := false }
 
 end Rules
 
@@ -182,6 +208,10 @@ def pendingN (s : St) (o : Nat) : Nat := (s.op o).tasks.countP pendingT
 def isAlive (s : St) (o : Nat) : Bool := (s.op o).phase == .alive
 end St
 
+/-- In the line's eyes: alive, or (with `stoppedWaits`) stopped. -/
+def liveOp (cfg : Cfg) (s : St) (o : Nat) : Bool :=
+  s.isAlive o || (cfg.rules.stoppedWaits && (s.op o).phase == .stopped)
+
 /-- Free places in `o`'s slots that are not draining, and in the tokens granted to it. -/
 def room (cfg : Cfg) (s : St) (o : Nat) : Nat :=
   (List.range s.cpus.length).foldl (fun acc c =>
@@ -194,7 +224,7 @@ def ceilDiv (a b : Nat) : Nat := (a + b - 1) / b
 /-- Slots `o` wants: no more than its ceiling C allows (slots and grants count), and no more
 than its pending tasks need beyond the room it has (packing, rule 3). -/
 def demand (cfg : Cfg) (s : St) (o : Nat) : Nat :=
-  if s.isAlive o then
+  if liveOp cfg s o then
     min ((cfg.op o).cap - (s.owned o + s.grants o))
         (ceilDiv (s.pendingN o - room cfg s o) (cfg.op o).K)
   else 0
@@ -202,7 +232,7 @@ def demand (cfg : Cfg) (s : St) (o : Nat) : Nat :=
 def validGrantC (cfg : Cfg) (s : St) (x : Cpu) : Bool :=
   match x.grant with
   | none => false
-  | some h => !cfg.rules.validGrant || s.isAlive h
+  | some h => !cfg.rules.validGrant || liveOp cfg s h
 
 /-- A token anyone may hand out: no flock, and no grant that still counts. -/
 def freeC (cfg : Cfg) (s : St) (x : Cpu) : Bool := x.lock.isNone && !validGrantC cfg s x
@@ -211,7 +241,8 @@ def freeN (cfg : Cfg) (s : St) : Nat := s.cpus.countP (freeC cfg s)
 /-- Slots `o` holds as the line counts them: a draining slot counts as given up under the
 ledger, and a grant counts as held. -/
 def eff (cfg : Cfg) (s : St) (o : Nat) : Nat :=
-  s.owned o - (if cfg.rules.ledger then s.drainOf o else 0) + s.grants o
+  if cfg.rules.liveCounts && !((s.op o).phase == .alive || (s.op o).phase == .stopped) then 0
+  else s.owned o - (if cfg.rules.ledger then s.drainOf o else 0) + s.grants o
 
 def opIds (cfg : Cfg) : List Nat := List.range cfg.ops.length
 
@@ -225,7 +256,7 @@ def urgentFirst (cfg : Cfg) (s : St) (o : Nat) : Bool :=
 
 /-- In the line: alive and wanting a slot (and, without `standing`, holding none). -/
 def waiter (cfg : Cfg) (s : St) (o : Nat) : Bool :=
-  s.isAlive o && decide (demand cfg s o > 0) && (cfg.rules.standing || s.owned o == 0)
+  liveOp cfg s o && decide (demand cfg s o > 0) && (cfg.rules.standing || s.owned o == 0)
 
 /-- `a` ranks strictly before `b` (rule 5): urgent class, then (with `zeroFirst`) holding
 nothing, then project slots ÷ weight, then own slots. Ties go to the older ticket. -/
@@ -334,7 +365,37 @@ def handout (cfg : Cfg) (s : St) : St := handoutOver cfg s (List.range s.cpus.le
 def drainEff (cfg : Cfg) (s : St) (o c : Nat) : St :=
   { s.setCpu c { s.cpu c with slot := some { owner := o, draining := true } } with
     drains := s.drains + 1
-    order := if cfg.rules.ledger then s.order.filter (· != o) ++ [o] else s.order }
+    order := if cfg.rules.ledger && !cfg.rules.renewAtRelease then s.order.filter (· != o) ++ [o]
+      else s.order }
+
+/-- `o` with the newest ticket. -/
+def renewed (s : St) (o : Nat) : List Nat := s.order.filter (· != o) ++ [o]
+
+/-- May `o` give a slot to the head `h` (rule 6, and the switches)? -/
+def mayGive (cfg : Cfg) (s : St) (o h c : Nat) : Bool :=
+  s.isAlive o && h != o && yieldTo cfg s o h &&
+  (!cfg.rules.giverBehind ||
+    (let s2 := drainEff cfg s o c
+     ahead cfg (if cfg.rules.behindFresh then { s2 with order := renewed s2 o } else s2) h o))
+
+/-- An operation's best not-draining slot to give, if any (the lowest CPU). -/
+def keptSlot (s : St) (o : Nat) : Option Nat :=
+  (List.range s.cpus.length).find? (fun c => (s.cpu c).slot == some { owner := o })
+
+/-- src/pool.zig's `giver`: of those who may give, the project holding the most for its weight,
+then the operation keeping the most, then the newest ticket. -/
+def giverOf (cfg : Cfg) (s : St) (h : Nat) : Option Nat :=
+  let ok := s.order.filter (fun g =>
+    match keptSlot s g with
+    | some c => mayGive cfg s g h c
+    | none => false)
+  let better (g b : Nat) : Bool :=
+    let lg := projEff cfg s (cfg.op g).proj * cfg.w (cfg.op b).proj
+    let lb := projEff cfg s (cfg.op b).proj * cfg.w (cfg.op g).proj
+    decide (lg > lb) || (lg == lb && (decide (eff cfg s g > eff cfg s b) || eff cfg s g == eff cfg s b))
+  ok.foldl (fun best g => match best with
+    | none => some g
+    | some b => if better g b then some g else best) none
 
 /-- Drain on demand (rule 6): may `o` mark its slot `c` draining now? -/
 def canDrain (cfg : Cfg) (s : St) (o c : Nat) : Bool :=
@@ -343,8 +404,8 @@ def canDrain (cfg : Cfg) (s : St) (o c : Nat) : Bool :=
     match head cfg s with
     | none => false
     | some h =>
-      h != o && yieldTo cfg s o h && decide (s.drains < need cfg s) &&
-      (!cfg.rules.giverBehind || ahead cfg (drainEff cfg s o c) h o)
+      decide (s.drains < need cfg s) && mayGive cfg s o h c &&
+      (!cfg.rules.oneGiver || giverOf cfg s h == some o)
   else
     s.order.any (fun w => w != o && waiter cfg s w && before cfg s w o && yieldTo cfg s o w)
 
@@ -460,7 +521,9 @@ def step (cfg : Cfg) (s : St) : Act → Option St
       if s.isAlive o && sl.owner == o && s.runningOn o c == 0 &&
          (!cfg.rules.releaseWaitsDying || (s.op o).tasks.all (fun t => t.dying != some c)) &&
          (sl.draining || s.pendingN o == 0) then
-        some (handout cfg { s.setCpu c {} with drains := s.drains - (if sl.draining then 1 else 0) })
+        some (handout cfg { s.setCpu c {} with
+          drains := s.drains - (if sl.draining then 1 else 0)
+          order := if cfg.rules.renewAtRelease then renewed s o else s.order })
       else none
     | none => none
   | .handout =>
@@ -473,7 +536,7 @@ def step (cfg : Cfg) (s : St) : Act → Option St
   | .drain o c =>
     if canDrain cfg s o c then some (drainEff cfg s o c) else none
   | .undrain o c =>
-    if cfg.rules.ledger && s.isAlive o &&
+    if cfg.rules.ledger && cfg.rules.undrains && s.isAlive o &&
        (s.cpu c).slot == some { owner := o, draining := true } && decide (s.drains > need cfg s) then
       some { s.setCpu c { s.cpu c with slot := some { owner := o } } with drains := s.drains - 1 }
     else none

@@ -88,7 +88,8 @@ def stepFails (cfg : Cfg) (s : St) (a : Act) (s' : St) : List String :=
     (match head cfg s with
      | some h =>
        (if h != o && yieldShare cfg s o h then [] else ["F6 drain not for the head"]) ++
-       (if h != o && ahead cfg s' o h then ["F6 giver ahead"] else [])
+       (if h != o && ahead cfg (if cfg.rules.renewAtRelease then { s' with order := renewed s' o } else s') o h
+        then ["F6 giver ahead"] else [])
      | none => ["F6 drain not for the head"])
   | _ => []
 

@@ -53,11 +53,14 @@ theorem grantOne_len (cfg : Cfg) (s : St) (c : Nat) : (grantOne cfg s c).cpus.le
 theorem isAlive_congr {s t : St} (h : s.ops = t.ops) (o : Nat) : s.isAlive o = t.isAlive o := by
   simp [St.isAlive, St.op, h]
 
+theorem liveOp_congr {cfg : Cfg} {s t : St} (h : s.ops = t.ops) (o : Nat) : liveOp cfg s o = liveOp cfg t o := by
+  simp [liveOp, St.isAlive, St.op, h]
+
 theorem validGrantC_congr {cfg : Cfg} {s t : St} (h : s.ops = t.ops) (x : Cpu) :
     validGrantC cfg s x = validGrantC cfg t x := by
   unfold validGrantC; split
   · rfl
-  · rw [isAlive_congr h]
+  · rw [liveOp_congr h]
 
 theorem freeC_congr {cfg : Cfg} {s t : St} (h : s.ops = t.ops) (x : Cpu) :
     freeC cfg s x = freeC cfg t x := by
@@ -108,13 +111,12 @@ theorem handoutOver_conserves {cfg : Cfg} (cs : List Nat) :
       | some h =>
         by_cases f0 : freeC cfg s (s.cpu c) = true
         · -- c is granted to h, a living waiter: no longer free, and it stays so.
-          have ha : s.isAlive h = true := by
-            have := head_waiter hh; simp only [waiter, Bool.and_eq_true] at this; exact this.1.1
+          have ha : liveOp cfg s h = true := waiter_live (head_waiter hh)
           have g1 : (grantOne cfg s c).cpu c = { s.cpu c with grant := some h } := by
             unfold grantOne; rw [ite_eq_left f0, hh]; simp only
             rw [St.cpu_setCpu]; simp [hlen]
           have nf : freeC cfg (grantOne cfg s c) ((grantOne cfg s c).cpu c) = false := by
-            rw [g1]; simp [freeC, validGrantC, isAlive_congr (grantOne_ops cfg s c), ha]
+            rw [g1]; simp [freeC, validGrantC, liveOp_congr (grantOne_ops cfg s c), ha]
           obtain ⟨k, _⟩ := handoutOver_keeps cs nf
           rw [k, freeC_congr (handoutOver_keeps cs nf).2, nf] at hf; cases hf
         · have nf : freeC cfg (grantOne cfg s c) ((grantOne cfg s c).cpu c) = false := by
@@ -165,8 +167,8 @@ theorem standing_line {cfg : Cfg} {s : St} (hst : cfg.rules.standing = true) (h 
     (o : Nat) (ho : o ∈ s.order) (ha : (s.op o).phase = .alive) : demand cfg s o = 0 := by
   refine Classical.byContradiction fun hd => ?_
   have w : waiter cfg s o = true := by
-    simp only [waiter, St.isAlive, ha, hst, Bool.and_eq_true, beq_self_eq_true, Bool.true_or,
-      decide_eq_true_eq, and_true, true_and]
+    have l : liveOp cfg s o = true := by simp [liveOp, St.isAlive, ha]
+    simp only [waiter, l, hst, Bool.and_eq_true, Bool.true_or, decide_eq_true_eq, and_true, true_and]
     omega
   have := head_some ho w
   rw [h] at this; cases this
@@ -177,16 +179,13 @@ theorem standing_line {cfg : Cfg} {s : St} (hst : cfg.rules.standing = true) (h 
 nothing and a drain is still owed, any other alive operation may drain any slot it holds that
 is not draining. -/
 theorem zero_head_can_drain {cfg : Cfg} {s : St} {h o c : Nat}
-    (hl : cfg.rules.ledger = true) (hsh : cfg.rules.shareRule = true) (hgb : cfg.rules.giverBehind = false)
+    (hl : cfg.rules.ledger = true) (hsh : cfg.rules.shareRule = true)
+    (hgb : cfg.rules.giverBehind = false) (hog : cfg.rules.oneGiver = false)
     (hh : head cfg s = some h) (hz : eff cfg s h = 0) (hne : h ≠ o)
     (ha : (s.op o).phase = .alive) (hsl : (s.cpu c).slot = some { owner := o })
     (hneed : s.drains < need cfg s) : canDrain cfg s o c = true := by
-  unfold canDrain
-  simp only [St.isAlive, ha, hsl, hl, hh, beq_self_eq_true, Bool.true_and, ite_true]
-  simp only [yieldTo, hsh, ite_true, hz, hgb, Bool.and_eq_true, bne_iff_ne, ne_eq, Bool.or_eq_true,
-    decide_eq_true_eq, beq_self_eq_true, or_true, Bool.not_false, and_true]
-  refine ⟨⟨hne, hneed⟩, ?_⟩
-  simp
+  unfold canDrain mayGive yieldTo
+  simp [St.isAlive, ha, hsl, hl, hh, hsh, hz, hgb, hog, hne, hneed]
 
 /-- A drain under the share clause is a transfer Lemma P counts: between the giver's project p
 and the head's project q, measured in slots held as the line counts them. -/
@@ -194,9 +193,13 @@ theorem drain_is_transfer {cfg : Cfg} {s : St} {h o c : Nat}
     (hl : cfg.rules.ledger = true) (hsh : cfg.rules.shareRule = true)
     (hd : canDrain cfg s o c = true) (hh : head cfg s = some h) (hz : eff cfg s h ≠ 0) :
     Transfers.shareOk cfg.w (projEff cfg s) (cfg.op o).proj (cfg.op h).proj := by
-  unfold canDrain at hd
-  simp only [hl, hh, ite_true, Bool.and_eq_true] at hd
-  have y := hd.2.1.1.2
+  have m : mayGive cfg s o h c = true := by
+    unfold canDrain at hd
+    simp only [hl, hh, ite_true, Bool.and_eq_true] at hd
+    exact hd.2.1.2
+  unfold mayGive at m
+  simp only [Bool.and_eq_true] at m
+  have y := m.1.2
   simp only [yieldTo, hsh, ite_true, Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq,
     beq_iff_eq, hz, or_false] at y
   exact y
@@ -250,6 +253,14 @@ theorem retired_phase (s : St) (o : Nat) (g : Task → Task) (p : Phase) (o' : N
     (ho : o < s.ops.length) :
     ((retired s o g p).op o').phase = if o = o' then p else (s.op o').phase := by
   simp only [St.op, retired, getD_set, ho, and_true]; split <;> rfl
+
+theorem mem_renewed {s : St} {o x : Nat} (h : x ∈ s.order ∨ x = o) : x ∈ renewed s o := by
+  unfold renewed
+  by_cases e : x = o
+  · subst e; simp
+  · rcases h with h | h
+    · exact List.mem_append_left _ (List.mem_filter.2 ⟨h, by simp [e]⟩)
+    · exact absurd h e
 
 /-- Tickets are never taken away, and a step makes an operation started only by its arrival
 (which takes a ticket) or by a phase change of one already started. -/
@@ -305,7 +316,11 @@ theorem step_tickets {cfg : Cfg} {s s' : St} {a : Act} (e : step cfg s a = some 
     · split at e
       · cases e; intro o' hs
         rw [(handout_order_ops cfg _).1]; rw [phase_of_ops (handout_order_ops cfg _).2] at hs
-        exact hold o' hs
+        have := hold o' hs
+        show o' ∈ (if cfg.rules.renewAtRelease then renewed s _ else s.order)
+        split
+        · exact mem_renewed (.inl this)
+        · exact this
       · cases e
     · cases e
   | handout =>
@@ -325,11 +340,9 @@ theorem step_tickets {cfg : Cfg} {s s' : St} {a : Act} (e : step cfg s a = some 
     · cases e; intro o' hs
       change (s.op o').phase = _ ∨ _ at hs
       have := hold o' hs
-      show o' ∈ (if cfg.rules.ledger then _ else _)
+      show o' ∈ (if cfg.rules.ledger && !cfg.rules.renewAtRelease then _ else _)
       split
-      · by_cases eo : o' = o
-        · subst eo; simp
-        · exact List.mem_append_left _ (List.mem_filter.2 ⟨this, by simp [eo]⟩)
+      · exact mem_renewed (.inl this)
       · exact this
     · cases e
   | undrain o c =>

@@ -13,7 +13,7 @@ no other dependencies.
 cd formal && cpuq run --label cpuq:lean --cores 1 -- lake build
 ```
 
-`lake build` checks every proof and runs every search in `Checks.lean` (about 20 s on pop).
+`lake build` checks every proof and runs every search in `Checks.lean` (about 30 s on pop).
 Every warning is an error. A search whose result changes fails the build.
 
 ## Layout
@@ -47,8 +47,16 @@ one pass" says. A crash frees tokens with no pass; the next pass (the 1 s fallba
 hands them out.
 
 `Rules` switches between FINAL-REPORT-1's rules (`report1`, as review2-formal reads them),
-FINAL-PLAN's (`plan`), the plan read loosely (`planLoose`), and the plan with this model's two
-fixes (`fixed`).
+FINAL-PLAN's (`plan`), the plan read loosely (`planLoose`), the plan with this model's two
+fixes (`fixed`), the rules the code implements on branch `slots` (`pool`, from `ahead`,
+`handOut`, `firstWaiter`, `giver` and `behindAfter` in src/pool.zig, and the loop in src/op.zig),
+and those with this model's two fixes for the code (`poolFixed`).
+
+`pool` differs from `fixed` where the code does what the plan doesn't say: the giver's ticket is
+renewed when it gives its CPU back, not when it starts to drain (`renewAtRelease`); one giver
+is chosen as `giver` chooses (`oneGiver`); a drain is never cancelled (`undrains` off); dead
+operations don't count in the line (`liveCounts`); a stopped operation stays in the line
+(`stoppedWaits`).
 
 ## What is proved
 
@@ -84,7 +92,7 @@ standing line.
 | A share-clause drain is a transfer of Lemma P | `drain_is_transfer` |
 | L2 work conservation: right after any hand-out pass, no token is free while anyone is in line | `handout_conserves` |
 | … and with a standing line, in every reachable state, no token is free while an alive operation wants a slot | `work_conserving` |
-| No tie-rule starvation: when the head holds nothing and a drain is owed, every other alive holder may drain | `zero_head_can_drain` |
+| No tie-rule starvation: under FINAL-PLAN's rules, when the head holds nothing and a drain is owed, every other alive holder may drain | `zero_head_can_drain` |
 
 **Liveness, searched, not proved.** "Every waiter is eventually served" (L3) is checked by the
 search, in two forms, for every scenario: `L3 never` (no state from which no run serves a waiter
@@ -150,6 +158,10 @@ valid-only grants, or reclaim, and that counterexample returns.
 FINAL-PLAN as written passes the crash, strand, timeout, herd and two-CPU scenarios, and fails
 two liveness scenarios (Findings 1, 2). With both fixes, every scenario passes.
 
+The code on branch `slots` (`pool`) has Findings 1 and 2 fixed and Finding 3's safe reading,
+and fails three scenarios (Findings 4, 5). With the two fixes (`poolFixed`), every scenario
+passes.
+
 ## Findings
 
 Sent to the cpuq lead and Rig - Final on 2026-11-25. Traces: `narrate` in `Explore.lean`
@@ -177,3 +189,24 @@ while its TERMed attempt still runs (the task runs twice, S5), and a slot whose 
 dying may be released and taken by another operation (the CPU is shared, S1'). The safety proof
 assumes the plan states: retry a timed-out task only after its attempt has exited, and a slot
 with a dying attempt is not empty. The place may still free at once for a different task.
+
+The cpuq lead has fixes 1 and 2 in src/pool.zig, with these scenarios as unit tests, and src/op.zig
+already had finding 3's safe reading.
+
+**4. (src/pool.zig) `behindAfter` compares with the giver's old ticket.** The giver's ticket is
+renewed only when it gives its CPU back (`giveBackEmpty`). On 2 CPUs, C and B hold one each in
+different projects and A arrives holding nothing. Each giver, once it holds one fewer, ties A on
+every key, and its older ticket wins, so `behindAfter` is false for both. No one gives, and A
+waits until B or C runs out of work: review2's F2 again (the Mac's ten one-CPU runs and a
+newcomer). Fix (`behindFresh`): compare with the ticket the giver will have, the newest.
+Renewing the ticket when the drain starts also passes.
+
+**5. (src/op.zig) A stopped operation stays first in line.** On Ctrl-Z, `suspend_` gives its CPUs
+back, but its record still wants CPUs (`wantMore` counts the stopped tasks as waiting) and its
+file stays locked, so promises to it stay valid. Holding nothing, it ranks first: the hand-out
+in the same step promises its CPUs back to it, and later hand-outs and drains go to it too. On 3
+CPUs, A holds all three and is stopped, B arrives, and the three CPUs idle until A continues.
+Fix (`stoppedWaits` off): a stopped operation wants nothing until it continues.
+
+The doc comment on `Op.want` says "beyond those it holds and is promised". `wantMore` leaves
+promises out, and the line subtracts them, so the code is right and the comment is wrong.

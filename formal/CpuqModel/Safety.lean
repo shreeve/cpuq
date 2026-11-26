@@ -462,26 +462,37 @@ theorem foldl_head_waiter (cfg : Cfg) (s : St) (l : List Nat) (init : Option Nat
 theorem head_waiter {cfg : Cfg} {s : St} {h : Nat} (e : head cfg s = some h) : waiter cfg s h = true :=
   foldl_head_waiter cfg s s.order none (by simp) h e
 
-theorem waiter_alive {cfg : Cfg} {s : St} {h : Nat} (w : waiter cfg s h = true) :
-    (s.op h).phase = .alive := by
-  simp only [waiter, St.isAlive, Bool.and_eq_true, beq_iff_eq] at w; exact w.1.1
+theorem liveOp_phase {cfg : Cfg} {s : St} {h : Nat} (l : liveOp cfg s h = true) :
+    (s.op h).phase = .alive ∨ (s.op h).phase = .stopped := by
+  simp only [liveOp, St.isAlive, Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq] at l
+  rcases l with l | l
+  · exact .inl l
+  · exact .inr l.2
+
+theorem waiter_live {cfg : Cfg} {s : St} {h : Nat} (w : waiter cfg s h = true) : liveOp cfg s h = true := by
+  simp only [waiter, Bool.and_eq_true] at w; exact w.1.1
+
+theorem demand_room {cfg : Cfg} {s : St} {h : Nat} (d : demand cfg s h > 0) :
+    s.owned h + s.grants h < (cfg.op h).cap := by
+  unfold demand at d
+  split at d
+  · have := Nat.lt_of_lt_of_le d (Nat.min_le_left _ _); omega
+  · exact absurd d (Nat.lt_irrefl 0)
 
 theorem waiter_room {cfg : Cfg} {s : St} {h : Nat} (w : waiter cfg s h = true) :
     s.owned h + s.grants h < (cfg.op h).cap := by
   simp only [waiter, Bool.and_eq_true, decide_eq_true_eq] at w
-  have := w.1.2
-  simp only [demand, w.1.1, ite_true] at this
-  have := Nat.lt_of_lt_of_le this (Nat.min_le_left _ _)
-  omega
+  exact demand_room w.1.2
 
 theorem freeC_lock {cfg : Cfg} {s : St} {x : Cpu} (f : freeC cfg s x = true) : x.lock = none := by
   simp only [freeC, Bool.and_eq_true, Option.isNone_iff_eq_none] at f; exact f.1
 
 theorem freeC_grant {cfg : Cfg} {s : St} {x : Cpu} {g : Nat} (f : freeC cfg s x = true)
-    (hg : x.grant = some g) : (s.op g).phase ≠ .alive := by
-  intro ha
-  simp only [freeC, validGrantC, hg, Bool.and_eq_true, Bool.not_eq_true'] at f
-  simp [St.isAlive, ha] at f
+    (hg : x.grant = some g) : liveOp cfg s g = false := by
+  cases l : liveOp cfg s g
+  · rfl
+  · simp only [freeC, validGrantC, hg, l, Bool.and_eq_true, Bool.not_eq_true', Bool.or_true] at f
+    exact absurd f.2 (by decide)
 
 theorem setCpu_eq (s : St) (c : Nat) (x : Cpu) : s.setCpu c x = withCpu s c x s.drains s.order := rfl
 
@@ -498,14 +509,15 @@ theorem Inv.grantOne {cfg : Cfg} {s : St} (h : Inv cfg s) (c : Nat) : Inv cfg (C
       · rw [setCpu_eq]
         have hl := freeC_lock f
         have w := head_waiter hh
-        have ha := waiter_alive w
+        have hlive := waiter_live w
         have hroom := waiter_room w
-        have hold : (s.cpu c).grant ≠ some g := fun e => freeC_grant f e ha
+        have hold : (s.cpu c).grant ≠ some g := fun e => by rw [freeC_grant f e] at hlive; cases hlive
         apply h.withCpu hc
         · intro o e; simp [hl] at e
         · intro sl hs hal; have := h.ownerLock c sl hs hal; rw [hl] at this; cases this
         · intro sl hs; exact h.ownerPhase c sl hs
-        · intro g' e; cases e; exact ⟨hl, by rw [ha]; decide⟩
+        · intro g' e; cases e
+          exact ⟨hl, by rcases liveOp_phase hlive with x | x <;> rw [x] <;> decide⟩
         · intro sl hs; exact h.kBound c sl hs
         · intro o hp
           have := h.capBound o hp
@@ -555,10 +567,10 @@ theorem drains_pos {cfg : Cfg} {s : St} {c : Nat} (h : Inv cfg s) (hd : draining
     simp [St.cpu, List.getD_eq_getElem?_getD, List.getElem?_eq_getElem hc]
   exact List.countP_pos_iff.2 ⟨_, List.getElem_mem hc, by rw [← e]; exact hd⟩
 
-theorem Inv.release {cfg : Cfg} {s : St} {c o : Nat} {sl : Slot} (h : Inv cfg s)
+theorem Inv.release {cfg : Cfg} {s : St} {c o : Nat} {sl : Slot} {ord : List Nat} (h : Inv cfg s)
     (hs : (s.cpu c).slot = some sl) (ho : sl.owner = o) (ha : (s.op o).phase = .alive)
     (hr0 : s.runningOn o c = 0) (hdy : ∀ i, (s.task o i).dying ≠ some c) :
-    Inv cfg (Cpuq.withCpu s c {} (s.drains - (if sl.draining then 1 else 0)) s.order) := by
+    Inv cfg (Cpuq.withCpu s c {} (s.drains - (if sl.draining then 1 else 0)) ord) := by
   have hc := s.lt_of_slot c (by rw [hs]; simp)
   have hl : (s.cpu c).lock = some o := by
     have := h.ownerLock c sl hs (by rw [ho]; exact ha); rwa [ho] at this
@@ -1092,11 +1104,7 @@ theorem Inv.tryOnce {cfg : Cfg} {s : St} {o : Nat} (hs : Safe cfg.rules) (h : In
     | some c =>
       obtain ⟨hfree, hc⟩ := firstFree_spec hf
       apply h.takeTok hs.reclaim ha hc (freeC_lock hfree)
-      have hroom : s.owned o + s.grants o < (cfg.op o).cap := by
-        have := g.1.2
-        simp only [demand, St.isAlive, ha, beq_self_eq_true, ite_true] at this
-        have := Nat.lt_of_lt_of_le this (Nat.min_le_left _ _)
-        omega
+      have hroom : s.owned o + s.grants o < (cfg.op o).cap := demand_room g.1.2
       split <;> omega
   · rw [ite_eq_right g]; exact h
 

@@ -158,4 +158,41 @@ urgent: ok: 141740 states, 1086544 steps
   row "herd" (herd .fixed)
   row "urgent" (urgent .fixed)
 
+/-! ## src/pool.zig and src/op.zig on branch `slots` (ba33a16)
+
+`Rules.pool`: FINAL-PLAN with both fixes, plus what the code does that the plan doesn't say: the
+giver's ticket is renewed when it gives its CPU back, one giver is chosen as `giver` chooses,
+a drain is never cancelled, dead operations don't count, and a stopped operation stays in the
+line. It fails two scenarios (README, Findings 4 and 5); `Rules.poolFixed` passes all. -/
+
+/--
+info: two CPUs: FAILED (664 states): L3 never, L3 fair
+strand: FAILED (3198 states): L3 never, L3 fair
+urgent: FAILED (78346 states): L2 idle
+-/
+#guard_msgs in
+#eval do
+  row "two CPUs" (twoCpus .pool)
+  row "strand" (strand .pool)
+  row "urgent" (urgent .pool)
+
+/--
+info: two CPUs: ok: 1002 states, 2618 steps
+odd split: ok: 9805 states, 34340 steps
+crash: ok: 20030 states, 52516 steps
+strand: ok: 6358 states, 16733 steps
+timeout: ok: 2347 states, 6536 steps
+herd: ok: 1607 states, 6037 steps
+urgent: ok: 186614 states, 1389637 steps
+-/
+#guard_msgs in
+#eval do
+  row "two CPUs" (twoCpus .poolFixed)
+  row "odd split" (oddSplit .poolFixed)
+  row "crash" (crash .poolFixed)
+  row "strand" (strand .poolFixed)
+  row "timeout" (timeout .poolFixed)
+  row "herd" (herd .poolFixed)
+  row "urgent" (urgent .poolFixed)
+
 end Cpuq.Checks
