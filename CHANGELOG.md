@@ -2,7 +2,7 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
-## 0.30.2
+## 0.30.2 — 2026-11-26
 
 - **`cpuq status` names a stuck pool instead of hanging.** Every step under the pool's lock takes
   milliseconds. If status can't take the lock within 5 s, it names the process holding it, how
