@@ -7,7 +7,7 @@ configurations it is given and says nothing past them. The proofs (`Safety.lean`
 `Liveness.lean`) say the general case.
 
 The checks, by name (README lists which guarantee each one is):
-- state: `S1 holder`, `S1 grant`, `S2 cap`, `S4 K`, `S5 twice`, `S1' shared`, `S1' unheld`,
+- state: `S1 holder`, `S1 grant`, `S3 cap`, `S4 K`, `S5 twice`, `S1' shared`, `S1' unheld`,
   `D count`, and `L2 idle` (a CPU no one holds while an operation wants one, and no grant or
   accept can happen until some task ends);
 - step: `F1 drain not owed`,
@@ -69,7 +69,7 @@ def stateFails (cfg : Cfg) (s : St) (enabled : List (Act × St)) : List String :
       | _ => false)
   (if holder then [] else ["S1 holder"]) ++
   (if grant then [] else ["S1 grant"]) ++
-  (if cap then [] else ["S2 cap"]) ++
+  (if cap then [] else ["S3 cap"]) ++
   (if kb then [] else ["S4 K"]) ++
   (if count then [] else ["D count"]) ++
   (if twice then [] else ["S5 twice"]) ++
