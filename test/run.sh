@@ -839,9 +839,9 @@ t_usage() {
   # 5 s it flags a run whose CPUs sit mostly idle.
   setup usage
   "$CPUQ" run --label u:spin -- python3 -c 'import time
-e = time.time() + 6.5
+e = time.time() + 9
 while time.time() < e: pass' &
-  "$CPUQ" run --label u:idle -- sleep 6.5 &
+  "$CPUQ" run --label u:idle -- sleep 9 &
   wait_held 2
   sleep 1
   local u; u=$("$CPUQ" status --json | python3 -c 'import json, sys
