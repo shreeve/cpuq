@@ -52,13 +52,13 @@ struct SettingsView: View {
                 Toggle("Text me what needs me", isOn: $text)
                     .disabled(!FileManager.default.isExecutableFile(atPath: (Prefs.textCommand as NSString).expandingTildeInPath))
             } footer: {
-                Text("At most once every 30 minutes, with \(Prefs.textCommand): a machine overloaded while another has room, a job that looks stuck, a cloud machine billing with nothing to do, or --opaque jobs holding cores while others wait.")
+                Text("At most once every 30 minutes, with \(Prefs.textCommand): a machine overloaded while another has room, a job that looks stuck, or a cloud machine billing with nothing to do.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
                 Toggle("Notify when something goes wrong", isOn: $notify)
             } footer: {
-                Text("Once each time it happens and lasts, on any machine watched: cpuq's gate shut (30 seconds); jobs waiting beside idle CPUs (a minute); --opaque jobs holding cores while others wait (2 minutes); heavy work outside cpuq (3 minutes); a job that looks stuck, or a machine overloaded while another has room (10 minutes); a cloud machine up with nothing to do (15 minutes: its idle stop failed, and it is billing), with a button to stop it.")
+                Text("Once each time it happens and lasts, on any machine watched: cpuq's gate shut (30 seconds); jobs waiting beside idle CPUs (a minute); heavy work outside cpuq (3 minutes); a job that looks stuck, or a machine overloaded while another has room (10 minutes); a cloud machine up with nothing to do (15 minutes: its idle stop failed, and it is billing), with a button to stop it.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {

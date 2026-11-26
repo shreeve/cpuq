@@ -45,7 +45,7 @@ final class GraphModel {
         var active: [Reading] = []
         /// Its average active cores from history, for the stretch the app did not watch.
         var average: Double?
-        /// A timing window (`--exclusive`): it held the Mac alone.
+        /// A drain (`cpuq drain`): it held the Mac alone.
         var exclusive = false
     }
 
@@ -64,7 +64,7 @@ final class GraphModel {
         var need = 1
         var from: Date
         var to: Date?
-        /// Waiting for a timing window of its own.
+        /// A drain waiting for the Mac to empty.
         var exclusive = false
     }
 
@@ -83,6 +83,9 @@ final class GraphModel {
         var busy: Double? = nil
         /// The same for each CPU, in the kernel's order.
         var perCPU: [Double]? = nil
+        /// The pool's CPUs no one held or was promised (cpuq's `free`); nil when unknown (the
+        /// recorder's samples from before the app watched).
+        var poolFree: Int? = nil
     }
 
     /// A project's finished jobs, summed.
@@ -90,7 +93,7 @@ final class GraphModel {
         var id: String { project }
         let project: String
         let jobs: Int
-        /// Core-hours held and used.
+        /// CPU-hours held and busy.
         let held: Double
         let used: Double
         var efficiency: Double { held > 0 ? used / held : 0 }
@@ -240,7 +243,7 @@ final class GraphModel {
         }
         cpuTicks = each
         samples.append(Sample(at: now, outside: s.outside.reduce(0) { $0 + $1.using }, load: s.load.first ?? 0,
-                              gate: s.gate.state, gateText: s.gate.text, busy: busy, perCPU: perCPU))
+                              gate: s.gate.state, gateText: s.gate.text, busy: busy, perCPU: perCPU, poolFree: s.free))
         let cutoff = now.addingTimeInterval(-Self.keep)
         samples.removeAll { $0.at < cutoff }
         blocks.removeAll { ($0.to ?? now) < cutoff }
@@ -258,7 +261,7 @@ final class GraphModel {
             }
         }
         var by: [String: (jobs: Int, held: Double, used: Double, waits: [Double])] = [:]
-        for j in jobs where j.state == "done" && j.pool == "cores" {
+        for j in jobs where j.state == "done" && j.pool == "cpus" {
             guard let cores = j.cores, let ran = j.ran else { continue }
             var e = by[Self.project(j.label)] ?? (0, 0, 0, [])
             e.jobs += 1
@@ -280,7 +283,7 @@ final class GraphModel {
     private func seed(_ jobs: [Job], now: Date = Date()) {
         seeded = true
         let since = max(now.addingTimeInterval(-Self.keep), cleared ?? .distantPast).timeIntervalSince1970
-        for j in jobs.sorted(by: { ($0.started ?? 0) < ($1.started ?? 0) }) where j.pool == "cores" && j.state != "active" {
+        for j in jobs.sorted(by: { ($0.started ?? 0) < ($1.started ?? 0) }) where j.pool == "cpus" && j.state != "active" {
             guard let start = j.started, let cores = j.cores, (j.ended ?? start) >= since else { continue }
             // A job the app saw start is a block already.
             if blocks.contains(where: { $0.id.hasPrefix("\(j.pid ?? -1)-") && abs($0.from.timeIntervalSince1970 - start) < 2 }) { continue }
@@ -289,7 +292,7 @@ final class GraphModel {
             blocks.append(Block(id: "\(j.pid ?? 0)-\(Int(start))", project: Self.group(j.label, j.note), label: j.label.isEmpty ? "-" : j.label,
                                 lanes: j.slots ?? fit(cores, from: from, to: to), from: from, to: to, average: j.used, exclusive: j.exclusive))
             if let w = j.waited, w >= 1, start > since {
-                waits.append(Wait(id: "h\(j.id)", project: Self.group(j.label, j.note), label: j.label, cores: "\(cores) cores",
+                waits.append(Wait(id: "h\(j.id)", project: Self.group(j.label, j.note), label: j.label, cores: cores == 1 ? "1 CPU" : "\(cores) CPUs",
                                   need: cores, from: Date(timeIntervalSince1970: start - w), to: from, exclusive: j.exclusive))
             }
             remember(Self.group(j.label, j.note))
@@ -359,7 +362,7 @@ final class GraphModel {
     }
 
     static func wants(_ w: Status.Waiter) -> String {
-        w.exclusive ? "every core" : (w.max > w.cores ? "\(w.cores)–\(w.max) cores" : w.cores == 1 ? "1 core" : "\(w.cores) cores")
+        w.exclusive ? "every CPU" : (w.max > w.cores ? "\(w.cores)–\(w.max) CPUs" : w.cores == 1 ? "1 CPU" : "\(w.cores) CPUs")
     }
 
     /// What the charts split CPU by: the project, and with a note ("#881 markers") the project
@@ -380,8 +383,6 @@ struct GraphsView: View {
     var control: ((Machine, String, Int, String) -> Void)? = nil
     /// Starts a stopped machine with its `remote_start` command.
     var start: ((GraphModel) -> Void)? = nil
-    /// Runs `cpuq jobs ARGS...` in a job's folder on its machine.
-    var jobControl: ((Machine, String, [String], String) -> Void)? = nil
     /// The machine shown: ⌘1 for this Mac, ⌘2 and on for the remotes.
     @AppStorage("machine") private var shown = "local"
 
@@ -393,11 +394,6 @@ struct GraphsView: View {
         return { action, pid, who in control(machine, action, pid, who) }
     }
 
-    private var jobAct: ((String, [String], String) -> Void)? {
-        guard let jobControl else { return nil }
-        let machine = model.machine
-        return { folder, args, who in jobControl(machine, folder, args, who) }
-    }
     /// Read here so that a new theme draws the whole window again.
     @AppStorage("theme") private var theme = "alive"
     @AppStorage("appearance") private var appearance = "auto"
@@ -415,7 +411,7 @@ struct GraphsView: View {
             if model.status == nil, let problem = model.problem {
                 unreachable(problem)
             } else {
-                NowView(model: model, control: act, jobControl: jobAct).id(model.machine.id)
+                NowView(model: model, control: act).id(model.machine.id)
             }
         }
         .padding(16)
@@ -540,8 +536,8 @@ struct HistoryCard: View {
                         HStack(spacing: 6) { Circle().fill(model.color(t.project)).frame(width: 8, height: 8); Text(t.project) }
                     }
                     TableColumn("Jobs") { t in Text("\(t.jobs)").monospacedDigit() }.width(50)
-                    TableColumn("Core-hours in use") { t in Text(String(format: "%.2f", t.held)).monospacedDigit() }
-                    TableColumn("Active") { t in Text(String(format: "%.2f", t.used)).monospacedDigit() }
+                    TableColumn("CPU-hours held") { t in Text(String(format: "%.2f", t.held)).monospacedDigit() }
+                    TableColumn("CPU-hours busy") { t in Text(String(format: "%.2f", t.used)).monospacedDigit() }
                     TableColumn("Share") { t in
                         // Used of held: noise for a project with next to nothing held.
                         if t.held < 0.01 {

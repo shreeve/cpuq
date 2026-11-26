@@ -16,37 +16,39 @@ import Testing
 
 @Test func decodesStatus() throws {
     let json = """
-    {"schema": 1, "version": "0.4.0", "budget": 8, "held": 5, "free": 3, "load": [7.5, 6, 5],
-     "memory_pressure": "normal", "gate": {"state": "spacing", "load": 9.1, "text": "spacing admissions"},
-     "holders": [{"pid": 10, "cores": 3, "using": 2.5, "priority": "high", "exclusive": false,
-                  "label": "rig:matrix", "command": "./test/run -j 3", "since": 100, "ticket": 4}],
-     "waiters": [{"order": 1, "cores": 2, "max": 4, "label": "nexis:build", "command": "zig build", "since": 120, "eta": 30.5}],
-     "leases": [{"name": "pup-bench", "holders": [{"label": "gate", "cores": 1}], "waiters": []}],
+    {"schema": 2, "version": "0.30.2", "admit": "pool", "budget": 8, "pool": [0, 1, 2, 3, 4, 5, 6, 7],
+     "held": 5, "free": 3, "load": [7.5, 6, 5],
+     "memory_pressure": "normal", "gate": {"state": "outside_load", "load": 9.1, "text": "outside load leaves 1 of 3 free CPUs idle"},
+     "holders": [{"ticket": 4, "pid": 10, "project": "rig", "weight": 2, "cores": 3, "slots": [0, 1, 2], "using": 2.5,
+                  "tasks": 40, "done": 12, "failed": 2, "running": 3, "urgent": false, "flags": [],
+                  "label": "rig:matrix", "command": "./test/one", "since": 100}],
+     "waiters": [{"order": 1, "ticket": 6, "pid": 11, "project": "nexis", "cores": 2, "max": 4, "holds": 0,
+                  "why": "behind rig: 3 of its fair 5.3", "label": "nexis:build", "command": "zig build -j1", "since": 120}],
+     "projects": [{"name": "rig", "weight": 2, "ops": 1, "held": 3, "want": 3, "fair": 5.3},
+                  {"name": "nexis", "weight": 1, "ops": 1, "held": 0, "want": 2, "fair": 2.7}],
      "outside": [{"pid": 77, "name": "Python", "using": 1.2}]}
     """
     let s = try Status.decode(Data(json.utf8))
-    #expect(s.budget == 8 && s.held == 5)
+    #expect(s.budget == 8 && s.held == 5 && s.free == 3 && s.pool.count == 8 && s.admit == "pool")
     #expect(s.memoryPressure == "normal")
-    #expect(s.gate.state == "spacing" && s.gate.load == 9.1)
-    #expect(s.holders.first?.label == "rig:matrix" && s.holders.first?.using == 2.5)
-    #expect(s.waiters.first?.max == 4)
+    #expect(s.gate.state == "outside_load" && s.gate.load == 9.1)
+    let h = try #require(s.holders.first)
+    #expect(h.label == "rig:matrix" && h.using == 2.5 && h.ticket == 4 && h.project == "rig" && h.weight == 2)
+    #expect(h.tasks == 40 && h.done == 12 && h.failed == 2 && h.running == 3 && h.flags.isEmpty)
+    let w = try #require(s.waiters.first)
+    #expect(w.max == 4 && w.ticket == 6 && w.project == "nexis" && w.why == "behind rig: 3 of its fair 5.3")
+    #expect(s.projects.map(\.name) == ["rig", "nexis"] && s.projects[0].fair == 5.3)
     #expect(s.outside.first?.name == "Python")
 }
 
-@Test func listsAJobAmongTheHoldersAtItsWorkers() throws {
+@Test func keepsAHoldersFlags() throws {
     let json = """
-    {"budget": 10, "held": 5, "holders": [{"pid": 10, "cores": 5, "label": "em:build"}],
-     "jobs": [{"name": "rig.corpus", "stamp": "20261017-193458", "path": "/s/jobs/rig.corpus/20261017-193458",
-               "pid": 42, "state": "running", "workers": 10, "workers_from": "set", "weight": 1, "gap_ms": 0,
-               "todo": 8000, "live": 10, "done": 2900, "fail": 2, "died": 0, "using": 6.6, "since": 100, "left": 1230.5}]}
+    {"holders": [{"ticket": 80, "pid": 3675197, "project": "trig", "cores": 22, "paused": true,
+                  "flags": ["op 80 (trig:slot766): its CPU averages 0.05 busy"], "label": "trig:slot766"}]}
     """
-    let s = try Status.decode(Data(json.utf8))
-    #expect(s.holders.count == 2)
-    let j = s.holders[1]
-    #expect(j.pid == 42 && j.cores == 10 && j.using == 6.6 && j.label == "rig:corpus")
-    #expect(j.progress == Status.Progress(done: 2902, total: 10912, failing: 2))
-    #expect(j.left == 1230.5 && j.leftFrom == "progress" && !j.paused)
-    #expect(j.job == "/s/jobs/rig.corpus/20261017-193458" && j.weight == 1 && s.holders[0].weight == nil)
+    let h = try #require(try Status.decode(Data(json.utf8)).holders.first)
+    #expect(h.paused && h.cores == 22 && h.weight == 1)
+    #expect(h.flags == ["op 80 (trig:slot766): its CPU averages 0.05 busy"])
 }
 
 @Test func decodesAStatusWithFieldsMissing() throws {

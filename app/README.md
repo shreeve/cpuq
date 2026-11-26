@@ -5,11 +5,11 @@ a window with a page per machine.
 
 ## The chip and its menu
 
-The chip fills a cell per quarter of the core budget handed out. It stays calm while all is well,
-turns orange while cpuq's gate is shut or jobs wait beside idle CPUs, is struck through while cpuq
+The chip fills a cell per quarter of the pool's CPUs held. It stays calm while all is well,
+turns orange while cpuq's gate is shut or jobs wait beside free pool CPUs, is struck through while cpuq
 cannot be read, and shows "☁ 23m" while a cloud machine runs.
 
-Its menu has the app's and cpuq's versions, one line of how it stands ("6 of 10 cores in use · 2
+Its menu has the app's and cpuq's versions, one line of how it stands ("6 of 10 CPUs in use · 2
 waiting"), a line for each thing wrong (only then), and **Open Cpuq** (⌘G), **What's Happening?**,
 **Settings…**, **Check for Updates…** and **Quit Cpuq**. While the window is open the app is an
 ordinary one, with a Dock icon and a menu bar; closed, only the chip remains.
@@ -22,15 +22,17 @@ Automatic, Light or Dark. A stopped cloud machine's page offers to start it. Eac
 bottom, its sections' heights dragged to taste:
 
 - **Right Now:** a glass cell per CPU, filled with each project's color, then other work; the jobs
-  waiting sit in a tray beside them, and when they wait beside idle CPUs the empty glass glows
-  rose. cpuq's gate, memory and the load sit at the right.
+  waiting sit in a tray beside them, and when they wait while CPUs of cpuq's pool sit free the
+  empty glass glows rose (CPUs outside the pool are no one's to take). cpuq's gate, memory and the load sit at the right.
 - **Last Hour:** stacked by project and per core (a lane per CPU, performance cores above
-  efficiency cores) on one time axis, with rose where jobs waited while CPUs sat idle and a strip
+  efficiency cores) on one time axis, with rose where jobs waited while pool CPUs sat free and a strip
   of how many waited. Pointing at a moment replays it in the cells. A right click forgets what is
   older than that moment, or than five minutes ago.
-- **Jobs:** each running job's progress, CPU of the cores it reserved, and how long it has run. A
-  right click pauses or resumes it, or stops it; a waiting job moves to the front, starts now or
-  is cancelled. Stop, Start Now and Cancel ask first.
+- **Jobs:** each project's CPUs against its fair share by weight, then each running job's
+  progress (its count, else its tasks done of all), what cpuq sees wrong with it, its project's
+  weight, the CPU it uses of the CPUs it holds, and how long it has run; each waiting job says why
+  it waits. A right click pauses or resumes a job (Ctrl-Z and fg: paused, its CPUs go back to the
+  line), or stops it; a waiting job can be cancelled. Stop and Cancel ask first.
 - **History:** `cpuq history` summed per project.
 
 **View ▸ Open Live View in Terminal** (⌘L) runs `cpuq status --watch`. Theme ▸ Visual Effects
@@ -40,10 +42,9 @@ and the Mac is not strained, thirty while the mouse moves in it.
 ## Notifications and texts
 
 Once each time it happens and lasts, on any machine watched: cpuq's gate shut (30 seconds), jobs
-waiting beside idle CPUs (a minute), --opaque jobs holding cores while others wait (2 minutes),
-heavy work outside cpuq (3 minutes), a job that looks stuck or a machine overloaded while another
+waiting beside free pool CPUs (a minute), heavy work outside cpuq (3 minutes), a job that looks stuck or a machine overloaded while another
 has room (10 minutes), and a cloud machine up with nothing to do (15 minutes), with a button to
-stop it. A stuck job, an overloaded machine, idle --opaque jobs and an idle cloud machine are also
+stop it. A stuck job, an overloaded machine and an idle cloud machine are also
 texted, at most once every 30 minutes, with `~/bin/send-imessage` (the `textCommand` default)
 when it is there. **What's Happening?** says what is wrong now, then
 what was found in the last hour, each with its age; a text that failed to go shows there too.
@@ -58,7 +59,8 @@ cpuq works the same with or without the app. The app runs:
 - `cpuq status --json` every 3 seconds while the window is open and every 10 while it is closed;
 - `cpuq history --json`, and `cpuq samples` once for the last hour when status says the recorder
   runs;
-- `cpuq first`, `start`, `cancel`, `pause`, `resume` and `stop` from the Jobs actions;
+- `cpuq kill TICKET` to stop or cancel a job, and SIGTSTP and SIGCONT to its cpuq to pause and
+  resume it;
 - the same over `ssh -o BatchMode=yes HOST` for each remote while the window is open, each cloud
   machine once a minute while it is closed, and `journalctl --list-boots` there for its hours
   this month;

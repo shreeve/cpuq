@@ -8,10 +8,9 @@ import SwiftUI
 /// Pointing at the hour replays that moment in the cells.
 struct NowView: View {
     let model: GraphModel
-    /// Runs a job action (`cpuq ACTION PID`), asking first where it costs something.
+    /// Acts on a run, asking first where it costs something: "stop" and "cancel" with its
+    /// ticket, "pause" and "resume" with its cpuq's pid.
     var control: ((String, Int, String) -> Void)? = nil
-    /// Runs `cpuq jobs ARGS...` in a job's folder (folder, args, its name).
-    var jobControl: ((String, [String], String) -> Void)? = nil
 
     /// The moment under the pointer in the hour chart; nil for now.
     @State private var scrub: Date?
@@ -31,7 +30,7 @@ struct NowView: View {
         return AnyView(SplitColumn(key: "page.splits", defaults: [0.24, 0.38, 0.19, 0.19], minimums: [196, 230, 64, 96], bleed: 10, sections: [
             AnyView(HeroCard(model: model, moment: shown, motion: motion, control: control)),
             AnyView(HourCard(model: model, hour: hour, scrub: $scrub)),
-            AnyView(JobsCard(model: model, control: control, jobControl: jobControl)),
+            AnyView(JobsCard(model: model, control: control)),
             AnyView(HistoryCard(model: model)),
         ]))
     }
@@ -58,7 +57,37 @@ func roughly(_ s: TimeInterval) -> String {
 
 /// How far a running job is: "4,210 of 12,629 · 3 failing · ~9m left" from its own count,
 /// or "usually 46m" from its label's history.
+/// What cpuq sees wrong with a run, in `cpuq status`'s words; a pause shows on its own.
+func flagWords(_ h: Status.Holder) -> [String] {
+    let per = (h.using ?? 0) / Double(max(h.cores, 1))
+    return h.flags.compactMap { f in
+        switch f {
+        case "low_use": h.tasks > 1 ? String(format: "its CPUs average %.2f busy each; -x could be higher", per) : String(format: "its CPU averages %.2f busy", per)
+        case "over_cpu": String(format: "%.2f busy per CPU held: its tasks run beyond their CPUs", per)
+        case "stopped": nil
+        default: f
+        }
+    }
+}
+
+/// How far a run is, then what cpuq sees wrong with it, in orange.
 func progressText(_ h: Status.Holder) -> Text {
+    let flags = flagWords(h).joined(separator: "; ")
+    switch (progressOnly(h), flags.isEmpty) {
+    case (let p?, true): return p
+    case (let p?, false): return p + Text(" · " + flags).foregroundStyle(.orange)
+    case (nil, false): return Text(flags).foregroundStyle(.orange)
+    case (nil, true): return Text("")
+    }
+}
+
+private func progressOnly(_ h: Status.Holder) -> Text? {
+    if h.progress == nil, h.tasks > 1 {
+        var t = Text("\(h.done + h.failed) of \(h.tasks) tasks").foregroundStyle(Alive.ink)
+        if h.failed > 0 { t = t + Text(" · \(h.failed) failed").foregroundStyle(.red) }
+        if h.running > 0 { t = t + Text(" · \(h.running) running").foregroundStyle(Alive.ink2) }
+        return t
+    }
     if let p = h.progress, p.total > 0 {
         var t = Text("\(p.done.formatted()) of \(p.total.formatted())").foregroundStyle(Alive.ink)
         if p.failing > 0 { t = t + Text(" · \(p.failing.formatted()) failing").foregroundStyle(.red) }
@@ -66,7 +95,7 @@ func progressText(_ h: Status.Holder) -> Text {
         return t
     }
     if let typical = h.typical { return Text("usually \(roughly(typical))").foregroundStyle(Alive.ink3) }
-    return Text("")
+    return nil
 }
 
 /// The Mac at one moment: the CPU each project kept busy, other work, and who waited.
@@ -74,7 +103,8 @@ struct Moment {
     struct Share { let project: String; let cpu: Double }
     struct Waiter: Identifiable {
         let id: String
-        let pid: Int
+        /// Its ticket: what Cancel ends it by (`cpuq kill`); 0 for a moment replayed.
+        let ticket: Int
         let label: String
         let project: String
         let asks: String
@@ -89,7 +119,7 @@ struct Moment {
     var waiters: [Waiter] = []
     /// Why cpuq's gate was shut, if it was.
     var gateShut: String?
-    /// A timing window (`--exclusive`) holding the Mac, or first in line and waiting for it to
+    /// A drain (`cpuq drain`) holding the Mac, or first in line and waiting for it to
     /// empty: its label. Jobs waiting meanwhile wait on purpose.
     var window: String?
     /// The window holds the Mac now (else it waits for running work to end).
@@ -104,11 +134,13 @@ struct Moment {
     /// The app was running then and measured the CPUs; before it was, jobs and waits are known
     /// from cpuq but how busy the CPUs were is not.
     var watched = true
-    /// Jobs waited while CPUs sat idle with the gate open: the case to fix. Never judged from
-    /// a moment the app did not watch: unknown CPU is not idle CPU.
-    /// Free CPUs count as idle beside a waiter only when there are enough for the smallest one's
-    /// minimum: a job asking for 4 beside 2 free waits fairly.
-    var needless: Bool { watched && !waiters.isEmpty && free >= max(2, Double(waiters.map(\.need).min() ?? 2)) && gateShut == nil && window == nil }
+    /// The pool's CPUs no one held or was promised (cpuq's `free`): the machine's other CPUs
+    /// are outside the pool, and an empty one there is no one's to take. Nil when unknown.
+    var poolFree: Int?
+    /// Jobs waited while pool CPUs sat free with the gate open: the case to fix, since cpuq hands
+    /// a free CPU to the line at once. Never judged from a moment the app did not watch, nor
+    /// without the pool's count: unknown is not idle.
+    var needless: Bool { watched && !waiters.isEmpty && (poolFree ?? 0) >= 1 && gateShut == nil && window == nil }
 
     /// No more than the CPUs, whatever the readings say.
     mutating func fit() {
@@ -130,10 +162,11 @@ struct Moment {
         // The rest of what the Mac measured busy, beyond cpuq's jobs, is other work.
         if let busy = m.samples.last?.busy { out.outside = max(busy * m.cpus - jobs, 0) } else { out.outside = s.outside.reduce(0) { $0 + $1.using } }
         out.waiters = s.waiters.map {
-            Waiter(id: "\($0.pid)-\($0.since)", pid: $0.pid, label: GraphModel.label($0.label, $0.command), project: GraphModel.group($0.label, $0.note),
+            Waiter(id: "\($0.pid)-\($0.since)", ticket: $0.ticket, label: GraphModel.label($0.label, $0.command), project: GraphModel.group($0.label, $0.note),
                    asks: GraphModel.wants($0), need: $0.exclusive ? Int(m.cpus) : max($0.cores, 1), since: Date(timeIntervalSince1970: Double($0.since)))
         }
         out.gateShut = s.gate.state == "open" ? nil : s.gate.text
+        out.poolFree = s.free
         out.load = s.load.first
         if let h = s.holders.first(where: \.exclusive) {
             out.window = GraphModel.label(h.label, h.command)
@@ -160,6 +193,7 @@ struct Moment {
         out.watched = sample != nil
         if let sample {
             out.load = sample.load
+            out.poolFree = sample.poolFree
             out.outside = sample.busy.map { max($0 * m.cpus - jobs, 0) } ?? sample.outside
             if !sample.gateOpen { out.gateShut = sample.gateText }
         }
@@ -170,7 +204,7 @@ struct Moment {
             out.window = w.label
         }
         out.waiters = m.waits.filter { $0.from <= t && ($0.to ?? .distantFuture) >= t }.map {
-            Waiter(id: $0.id, pid: 0, label: $0.label, project: $0.project, asks: $0.cores, need: $0.need, since: $0.from)
+            Waiter(id: $0.id, ticket: 0, label: $0.label, project: $0.project, asks: $0.cores, need: $0.need, since: $0.from)
         }
         out.fit()
         return out
@@ -190,15 +224,15 @@ final class HourCache {
         /// The app was watching: there are machine readings.
         var watched = false
         var gateShut = false
-        /// A timing window held the Mac or waited for it to empty: waiting then was on purpose.
+        /// A drain held the Mac or waited for it to empty: waiting then was on purpose.
         var window = false
         var perCPU: [Double]?
         /// The machine's CPUs.
         var cpus = 1.0
         var total: Double { shares.values.reduce(0, +) + outside }
-        /// The fewest CPUs any job waiting then asked for.
-        var minNeed = 2
-        var needless: Bool { watched && waiting > 0 && cpus - total >= Double(max(2, minNeed)) && !gateShut && !window }
+        /// The fewest pool CPUs free in the column's samples (cpuq's `free`); nil when unknown.
+        var poolFree: Int?
+        var needless: Bool { watched && waiting > 0 && (poolFree ?? 0) >= 1 && !gateShut && !window }
     }
 
     struct Hour {
@@ -264,6 +298,7 @@ final class HourCache {
             guard i >= 0 && i < total else { continue }
             if let b = s.busy { let e = busy[i] ?? (0, 0); busy[i] = (e.0 + b, e.1 + 1) }
             let g = shut[i] ?? (0, 0); shut[i] = (g.0 + (s.gateOpen ? 0 : 1), g.1 + 1)
+            if let f = s.poolFree { cols[i].poolFree = min(cols[i].poolFree ?? f, f) }
             if let p = s.perCPU {
                 var e = per[i] ?? (Array(repeating: 0, count: p.count), 0)
                 if e.0.count == p.count { for j in p.indices { e.0[j] += p[j] }; e.1 += 1 }
@@ -279,7 +314,7 @@ final class HourCache {
             if t > m.cpus { let f = m.cpus / t; cols[i].shares = cols[i].shares.mapValues { $0 * f }; cols[i].outside *= f }
             let waiting = m.waits.filter { $0.from < cols[i].to && ($0.to ?? end) > cols[i].from }
             cols[i].waiting = waiting.count
-            cols[i].minNeed = waiting.map(\.need).min() ?? 2
+
             let c = cols[i]
             cols[i].window = m.blocks.contains { $0.exclusive && $0.from < c.to && ($0.to ?? end) > c.from }
                 || m.waits.contains { $0.exclusive && $0.from < c.to && ($0.to ?? end) > c.from }
@@ -431,12 +466,13 @@ struct HeroCard: View {
     @ViewBuilder private var capacityVerdict: some View {
         let free = String(format: "%.1f", moment.free)
         if let w = moment.window {
-            verdict("lock.fill", "Timing window", moment.windowHolds ? "\(w) has \(model.machine.name) alone" : "\(w) waits for \(model.machine.name) to empty",
+            verdict("lock.fill", "Drain", moment.windowHolds ? "\(w) has \(model.machine.name) alone" : "\(w) waits for \(model.machine.name) to empty",
                     tint: Alive.windowTint)
         } else if !moment.watched {
             verdict("eye.slash", "Not watched", "The app wasn't running then: how busy the CPUs were is unknown")
         } else if moment.needless {
-            verdict("exclamationmark.triangle.fill", "\(moment.waiters.count) waiting while \(free) CPUs sit idle",
+            let n = moment.poolFree ?? 0
+            verdict("exclamationmark.triangle.fill", "\(moment.waiters.count) waiting while \(n) of the pool's CPUs sit free",
                     "Waiting with room to spare", tint: Alive.rose)
         } else if let shut = moment.gateShut {
             verdict("pause.circle.fill", "cpuq's gate is shut", shut.hasPrefix("closed: ") ? String(shut.dropFirst(8)) : shut, tint: .orange)
@@ -454,7 +490,7 @@ struct HeroCard: View {
         let ref = moment.at ?? Date()
         if let longest = moment.waiters.map({ ref.timeIntervalSince($0.since) }).max() {
             if moment.window != nil {
-                verdict("clock", "\(moment.waiters.count) waiting \(duration(longest))", "They start when the window ends")
+                verdict("clock", "\(moment.waiters.count) waiting \(duration(longest))", "They start when the drain ends")
             } else if !moment.watched {
                 verdict("clock", "\(moment.waiters.count) waiting \(duration(longest))", "Whether CPUs were free is unknown")
             } else if moment.needless {
@@ -555,28 +591,26 @@ struct WaitingTray: View {
                     .foregroundStyle(bad ? Alive.rose : Alive.ink2).fontWeight(bad ? .semibold : .regular)
             }
             .font(.caption)
-            Text(moment.window != nil ? "asks \(w.asks) · timing window" : bad ? "asks \(w.asks) · CPUs idle" : "asks \(w.asks) · \(String(format: "%.1f", moment.free)) free")
+            Text(moment.window != nil ? "asks \(w.asks) · drain" : bad ? "asks \(w.asks) · pool CPUs free" : "asks \(w.asks) · pool full")
                 .font(.system(size: 10.5)).foregroundStyle(Alive.ink2).lineLimit(1).padding(.leading, 14)
         }
         .padding(.horizontal, 8).padding(.vertical, 5)
         .background(RoundedRectangle(cornerRadius: 9).fill(bad ? Alive.roseSoft : Alive.card))
         .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(bad ? Alive.rose : Alive.glassEdge))
         .shadow(color: .black.opacity(bad ? 0 : 0.05), radius: 1, y: 1)
-        .contextMenu { WaiterActions(pid: w.pid, label: w.label, model: model, control: control) }
+        .contextMenu { WaiterActions(ticket: w.ticket, label: w.label, model: model, control: control) }
     }
 }
 
-/// Move to Front, Start Now and Cancel, for a job waiting now.
+/// Cancel, for a run waiting now: it leaves the line (`cpuq kill TICKET`).
 struct WaiterActions: View {
-    let pid: Int
+    let ticket: Int
     let label: String
     let model: GraphModel
     var control: ((String, Int, String) -> Void)?
     var body: some View {
-        if let control, pid > 0 {
-            Button("Move to Front") { control("first", pid, label) }
-            Button("Start Now…") { control("start", pid, label) }
-            Button("Cancel…") { control("cancel", pid, label) }
+        if let control, ticket > 0 {
+            Button("Cancel…") { control("cancel", ticket, label) }
         }
     }
 }
@@ -1216,7 +1250,6 @@ struct JobsCard: View {
     let model: GraphModel
     private var cpus: Double { model.cpus }
     var control: ((String, Int, String) -> Void)?
-    var jobControl: ((String, [String], String) -> Void)?
     /// The list's visible height and how far it is scrolled: what's below the card's edge.
     @State private var listHeight: CGFloat = 0
     @State private var scrolled: CGFloat = 0
@@ -1241,11 +1274,26 @@ struct JobsCard: View {
                 .padding(.leading, 8)
                 Spacer()
                 ViewThatFits(in: .horizontal) {
-                    Text("bar = how far a job is: its count, else (lighter) its usual time; else CPU used (0–\(Int(scale)))")
+                    Text("bar = how far a job is: its count or its tasks, else (lighter) its usual time; else CPU used (0–\(Int(scale)))")
                     Text("bar = CPU used (0–\(Int(scale)))")
                     Color.clear.frame(width: 0, height: 0)
                 }
                 .font(.system(size: 11)).foregroundStyle(Alive.ink3).lineLimit(1)
+            }
+            // Each project's CPUs against its fair share by weight, once two share the pool.
+            if let ps = s?.projects, ps.count > 1 {
+                HStack(spacing: 14) {
+                    ForEach(ps, id: \.name) { p in
+                        HStack(spacing: 5) {
+                            Circle().fill(model.color(p.name)).frame(width: 7, height: 7)
+                            Text(p.name).fontWeight(.medium).foregroundStyle(Alive.ink)
+                            Text("\(p.held) of fair \(String(format: "%.1f", p.fair))" + (p.weight == 1 ? "" : " · weight \(p.weight)"))
+                                .foregroundStyle(Alive.ink2)
+                        }
+                        .help("\(p.name): \(p.ops) run\(p.ops == 1 ? "" : "s") holding \(p.held) CPU\(p.held == 1 ? "" : "s"), wanting \(p.want); its fair share by weight is \(String(format: "%.1f", p.fair))")
+                    }
+                }
+                .font(.system(size: 11.5)).monospacedDigit().lineLimit(1)
             }
             if !holders.isEmpty { columnHeads }
             ScrollView(.vertical) {
@@ -1302,6 +1350,7 @@ struct JobsCard: View {
         // How far it is, when it says (DONE of TOTAL); else an estimate, its time so far against
         // its label's usual time (a lighter bar); else the bar is its CPU.
         let done: Double? = h.progress.flatMap { $0.total > 0 ? min(Double($0.done) / Double($0.total), 1) : nil }
+            ?? (h.tasks > 1 ? min(Double(h.done + h.failed) / Double(h.tasks), 1) : nil)
         let ran = max(Date().timeIntervalSince1970 - Double(h.since), 0)
         let usual: Double? = done == nil ? h.typical.flatMap { $0 > 0 ? $0 : nil } : nil
         let estimated: Double? = usual.map { min(ran / $0, 1) }
@@ -1346,82 +1395,40 @@ struct JobsCard: View {
         .contentShape(Rectangle())
         .contextMenu {
             let name = GraphModel.label(h.label, h.command)
-            if let folder = h.job {
-                if let jobControl {
-                    Button(h.paused ? "Resume \(name)" : "Pause \(name)") { jobControl(folder, [h.paused ? "resume" : "pause"], name) }
-                    Button("Stop \(name)…") { jobControl(folder, ["stop"], name) }
-                }
-            } else if let control {
+            if let control {
+                // Pause is Ctrl-Z: its tasks stop and its CPUs go back to the line.
                 Button(h.paused ? "Resume \(name)" : "Pause \(name)") { control(h.paused ? "resume" : "pause", h.pid, name) }
-                Button("Stop \(name)…") { control("stop", h.pid, name) }
+                if h.ticket > 0 { Button("Stop \(name)…") { control("stop", h.ticket, name) } }
             }
         }
+        .help(flagWords(h).joined(separator: "\n"))
     }
 
-    /// A job's weight, a menu of weights to choose (`cpuq jobs set weight W`): its share of the
-    /// machine against the other jobs'. Nothing for a job of the queue.
-    @ViewBuilder private func weight(_ h: Status.Holder) -> some View {
-        if let folder = h.job, let w = h.weight {
-            let text = "\(w)"
-            if let jobControl {
-                let name = GraphModel.label(h.label, h.command)
-                Menu {
-                    Section("Weight") {
-                        ForEach(Array(Set(Array(1...10) + [w])).sorted(), id: \.self) { n in
-                            Button { jobControl(folder, ["set", "weight", "\(n)"], name) } label: {
-                                if n == w { Label("\(n)", systemImage: "checkmark") } else { Text("\(n)") }
-                            }
-                        }
-                    }
-                } label: {
-                    Text(text).font(.system(size: 11.5)).foregroundStyle(Alive.ink2).underline(pattern: .dot)
-                }
-                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-                .frame(width: 56, alignment: .trailing)
-                .help("Weight: \(name)'s share of the machine against the other jobs'")
-            } else {
-                Text(text).font(.system(size: 11.5)).foregroundStyle(Alive.ink3).frame(width: 56, alignment: .trailing)
-            }
-        } else {
-            Text("–").font(.system(size: 11.5)).foregroundStyle(Alive.ink3).frame(width: 56, alignment: .trailing)
-        }
+    /// Its project's weight (the config's `weights`): its share of the pool against the other
+    /// projects'.
+    private func weight(_ h: Status.Holder) -> some View {
+        Text("\(h.weight)").font(.system(size: 11.5)).foregroundStyle(h.weight == 1 ? Alive.ink3 : Alive.ink2)
+            .frame(width: 56, alignment: .trailing)
+            .help("\(h.project.isEmpty ? "Its project" : h.project)'s weight: its share of the pool against the other projects' (the config's weights)")
     }
 
-    /// What it uses of what it reserves. A job's is a menu of its workers: choosing a count sets
-    /// it (`cpuq jobs set workers N`), which holds against the agent's.
-    @ViewBuilder private func reserved(_ h: Status.Holder) -> some View {
-        let text = h.exclusive ? "timing window" : h.using.map { String(format: "%.1f of %d", $0, h.cores) } ?? "\(h.cores) reserved"
-        if let folder = h.job, let jobControl {
-            let name = GraphModel.label(h.label, h.command)
-            let most = max(Int(cpus.rounded(.up)) * 2, h.cores)
-            Menu {
-                Section("Workers") {
-                    ForEach(Array(1...most), id: \.self) { n in
-                        Button { jobControl(folder, ["set", "workers", String(n)], name) } label: {
-                            if n == h.cores { Label("\(n)", systemImage: "checkmark") } else { Text("\(n)") }
-                        }
-                    }
-                }
-            } label: {
-                Text(text).font(.system(size: 11.5)).foregroundStyle(Alive.ink2).underline(pattern: .dot)
-            }
-            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-            .frame(width: 100, alignment: .trailing)
-            .help("Workers: how many tasks \(name) runs at once")
-        } else {
-            Text(text).font(.system(size: 11.5))
-                .foregroundStyle(h.exclusive ? Alive.windowTint : Alive.ink3).frame(width: 100, alignment: .trailing)
-        }
+    /// The CPU its tasks use, of the CPUs it holds: one per running task.
+    private func reserved(_ h: Status.Holder) -> some View {
+        let text = h.paused ? "paused" : h.exclusive ? "every CPU" : h.using.map { String(format: "%.1f of %d", $0, h.cores) } ?? "\(h.cores) held"
+        return Text(text).font(.system(size: 11.5))
+            .foregroundStyle(h.exclusive ? Alive.windowTint : Alive.ink3).frame(width: 100, alignment: .trailing)
     }
 
     private func waiting(_ w: Status.Waiter, free: Double) -> some View {
         let project = GraphModel.group(w.label, w.note)
         let name = GraphModel.label(w.label, w.command)
-        let need = w.exclusive ? cpus : Double(max(w.cores, 1))
         let gate = model.status?.gate.state ?? "open"
         let window = Moment.now(model).window
-        let needless = free >= max(2, need) && gate == "open" && window == nil
-        let why = w.exclusive ? "timing window: waits for \(model.machine.name) to empty" : window != nil ? "waits for the timing window" : gate != "open" ? "the gate is shut" : needless ? "CPUs idle" : free >= need ? "starting" : "\(String(format: "%.1f", free)) free, so it holds"
+        let poolFree = Double(model.status?.free ?? 0)
+        let needless = poolFree >= 1 && gate == "open" && window == nil
+        let guess = w.exclusive ? "a drain: waits for \(model.machine.name) to empty" : window != nil ? "waits for the drain" : gate != "open" ? "the gate is shut" : needless ? "pool CPUs free" : "every pool CPU is held"
+        // cpuq's own reason when it gives one; idle CPUs beside a waiter stay the app's alarm.
+        let why = needless || w.why.isEmpty ? guess : w.why
         return HStack(spacing: 10) {
             Circle().strokeBorder(model.color(project), lineWidth: 2).frame(width: 8, height: 8)
             (Text(name).fontWeight(.medium).foregroundStyle(Alive.ink)
@@ -1435,7 +1442,7 @@ struct JobsCard: View {
         .font(.system(size: 12)).monospacedDigit()
         .frame(height: 21)
         .contentShape(Rectangle())
-        .contextMenu { WaiterActions(pid: w.pid, label: name, model: model, control: control) }
+        .contextMenu { WaiterActions(ticket: w.ticket, label: name, model: model, control: control) }
     }
 }
 
@@ -1475,7 +1482,7 @@ enum Alive {
         return Theme.nsColor((d ? Theme.current.dark : Theme.current.light).rose, alpha: d ? 0.14 : 0.10)
     })
     static let out = tone(\.out)
-    /// A timing window: calm, deliberate, not an alarm.
+    /// A drain: calm, deliberate, not an alarm.
     static let windowTint = color(0x5856d6, 0x7d7aff)
 }
 
