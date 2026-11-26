@@ -20,23 +20,20 @@ binary, [AGENTS.md](AGENTS.md) is enough.
 
 ## Where things stand
 
-- **Released:** cpuq 0.29.0 (`v0.29.0`) and Cpuq.app 0.22.0 (`app-v0.22.0`), both on
-  2026-11-03, with the Homebrew formula and cask bumped. `main` matches `origin/main`.
-- **The CPU pool** (one CPU per task, the fair line, `cpuq drain`, `cpuq kill`) is on branch
-  `slots`, draft PR #7: not released, not installed anywhere. Every machine runs 0.29.0 (burst
-  0.28.0), which takes the old form: `cpuq run --label L --cores 2-4 -- sh -c 'zig build
-  -j"$CPUQ_CORES"'`. `test/run.sh` is being rewritten for the pool, so CI fails on the branch
-  until it lands. CHANGELOG's "Unreleased" lists what each project must change before a machine is
-  cut over; cut over one machine at a time (burst, then pup, then pop), each with a rollback.
+- **Released:** cpuq 0.30.0 (`v0.30.0`, 2026-11-26): the CPU pool (one CPU per task, the fair
+  line, `cpuq drain`, `cpuq kill`, `cpuq test` through the pool). Cpuq.app 0.22.0
+  (`app-v0.22.0`) predates it: its Move to Front, Start Now and Cancel items and its jobs panel
+  call removed commands, until the app's next release.
+- **Cut-over:** docs/CUTOVER.md, done on burst, pup and pop on 2026-11-26; each machine keeps its
+  old binary (`~/.local/bin/cpuq.0.29.0`, burst's `.0.28.0`) and config (`config.before-pool`)
+  for a rollback. CHANGELOG 0.30.0 lists what each project changed.
 - **The Lean model** of the pool is in `formal/` on the `lean-model` worktree (its README says what
   is proved and what is only searched). Changes to the line (src/pool.zig) or the loop's stop and
   give-back (src/op.zig) go past it.
-- **pop** (Steve's Mac): `~/.local/bin/cpuq` and brew's are 0.29.0. The 0.29 agent and the
-  recorder run under launchd (`com.github.shreeve.cpuq.agent`, `com.github.shreeve.cpuq.record`);
-  the agent's service goes at the cut-over (docs/CUTOVER.md).
-- **pup:** 0.29.0, with the 0.29 agent as the systemd user service `cpuq-agent` (linger on), which
-  goes at the cut-over.
-- **burst:** 0.28.0, and usually stopped (it stops itself when idle).
+- **pop** (Steve's Mac): `~/.local/bin/cpuq` and brew's; the recorder runs under launchd
+  (`com.github.shreeve.cpuq.record`).
+- **pup:** `~/.local/bin/cpuq`, with linger on.
+- **burst:** `/usr/local/bin/cpuq`, and usually stopped (it stops itself when idle).
 - **Users:** Rig, Trig, Em/Emdb and Nexus run their builds and gates under `cpuq run` and
   `cpuq submit`. No project uses `cpuq test` yet: Rig runs its suite through Swarm
   (`swarm test/rig.rip`). Moving Rig onto `cpuq test` is Steve's call, so ask him, not Rig.
@@ -117,7 +114,7 @@ Each file's `//!` header says what it owns.
 
 ## Open
 
-- **The pool, before release:** the projects' edits (CHANGELOG, Unreleased) and the cut-over
-  (docs/CUTOVER.md); the app follows in PR C.
+- **Cpuq.app** for the pool: Stop (`cpuq kill`) in place of Move to Front, Start Now and Cancel;
+  each operation's CPUs, tasks (`running_tasks`) and why it waits; projects' shares.
 - **Not decided. Don't build without Steve's yes:** run a run's longest tasks first, by each
   task's last duration (this needs durations per task).

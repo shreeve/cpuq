@@ -6,7 +6,7 @@ one sitting: an old cpuq refuses `-n`, and a new one refuses `--cores`.
 
 ## Before
 
-1. **The projects' edits are ready** (CHANGELOG, "Unreleased": Rig, Trig, Rip's swarm, Em/emdb,
+1. **The projects' edits are ready** (CHANGELOG, 0.30.0: Rig, Trig, Rip's swarm, Em/emdb,
    Nexus's pack recipe). Each lands right after its machines switch. Tell each session the time.
 2. **A release binary per machine,** built from the release tag on that machine (or the release's
    tarball): `zig build -Doptimize=ReleaseSafe`, then `bin/cpuq --version`.

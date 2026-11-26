@@ -2,7 +2,7 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
-## Unreleased
+## 0.30.0 — 2026-11-26
 
 **One CPU per task, from a pool shared through a fair line.** cpuq no longer reserves cores by
 request or admits by measured use. Every task of a `cpuq run` gets exactly one CPU of the
