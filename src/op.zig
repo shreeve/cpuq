@@ -50,6 +50,7 @@ const Task = struct {
     attempt: u32,
     pid: c.pid_t = 0,
     start_ms: i64 = 0,
+    /// The held CPU it runs on; `no_slot` while it is stopped with its operation (Ctrl-Z).
     slot: usize = 0,
     /// When TERM was sent for its time limit (0: not yet).
     term_ms: i64 = 0,
@@ -65,6 +66,8 @@ const Slot = struct {
     /// When its newest task started: the slot to empty is the one whose newest is oldest.
     newest_ms: i64 = 0,
 };
+
+const no_slot = std.math.maxInt(usize);
 
 const Outcome = struct { index: u32, attempt: u32, code: u8, timed_out: bool, out: []const u8, stopped: bool = false };
 
@@ -82,6 +85,28 @@ fn onStop(sig: c.SIG) callconv(.c) void {
     _ = c.write(self_pipe[1], "s", 1);
 }
 
+var got_tstp = std.atomic.Value(bool).init(false);
+
+fn onTstp(_: c.SIG) callconv(.c) void {
+    got_tstp.store(true, .release);
+    _ = c.write(self_pipe[1], "z", 1);
+}
+
+fn onCont(_: c.SIG) callconv(.c) void {
+    _ = c.write(self_pipe[1], "g", 1);
+}
+
+fn installStop() void {
+    var sa: c.Sigaction = .{ .handler = .{ .handler = onTstp }, .mask = undefined, .flags = c.SA.RESTART };
+    _ = c.sigemptyset(&sa.mask);
+    var old: c.Sigaction = undefined;
+    if (c.sigaction(.TSTP, null, &old) == 0 and old.handler.handler == c.SIG.IGN) return;
+    _ = c.sigaction(.TSTP, &sa, null);
+    var sc: c.Sigaction = .{ .handler = .{ .handler = onCont }, .mask = undefined, .flags = c.SA.RESTART };
+    _ = c.sigemptyset(&sc.mask);
+    _ = c.sigaction(.CONT, &sc, null);
+}
+
 fn installHandlers(forward_terminal: bool) void {
     if (c.pipe(&self_pipe) != 0) main.fail("pipe failed", .{});
     for (self_pipe) |fd| {
@@ -91,6 +116,7 @@ fn installHandlers(forward_terminal: bool) void {
     var sa: c.Sigaction = .{ .handler = .{ .handler = onChild }, .mask = undefined, .flags = c.SA.RESTART | c.SA.NOCLDSTOP };
     _ = c.sigemptyset(&sa.mask);
     _ = c.sigaction(.CHLD, &sa, null);
+    installStop();
     if (forward_terminal) {
         var st: c.Sigaction = .{ .handler = .{ .handler = onStop }, .mask = undefined, .flags = c.SA.RESTART };
         _ = c.sigemptyset(&st.mask);
@@ -141,7 +167,10 @@ const Run = struct {
         for (r.slots.items) |s| if (!s.draining) {
             free_places += r.o.overload - s.used;
         };
-        const waiting = r.pending();
+        var waiting = r.pending();
+        for (r.running.items) |t| if (t.slot == no_slot) {
+            waiting += 1;
+        };
         if (waiting <= free_places) return 0;
         const need = std.math.divCeil(u32, waiting - free_places, r.o.overload) catch 0;
         const room = r.limit -| @as(u32, @intCast(r.slots.items.len));
@@ -252,7 +281,9 @@ fn loop(r: *Run) void {
         signals(r);
         timeouts(r);
         if (r.running.items.len == 0 and (r.pending() == 0 or r.stopping_since != 0)) break;
+        if (got_tstp.swap(false, .acq_rel)) suspend_(r);
         consolidate(r);
+        resumeStopped(r);
         place(r);
         const released = giveBackEmpty(r);
         const took = settle(r, released);
@@ -321,8 +352,7 @@ fn reap(r: *Run) void {
             if (t.pid == pid) break i;
         } else continue;
         const t = r.running.swapRemove(i);
-        const s = &r.slots.items[t.slot];
-        s.used -= 1;
+        if (t.slot != no_slot) r.slots.items[t.slot].used -= 1;
         if (!r.single) _ = c.kill(-t.pid, .KILL); // what the task left behind in its group
         const code: u8 = switch (w.exit) {
             .code => |n| n,
@@ -338,7 +368,7 @@ fn reap(r: *Run) void {
             if (stopped) {} else if (failed) r.rec.failed += 1 else r.rec.done += 1;
             if (r.single) r.last_wait = w;
         }
-        noteGroups(r, t.slot);
+        if (t.slot != no_slot) noteGroups(r, t.slot);
     }
 }
 
@@ -431,6 +461,47 @@ fn start(r: *Run, t_in: Task, slot: usize) void {
     noteGroups(r, slot);
 }
 
+/// Ctrl-Z: stops every task, gives back every CPU, then stops cpuq itself. Continued, it stops
+/// the tasks again (a shell continues a whole job's group, and a single task shares cpuq's), and
+/// the loop asks the line for CPUs: each stopped task continues once it has a place again.
+fn suspend_(r: *Run) void {
+    for (r.running.items) |t| _ = c.kill(if (r.single) t.pid else -t.pid, .STOP);
+    r.pool.lock();
+    for (r.slots.items) |sl| r.pool.release(sl.file);
+    r.slots.clearRetainingCapacity();
+    for (r.running.items) |*t| t.slot = no_slot;
+    r.syncRecord();
+    settleOthers(r);
+    r.pool.unlock();
+    const stopped_at = sys.monoMs();
+    // SIGSTOP, not TSTP: a TSTP to a process outside job control (an agent's shell) is dropped.
+    _ = c.raise(.STOP);
+    // Continued.
+    for (r.running.items) |*t| {
+        _ = c.kill(if (r.single) t.pid else -t.pid, .STOP);
+        // The time stopped doesn't count against its time limit.
+        t.start_ms += sys.monoMs() - stopped_at;
+    }
+}
+
+/// Gives each task stopped with its operation a place on a held CPU, and continues it.
+fn resumeStopped(r: *Run) void {
+    for (r.running.items) |*t| {
+        if (t.slot != no_slot) continue;
+        var best: ?usize = null;
+        for (r.slots.items, 0..) |sl, i| {
+            if (sl.draining or sl.used >= r.o.overload) continue;
+            if (best == null or sl.used > r.slots.items[best.?].used) best = i;
+        }
+        const i = best orelse return;
+        t.slot = i;
+        r.slots.items[i].used += 1;
+        if (is_linux) repin(r, t.pid, r.slots.items[i].cpu);
+        _ = c.kill(if (r.single) t.pid else -t.pid, .CONT);
+        noteGroups(r, i);
+    }
+}
+
 /// While a held CPU is being emptied for the line, a place freeing on another held CPU takes
 /// one of its tasks (Linux moves the task's processes there), so the emptied CPU frees sooner.
 fn consolidate(r: *Run) void {
@@ -480,7 +551,7 @@ fn giveBackEmpty(r: *Run) bool {
             r.pool.release(s.file);
             _ = r.slots.orderedRemove(i);
             // Slots after it moved down one: fix the tasks' slot numbers.
-            for (r.running.items) |*t| if (t.slot > i) {
+            for (r.running.items) |*t| if (t.slot != no_slot and t.slot > i) {
                 t.slot -= 1;
             };
             continue;
