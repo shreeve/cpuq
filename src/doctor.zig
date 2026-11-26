@@ -57,7 +57,7 @@ pub fn cmdHook(ctx: *Ctx) u8 {
     if (!std.mem.eql(u8, call.tool_name, "Bash") or call.tool_input.command.len == 0) return 0;
     const project = std.fs.path.basename(call.cwd);
     var advisor: HookAdvisor = .{ .ctx = ctx, .cwd = call.cwd };
-    const r = hook.check(a, call.tool_input.command, sys.totalCpus(ctx.io), project, advisor.it()) orelse return 0;
+    const r = hook.check(a, call.tool_input.command, project, advisor.it()) orelse return 0;
     std.debug.print("cpuq: {s}.\nRun instead: {s}\n(See AGENTS.md in the cpuq repo. A command that must run as it is can end with `# cpuq: skip`.)\n", .{ r.reason, r.instead });
     return 2;
 }
