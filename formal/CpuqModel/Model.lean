@@ -68,7 +68,25 @@ structure St where
   drains : Nat
   /-- How many more crashes (SIGKILL of a parent) the search may take. -/
   crashes : Nat
+  /-- The pool lock's holder while a drain takes its mark (`enter`, then `mark`). Every other
+  step that touches the pool is one critical section, atomic here, and needs the lock free. -/
+  poolLock : Option Nat := none
+  /-- The drains holding the drain mark (`v2/drain`), as bits by operation. -/
+  marks : Nat := 0
+  /-- A Ctrl-Z the loop has not yet acted on (`got_tstp`), as bits by operation. -/
+  tstp : Nat := 0
+  /-- Stopped in the eyes of whoever sent the Ctrl-Z: a SIGCONT is still to come, as bits. -/
+  held : Nat := 0
+  /-- Stopped by the kernel: the parent raised SIGSTOP on itself, as bits. -/
+  halted : Nat := 0
+  /-- How many more Ctrl-Z the search may send. -/
+  zs : Nat := 0
   deriving DecidableEq, Repr, Hashable, Inhabited
+
+/-- Sets of operations as bits. -/
+def bit (n o : Nat) : Bool := n.testBit o
+def setBit (n o : Nat) : Nat := if n.testBit o then n else n + 2 ^ o
+def clrBit (n o : Nat) : Nat := if n.testBit o then n - 2 ^ o else n
 
 /-- One operation: `cpuq run -n tasks -c cap -x K -r retries`, its project, whether it is
 urgent, and `forever`: each task that passes starts over, so the work never runs out (a
@@ -81,6 +99,11 @@ structure OpCfg where
   retries : Nat := 0
   urgent : Bool := false
   forever : Bool := false
+  /-- `cpuq drain`: one command, urgent. It wants every CPU of the pool while its command waits,
+  starts it only holding them all, and keeps them while it runs; while it lives (it holds the
+  drain mark) every other operation empties its CPUs, and every free CPU goes to the first
+  drain in ticket order. -/
+  drain : Bool := false
   deriving Repr
 
 /-- The rule set. Each switch is one fix; `Rules.report1` has them all off. -/
@@ -127,6 +150,16 @@ structure Rules where
   stoppedGrants : Bool := false
   /-- A drain no longer owed is cancelled (`Act.undrain`). src/pool.zig never cancels one. -/
   undrains : Bool := true
+  /-- A `cpuq drain` holds its mark with a shared lock, so a second drain never waits for the
+  first under the pool lock. Off: an exclusive lock, which a second drain waits for while it
+  holds the pool lock. -/
+  markShared : Bool := false
+  /-- A SIGCONT cancels a Ctrl-Z the loop has not yet acted on (`onCont`). -/
+  contCancels : Bool := false
+  /-- Right before it raises SIGSTOP on itself, a stopping parent checks whether a SIGCONT came
+  since it took the Ctrl-Z, and if one did, goes on instead. The plan's rules have it: they say
+  nothing of how a Ctrl-Z is received, and the code's race is not theirs. -/
+  haltChecks : Bool := true
   deriving Repr
 
 namespace Rules
@@ -154,7 +187,7 @@ def fixed : Rules := { plan with zeroFirst := true, giverBehind := true }
 /-- The rules of src/pool.zig and src/op.zig on branch `slots` (ba33a16). -/
 def pool : Rules :=
   { fixed with renewAtRelease := true, stoppedWaits := true, liveCounts := true, oneGiver := true,
-               undrains := false }
+               undrains := false, haltChecks := false }
 
 /-- `pool` with the fixes this model proposes for it (README, "Findings" 4, 5 and 6), which is
 the code on `slots` at 8f997ec:
@@ -165,6 +198,13 @@ def poolFixed : Rules := { pool with behindFresh := true, stoppedWaits := false 
 /-- The code at 0d315ed: a stopped operation wants nothing, but a grant made to it before it
 stopped stays valid. (8f997ec drops those grants: the code there is `poolFixed`.) -/
 def pool0d315ed : Rules := { poolFixed with stoppedGrants := true }
+
+/-- The code as released (0.30.2): `poolFixed`, with a drain's mark held shared and a SIGCONT
+cancelling a Ctrl-Z not yet acted on. -/
+def released : Rules := { poolFixed with markShared := true, contCancels := true }
+
+/-- `released` with the stop check this model proposes (README, "Findings" 8). -/
+def releasedFixed : Rules := { released with haltChecks := true }
 
 end Rules
 
@@ -177,6 +217,8 @@ structure Cfg where
   /-- Crash budget: how many parents the search may kill with SIGKILL. -/
   crashes : Nat := 0
   stops : Bool := false
+  /-- With `stops`, how many Ctrl-Z the search may send. -/
+  ctrlZ : Nat := 1
   kills : Bool := false
   timeouts : Bool := false
 
@@ -190,6 +232,7 @@ end St
 
 def Cfg.op (cfg : Cfg) (o : Nat) : OpCfg := cfg.ops.getD o {}
 def Cfg.w (cfg : Cfg) (p : Nat) : Nat := cfg.weights.getD p 1
+def drainOp (cfg : Cfg) (o : Nat) : Bool := (cfg.op o).drain
 
 def ownsC (o : Nat) (x : Cpu) : Bool :=
   match x.slot with
@@ -213,6 +256,9 @@ def grants (s : St) (o : Nat) : Nat := s.cpus.countP (grantedC o)
 /-- `o`'s processes on CPU `c`. -/
 def runningOn (s : St) (o c : Nat) : Nat := (s.op o).tasks.countP (runningC c)
 def pendingN (s : St) (o : Nat) : Nat := (s.op o).tasks.countP pendingT
+/-- Some task of `o` runs. -/
+def busy (s : St) (o : Nat) : Bool :=
+  (s.op o).tasks.any (fun t => match t.st with | .running _ => true | _ => false)
 def isAlive (s : St) (o : Nat) : Bool := (s.op o).phase == .alive
 end St
 
@@ -237,6 +283,10 @@ def grantLive (cfg : Cfg) (s : St) (h : Nat) : Bool :=
 than its pending tasks need beyond the room it has (packing, rule 3). -/
 def demand (cfg : Cfg) (s : St) (o : Nat) : Nat :=
   if liveOp cfg s o then
+    if drainOp cfg o then
+      (if !s.busy o && decide (s.pendingN o > 0) then (cfg.op o).cap - (s.owned o + s.grants o)
+       else 0)
+    else
     min ((cfg.op o).cap - (s.owned o + s.grants o))
         (ceilDiv (s.pendingN o - room cfg s o) (cfg.op o).K)
   else 0
@@ -314,6 +364,18 @@ def yieldTo (cfg : Cfg) (s : St) (o h : Nat) : Bool :=
     (decide (a ≥ 1) && decide ((b + 1) * cfg.w p ≤ (a - 1) * cfg.w q)) || eff cfg s h == 0
   else decide (eff cfg s o ≥ eff cfg s h + 2)
 
+/-- The first `cpuq drain` in ticket order that has started and not ended (alive or stopped:
+its record stays while it is stopped). -/
+def drainer (cfg : Cfg) (s : St) : Option Nat :=
+  s.order.find? (fun o => drainOp cfg o && ((s.op o).phase == .alive || (s.op o).phase == .stopped))
+
+/-- Who a free token goes to: while there is a drainer, it alone (and no one while it wants
+nothing); else the head of the line. -/
+def target (cfg : Cfg) (s : St) : Option Nat :=
+  match drainer cfg s with
+  | some d => if decide (demand cfg s d > 0) then some d else none
+  | none => head cfg s
+
 /-! ## Changing the state -/
 
 namespace St
@@ -360,7 +422,7 @@ def firstPending (s : St) (o : Nat) : Option Nat :=
 /-- Hand token `c` to the head, if it is free and someone waits (one grant of a pass). -/
 def grantOne (cfg : Cfg) (s : St) (c : Nat) : St :=
   if freeC cfg s (s.cpu c) then
-    match head cfg s with
+    match target cfg s with
     | some h => s.setCpu c { s.cpu c with grant := some h }
     | none => s
   else s
@@ -385,10 +447,12 @@ def renewed (s : St) (o : Nat) : List Nat := s.order.filter (· != o) ++ [o]
 
 /-- May `o` give a slot to the head `h` (rule 6, and the switches)? -/
 def mayGive (cfg : Cfg) (s : St) (o h c : Nat) : Bool :=
-  s.isAlive o && h != o && yieldTo cfg s o h &&
-  (!cfg.rules.giverBehind ||
-    (let s2 := drainEff cfg s o c
-     ahead cfg (if cfg.rules.behindFresh then { s2 with order := renewed s2 o } else s2) h o))
+  s.isAlive o && h != o && !drainOp cfg o &&
+  (drainOp cfg h ||
+   (yieldTo cfg s o h &&
+    (!cfg.rules.giverBehind ||
+      (let s2 := drainEff cfg s o c
+       ahead cfg (if cfg.rules.behindFresh then { s2 with order := renewed s2 o } else s2) h o))))
 
 /-- An operation's best not-draining slot to give, if any (the lowest CPU). -/
 def keptSlot (s : St) (o : Nat) : Option Nat :=
@@ -412,6 +476,7 @@ def giverOf (cfg : Cfg) (s : St) (h : Nat) : Option Nat :=
 /-- Drain on demand (rule 6): may `o` mark its slot `c` draining now? -/
 def canDrain (cfg : Cfg) (s : St) (o c : Nat) : Bool :=
   s.isAlive o && (s.cpu c).slot == some { owner := o } &&
+  (s.marks != 0 && !drainOp cfg o ||
   if cfg.rules.ledger then
     match head cfg s with
     | none => false
@@ -419,7 +484,7 @@ def canDrain (cfg : Cfg) (s : St) (o c : Nat) : Bool :=
       decide (s.drains < need cfg s) && mayGive cfg s o h c &&
       (!cfg.rules.oneGiver || giverOf cfg s h == some o)
   else
-    s.order.any (fun w => w != o && waiter cfg s w && before cfg s w o && yieldTo cfg s o w)
+    s.order.any (fun w => w != o && waiter cfg s w && before cfg s w o && yieldTo cfg s o w))
 
 def anyDrain (cfg : Cfg) (s : St) (o : Nat) : Bool :=
   (List.range s.cpus.length).any (canDrain cfg s o)
@@ -484,9 +549,19 @@ inductive Act where
   | kill (o : Nat)
   /-- SIGKILL of the parent: the kernel drops its flocks; its tasks run on. -/
   | crash (o : Nat)
+  /-- The parent acts on a Ctrl-Z: its tasks stop and it gives every CPU back. -/
   | stop (o : Nat)
+  /-- A SIGCONT. -/
   | cont (o : Nat)
   | finish (o : Nat)
+  /-- A drain arriving takes the pool lock. -/
+  | enter (o : Nat)
+  /-- A drain holding the pool lock takes its mark, registers, and lets the lock go. -/
+  | mark (o : Nat)
+  /-- A Ctrl-Z (SIGTSTP) arrives; the handler only notes it. -/
+  | tstp (o : Nat)
+  /-- A parent that has given its CPUs back for a Ctrl-Z raises SIGSTOP on itself. -/
+  | halt (o : Nat)
   deriving DecidableEq, Repr, Hashable, Inhabited
 
 def step (cfg : Cfg) (s : St) : Act → Option St
@@ -522,7 +597,8 @@ def step (cfg : Cfg) (s : St) : Act → Option St
     | none => none
   | .refill o c =>
     if s.isAlive o && (s.cpu c).slot == some { owner := o } &&
-       decide (s.runningOn o c < (cfg.op o).K) && !anyDrain cfg s o then
+       decide (s.runningOn o c < (cfg.op o).K) && !anyDrain cfg s o &&
+       (!drainOp cfg o || s.owned o == s.cpus.length) then
       match firstPending s o with
       | some i => some (s.setTask o i { s.task o i with st := .running c })
       | none => none
@@ -532,7 +608,7 @@ def step (cfg : Cfg) (s : St) : Act → Option St
     | some sl =>
       if s.isAlive o && sl.owner == o && s.runningOn o c == 0 &&
          (!cfg.rules.releaseWaitsDying || (s.op o).tasks.all (fun t => t.dying != some c)) &&
-         (sl.draining || s.pendingN o == 0) then
+         (sl.draining || s.pendingN o == 0) && !(drainOp cfg o && s.busy o) then
         some (handout cfg { s.setCpu c {} with
           drains := s.drains - (if sl.draining then 1 else 0)
           order := if cfg.rules.renewAtRelease then renewed s o else s.order })
@@ -581,21 +657,77 @@ def step (cfg : Cfg) (s : St) : Act → Option St
     if s.isAlive o && s.owned o == 0 &&
        (s.op o).tasks.all (fun t =>
          (t.st == .done || t.st == .failed || t.st == .gone) && t.dying == none) then
-      some (s.setPhase o .over)
+      some (handout cfg (s.setPhase o .over))
     else none
+  | .enter _ | .mark _ | .tstp _ | .halt _ => none
+
+/-- Steps that touch the pool, under its lock. -/
+def needsLock : Act → Bool
+  | .arrive _ | .release _ _ | .handout | .accept _ _ | .drain _ _ | .undrain _ _ | .kill _
+  | .stop _ | .finish _ | .enter _ => true
+  | _ => false
+
+/-- Leaving: the kernel drops what the parent held (its drain mark), and its signals no longer
+matter. -/
+def leave (s : St) (o : Nat) : St :=
+  { s with marks := clrBit s.marks o, tstp := clrBit s.tstp o, held := clrBit s.held o,
+           halted := clrBit s.halted o }
+
+/-- A step with its locks and signals. `step` is the effect of each critical section on the
+pool; `move` adds the pool lock (a drain takes its mark while holding it), the drain mark, and
+Ctrl-Z as the code receives it: the handler notes it, the loop acts on it, the parent then
+raises SIGSTOP on itself, and a SIGCONT continues it. -/
+def move (cfg : Cfg) (s : St) (a : Act) : Option St :=
+  if needsLock a && s.poolLock.isSome then none else
+  match a with
+  | .arrive o => if drainOp cfg o then none else step cfg s a
+  | .enter o =>
+    if drainOp cfg o && (s.op o).phase == .waiting then some { s with poolLock := some o } else none
+  | .mark o =>
+    if s.poolLock == some o && (cfg.rules.markShared || s.marks == 0) then
+      (step cfg s (.arrive o)).map fun s' => { s' with poolLock := none, marks := setBit s'.marks o }
+    else none
+  | .crash o =>
+    (step cfg s a).map fun s' =>
+      { leave s' o with poolLock := if s.poolLock == some o then none else s.poolLock }
+  | .kill o => (step cfg s a).map (leave · o)
+  | .finish o => (step cfg s a).map (leave · o)
+  | .tstp o =>
+    if cfg.stops && decide (s.zs > 0) && !bit s.held o &&
+       ((s.op o).phase == .alive || (s.op o).phase == .stopped) then
+      some { s with tstp := setBit s.tstp o, held := setBit s.held o, zs := s.zs - 1 }
+    else none
+  | .stop o =>
+    if bit s.tstp o then (step cfg s a).map fun s' => { s' with tstp := clrBit s'.tstp o } else none
+  | .halt o =>
+    if (s.op o).phase == .stopped && !bit s.halted o then
+      if cfg.rules.haltChecks && !bit s.held o then step cfg s (.cont o)
+      else some { s with halted := setBit s.halted o }
+    else none
+  | .cont o =>
+    if bit s.held o then
+      if bit s.halted o then
+        (step cfg s a).map fun s' => { s' with held := clrBit s'.held o, halted := clrBit s'.halted o }
+      else
+        some { s with held := clrBit s.held o,
+                      tstp := if cfg.rules.contCancels then clrBit s.tstp o else s.tstp }
+    else none
+  | a => step cfg s a
 
 def init (cfg : Cfg) : St :=
   { cpus := List.replicate cfg.cpus {}
     ops := cfg.ops.map (fun oc => { phase := .waiting, tasks := List.replicate oc.tasks {} })
     order := []
     drains := 0
-    crashes := cfg.crashes }
+    crashes := cfg.crashes
+    zs := if cfg.stops then cfg.ctrlZ else 0 }
 
 /-- Every action worth trying in a state (`step` decides which are enabled). -/
 def actions (cfg : Cfg) : List Act :=
   let os := opIds cfg
   let cs := List.range cfg.cpus
-  os.flatMap (fun o => [.arrive o, .kill o, .crash o, .stop o, .cont o, .finish o]) ++
+  os.flatMap (fun o => [.arrive o, .kill o, .crash o, .stop o, .cont o, .finish o, .enter o,
+    .mark o, .tstp o, .halt o]) ++
   os.flatMap (fun o => (List.range (cfg.op o).tasks).flatMap (fun i =>
     [.exit o i true, .timeout o i, .gone o i] ++
     (if (cfg.op o).retries > 0 then [.exit o i false] else []) ++
@@ -605,6 +737,6 @@ def actions (cfg : Cfg) : List Act :=
   [.handout]
 
 def next (cfg : Cfg) (s : St) : List (Act × St) :=
-  (actions cfg).filterMap (fun a => (step cfg s a).map (a, ·))
+  (actions cfg).filterMap (fun a => (move cfg s a).map (a, ·))
 
 end Cpuq

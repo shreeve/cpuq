@@ -26,17 +26,17 @@ attribute [-simp] List.getD_eq_getElem?_getD
 
 /-! ### A hand-out pass -/
 
-theorem grantOne_of_head_none {cfg : Cfg} {s : St} {c : Nat} (h : head cfg s = none) :
+theorem grantOne_of_target_none {cfg : Cfg} {s : St} {c : Nat} (h : target cfg s = none) :
     grantOne cfg s c = s := by
   unfold grantOne; split
   · rw [h]
   · rfl
 
-theorem handoutOver_of_head_none {cfg : Cfg} {s : St} (h : head cfg s = none) (cs : List Nat) :
+theorem handoutOver_of_target_none {cfg : Cfg} {s : St} (h : target cfg s = none) (cs : List Nat) :
     handoutOver cfg s cs = s := by
   induction cs with
   | nil => rfl
-  | cons c cs ih => simp only [handoutOver, grantOne_of_head_none h, ih]
+  | cons c cs ih => simp only [handoutOver, grantOne_of_target_none h, ih]
 
 theorem grantOne_ops (cfg : Cfg) (s : St) (c : Nat) : (grantOne cfg s c).ops = s.ops := by
   unfold grantOne; split
@@ -95,11 +95,12 @@ theorem handoutOver_keeps {cfg : Cfg} {s : St} {c' : Nat} (cs : List Nat)
     obtain ⟨a, b⟩ := ih hf'
     exact ⟨a.trans k, b.trans o⟩
 
-/-- L2: after a pass over `cs`, a token of `cs` is free only if no one is in line. -/
+/-- L2: after a pass over `cs`, a token of `cs` is free only if there is no one to give it to:
+no one in line, or a drainer that wants nothing more. -/
 theorem handoutOver_conserves {cfg : Cfg} (cs : List Nat) :
     ∀ (s : St) (c : Nat), c ∈ cs → c < s.cpus.length →
       freeC cfg (handoutOver cfg s cs) ((handoutOver cfg s cs).cpu c) = true →
-      head cfg (handoutOver cfg s cs) = none := by
+      target cfg (handoutOver cfg s cs) = none := by
   induction cs with
   | nil => intro s c hc; cases hc
   | cons c0 cs ih =>
@@ -108,13 +109,13 @@ theorem handoutOver_conserves {cfg : Cfg} (cs : List Nat) :
     rcases List.mem_cons.1 hc with e | e
     · subst e
       -- What the grant did to c.
-      cases hh : head cfg s with
+      cases hh : target cfg s with
       | none =>
-        rw [grantOne_of_head_none hh, handoutOver_of_head_none hh]; exact hh
+        rw [grantOne_of_target_none hh, handoutOver_of_target_none hh]; exact hh
       | some h =>
         by_cases f0 : freeC cfg s (s.cpu c) = true
-        · -- c is granted to h, a living waiter: no longer free, and it stays so.
-          have ha : liveOp cfg s h = true := waiter_live (head_waiter hh)
+        · -- c is granted to h, a living operation: no longer free, and it stays so.
+          have ha : liveOp cfg s h = true := (target_ok hh).1
           have g1 : (grantOne cfg s c).cpu c = { s.cpu c with grant := some h } := by
             unfold grantOne; rw [ite_eq_left f0, hh]; simp only
             rw [St.cpu_setCpu]; simp [hlen]
@@ -129,10 +130,10 @@ theorem handoutOver_conserves {cfg : Cfg} (cs : List Nat) :
           rw [k, freeC_congr (handoutOver_keeps cs nf).2, nf] at hf; cases hf
     · exact ih _ c e (by rw [grantOne_len]; exact hlen) hf
 
-/-- L2, work conservation: right after a hand-out pass, a token is free only if no one is in
-line. -/
+/-- L2, work conservation: right after a hand-out pass, a token is free only if there is no one
+to give it to. -/
 theorem handout_conserves (cfg : Cfg) (s : St) (c : Nat) (hc : c < s.cpus.length)
-    (hf : freeC cfg (handout cfg s) ((handout cfg s).cpu c) = true) : head cfg (handout cfg s) = none :=
+    (hf : freeC cfg (handout cfg s) ((handout cfg s).cpu c) = true) : target cfg (handout cfg s) = none :=
   handoutOver_conserves _ s c (List.mem_range.2 hc) hc hf
 
 /-! ### The line -/
@@ -182,27 +183,29 @@ theorem standing_line {cfg : Cfg} {s : St} (hst : cfg.rules.standing = true) (h 
 nothing and a drain is still owed, any other alive operation may drain any slot it holds that
 is not draining. -/
 theorem zero_head_can_drain {cfg : Cfg} {s : St} {h o c : Nat}
-    (hl : cfg.rules.ledger = true) (hsh : cfg.rules.shareRule = true)
+    (hl : cfg.rules.ledger = true) (hsh : cfg.rules.shareRule = true) (hdo : drainOp cfg o = false)
     (hgb : cfg.rules.giverBehind = false) (hog : cfg.rules.oneGiver = false)
     (hh : head cfg s = some h) (hz : eff cfg s h = 0) (hne : h ≠ o)
     (ha : (s.op o).phase = .alive) (hsl : (s.cpu c).slot = some { owner := o })
     (hneed : s.drains < need cfg s) : canDrain cfg s o c = true := by
   unfold canDrain mayGive yieldTo
-  simp [St.isAlive, ha, hsl, hl, hh, hsh, hz, hgb, hog, hne, hneed]
+  simp [St.isAlive, ha, hsl, hl, hh, hsh, hz, hgb, hog, hne, hneed, hdo]
 
 /-- A drain under the share clause is a transfer Lemma P counts: between the giver's project p
 and the head's project q, measured in slots held as the line counts them. -/
 theorem drain_is_transfer {cfg : Cfg} {s : St} {h o c : Nat}
-    (hl : cfg.rules.ledger = true) (hsh : cfg.rules.shareRule = true)
+    (hl : cfg.rules.ledger = true) (hsh : cfg.rules.shareRule = true) (hm : s.marks = 0)
+    (hdh : drainOp cfg h = false)
     (hd : canDrain cfg s o c = true) (hh : head cfg s = some h) (hz : eff cfg s h ≠ 0) :
     Transfers.shareOk cfg.w (projEff cfg s) (cfg.op o).proj (cfg.op h).proj := by
   have m : mayGive cfg s o h c = true := by
     unfold canDrain at hd
-    simp only [hl, hh, ite_true, Bool.and_eq_true] at hd
+    simp only [hl, hh, hm, ite_true, Bool.and_eq_true, bne_self_eq_false, Bool.false_and,
+      Bool.false_or] at hd
     exact hd.2.1.2
   unfold mayGive at m
-  simp only [Bool.and_eq_true] at m
-  have y := m.1.2
+  simp only [Bool.and_eq_true, hdh, Bool.false_or] at m
+  have y := m.2.1
   simp only [yieldTo, hsh, ite_true, Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq,
     beq_iff_eq, hz, or_false] at y
   exact y
@@ -404,6 +407,7 @@ theorem step_tickets {cfg : Cfg} {s s' : St} {a : Act} (e : step cfg s a = some 
   | finish o =>
     simp only [Cpuq.step] at e; split at e
     · rename_i g; cases e; intro o' hs
+      rw [(handout_order_ops cfg _).1]; rw [phase_of_ops (handout_order_ops cfg _).2] at hs
       by_cases eo : o = o'
       · subst eo
         have ho : o < s.ops.length := s.lt_of_phase o (by
@@ -411,6 +415,14 @@ theorem step_tickets {cfg : Cfg} {s s' : St} {a : Act} (e : step cfg s a = some 
         rw [St.phase_setPhase _ _ _ _ ho] at hs; simp [started] at hs
       · rw [St.op_setPhase_ne _ _ _ _ eo] at hs; exact hold o' hs
     · cases e
+  | enter o | mark o | tstp o | halt o => simp [Cpuq.step] at e
+
+theorem move_tickets {cfg : Cfg} {s s' : St} {a : Act} (e : move cfg s a = some s')
+    (hold : ∀ o, started (s.op o).phase → o ∈ s.order) :
+    ∀ o, started (s'.op o).phase → o ∈ s'.order := by
+  rcases move_cases e with ⟨-, ho, hr, -⟩ | ⟨b, t, hb, ⟨-, ho, hr, -⟩⟩
+  · intro o hs; rw [hr]; rw [phase_of_ops ho] at hs; exact hold o hs
+  · intro o hs; rw [hr]; rw [phase_of_ops ho] at hs; exact step_tickets hb hold o hs
 
 theorem Reach.tickets {cfg : Cfg} {s : St} (r : Reach cfg s) :
     ∀ o, started (s.op o).phase → o ∈ s.order := by
@@ -420,16 +432,23 @@ theorem Reach.tickets {cfg : Cfg} {s : St} (r : Reach cfg s) :
     exfalso
     simp only [St.op, Cpuq.init, List.getD_eq_getElem?_getD, List.getElem?_map] at hs
     cases h : cfg.ops[o]? <;> simp [h, started] at hs
-  | step a _ e ih => exact step_tickets e ih
+  | step a _ e ih => exact move_tickets e ih
+
+theorem drainer_congr {cfg : Cfg} {s t : St} (ho : s.ops = t.ops) (hr : s.order = t.order) :
+    drainer cfg s = drainer cfg t := by
+  simp only [drainer, hr, phase_of_ops ho]
 
 /-- L2 for every reachable state under a standing line: right after a hand-out pass, if a token
-is free then no living operation wants a slot. -/
+is free and no `cpuq drain` is in the line, then no living operation wants a slot. -/
 theorem work_conserving {cfg : Cfg} {s : St} (r : Reach cfg s) (hst : cfg.rules.standing = true)
-    (c : Nat) (hc : c < s.cpus.length)
+    (hdr : drainer cfg s = none) (c : Nat) (hc : c < s.cpus.length)
     (hf : freeC cfg (handout cfg s) ((handout cfg s).cpu c) = true)
     (o : Nat) (ha : ((handout cfg s).op o).phase = .alive) : demand cfg (handout cfg s) o = 0 := by
-  have hh := handout_conserves cfg s c hc hf
+  have ht := handout_conserves cfg s c hc hf
   obtain ⟨ho1, ho2⟩ := handout_order_ops cfg s
+  have hh : head cfg (handout cfg s) = none := by
+    rw [← drainer_congr ho2 ho1] at hdr
+    simpa [target, hdr] using ht
   apply standing_line hst hh o _ ha
   rw [ho1]; rw [phase_of_ops ho2] at ha
   exact r.tickets o (by simp [started, ha])

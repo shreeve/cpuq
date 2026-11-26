@@ -8,8 +8,11 @@ configurations it is given and says nothing past them. The proofs (`Safety.lean`
 
 The checks, by name (README lists which guarantee each one is):
 - state: `S1 holder`, `S1 grant`, `S3 cap`, `S4 K`, `S5 twice`, `S1' shared`, `S1' unheld`,
-  `D count`, and `L2 idle` (a CPU no one holds while an operation wants one, and no grant or
-  accept can happen until some task ends);
+  `D count`, `L2 idle` (a CPU no one holds while an operation wants one, and no pass or
+  accept can happen until some task ends; a release, a finish and a drain's registration
+  run a pass), `CS stuck` (the pool lock's holder waits for a lock
+  that only the pool lock lets go: a deadlock) and `Z stuck` (a parent stopped by the kernel
+  that no SIGCONT will continue);
 - step: `F1 drain not owed`,
   `F6 drain not for the head`, `F6 giver ahead` (after the drain the giver ranks before the
   waiter it drained for, so the token may come back to the giver);
@@ -65,8 +68,12 @@ def stateFails (cfg : Cfg) (s : St) (enabled : List (Act × St)) : List String :
     cs.any (fun c => physFree s (s.cpu c)) &&
     os.any (fun o => s.isAlive o && decide (demand cfg s o > 0)) &&
     !enabled.any (fun (a, _) => match a with
-      | .handout | .accept _ _ => true
+      | .handout | .accept _ _ | .release _ _ | .finish _ | .mark _ => true
       | _ => false)
+  let csStuck := s.poolLock.isSome && !enabled.any (fun (a, _) => match a with
+      | .mark _ => true
+      | _ => false)
+  let zStuck := os.any (fun o => bit s.halted o && !bit s.held o)
   (if holder then [] else ["S1 holder"]) ++
   (if grant then [] else ["S1 grant"]) ++
   (if cap then [] else ["S3 cap"]) ++
@@ -75,7 +82,9 @@ def stateFails (cfg : Cfg) (s : St) (enabled : List (Act × St)) : List String :
   (if twice then [] else ["S5 twice"]) ++
   (if shared then [] else ["S1' shared"]) ++
   (if unheld then [] else ["S1' unheld"]) ++
-  (if idle then ["L2 idle"] else [])
+  (if idle then ["L2 idle"] else []) ++
+  (if csStuck then ["CS stuck"] else []) ++
+  (if zStuck then ["Z stuck"] else [])
 
 /-- The yield rule of FINAL-PLAN rule 6, whatever the rules searched. -/
 def yieldShare (cfg : Cfg) (s : St) (o h : Nat) : Bool :=
@@ -84,6 +93,8 @@ def yieldShare (cfg : Cfg) (s : St) (o h : Nat) : Bool :=
 def stepFails (cfg : Cfg) (s : St) (a : Act) (s' : St) : List String :=
   match a with
   | .drain o _ =>
+    -- While a `cpuq drain` lives, every other operation empties its CPUs: not a line drain.
+    if s.marks != 0 && !drainOp cfg o then [] else
     (if decide (s.drains < need cfg s) then [] else ["F1 drain not owed"]) ++
     (match head cfg s with
      | some h =>
@@ -98,17 +109,19 @@ def starving (cfg : Cfg) (s : St) (w : Nat) : Bool :=
   s.isAlive w && decide (demand cfg s w > 0) && s.owned w + s.grants w == 0
 
 /-- Steps of the environment that the liveness checks leave out: no more crashes, kills or
-stops (FINAL-PLAN's liveness assumptions). -/
+Ctrl-Z (FINAL-PLAN's liveness assumptions). A parent acting on a Ctrl-Z already received, and
+the SIGCONT owed for it, are not left out. -/
 def progressAct : Act → Bool
-  | .crash _ | .kill _ | .stop _ => false
+  | .crash _ | .kill _ | .tstp _ => false
   | _ => true
 
 /-- The weak-fairness class of a step, or none for steps nothing forces: an arrival, a
-timeout (optional), a crash, a kill, a stop. A task's exit is one class whether it passes or
-fails (A-term: every task ends). -/
+timeout (optional), a crash, a kill, a Ctrl-Z. A task's exit is one class whether it passes or
+fails (A-term: every task ends). A SIGCONT is weakly fair while one is owed (A-cont: whoever
+sent a Ctrl-Z continues the run). -/
 def fairKey : Act → Option Act
   | .exit o i _ => some (.exit o i true)
-  | .timeout _ _ | .arrive _ | .crash _ | .kill _ | .stop _ => none
+  | .timeout _ _ | .arrive _ | .crash _ | .kill _ | .tstp _ => none
   | a => some a
 
 structure Report where
@@ -325,7 +338,11 @@ def brief (cfg : Cfg) (s : St) : String :=
   let hd := match head cfg s with
     | some h => opName h
     | none => "none"
-  String.intercalate " " cs ++ s!" | head {hd}, drains {s.drains}"
+  let lk := match s.poolLock with
+    | some o => s!", pool lock {opName o}"
+    | none => ""
+  let mk := if s.marks != 0 then s!", marks {s.marks}" else ""
+  String.intercalate " " cs ++ s!" | head {hd}, drains {s.drains}{lk}{mk}"
 
 def actName : Act → String
   | .arrive o => s!"{opName o} arrives"
@@ -341,8 +358,12 @@ def actName : Act → String
   | .consolidate o i d => s!"{opName o}{i+1} moves to cpu{d}"
   | .kill o => s!"cpuq kill {opName o}"
   | .crash o => s!"{opName o}'s parent is SIGKILLed"
-  | .stop o => s!"{opName o} stopped"
-  | .cont o => s!"{opName o} continues"
+  | .stop o => s!"{opName o} gives its CPUs back for a Ctrl-Z"
+  | .cont o => s!"SIGCONT to {opName o}"
+  | .enter o => s!"{opName o} takes the pool lock"
+  | .mark o => s!"{opName o} takes the drain mark and registers"
+  | .tstp o => s!"Ctrl-Z to {opName o}"
+  | .halt o => s!"{opName o} raises SIGSTOP on itself"
   | .finish o =>
     if o ≥ 2000 then s!"(a weakly fair run that never gets {opName (o - 2000)} a CPU:)"
     else if o ≥ 1000 then s!"(from here no run gets {opName (o - 1000)} a CPU)"
@@ -357,7 +378,7 @@ def narrate (cfg : Cfg) (name : String) : String :=
     let mut s := init cfg
     let mut out := s!"{name}:\n"
     for a in tr do
-      match step cfg s a with
+      match move cfg s a with
       | some s' =>
         s := s'
         out := out ++ s!"  {actName a}: {brief cfg s}\n"

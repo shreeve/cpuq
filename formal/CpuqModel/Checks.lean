@@ -3,12 +3,12 @@ The exhaustive searches `lake build` runs, each with the result it gave, so a ch
 or the rules that changes what is found shows here. Names of the checks: `Explore.lean`.
 
 Scenarios: up to 3 CPUs, 3 operations, K ≤ 2, with crashes (SIGKILL of a parent), timeouts and
-retries, Ctrl-Z stops, `cpuq kill`, an urgent operation and project weights. `forever`
+retries, Ctrl-Z, `cpuq kill`, an urgent operation, project weights and `cpuq drain`. `forever`
 operations never run out of work, so a waiter that is not served is starved, not merely late.
 Rule sets: `Rules.report1` (FINAL-REPORT-1, as review2-formal read it), `Rules.plan`
 (FINAL-PLAN), `Rules.planLoose` (FINAL-PLAN with the unsafe reading of "its place frees at
-once"), `Rules.fixed` (FINAL-PLAN with the two fixes the search found it needs), and FINAL-PLAN
-with one fix taken out at a time.
+once"), `Rules.fixed` (FINAL-PLAN with the two fixes the search found it needs), FINAL-PLAN
+with one fix taken out at a time, and the code's rules (`Rules.pool` and after).
 -/
 import CpuqModel.Explore
 
@@ -53,6 +53,32 @@ def urgent (r : Rules) : Cfg :=
   { cpus := 3, rules := r, weights := [2, 1], stops := true, kills := true
     ops := [{ proj := 0, tasks := 3, forever := true }, { proj := 1, tasks := 2, forever := true },
             { proj := 1, tasks := 1, urgent := true }] }
+
+/-- A `cpuq drain` on a pool of `n` CPUs. -/
+def drainOn (n proj : Nat) : OpCfg := { proj, tasks := 1, urgent := true, drain := true, cap := n }
+
+/-- 2 CPUs, an operation with endless work and two `cpuq drain`s (the deadlock of 2026-11-26). -/
+def twoDrains (r : Rules) : Cfg :=
+  { cpus := 2, rules := r
+    ops := [{ proj := 0, tasks := 2, forever := true }, drainOn 2 1, drainOn 2 2] }
+
+/-- 3 CPUs, a drain among a K = 2 operation and a single; one parent may be killed by SIGKILL. -/
+def drainCrash (r : Rules) : Cfg :=
+  { cpus := 3, rules := r, crashes := 1
+    ops := [{ proj := 0, tasks := 2, K := 2, forever := true }, drainOn 3 1,
+            { proj := 2, tasks := 1, forever := true }] }
+
+/-- 2 CPUs, two operations with endless work, two Ctrl-Z. -/
+def ctrlZ (r : Rules) : Cfg :=
+  { cpus := 2, rules := r, stops := true, ctrlZ := 2
+    ops := [{ proj := 0, tasks := 2, forever := true }, { proj := 1, tasks := 1, forever := true }] }
+
+/-- 2 CPUs: an urgent operation with endless work holds one CPU of project P, an operation of
+project Q the other, and P's second operation waits. -/
+def urgentHolds (r : Rules) : Cfg :=
+  { cpus := 2, rules := r
+    ops := [{ proj := 0, tasks := 1, urgent := true, forever := true },
+            { proj := 1, tasks := 1, forever := true }, { proj := 0, tasks := 1, forever := true }] }
 
 def row (name : String) (cfg : Cfg) : IO Unit :=
   IO.println s!"{name}: {(explore cfg).summary}"
@@ -116,7 +142,7 @@ herd: ok: 1395 states, 5286 steps
 -- "its place frees at once" breaks safety (Finding 3).
 /--
 info: odd split: FAILED (11005 states): F6 giver ahead, L3 fair, L3 never
-urgent: FAILED (198187 states): F6 giver ahead, L3 fair
+urgent: FAILED (426821 states): F6 giver ahead, L3 fair
 loose timeout: FAILED (4248 states): S5 twice, S1' unheld, S1' shared
 -/
 #guard_msgs in
@@ -129,7 +155,7 @@ loose timeout: FAILED (4248 states): S5 twice, S1' unheld, S1' shared
 /--
 info: zero first only, odd split: FAILED (11251 states): F6 giver ahead, L3 fair
 giver behind only, odd split: FAILED (9862 states): L3 never, L3 fair
-zero first only, urgent: FAILED (227713 states): F6 giver ahead, L3 fair
+zero first only, urgent: FAILED (491551 states): F6 giver ahead, L3 fair
 -/
 #guard_msgs in
 #eval do
@@ -146,7 +172,7 @@ crash: ok: 20258 states, 52798 steps
 strand: ok: 5360 states, 14411 steps
 timeout: ok: 2347 states, 6536 steps
 herd: ok: 1395 states, 5286 steps
-urgent: ok: 141740 states, 1086544 steps
+urgent: ok: 314964 states, 2135829 steps
 -/
 #guard_msgs in
 #eval do
@@ -163,12 +189,13 @@ urgent: ok: 141740 states, 1086544 steps
 `Rules.pool`: FINAL-PLAN with both fixes, plus what the code does that the plan doesn't say: the
 giver's ticket is renewed when it gives its CPU back, one giver is chosen as `giver` chooses,
 a drain is never cancelled, dead operations don't count, and a stopped operation stays in the
-line. It fails two scenarios (README, Findings 4 and 5); `Rules.poolFixed` passes all. -/
+line. It fails two scenarios (README, Findings 4 and 5). `Rules.poolFixed`, the code at 8f997ec,
+passes them; it fails only on a SIGCONT lost while a parent stops (`Z stuck`, Finding 8). -/
 
 /--
 info: two CPUs: FAILED (664 states): L3 never, L3 fair
 strand: FAILED (3198 states): L3 never, L3 fair
-urgent: FAILED (78346 states): L2 idle
+urgent: FAILED (335938 states): L2 idle, Z stuck, L3 never
 -/
 #guard_msgs in
 #eval do
@@ -183,7 +210,7 @@ crash: ok: 20030 states, 52516 steps
 strand: ok: 6358 states, 16733 steps
 timeout: ok: 2347 states, 6536 steps
 herd: ok: 1607 states, 6037 steps
-urgent: ok: 186614 states, 1389637 steps
+urgent: FAILED (410930 states): Z stuck
 -/
 #guard_msgs in
 #eval do
@@ -198,9 +225,63 @@ urgent: ok: 186614 states, 1389637 steps
 -- The code at 0d315ed: a grant made to an operation before it stops still idles its CPU while it
 -- is stopped (README, Finding 6). 8f997ec fixes it; the code there is `poolFixed`, above.
 /--
-info: urgent: FAILED (202583 states): L2 idle
+info: urgent: FAILED (442296 states): L2 idle, Z stuck, L3 never
 -/
 #guard_msgs in
 #eval row "urgent" (urgent .pool0d315ed)
+
+/-! ## `cpuq drain`, the pool lock, and Ctrl-Z as the code receives them
+
+`Rules.poolFixed` is the code before 0.30.1: a drain takes its mark with an exclusive lock while
+it holds the pool lock, so a second drain waits for the first under the pool lock, and the
+first waits for the pool lock to leave: every cpuq stops (`CS stuck`). `Rules.released` is the
+code as released (0.30.2): the mark is shared. A SIGCONT that comes after the parent took the
+Ctrl-Z and before it raised SIGSTOP on itself is lost (`Z stuck`, Finding 8), before 0.30.2 and
+since; `Rules.releasedFixed` checks for one right before raising SIGSTOP. -/
+
+/--
+info: two drains, before 0.30.1: FAILED (791 states): CS stuck, L2 idle, L3 never
+two drains: ok: 1277 states, 2847 steps
+drain, crash: ok: 6454 states, 19135 steps
+Ctrl-Z, before 0.30.2: FAILED (3417 states): Z stuck
+Ctrl-Z: FAILED (2655 states): Z stuck
+Ctrl-Z, checked: ok: 2274 states, 8531 steps
+-/
+#guard_msgs in
+#eval do
+  row "two drains, before 0.30.1" (twoDrains .poolFixed)
+  row "two drains" (twoDrains .released)
+  row "drain, crash" (drainCrash .released)
+  row "Ctrl-Z, before 0.30.2" (ctrlZ .poolFixed)
+  row "Ctrl-Z" (ctrlZ .released)
+  row "Ctrl-Z, checked" (ctrlZ .releasedFixed)
+
+-- Every earlier scenario, on the released code with the stop check.
+/--
+info: two CPUs: ok: 1002 states, 2618 steps
+odd split: ok: 9805 states, 34340 steps
+crash: ok: 20030 states, 52516 steps
+strand: ok: 6358 states, 16733 steps
+timeout: ok: 2347 states, 6536 steps
+herd: ok: 1607 states, 6037 steps
+urgent: ok: 300171 states, 1932428 steps
+-/
+#guard_msgs in
+#eval do
+  row "two CPUs" (twoCpus .releasedFixed)
+  row "odd split" (oddSplit .releasedFixed)
+  row "crash" (crash .releasedFixed)
+  row "strand" (strand .releasedFixed)
+  row "timeout" (timeout .releasedFixed)
+  row "herd" (herd .releasedFixed)
+  row "urgent" (urgent .releasedFixed)
+
+-- An urgent operation with endless work starves an operation of its own project (Finding 7).
+/--
+info: urgent holds: FAILED (187 states): L3 never, L3 fair
+-/
+#guard_msgs in
+#eval do
+  row "urgent holds" (urgentHolds .releasedFixed)
 
 end Cpuq.Checks

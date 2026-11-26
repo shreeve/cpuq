@@ -226,7 +226,8 @@ def takenCpu (o : Nat) : Cpu := { lock := some o, grant := none, slot := some { 
 /-- The state after `o` takes token `c` with reclaim. -/
 def taken (s : St) (o c : Nat) : St :=
   St.mk (s.cpus.set c (takenCpu o)) (reclaimOps c s.ops) s.order
-    (s.drains - (if drainingC (s.cpu c) then 1 else 0)) s.crashes
+    (s.drains - (if drainingC (s.cpu c) then 1 else 0)) s.crashes s.poolLock s.marks s.tstp s.held
+    s.halted s.zs
 
 theorem takeTok_eq (cfg : Cfg) (s : St) (o c : Nat) (hr : cfg.rules.reclaim = true) :
     takeTok cfg s o c = taken s o c := by
@@ -358,7 +359,7 @@ theorem Inv.takeTok {cfg : Cfg} {s : St} {o c : Nat} (h : Inv cfg s) (hr : cfg.r
 
 /-- `s` with CPU `c`'s record replaced, the drain count and the tickets given. -/
 def withCpu (s : St) (c : Nat) (x : Cpu) (d : Nat) (ord : List Nat) : St :=
-  St.mk (s.cpus.set c x) s.ops ord d s.crashes
+  St.mk (s.cpus.set c x) s.ops ord d s.crashes s.poolLock s.marks s.tstp s.held s.halted s.zs
 
 theorem withCpu_cpu (s : St) (c : Nat) (x : Cpu) (d : Nat) (ord : List Nat) (c' : Nat)
     (hc : c < s.cpus.length) : (withCpu s c x d ord).cpu c' = if c = c' then x else s.cpu c' := by
@@ -476,13 +477,34 @@ theorem demand_room {cfg : Cfg} {s : St} {h : Nat} (d : demand cfg s h > 0) :
     s.owned h + s.grants h < (cfg.op h).cap := by
   unfold demand at d
   split at d
-  · have := Nat.lt_of_lt_of_le d (Nat.min_le_left _ _); omega
+  · split at d
+    · split at d
+      · omega
+      · exact absurd d (Nat.lt_irrefl 0)
+    · have := Nat.lt_of_lt_of_le d (Nat.min_le_left _ _); omega
+  · exact absurd d (Nat.lt_irrefl 0)
+
+theorem demand_live {cfg : Cfg} {s : St} {h : Nat} (d : demand cfg s h > 0) : liveOp cfg s h = true := by
+  unfold demand at d
+  split at d
+  · assumption
   · exact absurd d (Nat.lt_irrefl 0)
 
 theorem waiter_room {cfg : Cfg} {s : St} {h : Nat} (w : waiter cfg s h = true) :
     s.owned h + s.grants h < (cfg.op h).cap := by
   simp only [waiter, Bool.and_eq_true, decide_eq_true_eq] at w
   exact demand_room w.1.2
+
+/-- A free token goes only to a living operation with room under its ceiling. -/
+theorem target_ok {cfg : Cfg} {s : St} {g : Nat} (e : target cfg s = some g) :
+    liveOp cfg s g = true ∧ s.owned g + s.grants g < (cfg.op g).cap := by
+  unfold target at e
+  split at e
+  · split at e
+    · rename_i hd; cases e; simp only [decide_eq_true_eq] at hd
+      exact ⟨demand_live hd, demand_room hd⟩
+    · cases e
+  · have w := head_waiter e; exact ⟨waiter_live w, waiter_room w⟩
 
 theorem freeC_lock {cfg : Cfg} {s : St} {x : Cpu} (f : freeC cfg s x = true) : x.lock = none := by
   simp only [freeC, Bool.and_eq_true, Option.isNone_iff_eq_none] at f; exact f.1
@@ -508,9 +530,7 @@ theorem Inv.grantOne {cfg : Cfg} {s : St} (h : Inv cfg s) (c : Nat) : Inv cfg (C
       by_cases hc : c < s.cpus.length
       · rw [setCpu_eq]
         have hl := freeC_lock f
-        have w := head_waiter hh
-        have hlive := waiter_live w
-        have hroom := waiter_room w
+        obtain ⟨hlive, hroom⟩ := target_ok hh
         have hold : (s.cpu c).grant ≠ some g := fun e => by
           have := freeC_grant f e; simp [grantLive, hlive] at this
         apply h.withCpu hc
@@ -767,6 +787,7 @@ def dropLock (o : Nat) (x : Cpu) : Cpu := if x.lock == some o then { x with lock
 
 def crashed (s : St) (o : Nat) : St :=
   St.mk (s.cpus.map (dropLock o)) (s.setPhase o .dead).ops s.order s.drains (s.crashes - 1)
+    s.poolLock s.marks s.tstp s.held s.halted s.zs
 
 theorem crashed_cpu (s : St) (o c : Nat) : (crashed s o).cpu c = dropLock o (s.cpu c) := by
   simp only [St.cpu, crashed]
@@ -862,7 +883,7 @@ def clearOf (o : Nat) (x : Cpu) : Cpu := if ownsC o x then {} else x
 
 def retired (s : St) (o : Nat) (g : Task → Task) (p : Phase) : St :=
   St.mk (s.cpus.map (clearOf o)) (s.ops.set o { phase := p, tasks := (s.op o).tasks.map g }) s.order
-    (s.drains - s.drainOf o) s.crashes
+    (s.drains - s.drainOf o) s.crashes s.poolLock s.marks s.tstp s.held s.halted s.zs
 
 theorem retire_eq (s : St) (o : Nat) (g : Task → Task) (p : Phase) (ho : o < s.ops.length) :
     ((releaseAll s o).mapTasks o g).setPhase o p = retired s o g p := by
@@ -1184,7 +1205,7 @@ theorem Inv.step {cfg : Cfg} {s s' : St} {a : Act} (hs : Safe cfg.rules) (h : In
     split at e
     · rename_i g
       simp only [Bool.and_eq_true, beq_iff_eq, decide_eq_true_eq, Bool.not_eq_true'] at g
-      obtain ⟨⟨⟨ha, hsl⟩, hk⟩, -⟩ := g
+      obtain ⟨⟨⟨⟨ha, hsl⟩, hk⟩, -⟩, -⟩ := g
       split at e
       · rename_i i hp
         cases e
@@ -1210,7 +1231,7 @@ theorem Inv.step {cfg : Cfg} {s s' : St} {a : Act} (hs : Safe cfg.rules) (h : In
       split at e
       · rename_i g
         simp only [Bool.and_eq_true, beq_iff_eq, Bool.or_eq_true, Bool.not_eq_true'] at g
-        obtain ⟨⟨⟨⟨ha, hown⟩, hr0⟩, hdy⟩, -⟩ := g
+        obtain ⟨⟨⟨⟨⟨ha, hown⟩, hr0⟩, hdy⟩, -⟩, -⟩ := g
         cases e
         have ha' : (s.op o).phase = .alive := by simpa [St.isAlive] using ha
         apply Inv.handout
@@ -1325,6 +1346,7 @@ theorem Inv.step {cfg : Cfg} {s s' : St} {a : Act} (hs : Safe cfg.rules) (h : In
       obtain ⟨⟨ha, hown⟩, hall⟩ := g
       cases e
       have ha' : (s.op o).phase = .alive := by simpa [St.isAlive] using ha
+      apply Inv.handout
       apply h.finish ha' hown
       intro i c x
       have := all_task hall (by decide) i
@@ -1333,6 +1355,70 @@ theorem Inv.step {cfg : Cfg} {s s' : St} {a : Act} (hs : Safe cfg.rules) (h : In
       · rw [x] at this; simp at this
       · rw [x] at this; simp at this
     · cases e
+  | enter o | mark o | tstp o | halt o => simp [Cpuq.step] at e
+
+/-! ### Locks and signals -/
+
+/-- Two states that agree on everything the pool's rules read but the pool lock, the drain mark
+and the signals. -/
+def Same (s t : St) : Prop := t.cpus = s.cpus ∧ t.ops = s.ops ∧ t.order = s.order ∧ t.drains = s.drains
+
+theorem Same.rfl' (s : St) : Same s s := ⟨rfl, rfl, rfl, rfl⟩
+
+theorem Inv.congr {cfg : Cfg} {s t : St} (h : Inv cfg s) (e : Same s t) : Inv cfg t := by
+  obtain ⟨hc, ho, -, hd⟩ := e
+  cases s; cases t
+  simp only at hc ho hd; subst hc ho hd
+  exact ⟨h.len, h.lockOwner, h.ownerLock, h.ownerPhase, h.grantFree, h.kBound, h.capBound,
+    h.drainCount, h.dyingTimedOut, h.pinned⟩
+
+/-- What `move` adds to `step` touches only the pool lock, the drain mark and the signals. -/
+theorem move_cases {cfg : Cfg} {s s' : St} {a : Act} (e : move cfg s a = some s') :
+    Same s s' ∨ ∃ b t, step cfg s b = some t ∧ Same t s' := by
+  have viaMap : ∀ (b : Act) (f : St → St), (∀ t, Same t (f t)) →
+      (step cfg s b).map f = some s' → ∃ b t, step cfg s b = some t ∧ Same t s' := by
+    intro b f hf e
+    obtain ⟨t, ht, rfl⟩ := Option.map_eq_some_iff.1 e
+    exact ⟨b, t, ht, hf t⟩
+  unfold move at e
+  split at e
+  · cases e
+  · split at e
+    · split at e
+      · cases e
+      · exact .inr ⟨_, _, e, Same.rfl' _⟩
+    · split at e
+      · cases e; exact .inl ⟨rfl, rfl, rfl, rfl⟩
+      · cases e
+    · split at e
+      · exact .inr (viaMap _ _ (fun _ => by exact ⟨rfl, rfl, rfl, rfl⟩) e)
+      · cases e
+    · exact .inr (viaMap _ _ (fun _ => by exact ⟨rfl, rfl, rfl, rfl⟩) e)
+    · exact .inr (viaMap _ _ (fun _ => by exact ⟨rfl, rfl, rfl, rfl⟩) e)
+    · exact .inr (viaMap _ _ (fun _ => by exact ⟨rfl, rfl, rfl, rfl⟩) e)
+    · split at e
+      · cases e; exact .inl ⟨rfl, rfl, rfl, rfl⟩
+      · cases e
+    · split at e
+      · exact .inr (viaMap _ _ (fun _ => by exact ⟨rfl, rfl, rfl, rfl⟩) e)
+      · cases e
+    · split at e
+      · split at e
+        · exact .inr ⟨_, _, e, Same.rfl' _⟩
+        · cases e; exact .inl ⟨rfl, rfl, rfl, rfl⟩
+      · cases e
+    · split at e
+      · split at e
+        · exact .inr (viaMap _ _ (fun _ => by exact ⟨rfl, rfl, rfl, rfl⟩) e)
+        · cases e; exact .inl ⟨rfl, rfl, rfl, rfl⟩
+      · cases e
+    · exact .inr ⟨_, _, e, Same.rfl' _⟩
+
+theorem Inv.move {cfg : Cfg} {s s' : St} {a : Act} (hs : Safe cfg.rules) (h : Inv cfg s)
+    (e : move cfg s a = some s') : Inv cfg s' := by
+  rcases move_cases e with x | ⟨b, t, hb, x⟩
+  · exact h.congr x
+  · exact (h.step hs hb).congr x
 
 /-! ### The initial state, and every state reached -/
 
@@ -1371,12 +1457,12 @@ theorem Inv.init (cfg : Cfg) : Inv cfg (Cpuq.init cfg) := by
 /-- The states the protocol can reach from its start. -/
 inductive Reach (cfg : Cfg) : St → Prop where
   | init : Reach cfg (Cpuq.init cfg)
-  | step {s s' : St} (a : Act) : Reach cfg s → step cfg s a = some s' → Reach cfg s'
+  | step {s s' : St} (a : Act) : Reach cfg s → move cfg s a = some s' → Reach cfg s'
 
 theorem Reach.inv {cfg : Cfg} {s : St} (hs : Safe cfg.rules) (r : Reach cfg s) : Inv cfg s := by
   induction r with
   | init => exact Inv.init cfg
-  | step a _ e ih => exact ih.step hs e
+  | step a _ e ih => exact ih.move hs e
 
 /-! ### The guarantees, in every reachable state -/
 
@@ -1424,10 +1510,11 @@ theorem drain_count : s.drains = s.cpus.countP drainingC := (r.inv hs).drainCoun
 
 end
 
-/-- S8: a hand-out grant goes only to the first in line. -/
+/-- S8: a hand-out grant goes only to the first in line, or, while a `cpuq drain` is in the
+line, to the first drain. -/
 theorem grantOne_head (cfg : Cfg) (s : St) (c c' g : Nat)
     (e : ((Cpuq.grantOne cfg s c).cpu c').grant = some g) :
-    (s.cpu c').grant = some g ∨ head cfg s = some g := by
+    (s.cpu c').grant = some g ∨ target cfg s = some g := by
   unfold Cpuq.grantOne at e
   split at e
   · split at e
