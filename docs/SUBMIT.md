@@ -71,7 +71,7 @@ never write them.
 |---|---|---|
 | `label` | `project:task` | required |
 | `run` | `sh -c RUN cpuq ARGS...` at the copy's top, as one task; `-- ARGS` become `"$@"` (`cpuq submit`) | `run` or `tasks` |
-| `tasks` | `sh -c TASKS cpuq ARGS...` after `setup`, writing one task file per task into `$CPUQ_TODO` (its work up to the first blank line, run with `sh`); `cpuq jobs run` then runs them on the host, each with `$CPUQ_CODE`, the copy's path (`cpuq test`) | `run` or `tasks` |
+| `tasks` | `sh -c TASKS cpuq ARGS...` after `setup`, writing one task file per task into `$CPUQ_TODO` (its work up to the first blank line, run with `sh`); they then run on the host one per CPU of its pool (`cpuq run -n COUNT -- cpuq _task FOLDER`, README "A test's tasks"), each with `$CPUQ_CODE`, the copy's path (`cpuq test`) | `run` or `tasks` |
 | `setup` | run first, in the same job | none |
 | `driver` | `true`: the job is a runner (`cpuq run --driver`): it holds no CPU, and each `cpuq run` it starts takes its own, so `run` may fan out with `cpuq run -n M` | `false`: one task on one CPU |
 | `time` | wall time from the job's start on its CPU, enforced by `cpuq cap --time` around setup and run; required on a host with `remote_start` | 2h there, none here |

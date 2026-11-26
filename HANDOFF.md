@@ -9,7 +9,7 @@ binary, [AGENTS.md](AGENTS.md) is enough.
 2. [AGENTS.md](AGENTS.md): how coding agents on these machines are told to use cpuq. Keep it
    true whenever a command or flag changes.
 3. [docs/DESIGN.md](docs/DESIGN.md): how it works inside: the pool's files, an operation's loop,
-   the line, giving CPUs back, the gates, nesting, leases, jobs of task files and the agent.
+   the line, giving CPUs back, the gates, nesting, leases, and a test's tasks.
 4. [docs/SUBMIT.md](docs/SUBMIT.md): specs, `cpuq submit` and `cpuq test`.
 5. [docs/RELEASING.md](docs/RELEASING.md): cutting a CLI release and a Cpuq.app release;
    [docs/CUTOVER.md](docs/CUTOVER.md): moving a machine onto the pool, once.
@@ -31,11 +31,12 @@ binary, [AGENTS.md](AGENTS.md) is enough.
 - **The Lean model** of the pool is in `formal/` on the `lean-model` worktree (its README says what
   is proved and what is only searched). Changes to the line (src/pool.zig) or the loop's stop and
   give-back (src/op.zig) go past it.
-- **pop** (Steve's Mac): `~/.local/bin/cpuq` and brew's are 0.29.0. The agent and the recorder
-  run under launchd (`com.github.shreeve.cpuq.agent`, `com.github.shreeve.cpuq.record`).
-- **pup:** 0.29.0, with the agent as the systemd user service `cpuq-agent` (linger on).
-- **burst:** 0.28.0, and usually stopped. The next time it is up for other work, upgrade it and
-  run `cpuq agent --install`. Steve approved this, but never start burst just to do it.
+- **pop** (Steve's Mac): `~/.local/bin/cpuq` and brew's are 0.29.0. The 0.29 agent and the
+  recorder run under launchd (`com.github.shreeve.cpuq.agent`, `com.github.shreeve.cpuq.record`);
+  the agent's service goes at the cut-over (docs/CUTOVER.md).
+- **pup:** 0.29.0, with the 0.29 agent as the systemd user service `cpuq-agent` (linger on), which
+  goes at the cut-over.
+- **burst:** 0.28.0, and usually stopped (it stops itself when idle).
 - **Users:** Rig, Trig, Em/Emdb and Nexus run their builds and gates under `cpuq run` and
   `cpuq submit`. No project uses `cpuq test` yet: Rig runs its suite through Swarm
   (`swarm test/rig.rip`). Moving Rig onto `cpuq test` is Steve's call, so ask him, not Rig.
@@ -83,7 +84,7 @@ Run everything heavy under cpuq, even here:
 | Config and gates | `policy.zig` (config keys, removed keys with their pointers, the gates, weights, CPU lists) |
 | Named leases | `leasing.zig`, `state.zig` (a lease's queue) |
 | Machine signals | `sys.zig` (CPU ticks, memory, spawning, affinity, `PR_SET_PDEATHSIG`), `records.zig` (record, samples, history, clean), `history.zig`, `joblog.zig`, `runtimes.zig` |
-| Jobs of task files | `jobs.zig` (the driver, `cpuq jobs`), `agent.zig` (`cpuq agent`, `attach`), `lines.zig` (line sockets), `cap.zig` |
+| A test's tasks, limits | `tasks.zig` (`cpuq test`'s task folder, `cpuq _task`), `cap.zig` |
 | Other machines | `remotes.zig` (`--on`), `submit.zig` (`submit`, `test`, `job`; a spec's removed `cores`), `gitship.zig`, `place.zig`, `packs.zig`, `repos.zig` |
 | Showing and guarding | `status.zig`, `statusjson.zig` (schema 2), `hook.zig` (rules, `removed_options`), `clean.zig` |
 
@@ -116,14 +117,7 @@ Each file's `//!` header says what it owns.
 
 ## Open
 
-- **The pool, before release:** PR B removes `cpuq jobs`, the agent and `cpuq test`'s driver, with
-  the projects' edits (Rip's swarm wraps each case in `cpuq run --`); the app follows in PR C.
-  Known gaps on `slots` are listed in the PR.
-- **Tune the agent once it runs real work:** the ×2-per-step cap, the 10% deadband, "cut fast"
-  (two ticks over: × target/runq), and memory-short × 0.75. A new job's cost starts at 1.0. It
-  could come from its label's history instead, but that isn't built.
-- **Not decided. Don't build these without Steve's yes:**
-  1. Run longest tasks first, by each task's last duration (this needs durations per task).
-  2. On Linux, autogroup nice (`/proc/PID/autogroup`) and ionice best-effort 7 for job tasks.
-  3. A hook in Rig's test/run (`RIG_JOBS_DIR`) that writes one task file per test;
-     `scripts/rig-jobs.sh` expects it.
+- **The pool, before release:** the projects' edits (CHANGELOG, Unreleased) and the cut-over
+  (docs/CUTOVER.md); the app follows in PR C.
+- **Not decided. Don't build without Steve's yes:** run a run's longest tasks first, by each
+  task's last duration (this needs durations per task).

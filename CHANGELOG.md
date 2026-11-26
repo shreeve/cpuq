@@ -55,13 +55,21 @@ time, so a build runs at one job (`zig build -j1`) as one task.
   `$CPUQ_CORES`, and accepts `--driver` only for a test runner.
 - **A removed option, config key, spec field or command fails with one line naming what replaces
   it** (exit 2), so agents' notes learn the new form.
+- **`cpuq test` runs a spec's tasks one per CPU of the pool,** as `cpuq run -n COUNT -- cpuq
+  _task FOLDER`, beside every other run (README, "A test's tasks"). A task file's work, output and
+  `==` line are as before; exit 0 goes to `done/`, anything else to `fail/`, and a task cut off
+  stays in `todo/`. A run of many writes its progress to `CPUQ_PROGRESS`, which `cpuq job` shows.
 
 **Removed.** Run and lease options `--cores`, `--priority`, `--max-wait` (now `--wait-max`),
 `--exclusive` (`cpuq drain`; for a lease, `cpuq lease NAME -- cpuq drain -- CMD`),
 `--no-load-check`, `--qos`, `--opaque`. Variables `CPUQ_CORES`, `CPUQ_CPUS`, `CPUQ_TOKEN`,
 `CPUQ_WINDOW_OWNER` and the make jobserver in `MAKEFLAGS`; `CPUQ_PROGRESS` is set only for a
 submitted job. Commands `cpuq first`, `start`, `cancel`, `pause`, `resume`, `stop` (`cpuq kill`,
-Ctrl-Z), `note` (`--note`), `doctor` (`cpuq status`), `qos`. Config keys `admit`, `target`,
+Ctrl-Z), `note` (`--note`), `doctor` (`cpuq status`), `qos`; `cpuq jobs run`, `status`, `watch`,
+`set`, `pause`, `resume`, `stop` and `reset` (a folder of task files: `cpuq test`, or `cpuq run -n`),
+`cpuq agent` and `cpuq attach` (the pool shares the machine by itself; `cpuq jobs` lists submitted
+jobs). Stop an installed 0.29 agent: `launchctl bootout gui/$UID/com.github.shreeve.cpuq.agent`
+(macOS), `systemctl --user disable --now cpuq-agent` (Linux). Config keys `admit`, `target`,
 `settle`, `right_size`, `poll`, `aging`, `note`, `backfill`, `window_backfill`, `patience`,
 `exclusive`, `window_gap`, `window_lend`, `lend`, `lend_after`, `cpu_weights`, `affinity`,
 `load_check`, `load_margin`, `active_cap`, `qos`, `max_memory` (`cpuq cap --mem`). A spec's
