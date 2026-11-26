@@ -85,8 +85,8 @@ structure St where
 
 /-- Sets of operations as bits. -/
 def bit (n o : Nat) : Bool := n.testBit o
-def setBit (n o : Nat) : Nat := if n.testBit o then n else n + 2 ^ o
-def clrBit (n o : Nat) : Nat := if n.testBit o then n - 2 ^ o else n
+def setBit (n o : Nat) : Nat := n ||| 2 ^ o
+def clrBit (n o : Nat) : Nat := if n.testBit o then n ^^^ 2 ^ o else n
 
 /-- One operation: `cpuq run -n tasks -c cap -x K -r retries`, its project, whether it is
 urgent, and `forever`: each task that passes starts over, so the work never runs out (a
