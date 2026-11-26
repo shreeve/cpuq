@@ -14,6 +14,7 @@
 //! Every file lives under the state directory (`~/.local/state/cpuq/jobs/ID/`), on both sides.
 
 const std = @import("std");
+const tasks_mod = @import("tasks.zig");
 const builtin = @import("builtin");
 const Io = std.Io;
 const c = std.c;
@@ -94,10 +95,15 @@ const Spec = struct {
     /// The job, one command (`cpuq submit`); a spec has this or `tasks`.
     run: ?[]const u8 = null,
     /// A command that writes the job's tasks, one file each, into `$CPUQ_TODO`, after `setup`
-    /// (`cpuq test`): `cpuq jobs run` then runs them, each with `$CPUQ_CODE`, the copy's path.
+    /// (`cpuq test`): they then run one per CPU of the pool (tasks.zig), each with `$CPUQ_CODE`,
+    /// the copy's path.
     tasks: ?[]const u8 = null,
     setup: ?[]const u8 = null,
-    cores: ?[]const u8 = null,
+    /// Read only to refuse it, with what replaces it.
+    cores: ?std.json.Value = null,
+    /// The job is a runner (`cpuq run --driver`): it holds no CPU, and the `cpuq run`s it
+    /// starts take their own. Without it, the job is one task on one CPU.
+    driver: bool = false,
     time: ?[]const u8 = null,
     mem: ?[]const u8 = null,
     tools: ?Map = null,
@@ -132,7 +138,7 @@ const Payload = struct {
     tasks: ?[]const u8 = null,
     /// A `tasks` job's name under the host's jobs folder: one per worktree.
     job: []const u8 = "",
-    cores: ?[]const u8 = null,
+    driver: bool = false,
     time: ?[]const u8 = null,
     mem: ?[]const u8 = null,
     tools: ?Map = null,
@@ -227,7 +233,6 @@ const Result = struct {
     host: []const u8 = "",
     code: ?i64 = null,
     seconds: f64 = 0,
-    cores: []const u8 = "",
     /// The host's CPUs (0 from a host before 0.28.0): what its time is scaled by for another.
     cpus: u32 = 0,
     total: u64 = 0,
@@ -558,7 +563,7 @@ fn submit(cx: Cx, args: []const [:0]const u8, as_test: bool) u8 {
     const spec_abs = realpath(cx, sp) orelse return fail2("{s}: not found", .{sp});
     const text = readFile(cx, spec_abs) orelse return fail2("{s}: can't be read", .{sp});
     const spec = std.json.parseFromSliceLeaky(Spec, cx.a, text, .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| {
-        return fail2("spec {s}: {t} (fields: label, run or tasks, setup, cores, time, mem, tools, env, exclude, deps, caches, needs, report, return, git, packs)", .{ sp, err });
+        return fail2("spec {s}: {t} (fields: label, run or tasks, setup, driver, time, mem, tools, env, exclude, deps, caches, needs, report, return, git, packs)", .{ sp, err });
     };
     if (as_test and (spec.tasks == null or spec.run != null)) return fail2("spec {s}: cpuq test runs a spec with \"tasks\" and no \"run\" (cpuq submit runs one with \"run\")", .{sp});
     if (!as_test and (spec.run == null or spec.tasks != null)) return fail2("spec {s}: cpuq submit runs a spec with \"run\" and no \"tasks\" (cpuq test runs one with \"tasks\")", .{sp});
@@ -566,7 +571,7 @@ fn submit(cx: Cx, args: []const [:0]const u8, as_test: bool) u8 {
     const dir = if (top_run.ok) std.mem.trim(u8, top_run.out, " \n") else (std.fs.path.dirname(spec_abs) orelse ".");
     if (std.mem.findScalar(u8, spec.label, ':') == null or !policy.validLabel(spec.label))
         return fail2("spec {s}: \"label\" is project:task, of lowercase letters, digits, '.', '_' and '-', not '{s}'", .{ sp, spec.label });
-    if (spec.cores) |cr| if (policy.Request.parse(cr) == null) return fail2("spec {s}: \"cores\" must be N or MIN-MAX, not '{s}'", .{ sp, cr });
+    if (spec.cores != null) return fail2("spec {s}: \"cores\" is gone: a spec's job runs as one task on one CPU; a runner whose own cpuq runs (-n M) take their own CPUs sets \"driver\": true", .{sp});
     if (spec.time) |t| if (@import("cap.zig").parseDuration(t) == null) return fail2("spec {s}: \"time\" must be a duration like 90m, not '{s}'", .{ sp, t });
     if (spec.mem) |m| if (policy.parseBytes(m) == null) return fail2("spec {s}: \"mem\" must be a size like 64G, not '{s}'", .{ sp, m });
     for (spec.exclude) |p| if (!inside(p)) return fail2("spec {s}: \"exclude\" paths are relative, without .., not '{s}'", .{ sp, p });
@@ -666,8 +671,8 @@ fn submit(cx: Cx, args: []const [:0]const u8, as_test: bool) u8 {
         .run = spec.run orelse "",
         .tasks = spec.tasks,
         .job = if (as_test) jobName(cx, project, dir) else "",
-        .cores = spec.cores,
         .time = spec.time,
+        .driver = spec.driver,
         .mem = spec.mem,
         .tools = spec.tools,
         .env = env_map,
@@ -990,7 +995,7 @@ fn printVerdict(cx: Cx, id: []const u8) u8 {
     // The words line up: the longest, NOT STARTED, has 11 letters.
     w.print("{s}{s}  {s}  {s}  ", .{ word, "           "[0..11 -| word.len], r.label, r.digest[0..@min(8, r.digest.len)] }) catch {};
     switch (v) {
-        .pass => w.print("{s}  {s}  {s} cores{s}\n", .{ ageText(cx, @intFromFloat(r.seconds)), r.host, r.cores, countsText(cx, r) }) catch {},
+        .pass => w.print("{s}  {s}{s}\n", .{ ageText(cx, @intFromFloat(r.seconds)), r.host, countsText(cx, r) }) catch {},
         .fail => w.print("exit {d}  {s}  {s}{s}\n", .{ r.code orelse -1, ageText(cx, @intFromFloat(r.seconds)), r.host, countsText(cx, r) }) catch {},
         else => w.print("{s}\n", .{r.detail}) catch {},
     }
@@ -1609,20 +1614,21 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
     if (p.report) |r| if (inside(r)) Io.Dir.cwd().deleteFile(cx.io, cx.a.print("{s}/{s}", .{ copy, r }) catch "") catch {};
     for (p.returns) |r| if (inside(r)) Io.Dir.cwd().deleteTree(cx.io, cx.a.print("{s}/{s}", .{ copy, std.mem.trimEnd(u8, r, "/") }) catch "") catch {};
 
-    // cpuq run takes the cores and the job's cgroup; cap enforces time from admission, and memory.
+    // cpuq run gives the job its CPU; cap enforces its time from its start, and its memory.
     var argv: std.ArrayList([]const u8) = .empty;
-    argv.appendSlice(cx.a, &.{ cx.self, "run", "--label", p.label }) catch return 125;
+    // The spec's `time` (cap's --time) limits the job, not the host's per-task default.
+    argv.appendSlice(cx.a, &.{ cx.self, "run", "--label", p.label, "-t", "off" }) catch return 125;
+    if (p.driver) argv.append(cx.a, "--driver") catch {};
     if (p.note.len != 0) argv.appendSlice(cx.a, &.{ "--note", p.note }) catch {};
-    if (p.cores) |cr| argv.appendSlice(cx.a, &.{ "--cores", cr }) catch {};
     argv.appendSlice(cx.a, &.{ "--", cx.self, "cap" }) catch {};
     if (p.time) |t| argv.appendSlice(cx.a, &.{ "--time", t }) catch {};
     if (p.mem) |m| argv.appendSlice(cx.a, &.{ "--mem", m }) catch {};
     // A test's tasks: setup, then its tasks command filling the job folder's todo/.
     var folder: []const u8 = "";
     if (p.tasks != null) {
-        const state = @import("jobs.zig").stateDir(cx.a, cx.env) orelse return hostDone(cx, id, p, .cpuq_error, null, "no HOME on the host: not your code", started);
+        const state = tasks_mod.stateDir(cx.a, cx.env) orelse return hostDone(cx, id, p, .cpuq_error, null, "no HOME on the host: not your code", started);
         var stamp_buf: [15]u8 = undefined;
-        folder = cx.a.print("{s}/jobs/{s}/{s}", .{ state, p.job, @import("jobs.zig").stampNow(&stamp_buf, now(cx.io)) }) catch return 125;
+        folder = cx.a.print("{s}/jobs/{s}/{s}", .{ state, p.job, tasks_mod.stampNow(&stamp_buf, now(cx.io)) }) catch return 125;
         Io.Dir.cwd().createDirPath(cx.io, cx.a.print("{s}/todo", .{folder}) catch "") catch {};
         writeFile(cx, jobFile(cx, id, "folder"), folder);
         env.put("CPUQ_TODO", cx.a.print("{s}/todo", .{folder}) catch "") catch {};
@@ -1638,17 +1644,26 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
 
     const log = jobFile(cx, id, "output.log");
     var code = runLogged(cx, id, argv.items, &env, copy, log, false);
-    // The tasks, by their own driver: outside any grant (the agent shares the machine among
-    // jobs), under the spec's time and memory limits, the pack tools on PATH.
+    // The tasks, one per CPU of the pool (tasks.zig), under the spec's time and memory limits
+    // for them all, the pack tools on PATH; then their verdict, after the run's own lines.
     if (p.tasks != null and code != null and code.? == 0 and !cancelled(cx, id)) {
         if (dirs.items.len != 0) env.put("PATH", cx.a.print("{s}{s}", .{ dirs.items, env.get("PATH") orelse "/usr/bin:/bin" }) catch "") catch {};
-        env.put("CPUQ_PROGRESS", jobFile(cx, id, "progress")) catch {};
-        var driver: std.ArrayList([]const u8) = .empty;
-        driver.appendSlice(cx.a, &.{ cx.self, "cap" }) catch {};
-        if (p.time) |t| driver.appendSlice(cx.a, &.{ "--time", t }) catch {};
-        if (p.mem) |m| driver.appendSlice(cx.a, &.{ "--mem", m }) catch {};
-        driver.appendSlice(cx.a, &.{ "--", cx.self, "jobs", "run" }) catch {};
-        code = runLogged(cx, id, driver.items, &env, folder, log, true);
+        const n = tasks_mod.manifest(cx.io, cx.a, folder);
+        if (n != 0) {
+            var driver: std.ArrayList([]const u8) = .empty;
+            driver.appendSlice(cx.a, &.{ cx.self, "cap" }) catch {};
+            if (p.time) |t| driver.appendSlice(cx.a, &.{ "--time", t }) catch {};
+            if (p.mem) |m| driver.appendSlice(cx.a, &.{ "--mem", m }) catch {};
+            const count_text = cx.a.print("{d}", .{n}) catch "1";
+            driver.appendSlice(cx.a, &.{ "--", cx.self, "run", "--label", p.label, "-n", count_text, "-t", "off", "--", cx.self, "_task", folder }) catch {};
+            code = runLogged(cx, id, driver.items, &env, folder, log, true);
+        }
+        // cap's own last line says when it stopped them; else the folder's verdict.
+        const stopped = std.mem.startsWith(u8, lastLine(cx, log), "cpuq cap: stopped");
+        if (!stopped) {
+            const v = tasks_mod.verdict(cx.io, cx.a, folder, log);
+            if (code != null and (code.? == 0 or code.? == 1)) code = v;
+        }
         bringFailures(cx, folder, copy);
         p.report = report_back;
     }
@@ -1675,7 +1690,6 @@ const report_back = ".cpuq/report.jsonl";
 /// worktree), and a report line per task in done/ and fail/, each failure with its last line of
 /// output.
 fn bringFailures(cx: Cx, folder: []const u8, copy: []const u8) void {
-    const jobs_mod = @import("jobs.zig");
     const back = cx.a.print("{s}/{s}", .{ copy, fail_back }) catch return;
     Io.Dir.cwd().deleteTree(cx.io, back) catch {};
     Io.Dir.cwd().createDirPath(cx.io, back) catch {};
@@ -1685,14 +1699,14 @@ fn bringFailures(cx: Cx, folder: []const u8, copy: []const u8) void {
         defer dir.close(cx.io);
         var it = dir.iterate();
         while (it.next(cx.io) catch null) |e| {
-            if (e.kind != .file or !jobs_mod.visible(e.name)) continue;
+            if (e.kind != .file or !tasks_mod.visible(e.name)) continue;
             const ok = std.mem.eql(u8, sub, "done");
             var reason: []const u8 = "";
             if (!ok) {
                 const from = cx.a.print("{s}/fail/{s}", .{ folder, e.name }) catch continue;
                 const text = readFile(cx, from) orelse "";
                 writeFile(cx, cx.a.print("{s}/{s}", .{ back, e.name }) catch continue, text);
-                var t: jobs_mod.Tally = .{};
+                var t: tasks_mod.Tally = .{};
                 t.feed(text);
                 t.finish();
                 reason = t.lastLine();
@@ -1753,7 +1767,7 @@ pub fn cmdPacks(cx: Cx, args: []const [:0]const u8) u8 {
         cx.out.print("{s} {s}{s}{s}\n", .{ pk.name, pk.version, if (pk.alias.len != 0) "  " else "", pk.alias }) catch {};
     }
     cx.out.flush() catch {};
-    const line = cx.a.print("{s} run --label cpuq:packs --cores 2-8 -- /bin/sh -c {s}", .{ self, quote(cx, script.items) }) catch return 125;
+    const line = cx.a.print("{s} run --label cpuq:packs -- /bin/sh -c {s}", .{ self, quote(cx, script.items) }) catch return 125;
     const ran = if (where) |h| onHost(cx, h, line) else run(cx, &.{ "/bin/sh", "-c", line }, null);
     std.debug.print("{s}{s}", .{ ran.out, ran.err });
     return ran.code;
@@ -1880,7 +1894,6 @@ fn hostDone(cx: Cx, id: []const u8, p: Payload, v: Verdict, code: ?i64, detail: 
         .host = hostname(cx),
         .code = code,
         .seconds = @floatFromInt(now(cx.io) - started),
-        .cores = p.cores orelse "",
         .cpus = sys.totalCpus(cx.io),
         .detail = detail,
     };

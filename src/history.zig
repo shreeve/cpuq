@@ -1,10 +1,9 @@
 //! The job history: one JSON line per event, appended to a file outside the
-//! state directory so it survives a reboot. A job writes `queued`, then
-//! `started` once admitted, then `ended` (or `gave_up` at --max-wait). A
-//! line under 4 KB written with O_APPEND lands whole however many processes
-//! append at once, so no lock is needed. A job with neither `ended` nor
-//! `gave_up` whose process is gone, or which was queued before the machine
-//! last booted, was lost.
+//! state directory so it survives a reboot. A run writes `queued` when it joins the line, then
+//! `started` (when its first task started) and `ended`, or `gave_up` at --wait-max. A named
+//! lease writes the same. A line under 4 KB written with O_APPEND lands whole however many
+//! processes append at once, so no lock is needed. A job with neither `ended` nor `gave_up`
+//! whose process is gone, or which was queued before the machine last booted, was lost.
 const std = @import("std");
 const Io = std.Io;
 const c = std.c;
@@ -21,53 +20,33 @@ pub const Event = struct {
     /// Unix time in seconds.
     t: f64 = 0,
     pid: i32 = 0,
-    /// "cores"; the lease's name for a named lease; "remote" for a job this machine sent to
-    /// another (`host`), its run there timed from here, copy and queue included.
-    pool: []const u8 = "cores",
-    /// The host a `--host` lease is held on; for pool "remote", the host the job was sent to.
+    /// "cpus" for a run on this machine's pool; the lease's name for a named lease; "remote"
+    /// for a run this machine sent to another (`host`), timed from here, copy and queue included.
+    pool: []const u8 = "cpus",
+    /// The host a `--host` lease is held on; for pool "remote", the host the run was sent to.
     host: ?[]const u8 = null,
     /// The repository it ran in, by name: the same for each of its worktrees and its copies on
     /// other machines.
     repo: ?[]const u8 = null,
+    /// The project it shared the pool as.
+    project: ?[]const u8 = null,
     label: []const u8 = "",
-    /// What the job was for (`--note`), shown, never matched or sized by.
+    /// What the run was for (`--note`), shown, never matched by.
     note: []const u8 = "",
     cmd: []const u8 = "",
-    priority: []const u8 = "normal",
-    exclusive: bool = false,
-    /// The request: at least `min`, up to `max`.
-    min: u32 = 0,
-    max: u32 = 0,
-    /// The grant (started, ended).
+    /// Its tasks (-n), when more than one.
+    tasks: ?u32 = null,
+    /// The CPUs (or a lease's slots) it held: the most at once (ended).
     cores: ?u32 = null,
     /// How the command ended (ended): its exit status, or the signal that
     /// killed it.
     exit: ?u8 = null,
     signal: ?u32 = null,
-    /// CPU seconds the command and the descendants it reaped used (ended).
+    /// CPU seconds its commands and the descendants they reaped used (ended).
     cpu: ?f64 = null,
-    /// The core tokens it took, by number (started).
-    slots: ?[]const u32 = null,
-    /// It started ahead of the head of the queue, on cores the head could
-    /// not use yet (started).
-    ahead: ?bool = null,
-    /// How many of its cores were lent by holders that left them idle
-    /// (started).
-    lent: ?u32 = null,
-    /// Started by hand past the queue and its gates (`cpuq start`).
-    forced: ?bool = null,
-    /// Stopped by cpuq for using more memory than `max_memory`: how much its
-    /// processes used then, in bytes (ended).
-    memory: ?u64 = null,
-    /// The most memory it used at once, in bytes (ended).
-    peak: ?u64 = null,
-    /// A timing window's: CPUs of other work beside it, on average and at
-    /// most (ended).
-    noise: ?f64 = null,
-    noise_peak: ?f64 = null,
-    /// The most cores its process tree kept busy over any 2-second look
-    /// (ended).
-    cpu_peak: ?f64 = null,
+    /// Its tasks that passed and failed (ended).
+    done: ?u32 = null,
+    failed: ?u32 = null,
 };
 
 /// The longest command kept in a line, so a line stays well under 4 KB.
@@ -155,13 +134,11 @@ pub const Job = struct {
     pool: []const u8,
     host: ?[]const u8,
     repo: ?[]const u8 = null,
+    project: ?[]const u8 = null,
     label: []const u8,
     note: []const u8 = "",
     cmd: []const u8,
-    priority: []const u8,
-    exclusive: bool,
-    min: u32,
-    max: u32,
+    tasks: ?u32 = null,
     cores: ?u32 = null,
     queued: f64,
     started: ?f64 = null,
@@ -169,14 +146,8 @@ pub const Job = struct {
     exit: ?u8 = null,
     signal: ?u32 = null,
     cpu: ?f64 = null,
-    slots: ?[]const u32 = null,
-    /// Stopped by cpuq for its memory: how much it used, in bytes.
-    memory: ?u64 = null,
-    /// The most memory it used at once, in bytes.
-    peak: ?u64 = null,
-    noise: ?f64 = null,
-    noise_peak: ?f64 = null,
-    cpu_peak: ?f64 = null,
+    done: ?u32 = null,
+    failed: ?u32 = null,
     state: State = .active,
 
     /// Seconds spent waiting: until admitted, or until it gave up.
@@ -193,7 +164,7 @@ pub const Job = struct {
         return (j.ended orelse return null) - s;
     }
 
-    /// The cores the command kept busy on average: its CPU time over its
+    /// The CPUs its commands kept busy on average: their CPU time over its
     /// run time.
     pub fn used(j: Job) ?f64 {
         const r = j.ran() orelse return null;
@@ -229,13 +200,11 @@ pub fn load(io: Io, a: std.mem.Allocator, path: []const u8, boot: f64, alive: *c
                     .pool = ev.pool,
                     .host = ev.host,
                     .repo = ev.repo,
+                    .project = ev.project,
                     .label = ev.label,
                     .note = ev.note,
                     .cmd = ev.cmd,
-                    .priority = ev.priority,
-                    .exclusive = ev.exclusive,
-                    .min = ev.min,
-                    .max = ev.max,
+                    .tasks = ev.tasks,
                     .queued = ev.t,
                 }) catch continue;
             }
@@ -244,18 +213,14 @@ pub fn load(io: Io, a: std.mem.Allocator, path: []const u8, boot: f64, alive: *c
                 j.queued = ev.t;
             } else if (std.mem.eql(u8, ev.event, "started")) {
                 j.started = ev.t;
-                j.cores = ev.cores;
-                j.slots = ev.slots;
+                if (ev.cores) |k| j.cores = k;
             } else if (std.mem.eql(u8, ev.event, "ended")) {
                 j.ended = ev.t;
                 j.exit = ev.exit;
                 j.signal = ev.signal;
                 j.cpu = ev.cpu;
-                j.memory = ev.memory;
-                j.peak = ev.peak;
-                j.noise = ev.noise;
-                j.noise_peak = ev.noise_peak;
-                j.cpu_peak = ev.cpu_peak;
+                j.done = ev.done;
+                j.failed = ev.failed;
                 if (ev.cores) |k| j.cores = k;
                 j.state = .done;
             } else if (std.mem.eql(u8, ev.event, "gave_up")) {
@@ -305,7 +270,7 @@ test "events assemble into jobs: done, gave up, lost" {
     const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
     const path = try std.mem.concat(a, u8, &.{ dir, "/history.jsonl" });
 
-    append(testing.io, path, .{ .event = "queued", .id = "1-100", .t = 100, .pid = 1, .label = "build", .min = 2, .max = 4 });
+    append(testing.io, path, .{ .event = "queued", .id = "1-100", .t = 100, .pid = 1, .label = "build" });
     append(testing.io, path, .{ .event = "started", .id = "1-100", .t = 103, .pid = 1, .cores = 3 });
     append(testing.io, path, .{ .event = "ended", .id = "1-100", .t = 113, .pid = 1, .cores = 3, .exit = 0, .cpu = 20 });
     append(testing.io, path, .{ .event = "queued", .id = "2-200", .t = 200, .pid = 2, .label = "test" });

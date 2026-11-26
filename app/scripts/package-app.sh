@@ -16,7 +16,7 @@ scratch="$(cd "$scratch" && pwd)"
 
 config="${CONFIG:-debug}"
 # Within a cpuq job, build on the cores it was granted, not every core.
-swift build -c "$config" --scratch-path "$scratch" ${CPUQ_CORES:+-j "$CPUQ_CORES"} >&2
+swift build -c "$config" --scratch-path "$scratch" -j 1 >&2
 bin_dir="$(swift build -c "$config" --scratch-path "$scratch" --show-bin-path)"
 app="$scratch/Cpuq.app"
 

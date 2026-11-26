@@ -1,17 +1,19 @@
 # cpuq design
 
 How cpuq works inside. The [README](../README.md) says how to use it; this file says how each
-decision is made, for anyone changing the code or wondering why a job waited. The words below
-are the code's own: a waiter holds a *ticket*, a running job holds a *lease* and *tokens*, and
-the waiter at the front of the queue is the *head*.
+decision is made, for anyone changing the code or wondering why a run waited. The words below are
+the code's own: a `cpuq run` is an *operation* (its record is an `Op`), each pool CPU has a
+*token*, a CPU held by an operation is a *slot* with K *places*, a CPU promised to a waiting
+operation is a *promise* (a grant file), and an operation emptying a CPU for the line is
+*draining* it.
 
-## No daemon in the queue
+## No daemon
 
-Nothing admits, holds or decides for `cpuq run` but the `cpuq` processes of the jobs themselves.
-The optional recorder (`cpuq record`) only samples: no command waits on it or needs it, so a
-machine without one works the same, and one that dies takes nothing with it. Jobs of task files
-(`cpuq jobs`) have an optional agent of their own (below): without it each runs at the workers it
-was given.
+Nothing hands out, holds or decides for `cpuq run` but the `cpuq` processes of the operations
+themselves. The optional recorder (`cpuq record`) only samples: no command waits on it or needs
+it, so a machine without one works the same, and one that dies takes nothing with it. Jobs of
+task files (`cpuq jobs`) have an optional agent of their own (below): without it each runs at the
+workers it was given.
 
 Every hold is a `flock(2)` on a file in a state directory, so the kernel releases it when the
 last process holding the descriptor exits, however it exits. Only `flock(2)` is used, never
@@ -24,220 +26,276 @@ dropped when some other descriptor of the file closes.
 so every session of one user agrees on it whatever its `TMPDIR`. If it cannot be created or
 written, cpuq fails; it never falls back to another directory.
 
-    admission.lock      the admission lock; scans, grants and probes happen under it
-    seq                 the last ticket number handed out
-    valve               the load valve's state
-    usage               each running job's measured use, carried from one head to the next
-    window-ended        when the last exclusive run ended (for window_gap)
-    control-TICKET      an order for a waiter from `cpuq first`, `start` or `cancel`
-    paused-LEASE        a job paused by hand (empty), or frozen by the timing window it names
-    lending             the timing window lending the machine (window_lend)
-    weights-ok          systemd user scopes work here (cpu_weights), probed at most every 10 min
-    queue/P-NNNNNNNNNN  one ticket per waiter (P: 0 high, 1 normal, 2 low)
-    tokens/NNNN         one file per core handed out; an exclusive lock is a held core
-    leases/NNNNNNNNNN   one record per running job (suffix .x: an exclusive run)
-    named/NAME/         a named lease: a state directory of its own, one token per slot
+The pool lives under a versioned folder, `v2/`, so a cpuq of another version never reads these
+files as its own, and an old and a new cpuq never hand out the same CPU (src/pool.zig):
 
-There are as many token files as the most cores ever handed out at once: the machine's CPUs,
-the budget, or under measured admission up to four times `target`. Token files are never
-removed. The history file lives elsewhere (see the README), outside `/tmp`, so it outlives a
-reboot.
+    v2/lock             the pool's lock: every scan, take, promise and release happens under it
+    v2/seq              the last ticket number handed out
+    v2/ops/C-TICKET     one per running operation, exclusively locked by its cpuq for its whole
+                        life (C: 0 urgent, 1 normal); its text is the operation's record
+    v2/wake/TICKET      the operation's FIFO: whoever promises it a CPU writes a byte there
+    v2/cpus/N           one per pool CPU, named by the CPU's number; an exclusive lock is a
+                        held CPU; its text names the task groups running on it
+    v2/grants/N         a promise of CPU N to one operation: its ticket
+    v2/drain            locked while `cpuq drain` waits for or holds the machine
+    v2/ticks            the last sample of the machine's CPU ticks, for the outside-load gate
+    named/NAME/         a named lease: a queue of its own (src/state.zig)
+    scopes-ok           whether systemd user scopes work here, probed at most every 10 min
 
-## The queue
+An operation's record is `key=value` lines: `pid`, `urgent`, `drain`, `project`, `label`,
+`weight`, `want` (CPUs it could use now beyond those it holds), `held` (its CPUs, by number),
+`draining` (how many of those it is emptying), `overload` (`-x`), `limit` (`-c`, worked out),
+`tasks`, `done`, `failed`, `running`, `since`, `why` (what holds it back, for status) and `cmd`.
+Records are written in place and read only under the pool's lock, as they are written, so no
+reader sees one half written.
 
-A waiter creates its ticket under a temporary name, locks it exclusively, writes its record and
-renames it into place, all under the admission lock, and holds that lock while it waits.
-Waiters are ordered by `cpuq first` (moved waiters go ahead of the rest), then class (priority
-after aging), then ticket number.
+**Dead files.** A file whose lock can be taken has no live holder: whoever finds it so, under the
+pool's lock, removes it (an operation's record and FIFO), or treats it as free (a token). A
+promise is valid only while its operation's record is locked and its CPU is in the pool; any other
+is removed by the next scan. So a waiter killed mid-promise strands nothing. Nothing depends on a
+pid being alive except killing a dead operation's leftover processes, and that checks each group
+leader's start time first.
 
-A waiter that is not the head blocks on the ticket just ahead of it: a blocking shared flock
-that returns when that waiter is admitted or dies, so a long queue costs nothing. The head polls
-every `poll` seconds: under the admission lock it reads the gates and, if they are open, tries
-to take its tokens, all of them or none (on failure it releases what it took). Every grant is
-all or nothing under the admission lock, so two waiters can never each hold part of what they
-need.
+The history file lives elsewhere (see the README), outside `/tmp`, so it outlives a reboot.
 
-The first eight waiters, the head included, also look every 2 seconds: for a hand-given order
-(`cpuq first`, `start`, `cancel`, left as `control-TICKET`) and for room to start ahead of the
-head. The rest wake when the waiter ahead of them leaves, or at their next once-a-minute note.
+## The pool
 
-## Measured admission (`admit = measured`)
+The pool's CPUs, and their order, come from src/cpus.zig, which every cpuq on the machine works
+out the same way: the config's `cpus` list; else on Linux the CPUs online, less those in
+`/sys/devices/system/cpu/isolated`, within pid 1's `Cpus_allowed_list` (a container's CPU set),
+the lowest thread of each core first, then their siblings; else 0 to the active count less one
+(macOS, which can't pin, so the numbers only name places). `budget` or `CPUQ_BUDGET` keeps the
+first N.
 
-The tokens still number the cores handed out (for `CPUQ_CORES`, the jobserver and the app), but
-their pool is only a sanity cap: four times `target`, at least 4. What counts against the
-machine is each running job's measured demand.
+A token is held by its operation's cpuq alone. The descriptor is close-on-exec, so no task, and
+nothing a task leaves behind, holds a CPU. Taking a token (`Pool.take`) is a non-blocking
+exclusive flock under the pool's lock; it first ends what a dead holder left running there
+(below), then empties the token's text. Giving it back clears the text, unlocks and closes it.
 
-**What a running job counts for.** Each head that needs to decide measures every running job's
-command tree: its CPU time between looks, smoothed with a time constant of half of `settle`
-(about ten seconds by default), kept in `usage` so the next head carries on. For its first
-`settle` seconds (20) a job counts at its expected use: the 75th percentile of its label's last
-64 finished runs' average active cores, at most what it holds, or all it holds when the label
-has fewer than three runs. After that it counts at what it is measured asking of the CPUs,
-however little, never under a twentieth of a CPU.
+## An operation's loop
 
-Demand is the CPU time a job gets. While the CPUs are at least 90% busy it is the larger of
-that and the threads it has ready to run (at most twice what it holds), so a job that a
-contended machine slows still counts in full. With CPUs idle, ready threads are waiting on
-something else (a pool of workers, a burst of short processes) and do not count. A job paused
-by hand counts for nothing. While an exclusive run holds the machine nothing is measured and
-nothing is admitted.
+One process per operation, its cpuq, holds the CPUs and starts the tasks (src/op.zig). It holds
+no CPU itself, and it never sleeps while a held CPU has an empty place and a task is waiting.
+Each turn:
 
-**The head** starts when the running jobs count for nothing (none run, or all are paused), or
-when its own expected use fits in the room (`target` less what the running jobs count for) and
-the CPUs are not measured 97% busy or more. The machine gates apply; the load valve only to an
-exclusive run.
+1. **Reap** every ended task: record its outcome, or queue it for a retry (`-r`); free its place.
+   For a run of many tasks, kill whatever the task left in its process group.
+2. **Signals and time limits:** pass a TERM, INT, HUP or QUIT to every task group; TERM a task at
+   its limit and KILL it 5 s later; KILL what is left 5 s after a signal.
+3. **Ctrl-Z**, if one came (below).
+4. **Consolidate:** move tasks from a draining CPU into free places on its other CPUs (below).
+5. **Continue stopped tasks** that have a place again.
+6. **Place** waiting tasks (retries behind the tasks not yet started) into free places of held, non-draining CPUs, the
+   fullest first, so CPUs fill to K before another is used and empty ones can go back.
+7. **Give back** each held CPU that is empty and has nothing coming (no task waits, or it is
+   draining). Giving any back renews the operation's ticket and hands the CPUs to the line, under
+   the lock.
+8. **Settle**, under the lock, when something happened here (a task ended, a signal or a promise
+   came, a CPU went back) or on its timer: every second for the head of the line, which catches
+   CPUs freed without a word (a SIGKILLed holder) and gates that reopen, every 10 s for the
+   rest. Write the record; scan the operations and promises; hand every free
+   CPU to the line (`handOut`), writing promises and waking their operations; take each CPU
+   promised to this operation that it still wants, and drop the rest; if it took none and it is
+   the line's giver (`giver`), mark one of its CPUs draining; if a drain waits, mark all of them.
+9. **Sleep** in `poll()` on its self-pipe (SIGCHLD and the stop and terminal signals write a byte)
+   and its wake FIFO, for at most a second, or until the next time limit is due. A long line
+   costs little: a waiter wakes for its promise, not to look.
 
-**Behind the head**, a waiter starts at once, while there is no memory pressure, when its
-expected use fits the room and either the head's expected use still fits after it, or the head
-has waited less than `patience` seconds. Behind an exclusive head, only backfill (below) lets
-anything start.
+The record's `want` is what the line reads: the tasks waiting (stopped ones included) less the
+free places on CPUs it keeps, divided by K and rounded up, at most `limit` less the CPUs held.
+A stopped operation wants nothing.
 
-**The grant.** A fixed `--cores K` stands. A range is capped near the label's use, as
-right-sizing does (75th percentile plus 0.3, rounded, never below its minimum), and then gives
-way to the room there is, down to its minimum. With no `--cores`, a label with three or more
-finished runs gets 1 up to its 75th percentile plus 0.3, rounded, at most half the machine's
-CPUs, as room allows; any other gets 2.
+`limit` is `-c` worked out against the pool when the run starts (a percentage of the pool, at
+least 1), at most the pool, and at most the tasks ÷ K rounded up, so a run never holds more CPUs
+than it has tasks for.
 
-## Reservation mode (`admit = cores`)
+A run of one task (`cpuq run -- CMD`) starts its task in cpuq's own process group, with the
+terminal, and its exit status, signal or 124 is cpuq's. A run of many (`-n M`) starts each task as
+the leader of a group of its own, with stdin `/dev/null` and stdout and stderr to
+`~/.local/state/cpuq/runs/PROJECT/STAMP-PID/N` (`N.ATTEMPT` for a retry), and ends with a summary
+and exit 0 or 1.
 
-Each job counts at the cores it holds, against the budget.
+## Promises and wake FIFOs
 
-**The admission rule.** Once the head's minimum fits beside the cores held, it takes up to its
-maximum of what is free, but leaves the next waiter's minimum free when it can still get its
-own, so a wide request does not stall the job behind it. Lowering the budget below what is held
-only stops admissions.
+Whoever frees a CPU, or finds one free, hands it out at once: `handOut` decides, and for each CPU
+it writes `grants/N` by rename (never seen half written) and writes a byte to the promised
+operation's FIFO. An operation opens its FIFO, read and write and non-blocking, before it first
+looks for a CPU, so a promise made after that look always finds it open, and a wake never blocks
+its writer (a full FIFO already holds a wake). The promised operation takes the CPU in its next
+settle. A CPU promised to an operation that no longer wants it is dropped, and the next hand-out
+gives it to the next in line.
 
-**Right-sizing.** A grant is fixed for the whole run, so a range that takes everything free
-wastes cores whenever the job uses fewer. Once a label has three finished runs, `--cores
-MIN-MAX` takes at most the 75th percentile of their average active cores plus 0.3, rounded,
-never below MIN: a test that keeps 0.8 of a core busy and asks for `1-4` gets 1, a build that
-uses 3.5 keeps `1-4`. It says so when it caps. `right_size = off` turns it off.
+While CPUs are free the 1-second poll timeout is the fallback: any operation's settle hands out
+what a crash freed without a hand-out.
 
-**Backfill.** Cores the head cannot use yet need not sit idle. A waiter behind it may start at
-once, taking what is free up to its maximum, when its minimum fits, nobody ahead of it may go
-first (the head if it fits, or an earlier waiter backfill would also let go), and either:
+## The line
 
-- history knows both run times, and the waiter's typical run ends before the head is expected
-  to start, so the head loses nothing; or
-- history cannot say, and the head has waited less than its patience: half its own typical run,
-  from `patience` seconds (30) to 5 minutes. After that nothing goes ahead, and cores that free
-  up are kept for the head.
+`ahead(x, y)` in src/pool.zig decides who gets the next CPU. Each operation's *has* is the CPUs it
+keeps (held less draining) plus those promised to it; a project's count is the sum of its
+operations'. In order:
 
-A wrong estimate delays the head by at most one job's overrun, and patience bounds how long
-others may go ahead, so the head never starves. Behind an exclusive head (in either mode) only
-the first rule applies: a job goes ahead only when history says it ends before the running work
-does. Named leases stay strictly in order. A job that went ahead says so and is marked
-`"ahead": true` in history. `backfill = off` keeps strict order. A head waiting for an exact
-count while fewer cores are free says once that a range would start it now.
+1. **Urgent:** an urgent operation that has nothing, while its project holds no urgent CPU, goes
+   first. So urgency is for an operation's first CPU, one per project at a time.
+2. **Holding nothing:** an operation with nothing goes before every operation with something, so
+   it can't starve behind a head nobody may give to.
+3. **The project's share:** the lower project count ÷ weight (compared without division).
+4. **The operation's share:** the lower *has*.
+5. **The ticket:** the lower first.
 
-**Lending.** A job that holds cores it does not use keeps others waiting for nothing. A head
-that cannot start measures each running job's command tree, averaged over half of `lend_after`
-seconds. Cores a job has left wholly idle for `lend_after` (60) are lent to the head on top of
-the budget: a job holding 3 cores and keeping 1 busy for a minute lends 1 (a quarter of a core
-is kept as slack). Only idle cores are lent, so the work running stays within the budget, and
-nothing is taken from the lender; if it gets busy again the machine runs over the budget until
-someone finishes, and the load valve holds further admissions meanwhile. Lending goes only into
-CPUs the machine has to spare, judged by the load and the CPUs' measured busy share, so it never
-pushes the load past the CPU count. A job paused by hand lends all its cores at once. Nothing is
-lent to an exclusive run or a named lease.
+`handOut` gives free CPUs, in the pool's order, one at a time, counting each promise as held at
+once and ranking the line again before the next, so free CPUs spread over projects by weight.
+Only operations with `want` left are in the line. While a drain is in the line, every CPU goes to
+it. `firstWaiter` is the head of the same order once every promise is counted.
 
-A job started on lent cores says so, and history marks how many (`"lent": N`). On Linux it runs
-at nice 15, so a lender that gets busy again has its CPUs back at once. On macOS it keeps its
-class: background QoS would hold it to Apple silicon's efficiency cores, with throttled I/O, for
-its whole run.
+An operation's ticket is renewed (its record and FIFO renamed, under the lock) each time it gives
+a CPU back, so it takes its turn behind every other: runs that hold one CPU each take turns with
+a newcomer.
 
-## The machine gates
+## Giving CPUs back
 
-The head admits nothing while one of these is closed:
+No operation ever stops a task to give its CPU away. When the head of the line wants a CPU and
+none is free, `giver` names at most one operation to empty one CPU, and each operation checks, in
+its settle, whether that is itself:
+
+- **Drains owed:** the CPUs being emptied, summed over every operation's `draining`, under the
+  lock. While they are as many as the head still wants, nobody else drains, so twelve operations
+  don't all empty a CPU for one waiter. A draining CPU counts as given up already (it isn't in
+  *has*). There is no separate count to drift: a dead operation's drains vanish with its record.
+- **The share rule:** a giver qualifies when the head holds nothing, or when after the move the
+  head's project still holds no more than the giver's for their weights:
+  (head's + 1) × giver's weight ≤ (giver's − 1) × head's weight.
+- **Guard 1, holding nothing first:** the line's second key means a head that holds nothing is
+  head, and the share rule lets anyone give to it.
+- **Guard 2, the waiter must stay ahead:** a giver qualifies only if the head still goes ahead of
+  it once it holds one fewer and has its renewed ticket, the newest (`behindAfter`). Without this,
+  a giver holding nothing, or urgent, would rank first again and take the freed CPU straight back.
+- **Which giver:** of those that qualify, the operation whose project holds the most for its
+  weight, then the one keeping the most, then the newest ticket. A drain (`cpuq drain`) never
+  gives; while it waits, every operation drains every CPU.
+- **Which CPU:** an empty one, else the one with the fewest tasks, then the one whose newest task
+  started longest ago (`drainOne`).
+
+A draining CPU gets no new task. When its last task ends, the operation gives it back (step 7 of
+the loop), renews its ticket, and hands it out; the head, being first, gets it.
+
+**Consolidation.** While a CPU drains, a free place on another of the operation's CPUs takes the
+draining CPU's newest task, the one likely to run longest. On Linux every thread of that task's
+processes is re-pinned there (`sched_setaffinity` per thread); on macOS only the counts move. The
+draining CPU frees sooner, and half-empty CPUs are rare.
+
+## Outside load
+
+`Pool.machineBusy` reads the kernel's CPU ticks (busy and total, every CPU) and keeps one sample in
+`v2/ticks`, renewed once it is a second old, so every operation shares one measure over the last
+second or so. In `freeCpus`, the CPUs handed out are cut to
+
+    room = floor(active CPUs − max(busy, CPUs held) + 0.25)
+
+so a CPU goes out only when one is idle. Held CPUs count as busy even when idle, so a burst of
+task starts never looks like room; busy beyond the CPUs held is work cpuq doesn't run, or tasks
+using more than their CPU (which macOS can't stop). It never reads the load average, which counts
+threads, so `-x` overload would trip it, and lags a minute. With no room, the operation's `why`
+says `outside load`.
+
+## The gates
+
+Before handing out any CPU, `freeCpus` reads the machine gates (src/policy.zig `gate`); while one
+is closed nothing is handed out, and `why` says which. Runs keep the CPUs they hold, and keep
+filling them.
 
 - **Memory pressure.** macOS `kern.memorystatus_vm_pressure_level` at 4 (critical). The warn
-  level (2) can last many minutes with half the memory free, so it does not count; a runaway
-  job is `max_memory`'s to stop. Linux `/proc/pressure/memory` `some avg10` at `pressure_psi` or
+  level (2) can last many minutes with half the memory free, so it does not count; a runaway task
+  is `cpuq cap --mem`'s to stop. Linux `/proc/pressure/memory` `some avg10` at `pressure_psi` or
   more, when the file exists. `pressure_check = off` turns it off.
 - **Low memory.** With `min_available` set, available memory under it: Linux `MemAvailable`,
   macOS the kernel's free share (`kern.memorystatus_level`) of `hw.memsize`.
 - **Low disk.** Less than `min_disk` (5G by default) free to an ordinary user (`f_bavail`) on the
   filesystem holding `$HOME`, the one holding the state directory (the temp directory where
-  builds and agents keep scratch files), or `~/cpuq`, where jobs sent here keep their copies and caches, which a
-  host may give its own filesystem (burst's is a ZFS dataset with a quota); status names the
-  fullest. It is on by default
-  because a full disk breaks everything at once: on 2026-10-11 one session's scratch copies of a
-  database filled this Mac's disk to its last byte, and every session's builds and tool calls
-  failed. It cannot stop a running job from filling the disk; it keeps new ones from piling on.
-- **The load valve** (`load_check`, or `--no-load-check` per run). Under measured admission it
-  gates exclusive runs only; under `admit = cores`, every job. It reads the machine's whole
-  1-minute load, cpuq's own jobs included, so it catches load from outside cpuq and jobs that use
-  more CPUs than they were granted alike. It trips when the load exceeds budget + `load_margin`
-  and the CPUs are measured at least 90% busy (the load average counts threads and lags a
-  minute, so a high load with CPUs to spare does not trip it). It reopens as soon as the CPUs
-  fall below 75% busy, or once the load has stayed at or under budget + `load_margin`/2 (10 for
-  a budget of 8) for 15 seconds. While the load is above the budget it admits at most one job
-  per 10 seconds (`spacing`), so waiters never stampede into a lagging average. A tripped valve
-  nobody has checked for over a minute reopens at once when the load is at or under that level,
-  since the 1-minute average already covers that calm.
+  builds and agents keep scratch files), or `~/cpuq`, where jobs sent here keep their copies and
+  caches, which a host may give its own filesystem (burst's is a ZFS dataset with a quota); status
+  names the fullest. It is on by default because a full disk breaks everything at once: on
+  2026-10-11 one session's scratch copies of a database filled this Mac's disk to its last byte,
+  and every session's builds and tool calls failed. It cannot stop a running task from filling the
+  disk; it keeps new ones from piling on.
 
-The budget is capped by the cores active now (macOS `hw.activecpu`, Linux the process's CPU
-affinity). On Apple silicon `hw.activecpu` does not appear to drop under thermal throttling, so
-this cap is a safeguard, not a thermal signal.
+## Nesting
 
-## Exclusive runs
+A `cpuq run` inside a task runs on that task's CPU, with no line (`nestedCpu`): when `CPUQ_CPU`
+and `CPUQ_OP` are set and `CPUQ_OP` names a live operation, or else when one of this process's
+ancestors (up to 64 hops, by parent pid) is a live operation's cpuq, which no `env -i` can hide.
+The environment is only the fast path. One task execs the command in cpuq's place; `-n M` starts
+M tasks `-x` at a time, with the terminal, and exits 0 or 1. `-c`, `-t`, `-r` and `--urgent` don't
+apply there.
 
-An exclusive run waits, at its turn, until no core is held, then takes the budget's worth of
-cores. While it holds them nothing is admitted. `start` never starts a job into one, and pause,
-resume and stop leave one alone. A run opens beside jobs paused by hand (their processes are
-stopped, so the window stays quiet), and one started by hand opens at once on the cores that are
-free, beside those still held. Neither counts those cores as lent.
+## Parent death
 
-`cpuq lease NAME --exclusive` takes NAME first, then the machine's cores, so two holders never
-wait on each other. Its claim on the cores queues at the front, as `cpuq first` would put it.
-A `cpuq run` on the same machine whose `CPUQ_LEASES` names that lease's holder runs inside the
-window at once, with `CPUQ_CORES` set to its maximum request.
+Every task is started with `PR_SET_PDEATHSIG` = SIGKILL on Linux, so it dies with its operation's
+cpuq however that dies (a check after the call covers a parent that died first). That reaches the
+task's own process; what it started may outlive it, and on macOS nothing reaches the task at all.
 
-With `window_gap` set, for that many seconds after an exclusive run ends (`window-ended`) the
-exclusive waiters are served after every other waiter.
+So each held CPU's token names the task groups running on it, one `PGID START` line each (the
+group leader's start time, from the kernel), rewritten whenever a task starts, ends or moves.
+When an operation dies, the kernel drops its flocks and its CPUs are free at once. Whoever takes
+such a CPU next reads the token first and SIGKILLs each group whose leader still runs with the
+same start time (a pgid alone may name someone else's group by now). So a CPU is never shared
+with an orphan. A dead operation's history reads `lost`.
 
-## Noise and lending in a timing window
+## Ctrl-Z
 
-A timing window's cpuq looks at every process while the window runs: the one running a command
-in its 2-second checks (the same look that tracks peak memory), a `--hold` window every 5 seconds
-(every second while it lends). Everything but the window's own work counts as noise: its CPU over
-each interval, summed, gives the peak and the mean that go into history, and the programs that
-used the most. A process that appeared since the last look counts in full; one that came and went
-between looks is missed.
+cpuq takes SIGTSTP (unless it was started with it ignored). It SIGSTOPs every task, gives back
+every CPU, marks itself stopped (its record wants nothing, so the line passes it by), drops every
+promise made to it, hands the freed CPUs to the line, and then stops itself with SIGSTOP (a TSTP
+to a process outside job control, an agent's shell, would be dropped). Continued, it stops the
+tasks again (a shell continues the whole job's group, and a single task shares cpuq's), adds the
+time stopped to each task's start so it doesn't count against its limit, and the loop asks the
+line for CPUs again: each stopped task gets a place, is re-pinned there on Linux, and gets SIGCONT.
 
-`window_lend` applies to a window held with no command (`--hold --exclusive`): the remote end of
-a kit's lease. Its owner's work arrives over ssh outside any cpuq, so the owner is taken to be
-this user's processes that started after the window opened, less the jobs it lent to
-(`CPUQ_WINDOW_OWNER` names a process tree instead). Lending writes `lending` (the window's lease
-name); `measuredLoad` then counts the window for nothing and admits as usual. When the owner works
-again the window removes `lending` and freezes every ordinary job: it writes `paused-LEASE` with
-its own name, then SIGSTOPs each job's tree. A frozen job's own cpuq keeps its tree stopped in its
-2-second checks (a child started as it froze), and thaws itself when the window lends again or
-is no longer held, so a window killed outright leaves nothing stopped. A clean end thaws them all
-at once. A hand `cpuq pause` overwrites the marker as a hand pause, which only `cpuq resume`
-ends.
+## cpuq drain
 
-cpuq has no separate hold command: a window is always tied to a running process. A hold not
-tied to one would need a file that outlives its owner, which is the thing cpuq exists to avoid.
+`cpuq drain` is an operation with `drain` and `urgent` set, `want` the whole pool while its
+command hasn't started, and no time limit. It holds `v2/drain` locked for its life. While it is
+in the line every CPU handed out goes to it (`handOut`), and every other operation, seeing
+`v2/drain` held, marks all its CPUs draining: it starts nothing new and gives each CPU back as its
+tasks end. Once the drain holds every pool CPU its command runs, unpinned, and the CPUs go back
+when it ends. `--max` gives up (exit 75) while it holds less than the pool.
 
-## Holds
+## cpuq kill
 
-A job's tokens and its lease are exclusively flocked, and the command inherits those
-descriptors (they are not close-on-exec; every other descriptor is). If cpuq itself is
-SIGKILLed, the command and its children keep the cores until they exit; `cpuq status` shows such
-a job with its holder gone (`*`). When the command exits, cpuq unlocks every token (`LOCK_UN`
-releases the lock for every process sharing the descriptor) before closing it, so a descendant
-that kept a descriptor (a build server, a `nohup`'d helper) does not keep the cores.
+`cpuq kill` finds the operation by ticket, its cpuq's pid or its label (several matches: it lists
+them and does nothing) and sends its cpuq SIGTERM. A run of many tasks passes it to every task
+group and kills what is left 5 seconds later; a run of one forwards it to its command. Its tasks
+are recorded as stopped, not failed, and never retried.
 
-**Dead files.** Any file whose lock can be taken has no holder. Probes take a shared lock, and
-only under the admission lock, so a probe never makes a free token look busy to the head; a dead
-ticket or lease found this way is removed (after checking that the path still names the probed
-inode). Nothing depends on pids: they are recorded for `cpuq status` only.
+## --driver
 
-**Kill and reboot.** A SIGKILLed waiter's ticket lock is released by the kernel: the waiter
-behind it wakes at once, and the dead ticket is removed by the next scan. A SIGKILLed job (cpuq
-and its command) releases its tokens the moment the last process holding them exits. A reboot
-releases everything; the leftover files are dead and are cleaned as they are found.
+A `--driver` run holds no CPU and has no record in the pool: it runs its command with the
+terminal, `CPUQ_CPU` and `CPUQ_OP` removed so the runs it starts aren't nested, and its exit
+status or signal is cpuq's. On Linux with `cgroups` it runs as
+
+    systemd-run --user --scope --quiet --collect --expand-environment=no
+        --property=Delegate=yes --property=OOMPolicy=continue
+        --unit=cpuq-driver-PID -- cpuq _job -- CMD...
+
+- **The pid:** systemd-run moves itself into the new scope and execs; `cpuq _job` then moves itself
+  into the scope's `job/`, enables `+memory +pids` for the scope's children (allowed only once the
+  scope's own cgroup holds no process), exports the scope as `CPUQ_CGROUP`, and execs CMD. So the
+  pid cpuq tracks stays the command's.
+- **`--expand-environment=no`:** systemd 254 and later expand `$VAR` and `${VAR}` in the command
+  line themselves, before CMD's shell sees it: `sh -c 'echo ${x%/job}'` failed with "Invalid
+  environment variable name". The flag stops that. Older systemd, which lacks it, didn't expand.
+- **Probing:** whether scopes work, and with which flag, is probed once and kept in `scopes-ok`
+  for ten minutes (a failure for one). Without them, or off Linux, CMD starts as it is.
+- **`OOMPolicy=continue`:** a capped program's cgroup running out of memory is that program's end,
+  not the runner's.
+- **The end:** when the runner exits, whatever it left in the scope is killed (`cgroup.kill`).
+
+## Named leases
+
+A named lease (`cpuq lease NAME`) is a queue of its own under `named/NAME/`, older than the pool
+and unchanged by it: `--slots` token files, one ticket per waiter (exclusively locked while it
+waits), one record per holder, strictly first come first served, no gates. A waiter that is not
+the head blocks on the ticket just ahead of it; the head takes a free slot under the lease's lock.
+A lease holds no CPU.
 
 ## Named leases over ssh
 
@@ -255,176 +313,114 @@ remote one while that local cpuq lives.
 
 ## Signals
 
-While the command runs, cpuq forwards HUP, INT, QUIT, TERM, USR1 and USR2 that a process sends
-it (`kill -INT <cpuq>` reaches the command). While cpuq is in its terminal's foreground, INT and
-QUIT are always the terminal's (`^C`, `^\`), as is any signal with no sending pid (`si_pid` 0,
-the terminal driver's hangup): the terminal already sent them to the whole foreground process
-group, the command included, so cpuq does not send them again (as with `system(3)`). macOS can
-name the process that wrote a keystroke to a pseudo-terminal as the sender of `^C`, so INT and
-QUIT are not judged by their sender. Elsewhere a signal with no sending pid is still forwarded:
-macOS records a sender only for a signal that can be taken at once, so a kill that lands while
-cpuq is handling the same signal arrives without one. A process that signals the whole process
-group (`kill -INT -PGID`) has a pid, so the command receives such a signal twice.
+A run of one task forwards HUP, INT, QUIT, TERM, USR1 and USR2 that a process sends cpuq to its
+command (`kill -INT <cpuq>` reaches it). While cpuq is in its terminal's foreground, INT and QUIT
+are always the terminal's (`^C`, `^\`), as is any signal with no sending pid (`si_pid` 0, the
+terminal driver's hangup): the terminal already sent them to the whole foreground process group,
+the command included, so cpuq does not send them again (as with `system(3)`). macOS can name the
+process that wrote a keystroke to a pseudo-terminal as the sender of `^C`, so INT and QUIT are not
+judged by their sender. Elsewhere a signal with no sending pid is still forwarded: macOS records a
+sender only for a signal that can be taken at once, so a kill that lands while cpuq is handling
+the same signal arrives without one.
+
+A run of many tasks takes INT, TERM, HUP and QUIT itself (each task leads its own group, out of
+the terminal's reach), passes the signal to every task group, and kills what is left 5 seconds
+later.
 
 A signal cpuq was started with ignored (`nohup`, a `&` job in a script) is left ignored, so the
 command inherits it ignored. When the command dies by a signal, cpuq dies by the same signal
 (without a core dump), so the caller's shell sees 128+N and a `^C` stops a shell loop.
 
-## The GNU make jobserver
+## Status and history
 
-CMD gets a pipe holding K-1 tokens whose descriptors it inherits, and MAKEFLAGS with
-` -j --jobserver-auth=R,W --jobserver-fds=R,W`, the form GNU make hands its own sub-makes (make
-4.2 and later read `--jobserver-auth`, macOS's `/usr/bin/make` 3.81 reads `--jobserver-fds`).
-The caller's other MAKEFLAGS are kept; their `-j` and jobserver options are replaced. So `make`
-under `cpuq run --cores 3` runs at most 3 recipes at once, with GNU make 3.81 and 4.4 alike, and
-so does `make -j` with 3.81. GNU make 4.x lets a `-j` on its own command line override any
-jobserver (it warns "-jN forced in submake"): `make -jN` then runs N at once, and a bare
-`make -j` is unlimited. A nested run leaves MAKEFLAGS as it is.
+**Status** (src/status.zig) reads the pool under its lock: the operations, the promises, the free
+CPUs and whether a drain waits. Its sample (skipped with `--no-usage`) watches every process and
+the machine's CPU ticks for half a second: each operation's tasks' CPU is its cpuq's process tree's
+CPU time over the sample, less cpuq's own, with tasks reaped meanwhile counted through cpuq's
+children time; processes outside every operation's tree at 0.3 of a CPU or more are outside work.
+The line's order is `handOut` played one CPU at a time; a waiter's place is where it first gets
+one, and its `why` says what holds it (a gate, outside load, a CPU being emptied for it, its place
+in line). A run's time left comes from its tasks ended so far; the next CPU to free, from the
+operations giving CPUs back and their mean task time. A project's fair share is water-filled by
+weight over each project's demand (held plus wanted). Flags come only after a run's first five
+seconds, and only when measured: under half a CPU busy per CPU held, over 1.2, stopped.
 
-## Measuring
+**History.** Each operation appends `queued` when it enters the line, then at its end `started`
+(dated at its first task's start) and `ended`, or `gave_up` for `--wait-max`. The end line holds
+the most CPUs it held at once, its tasks' CPU time (`wait4`'s figures summed over every child),
+tasks done and failed, and its exit status or signal. A line under 4 KB written with `O_APPEND`
+lands whole, so no lock is needed. An operation with neither `ended` nor `gave_up` whose cpuq is
+gone, or which queued before the machine last booted, is `lost`.
 
-**Cores active** in `cpuq status` is the CPU time a command's whole process tree spends over
-half a second, the short-lived processes it starts and reaps included. The same sample rates
-every other process: the five busiest outside every cpuq job (each at 0.3 of a CPU or more) are
-shown when together they use a CPU or more, or a gate is closed.
+## What the Lean model checks
 
-**ETA.** A waiter's ETA plays the queue forward: running jobs free their cores at their label's
-typical end (the median run of its finished jobs, or its project's when the label is new), and
-each waiter, in order, starts once its minimum fits the budget and then holds it for its own
-typical run. An unknown run time ahead of a waiter leaves its ETA unknown (`?`).
+A Lean 4 model of the protocol lives in `formal/` on the `lean-model` worktree. It models the
+protocol, not the Zig code: one step function over finite state (each CPU's flock holder, promise
+and record; each operation's phase and tasks; the tickets; the drain count), with the rules of
+src/pool.zig and the loop of src/op.zig as one of its rule sets (`Rules.poolFixed`, the code at
+8f997ec).
 
-**History.** Each job appends `queued`, `started`, then `ended` or `gave_up` lines to the history
-file; a line under 4 KB written with `O_APPEND` lands whole, so no lock is needed. A job armed to
-die writes its last line from the signal handler. A job with neither `ended` nor `gave_up` whose
-cpuq is gone, or which queued before the machine last booted, is `lost`. A `--hold` lease killed
-while held ends by that signal; one whose stdin closed first ends with status 0. A job's *active
-cores* is its CPU time (from the kernel's `wait4`) over its run time.
+- **Proved, safety,** in every reachable state, crashes, kills and stops included: one holder per
+  token, and a held token has no promise; never more CPUs held than the pool; never more than C
+  CPUs per operation, promises included; never more than K processes per CPU; no task running
+  twice at once; no CPU shared (a process runs only on its holder's CPU, or, a dead operation's,
+  on a CPU nobody holds); the drain count equals the draining CPUs; a promise goes only to the
+  first in line.
+- **Proved, liveness parts:** right after any hand-out, no CPU is free while anyone is in line;
+  each share-rule transfer lowers Σ nₚ²/wₚ, so transfers can't go back and forth; and a head that
+  holds nothing may take from every holder.
+- **Searched, not proved:** that every waiter is eventually served, by exhaustive search at small
+  sizes (up to 3 CPUs, 3 operations, K ≤ 2, 3 tasks each, one crash), under its assumptions: every
+  task ends (`-t`, the 1-hour default), no process stops holding the pool's lock, finitely many
+  urgent arrivals, no task waits on a `cpuq run` outside its own tree, the fallback hand-out runs,
+  and crashes, kills and stops end. The search found the line's earlier faults (a waiter holding
+  nothing starved; a giver taking its CPU back; the giver weighed at its old ticket; a stopped run
+  kept first in line), each fixed in the code with its scenario as a unit test.
+- **Not modelled:** flock itself, pinning, macOS, process groups and leftovers beyond a task's own
+  processes, the gates and outside load, `-c` as a percentage, nesting, `cpuq drain`, output
+  files, and time: no timed bound is proved.
 
-**Memory.** Each running job's cpuq looks every 2 seconds at the memory its command and the
-command's descendants use together (macOS's physical footprint, compressed pages included, as
-Activity Monitor shows it; Linux's resident set) and records the most in history; a job too
-quick to look at gets the most any one of its processes held. With `max_memory` set, over the
-limit, it asks the whole tree to stop (SIGTERM), makes it (SIGKILL) 10 seconds later if any of it
-remains, says so, and records the job as stopped for its memory (`memory` in `history --json`,
-"memory 42.0G" in `cpuq history`). One job that balloons would otherwise fill the swap and shut
-the memory gate on everyone.
+## The hook
 
-## Scheduling class
+`cpuq hook` (src/hook.zig) never touches state or config, except to stand down inside a task
+(`CPUQ_OP` naming a live operation). It splits the command at `;`, `&`, `|`, newlines, parentheses
+and `$(…)`, unquotes words, skips assignments and wrappers (`nice`, `env`, `time`, `timeout`…),
+follows `sh -c` scripts, heredocs and `ssh HOST CMD`, strips `cpuq cap`, and checks each simple
+command:
 
-On macOS, high and normal leave the command's QoS class unchanged and low runs it at background
-QoS (`posix_spawnattr_set_qos_class_np`): on Apple silicon background work stays on the
-efficiency cores, with throttled I/O. Utility QoS for normal would keep work mostly on the
-efficiency cores too, and leave the performance cores idle. On Linux, where cores are alike,
-high, normal and low run at nice 0, 5 and 15. Children inherit the class. Exclusive runs (they
-time benchmarks), named leases and `--qos none` leave it unchanged.
+1. A heavy command outside cpuq is refused with `cpuq run --label PROJECT:build|test -- CMD` at one
+   job: zig build `-j1`, cargo and swift `-j 1`, go `-p 1`, bazel `--jobs=1`, ninja and cmake
+   `-j 1`, xcodebuild `-jobs 1`; make, pytest and ctest with their `-j`/`-n` dropped; a jobs
+   option already given set to 1. Over ssh, with `--on HOST`.
+2. A removed option is refused with cpuq's own line for it (`hook.removed_options`, the list
+   `cpuq run` and `cpuq lease` use) and the command rewritten.
+3. `$CPUQ_CORES` in a run is refused, with the variable made 1, a one-command `sh -c` unwrapped,
+   and the command at one job.
+4. `--driver` passes for swarm, rip, or a script named `run`, `run.sh` or `run-tests*`, or under
+   `test/` or `tests/`; a build under it is refused (it would hold no CPU).
+5. Inside `cpuq run` or `cpuq lease`, a jobs count above 1, no limit (`make -j`, `-j0`,
+   `-n auto`), or a tool whose default is every CPU without its one-job option, is refused, with
+   the fix at one job "or split the work into tasks with -n M". A count it can't read passes.
 
-## Opaque jobs and CPU weights
+A `cpuq run` here (not `--on`) is also put to the advisor: long spec work that another host runs
+in half the time is sent to `cpuq submit`.
 
-A job's record carries `opaque=1` when it was started with `--opaque`. `measuredLoad` charges such
-a job its whole grant instead of its measured use, and an opaque waiter does not start while a
-window lends the machine; `freezeBeside` skips it.
+## A test's tasks
 
-With `cgroups` or `cpu_weights`, `runAdmitted` starts a core job as:
+`cpuq test` on a spec with `tasks` (src/tasks.zig, src/submit.zig's `_runjob`): after `setup`, the
+spec's `tasks` command writes one file per task into the job's folder,
+`~/.local/state/cpuq/jobs/JOB/STAMP/todo/`. The host then writes `manifest`, the names in `todo/`
+sorted, one a line, and runs, under `cpuq cap` with the spec's `time` and `mem` for them all:
 
-    systemd-run --user --scope --quiet --collect --expand-environment=no
-        [--property=CPUWeight=GRANT×100] [--property=Delegate=yes --property=OOMPolicy=continue]
-        --unit=cpuq-LEASE-PID -- [cpuq _job --] CMD...
+    cpuq run --label LABEL -n COUNT -t off -- cpuq _task FOLDER
 
-- **The pid:** systemd-run moves itself into the new scope and execs; `cpuq _job` then moves itself
-  into the scope's `job/`, enables `+memory +pids` for the scope's children (allowed only once the
-  scope's own cgroup holds no process), exports the scope as `CPUQ_CGROUP`, and execs CMD. So the
-  pid cpuq tracks stays the command's.
-- **`--expand-environment=no`:** systemd 254 and later expand `$VAR` and `${VAR}` in the command
-  line themselves, before CMD's shell sees it: `sh -c 'echo ${x%/job}'` failed with "Invalid
-  environment variable name". The flag stops that. Older systemd, which lacks it, didn't expand.
-- **Probing:** whether scopes work, and with which flag, is probed once and kept in `weights-ok`
-  for ten minutes. Without them, or off Linux, CMD starts as it is.
-- **What isn't scoped:** timing windows and named leases.
-- **`OOMPolicy=continue`:** a capped program's cgroup running out of memory is that program's end,
-  not the job's.
-
-## Fair turns, peaks, doctor and the hook
-
-`fairOrder` reorders the cores' queue within each priority class: a waiter's turn is its
-project's running jobs plus its project's waiters ahead of it (in ticket order), and the queue
-sorts by (moved to the front, class, turn, ticket). Every waiter computes the same order under the
-admission lock, so they agree on the head. Named leases keep arrival order.
-
-`watchChild` reads the command tree's CPU at each 2-second look and keeps the most cores used over
-any look of a second or more; `logEnded` writes it as `cpu_peak`. History sizing (`RunTimes.uses`)
-prefers `cpu_peak` over the run's average, so a build that fans out briefly counts at what it fans
-out to while it settles.
-
-`cpuq doctor` takes the state under the lock, samples like `cpuq status` (each job's CPU, the
-processes outside every job) and one more process snapshot for threads ready to run, then prints
-a line per finding.
-
-`cpuq hook` (src/hook.zig) never touches state or config. It splits the command at `;`, `&`, `|`,
-newlines, parentheses and `$(…)`, unquotes words, skips assignments and wrappers (`nice`, `env`,
-`time`, `timeout`…), follows `sh -c` scripts and `ssh HOST CMD`, and checks each simple command;
-quoting is tracked for `$CPUQ_CORES` expanded outside single quotes.
-
-## Jobs of task files
-
-A job is a folder, `STATE/jobs/NAME/STAMP/` (`STATE` is `CPUQ_STATE`, else
-`~/.local/state/cpuq`), whose files move between `todo/`, `live/`, `done/` and `fail/`, and one
-driver, `cpuq jobs run`, the only process that moves them. It holds an flock on the folder while
-it runs, so a second driver is refused and `reset` waits for none.
-
-**A task's run.** The driver renames the oldest file in `todo/` into `live/`, opens it to append
-and takes its flock, reads its work (up to the first blank line, ending the work with one if it
-has none), and starts `cpuq cap --link FD -- /bin/sh -c WORK` in a process group of its own, at a
-normal job's class, with the file as stdout and stderr and FD the read end of a pipe whose write
-end only the driver holds. Every descriptor of the file is the task tree's, so the lock lasts as
-long as anything the task started: a file in `live/` whose lock is free runs nowhere. When the
-driver goes, however it goes, the pipe closes and every cap stops its tree (exit 123). When the
-cap ends, the driver appends `== TIME HOST OUTCOME SECS` and renames the file by its outcome.
-Deaths are counted from those lines, so a task dies at most three times across drivers.
-
-**Restart.** A new driver files each file in `live/` whose lock is free as `died: lost`; one still
-locked belongs to a tree still ending, and the driver waits for it before it finishes.
-
-**Pacing.** Each new worker starts 50 ms ± 25 after the last (`stagger`), so a rise of workers
-doesn't start a crowd of compilers at once; a worker waits `gap` after each task.
-
-**Its sockets.** `jobs.sock` in the folder serves `status`, `watch`, `set`, `pause`, `resume` and
-`stop`, each a line, answered by a snapshot or `ok`/`error`. The driver also connects to the
-agent's `host.sock` when one listens (retrying each second), says `hello PATH pid P`, then
-`state STATE WEIGHT WORKERS GAP TODO LIVE DONE FAIL AVG_MS WSRC GSRC` at most every 250 ms while
-anything changes, then `bye`. It takes `workers N` and `gap MS` from the agent unless a user set
-that knob (`set`, which holds), and relays any other line the agent sends as a command. Without
-an agent, or after losing it, it keeps the counts it has.
-
-## The agent
-
-`cpuq agent` keeps the machine at its target load (`target`, else the CPUs online) and shares it
-among the running jobs by weight. It keeps no state file: what it knows is what the drivers
-connected now told it, so one started late learns every job within a second.
-
-Each second it measures the machine's busy CPU (the kernel's CPU ticks), its run queue now (not
-the load average), and each job's CPU: the change in its driver's process tree's CPU time, which
-counts reaped children too, so tasks that end within the second count. Outside load is the busy
-CPU less the jobs'. Then:
-
-1. **Cost** is a job's CPU per busy worker, an EWMA over about 15 seconds, starting at 1.0. It is
-   not updated while the machine is over target, where a starved job would look cheap.
-2. **Budget** is the target less outside load. While the run queue stays over target (two seconds
-   running) it is cut by target ÷ run queue each second, and while memory is short (memory
-   pressure, or less available than `min_available`) by a quarter; otherwise it grows at most 1.5
-   times a second, by at least one CPU.
-3. **Shares.** A job whose workers a user set keeps them, and its cost times them comes off the
-   budget first. The rest is water-filled by weight (whole numbers, 0 counting as 1): each job
-   gets min(what it can use, λ × weight), what it can use being its cost × its todo and live
-   tasks, with λ as large as the budget allows. It is deterministic: no lottery.
-4. **Knobs.** Workers are the share ÷ the cost rounded up: at least one while the job has work,
-   at most twice its last count each second. The rounding is taken back as a gap after each task,
-   from its usual task time, so the job uses its share and no more. A new count is pushed when it
-   moves 10% or more (any move under 10), a gap likewise.
-
-A job's priority is fixed when each task starts and is never the agent's knob: two controllers
-would fight, and lowering priority is one-way without root. A build is a single task, sized once
-by `$CPUQ_CORES` when it starts.
-
-`cpuq attach` joins stdin and stdout to `host.sock`: `jobs` lists the jobs, and `to PATH COMMAND`
-relays a driver command to the job whose folder is PATH (its real path), which is how a remote
-Cpuq.app reaches a host's jobs over ssh.
+So the tasks are an operation like any other: one CPU each, in the same line, packed and handed
+back as any run's. Task N (`CPUQ_TASK`) runs the file on line N of the manifest: its text up to the
+first blank line, by `/bin/sh -c` in the folder, with `$CPUQ_CODE` the copy's path, its output
+appended to the file. It then appends `== TIME HOST pass|fail|died: REASON SECS` and renames the
+file into `done/` (exit 0) or `fail/` (anything else). Only that task touches its file, so no two
+renames of one file race. A task cut off leaves its file in `todo/`; the folder's verdict
+(`PASS: N done`, `FAIL: F failed, N done[, T in todo/]`, `FAIL: no tasks`) follows the run's lines
+in the job's log, and `fail/`'s files come back to the worktree's `.cpuq/fail/`. A run of many
+writes its progress (`DONE TOTAL FAILING`) to `CPUQ_PROGRESS` as its tasks end, which
+`cpuq job` shows while it runs.

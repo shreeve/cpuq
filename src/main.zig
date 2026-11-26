@@ -1,183 +1,129 @@
-//! cpuq: a machine-wide CPU core queue. Jobs wait their turn for a number
-//! of cores out of a budget, then run in the foreground holding them. There
-//! is no daemon: every hold is a flock(2) in the state directory.
+//! cpuq: a machine-wide CPU pool. Each task of a run gets one CPU of the pool, handed out
+//! through a fair line shared by every run on the machine. There is no daemon: every hold is a
+//! flock(2) in the state directory.
 const std = @import("std");
 const Io = std.Io;
 const policy = @import("policy.zig");
-const state = @import("state.zig");
 const sys = @import("sys.zig");
-const gitship = @import("gitship.zig");
-const clean = @import("clean.zig");
-const packs_mod = @import("packs.zig");
-
-const history = @import("history.zig");
 const layout = @import("layout.zig");
-const hook = @import("hook.zig");
-const table = @import("table.zig");
 const cap = @import("cap.zig");
 const submit = @import("submit.zig");
-const place = @import("place.zig");
-
-const runopts = @import("runopts.zig");
-const repos = @import("repos.zig");
-const joblog = @import("joblog.zig");
-const texts = @import("texts.zig");
-const admission = @import("admission.zig");
+const cpus = @import("cpus.zig");
+const op = @import("op.zig");
 const runner = @import("runner.zig");
 const leasing = @import("leasing.zig");
-const timing = @import("timing.zig");
-const remotes = @import("remotes.zig");
-const control = @import("control.zig");
-const doctor = @import("doctor.zig");
 const records = @import("records.zig");
-const runtimes = @import("runtimes.zig");
-const statusjson = @import("statusjson.zig");
 const status = @import("status.zig");
-const jobs = @import("jobs.zig");
-const agent = @import("agent.zig");
-const lines = @import("lines.zig");
-
-const cmdRun = runner.cmdRun;
-const cmdJob = runner.cmdJob;
-const cmdLease = leasing.cmdLease;
-const cmdClean = control.cmdClean;
-const cmdNote = control.cmdNote;
-const cmdControl = control.cmdControl;
-const cmdWait = control.cmdWait;
-const cmdHook = doctor.cmdHook;
-const cmdDoctor = doctor.cmdDoctor;
-const cmdRecord = records.cmdRecord;
-const cmdSamples = records.cmdSamples;
-const cmdHistory = records.cmdHistory;
-const cmdStatus = status.cmdStatus;
+const tasks = @import("tasks.zig");
 
 test {
-    _ = jobs;
-    _ = agent;
-    _ = lines;
+    _ = tasks;
     _ = cap;
     _ = submit;
-    _ = hook;
+    _ = @import("hook.zig");
     _ = policy;
-    _ = state;
-    _ = history;
-    _ = table;
-    _ = gitship;
-    _ = packs_mod;
-    _ = clean;
-    _ = place;
+    _ = @import("state.zig");
+    _ = @import("history.zig");
+    _ = @import("table.zig");
+    _ = @import("gitship.zig");
+    _ = @import("packs.zig");
+    _ = @import("clean.zig");
+    _ = @import("place.zig");
     _ = sys;
+    _ = @import("pool.zig");
+    _ = op;
+    _ = cpus;
     _ = layout;
-    _ = runopts;
-    _ = repos;
-    _ = joblog;
-    _ = texts;
-    _ = admission;
+    _ = @import("runopts.zig");
+    _ = @import("repos.zig");
+    _ = @import("joblog.zig");
+    _ = @import("texts.zig");
     _ = runner;
     _ = leasing;
-    _ = timing;
-    _ = remotes;
-    _ = control;
-    _ = doctor;
+    _ = @import("remotes.zig");
     _ = records;
-    _ = runtimes;
-    _ = statusjson;
+    _ = @import("runtimes.zig");
+    _ = @import("statusjson.zig");
     _ = status;
 }
 
 pub const version = @import("build_options").version;
 
 const usage =
-    \\usage: cpuq run [run options] [--] CMD [ARGS...]
-    \\       cpuq lease NAME [lease options] [--] CMD [ARGS...]
-    \\       cpuq lease NAME --host HOST --hold [lease options]
-    \\       cpuq wait --label PATTERN [--max-wait SECONDS]
+    \\usage: cpuq run [-n M] [-c C] [-x K] [-t T] [-r N] [run options] [--] CMD [ARGS...]
+    \\       cpuq drain [--max T] [--label L] [--] CMD [ARGS...]
+    \\       cpuq kill TICKET|PID|LABEL
+    \\       cpuq lease NAME [--slots N] [--label L] [--wait-max S] [--host HOST] [--] CMD [ARGS...]
+    \\       cpuq lease NAME --host HOST --hold [--slots N] [--label L] [--wait-max S]
+    \\       cpuq wait --label PATTERN [--max-wait S]
     \\       cpuq status [--host HOST]... [--json] [--no-usage] [--watch[=SECONDS]]
     \\       cpuq history [--label PATTERN] [--limit N] [--json]
-    \\       cpuq first|start|cancel|pause|resume|stop LABEL|PID [--all] [--host HOST]
-    \\       cpuq doctor [--host HOST]
     \\       cpuq clean [--dry-run] [--older AGE] [--host HOST]
     \\       cpuq record [--interval SECONDS] | --install | --uninstall
-    \\       cpuq agent [--install | --uninstall] | cpuq attach
     \\       cpuq samples [--since UNIX-SECONDS]
     \\       cpuq cap [--mem SIZE] [--time DURATION] [--output SIZE] [--pids N] -- PROGRAM [ARGS...]
-    \\       cpuq note PID|LABEL TEXT [--all] [--host HOST]
     \\       cpuq submit SPEC [--note TEXT] [--env K=V]... [--replace | --again] [-- ARGS]
     \\       cpuq test SPEC [--on HOST] [--note TEXT] [--env K=V]... [--again] [-- ARGS]
     \\       cpuq packs [--host HOST] | cpuq packs install NAME@VERSION... [--host HOST]
-    \\       cpuq jobs [--all] | run [--workers N] [--weight W] [--gap MS] | status | watch | reset
-    \\       cpuq jobs set workers N | weight W | gap MS | cpuq jobs pause | resume | stop
+    \\       cpuq jobs [--all]
     \\       cpuq job [ID|last] [--wait [--max-wait S]] [--tail N] [--json] [--cancel]
     \\       cpuq hook                (an agent harness's pre-command hook)
-    \\       cpuq budget | qos | --version | --help
+    \\       cpuq budget | --version | --help
     \\
-    \\run options:
-    \\  --cores K             exactly K cores
-    \\  --cores MIN-MAX       MIN to MAX, as many as there is room for
-    \\                        (none: sized from the label's history, else 2)
-    \\  --label PROJECT:TASK  the job's name; history sizes and times jobs by it
-    \\  --priority P          high, normal (default) or low
-    \\  --max-wait SECONDS    give up after this long (exit 75); 0: start now or
-    \\                        give up
-    \\  --exclusive           hold the machine alone once it drains (timing only)
-    \\  --opaque              its work runs where cpuq can't see it (a container,
-    \\                        a VM): counted at its whole grant; give --cores
-    \\  --no-load-check       ignore the load valve
-    \\  --qos none|auto       none: leave the command's scheduling class alone
-    \\  --on HOST             run on HOST, one of this machine's remotes (config
-    \\                        `remotes`), or this machine itself: the repo is copied
-    \\                        there with rsync; it queues there if HOST is busy, and
+    \\run: M tasks of CMD (none: one, with the terminal), each on one CPU of the pool:
+    \\  -n M                  M tasks; each gets CPUQ_TASK (1..M), CPUQ_TASKS and CPUQ_CPU,
+    \\                        and its output goes to a file of its own
+    \\  -c C | -c P%          hold at most C CPUs, or P% of the pool (default 100%)
+    \\  -x K                  K tasks per CPU, for tasks that mostly wait (default 1)
+    \\  -t T                  each task's time limit (30s, 10m, 2h; config `timeout`, 1h)
+    \\  -r N                  try a failed task up to N more times (CPUQ_ATTEMPT says which)
+    \\  --label PROJECT:TASK  the run's name in status and history
+    \\  --note TEXT           what the run is for, kept beside its label
+    \\  --urgent              its first CPU goes ahead of the line (a rebuild someone waits on)
+    \\  --wait-max S          give up (exit 75) if no CPU comes within S seconds
+    \\  --driver              a test runner that starts `cpuq run`s of its own: holds no CPU
+    \\  --on HOST             run on HOST, one of this machine's remotes (config `remotes`):
+    \\                        the repo is copied there with rsync; it waits in HOST's line, and
     \\                        a stopped HOST is started (config `remote_start.HOST`)
     \\  --return PATH         with --on: copy PATH back here afterwards
     \\  --include PATH        with --on: copy PATH there too, gitignored or not,
     \\                        .git included (also listed in the repo's .cpuqinclude)
     \\
-    \\lease options (NAME: letters, digits, . _ -):
-    \\  --slots N             let N hold NAME at once (default 1)
-    \\  --host HOST           hold NAME on HOST's cpuq over ssh while CMD runs here
-    \\  --hold                with --host and no CMD: once granted, print
-    \\                        `held NAME@HOST ENTRY` and hold until stdin closes
-    \\  --exclusive           also hold the machine alone (HOST's, with --host)
-    \\  --priority, --label, --max-wait   as for run
-    \\
     \\commands:
-    \\  wait                  until no job whose label matches runs or waits
-    \\  status                --json for programs, --watch on a terminal, --host HOST
+    \\  drain                 empty the machine (every run gives its CPUs back as its tasks
+    \\                        end), then run CMD alone: for timing; --max T gives up (exit 75)
+    \\  kill                  end a run here: SIGTERM to its tasks, SIGKILL 5 s later
+    \\  lease                 hold one of NAME's --slots places (default 1) while CMD runs, first
+    \\                        come first served; --host holds it on HOST over ssh, --hold prints
+    \\                        `held NAME@HOST ENTRY` and holds until stdin closes
+    \\  wait                  until no run whose label matches (PATTERN* a prefix) runs or waits
+    \\  status                who holds which CPU, the line and why each waits; --json for
+    \\                        programs, --watch on a terminal, --host HOST
     \\  history               newest first: --label PATTERN, --limit N (20), --json
-    \\  first                 move a waiting job to the front
-    \\  start                 start a waiting job now, past the queue and the gates
-    \\  cancel                take a waiting job out of the queue (it exits 75)
-    \\  pause | resume        SIGSTOP | SIGCONT a running job's process tree
-    \\  stop                  SIGTERM a running job's process tree
-    \\  doctor                what's wrong that cpuq sees but can't stop: work
-    \\                        outside it, jobs over their grant, parked jobs,
-    \\                        requests too big to start; exit 1 if any
-    \\  record                sample this machine every 3 s (CPUs busy, load, cores held,
+    \\  record                sample this machine every 3 s (CPUs busy, load, CPUs held,
     \\                        waiting, gate) into a day of samples beside the history;
     \\                        --install keeps it running (launchd / systemd --user)
     \\  samples               the recorded samples since a time, one JSON line each
     \\  cap                   run one program under limits on its memory, time and output:
     \\                        for a test runner, around each program it starts (exit 122
-    \\                        memory, 124 time, 121 output); a cgroup of its own inside a job
-    \\                        on Linux, its own process tree read once a second elsewhere
+    \\                        memory, 124 time, 121 output); on Linux under --driver, a cgroup
+    \\                        of its own; elsewhere its process tree read once a second
     \\  hook                  Claude Code PreToolUse hook: refuses heavy commands
     \\                        outside cpuq or misusing it (exit 2, fix on stderr)
-    \\  budget | qos          print the budget | this process's scheduling class
-    \\  (a LABEL ending in * is a prefix; several matches need --all)
+    \\  budget                print the pool's size in CPUs
     \\
     \\environment: CPUQ_DIR (state directory), CPUQ_CONFIG (~/.config/cpuq/config),
-    \\CPUQ_BUDGET, CPUQ_HISTORY. A run's command gets CPUQ_CORES (its grant),
-    \\CPUQ_TOKEN and a GNU make jobserver in MAKEFLAGS; a lease's gets CPUQ_LEASES.
+    \\CPUQ_BUDGET (the pool's size), CPUQ_HISTORY. A task gets CPUQ_TASK, CPUQ_TASKS, CPUQ_CPU,
+    \\CPUQ_OP, CPUQ_ATTEMPT and CPUQ_ATTEMPTS; a lease's command gets CPUQ_LEASES.
     \\
-    \\exit: the command's own status; 128+N killed by signal N; 75 gave up waiting
-    \\(the command never ran); 125 cpuq failed; 126/127 not executable/not found;
-    \\2 usage or config error.
+    \\exit: one task: its own status, 124 at its time limit; many: 0 when every task
+    \\passed, else 1; 128+N killed by signal N; 75 gave up waiting (nothing ran);
+    \\125 cpuq failed; 126/127 not executable/not found; 2 usage or config error.
     \\
     \\for agents and scripts:
-    \\  pass the grant in single quotes, so it is expanded after cpuq sets it:
-    \\    cpuq run --label app:build --cores 2-6 -- sh -c 'zig build -j"$CPUQ_CORES"'
-    \\  plain `make` needs no -j: it takes its slots from the jobserver.
-    \\  exit 75: the command never ran; run it again later, not in a loop.
+    \\  a build runs on one CPU: cpuq run --label app:build -- zig build -j1
+    \\  many independent pieces run as tasks: cpuq run -n 40 -- sh -c 'test/one "$CPUQ_TASK"'
+    \\  exit 75: nothing ran; run it again later, not in a loop.
     \\  see AGENTS.md: https://github.com/shreeve/cpuq/blob/main/AGENTS.md
     \\
 ;
@@ -231,26 +177,28 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
         ctx.out.writeAll("cpuq " ++ version ++ "\n") catch {};
         return 0;
     }
-    if (std.mem.eql(u8, cmd, "hook")) return cmdHook(ctx);
-    if (std.mem.eql(u8, cmd, "_job")) return cmdJob(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "hook")) return runner.cmdHook(ctx);
+    if (std.mem.eql(u8, cmd, "_job")) return runner.cmdJob(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "_task")) return tasks.cmdTask(ctx.io, ctx.arena, ctx.env, args[1..]);
     if (std.mem.eql(u8, cmd, "cap")) return cap.main(ctx.arena, args[1..], ctx.env.get("CPUQ_CGROUP"), ctx.env.get("PATH"));
-    if (std.mem.eql(u8, cmd, "run")) return cmdRun(ctx, args[1..]);
-    if (std.mem.eql(u8, cmd, "lease")) return cmdLease(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "run")) return runner.cmdRun(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "drain")) return op.cmdDrain(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "lease")) return leasing.cmdLease(ctx, args[1..]);
     loadConfig(ctx);
-    if (std.mem.eql(u8, cmd, "status")) return cmdStatus(ctx, args[1..]);
-    if (std.mem.eql(u8, cmd, "agent")) return agent.cmdAgent(ctx, args[1..]);
-    if (std.mem.eql(u8, cmd, "attach")) return agent.cmdAttach(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "status")) return status.cmdStatus(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "jobs")) {
+        // The submitted jobs: this worktree's, or --all.
         const rest = args[1..];
-        if (rest.len != 0 and !std.mem.eql(u8, rest[0], "--all")) return jobs.cmdJobs(ctx, rest);
-        // Every job here: the job folders, then the submitted jobs (this worktree's, or --all).
-        _ = jobs.cmdJobs(ctx, &.{});
+        if (rest.len != 0 and !std.mem.eql(u8, rest[0], "--all")) {
+            std.debug.print("cpuq: jobs {s} is gone: a test's tasks run one per CPU of the pool (cpuq test), and tasks of your own with cpuq run -n M; cpuq jobs lists submitted jobs\n", .{rest[0]});
+            return exit_usage;
+        }
         return submit.cmdJobs(submitCx(ctx), rest);
     }
-    if (std.mem.eql(u8, cmd, "wait")) return cmdWait(ctx, args[1..]);
-    if (std.mem.eql(u8, cmd, "history")) return cmdHistory(ctx, args[1..]);
-    if (std.mem.eql(u8, cmd, "doctor")) return cmdDoctor(ctx, args[1..]);
-    if (std.mem.eql(u8, cmd, "record")) return cmdRecord(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "wait")) return runner.cmdWait(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "kill")) return op.cmdKill(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "history")) return records.cmdHistory(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "record")) return records.cmdRecord(ctx, args[1..]);
     inline for (.{
         .{ "submit", submit.cmdSubmit },
         .{ "test", submit.cmdTest },
@@ -268,24 +216,33 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
             return entry[1](submitCx(ctx), args[1..]);
         }
     }
-    if (std.mem.eql(u8, cmd, "samples")) return cmdSamples(ctx, args[1..]);
-    if (std.mem.eql(u8, cmd, "note")) return cmdNote(ctx, args[1..]);
-    if (std.mem.eql(u8, cmd, "clean")) return cmdClean(ctx, args[1..]);
-    inline for (.{ "first", "start", "cancel", "pause", "resume", "stop" }) |action| {
-        if (std.mem.eql(u8, cmd, action)) return cmdControl(ctx, action, args[1..]);
-    }
+    if (std.mem.eql(u8, cmd, "samples")) return records.cmdSamples(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "clean")) return records.cmdClean(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "budget")) {
-        const m = machine(ctx);
-        ctx.out.print("{d}\n", .{budgetNow(ctx, m)}) catch {};
+        ctx.out.print("{d}\n", .{poolCpus(ctx).len}) catch {};
         return 0;
     }
-    if (std.mem.eql(u8, cmd, "qos")) {
-        var buf: [32]u8 = undefined;
-        ctx.out.print("{s}\n", .{sys.currentQos(&buf)}) catch {};
-        return 0;
-    }
+    for (removed_commands) |r| if (std.mem.eql(u8, cmd, r[0])) {
+        std.debug.print("cpuq: {s}\n", .{r[1]});
+        return exit_usage;
+    };
     return usageError("unknown command '{s}'", .{cmd});
 }
+
+/// Commands cpuq does not take, each with what does that work.
+const removed_commands = [_][2][]const u8{
+    .{ "first", "first is gone: --urgent puts a run's first CPU ahead of the line" },
+    .{ "start", "start is gone: a free CPU goes to the first in the line" },
+    .{ "cancel", "cancel is gone: `cpuq kill TICKET` ends a run, waiting or running" },
+    .{ "pause", "pause is gone: Ctrl-Z on a run gives its CPUs back until it continues" },
+    .{ "resume", "resume is gone: a run continued after Ctrl-Z takes CPUs again" },
+    .{ "stop", "stop is gone: `cpuq kill TICKET` ends a run" },
+    .{ "note", "note is gone: `cpuq run --note TEXT` keeps a note beside the label" },
+    .{ "doctor", "doctor is gone: cpuq status flags runs over or under their CPUs, and work outside cpuq" },
+    .{ "qos", "qos is gone: tasks run as they are" },
+    .{ "agent", "agent is gone: the pool shares the machine by itself; stop an installed agent with launchctl bootout gui/$UID/com.github.shreeve.cpuq.agent (macOS) or systemctl --user disable --now cpuq-agent (Linux)" },
+    .{ "attach", "attach is gone: cpuq status --json shows every run" },
+};
 
 fn submitCx(ctx: *Ctx) submit.Cx {
     const self = std.process.executablePathAlloc(ctx.io, ctx.arena) catch fail("can't find this binary's path", .{});
@@ -324,8 +281,8 @@ pub fn loadConfig(ctx: *Ctx) void {
     };
 }
 
-/// Re-reads the config file when it has changed since it was read, so a run
-/// already waiting takes up a new budget or margin. An invalid file keeps
+/// Re-reads the config file when it has changed since it was read, so a cpuq
+/// that runs for long (the recorder) takes up a change. An invalid file keeps
 /// the settings in force, and says so once.
 pub fn reloadConfig(ctx: *Ctx) void {
     if (ctx.cfg_path.len == 0) return;
@@ -359,11 +316,6 @@ pub fn stateDir(ctx: *Ctx) []const u8 {
     }
     const tmp = Io.Dir.realPathFileAbsoluteAlloc(ctx.io, "/tmp", ctx.arena) catch "/tmp";
     return ctx.arena.print("{s}/cpuq-{d}", .{ tmp, sys.getuid() }) catch fail("out of memory", .{});
-}
-
-pub fn openState(ctx: *Ctx) state.State {
-    const dir = stateDir(ctx);
-    return state.State.open(ctx.io, dir) catch |err| fail("state directory {s}: {t}", .{ dir, err });
 }
 
 pub fn machine(ctx: *Ctx) policy.Machine {
@@ -401,11 +353,12 @@ fn leastDisk(ctx: *Ctx) ?policy.Disk {
     return least;
 }
 
-fn envBudget(ctx: *Ctx) ?u32 {
-    const s = ctx.env.get("CPUQ_BUDGET") orelse return null;
-    return policy.parseCount(s) orelse fail("CPUQ_BUDGET must be a whole number of cores, at least 1, not '{s}'", .{s});
-}
-
-pub fn budgetNow(ctx: *Ctx, m: policy.Machine) u32 {
-    return policy.effectiveBudget(envBudget(ctx), ctx.cfg, m.active);
+/// The pool's CPUs, in the order they are handed out (cpus.zig): the config's `cpus`, else
+/// the machine's, the first CPUQ_BUDGET (else `budget`) of them.
+pub fn poolCpus(ctx: *Ctx) []const u32 {
+    const env_budget: ?u32 = if (ctx.env.get("CPUQ_BUDGET")) |s|
+        policy.parseCount(s) orelse fail("CPUQ_BUDGET must be a whole number of CPUs, at least 1, not '{s}'", .{s})
+    else
+        null;
+    return cpus.list(ctx.io, ctx.arena, if (ctx.cfg.cpus.len != 0) ctx.cfg.cpus else null, env_budget orelse ctx.cfg.budget);
 }

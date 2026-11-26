@@ -21,7 +21,7 @@ fail() { echo "error: $*" >&2; exit 1; }
 # Compiling takes cores from cpuq, when it is installed and this is not already inside a cpuq
 # job; the rest (notarizing waits minutes on Apple) holds none.
 compiling() {
-    if [ -z "${CPUQ_TOKEN:-}" ] && command -v cpuq >/dev/null; then cpuq run --cores 2-4 --label cpuq:app-build -- "$@"; else "$@"; fi
+    if [ -z "${CPUQ_OP:-}" ] && command -v cpuq >/dev/null; then cpuq run --label cpuq:app-build -- "$@"; else "$@"; fi
 }
 
 version=${1:?usage: app/scripts/release.sh X.Y.Z [--dry-run]}
@@ -38,7 +38,7 @@ out="$root/.build/release-$version"
 # --- Preflight -------------------------------------------------------------------------------
 security find-identity -v -p codesigning | grep -qF "\"$sign\"" || fail "the keychain has no \"$sign\""
 xcrun notarytool history --keychain-profile "$profile" >/dev/null 2>&1 || fail "notarytool cannot sign in with keychain profile \"$profile\""
-compiling sh -c 'swift build -c release ${CPUQ_CORES:+-j "$CPUQ_CORES"}' >&2
+compiling sh -c 'swift build -c release -j 1' >&2
 bin=$(find .build/artifacts -type d -path '*Sparkle/bin' | head -1)
 [ -x "$bin/generate_keys" ] || fail "no Sparkle tools under .build/artifacts"
 keychain_key=$("$bin/generate_keys" --account cpuq -p 2>/dev/null | tail -1)

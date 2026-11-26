@@ -15,7 +15,6 @@ extern "c" fn getpriority(which: c_int, who: c_uint) c_int;
 extern "c" fn setpriority(which: c_int, who: c_uint, prio: c_int) c_int;
 extern "c" fn posix_spawnattr_setsigmask(attr: *c.posix_spawnattr_t, mask: *const c.sigset_t) c_int;
 extern "c" fn posix_spawnattr_set_qos_class_np(attr: *c.posix_spawnattr_t, qos: c_uint) c_int;
-extern "c" fn qos_class_self() c_uint;
 
 /// macOS struct statfs (64-bit inodes), and Linux struct statvfs, alike in
 /// glibc and musl on 64-bit targets.
@@ -62,10 +61,9 @@ const PRIO_PROCESS = 0;
 const QOS_CLASS_UTILITY = 0x11;
 const QOS_CLASS_BACKGROUND = 0x09;
 
-/// Cores the OS has active now: macOS hw.activecpu (it drops under thermal
+/// CPUs the OS has active now: macOS hw.activecpu (it drops under thermal
 /// limits); Linux the CPUs in this process's affinity mask, or every CPU online
-/// in a job cpuq confined to its own (CPUQ_CPUS): a cpuq run there is a job of
-/// its own, on the machine's CPUs.
+/// inside a task (CPUQ_OP), which cpuq pinned to its one CPU.
 pub fn activeCpus(io: Io) u32 {
     if (is_darwin) {
         var n: c_int = 0;
@@ -73,7 +71,7 @@ pub fn activeCpus(io: Io) u32 {
         if (c.sysctlbyname("hw.activecpu", &n, &len, null, 0) == 0 and n > 0) return @intCast(n);
         return 1;
     }
-    if (c.getenv("CPUQ_CPUS") != null) {
+    if (c.getenv("CPUQ_OP") != null) {
         var buf: [1024]u8 = undefined;
         const text = Io.Dir.cwd().readFile(io, "/sys/devices/system/cpu/online", &buf) catch "";
         if (policy.cpuListCount(text)) |n| return n;
@@ -82,16 +80,8 @@ pub fn activeCpus(io: Io) u32 {
     return @intCast(@max(n, 1));
 }
 
-/// Linux: the CPUs online now; empty when they cannot be read.
-pub fn onlineCpus(io: Io, a: std.mem.Allocator) []const u32 {
-    var buf: [1024]u8 = undefined;
-    const text = Io.Dir.cwd().readFile(io, "/sys/devices/system/cpu/online", &buf) catch return &.{};
-    return policy.cpuList(a, text) catch &.{};
-}
-
-/// The machine's cores: one token file each. On Linux this is every CPU the
-/// machine has, not the caller's affinity, so that runs confined to fewer
-/// CPUs (taskset, a cpuset) agree with everyone else on the token set.
+/// The machine's CPUs. On Linux this is every CPU the machine has, not the
+/// caller's affinity (taskset, a cpuset, a task's pin).
 pub fn totalCpus(io: Io) u32 {
     if (is_darwin) {
         var n: c_int = 0;
@@ -367,38 +357,6 @@ pub fn memoryPressure(io: Io, psi_threshold: f64) policy.Pressure {
     return policy.psiPressure(text, psi_threshold);
 }
 
-/// The scheduling class of the calling process, for `cpuq qos`.
-pub fn currentQos(buf: []u8) []const u8 {
-    if (is_darwin) {
-        const class = switch (qos_class_self()) {
-            0x21 => "user-interactive",
-            0x19 => "user-initiated",
-            0x15 => "default",
-            QOS_CLASS_UTILITY => "utility",
-            QOS_CLASS_BACKGROUND => "background",
-            0x00 => "unspecified",
-            else => |q| std.mem.print(buf, "qos 0x{x}", .{q}) catch "qos ?",
-        };
-        // A nice value, when one is set: "default, nice 10".
-        const nice = getpriority(PRIO_PROCESS, 0);
-        if (nice == 0) return class;
-        var tmp: [32]u8 = undefined;
-        @memcpy(tmp[0..class.len], class);
-        return std.mem.print(buf, "{s}, nice {d}", .{ tmp[0..class.len], nice }) catch class;
-    }
-    return std.mem.print(buf, "nice {d}", .{getpriority(PRIO_PROCESS, 0)}) catch "nice ?";
-}
-
-/// A pipe whose descriptors the command inherits, holding `tokens` bytes:
-/// a GNU make jobserver.
-pub fn jobserverPipe(tokens: u32) ![2]c.fd_t {
-    var fds: [2]c.fd_t = undefined;
-    if (c.pipe(&fds) != 0) return error.PipeFailed;
-    var buf: [256]u8 = @splat('+');
-    writeAll(fds[1], buf[0..@min(tokens, buf.len)]);
-    return fds;
-}
-
 pub fn writeAll(fd: c.fd_t, bytes: []const u8) void {
     var i: usize = 0;
     while (i < bytes.len) {
@@ -430,6 +388,8 @@ pub const SpawnOpts = struct {
     dir: ?[*:0]const u8 = null,
     /// In a process group of its own, out of reach of the terminal's ^C.
     group: bool = false,
+    /// Linux: killed (SIGKILL) when the process that started it dies, however it dies.
+    pdeath: bool = false,
 };
 
 /// Starts `path` with an empty signal mask, in the given scheduling class.
@@ -483,9 +443,15 @@ pub fn spawn(
     for (o.cpus) |cpu| if (cpu < set.len * bits) {
         set[cpu / bits] |= @as(usize, 1) << @intCast(cpu % bits);
     };
+    const parent = c.getpid();
     const pid = c.fork();
     if (pid < 0) return error.SpawnFailed;
     if (pid == 0) {
+        if (o.pdeath) {
+            _ = std.os.linux.prctl(@intCast(@backingInt(std.os.linux.PR.SET_PDEATHSIG)), @backingInt(std.os.linux.SIG.KILL), 0, 0, 0);
+            // The parent may have died before the call: then nobody would send it.
+            if (c.getppid() != parent) c._exit(125);
+        }
         // Before exec, so the command's first thread, and all it starts, see only these.
         if (o.group) _ = c.setpgid(0, 0);
         if (o.cpus.len != 0) _ = std.os.linux.syscall3(.sched_setaffinity, 0, @sizeOf(std.os.linux.cpu_set_t), @intFromPtr(&set));
@@ -549,8 +515,7 @@ var pending_signal = std.atomic.Value(u32).init(0);
 /// Last words: the history line cpuq appends if a signal kills it while it
 /// waits, or holds a lease with no command, so the job reads as ended and
 /// not as lost. The line is `head`, the time, `tail` and (when asked) the
-/// signal, rendered ahead of time so the handler only writes. There are two
-/// slots: a lease taken `--exclusive` is two jobs, the lease and the cores.
+/// signal, rendered ahead of time so the handler only writes.
 const Words = struct {
     head: [256]u8 = undefined,
     head_len: usize = 0,
@@ -560,18 +525,17 @@ const Words = struct {
     armed: std.atomic.Value(bool) = .init(false),
 };
 var last_path: [1024]u8 = undefined;
-var last_words: [2]Words = .{ .{}, .{} };
+var last_words: Words = .{};
 
-/// Arms slot `slot`'s last words, catching hangup, ^C, ^\ and kill; arming
-/// it again replaces them. A signal cpuq was started with ignored stays
-/// ignored.
-pub fn armLastWords(slot: u1, path: []const u8, head: []const u8, tail: []const u8, with_signal: bool) void {
+/// Arms the last words, catching hangup, ^C, ^\ and kill; arming them again
+/// replaces them. A signal cpuq was started with ignored stays ignored.
+pub fn armLastWords(path: []const u8, head: []const u8, tail: []const u8, with_signal: bool) void {
     // A fatal signal arriving while the line is rewritten waits until it is
     // in place: the kit closes a hold's stdin and kills it at once, which
     // lands exactly as cpuq re-arms.
     const before = holdFatal();
     defer restoreSignals(before);
-    const w = &last_words[slot];
+    const w = &last_words;
     w.armed.store(false, .release);
     if (path.len >= last_path.len or head.len > w.head.len or tail.len > w.tail.len) return;
     @memcpy(last_path[0..path.len], path);
@@ -592,8 +556,8 @@ pub fn armLastWords(slot: u1, path: []const u8, head: []const u8, tail: []const 
 }
 
 fn onFatal(sig: c.SIG) callconv(.c) void {
-    for (&last_words) |*w| {
-        if (!w.armed.swap(false, .acq_rel)) continue;
+    const w = &last_words;
+    if (w.armed.swap(false, .acq_rel)) {
         var buf: [256 + 64 + 64]u8 = undefined;
         var n: usize = 0;
         @memcpy(buf[n..][0..w.head_len], w.head[0..w.head_len]);
@@ -693,6 +657,12 @@ pub fn installForwarding() void {
 
 /// Records the command's pid for the handlers and delivers any signal that
 /// arrived while it was being started.
+/// A forwarded signal that came while no command ran yet (0: none), taken: a run waiting for
+/// its CPU ends on it rather than starting the command.
+pub fn takePending() u32 {
+    return pending_signal.swap(0, .acq_rel);
+}
+
 pub fn setChild(pid: c.pid_t) void {
     child_pid.store(pid, .release);
     const sig = pending_signal.swap(0, .acq_rel);
@@ -757,6 +727,16 @@ fn waited(status: c_int, ru: c.rusage) Waited {
     if (c.W.IFEXITED(s)) return .{ .exit = .{ .code = c.W.EXITSTATUS(s) }, .cpu_s = cpu_s, .peak = peak };
     if (c.W.IFSIGNALED(s)) return .{ .exit = .{ .signal = c.W.TERMSIG(s) }, .cpu_s = cpu_s, .peak = peak };
     return .{ .exit = .{ .code = 125 }, .cpu_s = cpu_s, .peak = peak };
+}
+
+extern "c" fn getrusage(who: c_int, usage: *c.rusage) c_int;
+
+/// CPU seconds used by every child this process has reaped, and their descendants that were
+/// reaped in turn (RUSAGE_CHILDREN): what wait4 reported for each, summed.
+pub fn childrenCpu() f64 {
+    var ru: c.rusage = undefined;
+    if (getrusage(-1, &ru) != 0) return 0;
+    return seconds(ru.utime) + seconds(ru.stime);
 }
 
 fn seconds(tv: c.timeval) f64 {
@@ -1057,46 +1037,6 @@ fn rusage(pid: c_int, tb: MachTimebase) ?Rusage {
     };
 }
 
-/// Threads ready to run in a process and its descendants.
-pub fn treeRunning(procs: []const Proc, root: i32) u32 {
-    var total: u32 = 0;
-    var frontier: [512]i32 = undefined;
-    var len: usize = 1;
-    frontier[0] = root;
-    var seen: usize = 0;
-    while (seen < len) : (seen += 1) {
-        const pid = frontier[seen];
-        for (procs) |p| {
-            if (p.pid == pid) total += p.running;
-            if (p.ppid == pid and p.pid != pid and len < frontier.len) {
-                frontier[len] = p.pid;
-                len += 1;
-            }
-        }
-    }
-    return total;
-}
-
-/// The memory a process and its descendants use, in bytes.
-pub fn treeMem(procs: []const Proc, root: i32) u64 {
-    var total: u64 = 0;
-    var frontier: [512]i32 = undefined;
-    var len: usize = 1;
-    frontier[0] = root;
-    var seen: usize = 0;
-    while (seen < len) : (seen += 1) {
-        const pid = frontier[seen];
-        for (procs) |p| {
-            if (p.pid == pid) total += p.mem;
-            if (p.ppid == pid and p.pid != pid and len < frontier.len) {
-                frontier[len] = p.pid;
-                len += 1;
-            }
-        }
-    }
-    return total;
-}
-
 pub fn treeCpu(procs: []const Proc, root: i32) u64 {
     var total: u64 = 0;
     var frontier: [512]i32 = undefined;
@@ -1120,6 +1060,93 @@ pub fn processAlive(pid: c.pid_t) bool {
     if (pid <= 0) return false;
     if (c.kill(pid, @fromBackingInt(@intCast(0))) == 0) return true;
     return c.errno(-1) == .PERM;
+}
+
+/// When a process started, as a number that differs between two processes that held the same
+/// pid: macOS its start time in microseconds (proc_bsdinfo's pbi_start_tvsec and _tvusec),
+/// Linux its start in clock ticks since boot (/proc/PID/stat, field 22). Null when it is gone,
+/// a zombie (macOS has no bsdinfo for one), or can't be read.
+pub fn procStart(pid: c.pid_t) ?u64 {
+    if (pid <= 0) return null;
+    if (is_darwin) {
+        // struct proc_bsdinfo (PROC_PIDTBSDINFO, 136 bytes): pbi_start_tvsec at 120, _tvusec at 128.
+        var info: [136]u8 align(8) = undefined;
+        if (proc_pidinfo(pid, 3, 0, &info, info.len) != info.len) return null;
+        const sec = std.mem.readInt(u64, info[120..128], .little);
+        const usec = std.mem.readInt(u64, info[128..136], .little);
+        return sec * 1_000_000 + usec;
+    }
+    var path_buf: [32]u8 = undefined;
+    const path = std.mem.printSentinel(&path_buf, "/proc/{d}/stat", .{pid}, 0) catch return null;
+    const fd = c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    if (fd < 0) return null;
+    defer _ = c.close(fd);
+    var buf: [1024]u8 = undefined;
+    const n = c.read(fd, &buf, buf.len);
+    if (n <= 0) return null;
+    return statStart(buf[0..@intCast(n)]);
+}
+
+/// Field 22 (starttime) of a /proc/PID/stat line; null for a zombie (state Z or X), which has
+/// ended though its parent has not reaped it yet. The name in field 2 is in parentheses and may
+/// hold spaces and parentheses itself, so the count starts after the last ')'.
+fn statStart(line: []const u8) ?u64 {
+    const close = std.mem.findScalarLast(u8, line, ')') orelse return null;
+    var it = std.mem.tokenizeScalar(u8, line[close + 1 ..], ' ');
+    var field: u32 = 3;
+    while (it.next()) |f| : (field += 1) {
+        if (field == 3 and (std.mem.eql(u8, f, "Z") or std.mem.eql(u8, f, "X"))) return null;
+        if (field == 22) return std.fmt.parseInt(u64, f, 10) catch null;
+    }
+    return null;
+}
+
+test "statStart" {
+    try std.testing.expectEqual(@as(?u64, 4242), statStart("17 (a) b) c) S 1 17 17 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 4242 1000 10"));
+    try std.testing.expectEqual(@as(?u64, null), statStart("17 (short) S 1"));
+    try std.testing.expectEqual(@as(?u64, null), statStart("17 (a) Z 1 17 17 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 4242 1000 10"));
+}
+
+/// Linux: pins every thread of process `pid` to `cpu` (sched_setaffinity works per thread,
+/// so each in /proc/PID/task). Elsewhere it does nothing.
+pub fn pinThreads(io: Io, a: std.mem.Allocator, pid: c.pid_t, cpu: u32) void {
+    if (is_darwin) return;
+    var set: std.os.linux.cpu_set_t = @splat(0);
+    const bits = @bitSizeOf(usize);
+    if (cpu >= set.len * bits) return;
+    set[cpu / bits] |= @as(usize, 1) << @intCast(cpu % bits);
+    const path = std.fmt.allocPrint(a, "/proc/{d}/task", .{pid}) catch return;
+    var dir = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| {
+        const tid = std.fmt.parseInt(i32, e.name, 10) catch continue;
+        _ = std.os.linux.syscall3(.sched_setaffinity, @as(usize, @bitCast(@as(isize, tid))), @sizeOf(std.os.linux.cpu_set_t), @intFromPtr(&set));
+    }
+}
+
+/// A process's parent, or null when it is gone or can't be read: macOS proc_bsdinfo's
+/// pbi_ppid, Linux /proc/PID/stat's fourth field.
+pub fn parentOf(pid: c.pid_t) ?c.pid_t {
+    if (pid <= 0) return null;
+    if (is_darwin) {
+        var info: [136]u8 align(8) = undefined;
+        if (proc_pidinfo(pid, 3, 0, &info, info.len) != info.len) return null;
+        return @intCast(std.mem.readInt(u32, info[16..20], .little));
+    }
+    var path_buf: [32]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/stat", .{pid}, 0) catch return null;
+    const fd = c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    if (fd < 0) return null;
+    defer _ = c.close(fd);
+    var buf: [1024]u8 = undefined;
+    const n = c.read(fd, &buf, buf.len);
+    if (n <= 0) return null;
+    const line = buf[0..@intCast(n)];
+    const close = std.mem.findScalarLast(u8, line, ')') orelse return null;
+    var it = std.mem.tokenizeScalar(u8, line[close + 1 ..], ' ');
+    _ = it.next() orelse return null; // state
+    return std.fmt.parseInt(c.pid_t, it.next() orelse return null, 10) catch null;
 }
 
 pub fn getpid() c.pid_t {

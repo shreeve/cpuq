@@ -10,7 +10,7 @@
 //! submitting machine resolves each to an exact version (`latest`: the default branch's head;
 //! `stable`: the newest release tag; `0.2.9`: that tag; a hash: that commit), and its recipe
 //! (~/.config/cpuq/packs.json, beside the config) says how to build it and what it needs. A
-//! version is installed once, by the first job that needs it, inside that job's grant and under
+//! version is installed once, by the first job that needs it, inside that job and under
 //! a lock, and never changes after: `latest` and `stable` are links to what they last were.
 
 const std = @import("std");
@@ -299,7 +299,7 @@ pub fn ship(a: std.mem.Allocator, io: Io, host: ?[]const u8, p: Pack) ?[]const u
 }
 
 /// `cpuq _pack NAME VERSION ALIAS KIND BIN BUILD`: a submitted job's first steps, one per pack,
-/// inside its grant. Installs that version in the store unless it's there: zig's release
+/// inside it. Installs that version in the store unless it's there: zig's release
 /// downloaded and checked, or a git pack built from the source its submitter shipped. One
 /// install at a time per version; a job that finds one going waits for it.
 pub fn install(a: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, args: []const [:0]const u8) u8 {

@@ -1,8 +1,9 @@
-//! `cpuq record`, `cpuq samples` and `cpuq history`: what this machine and its jobs did.
+//! `cpuq record`, `cpuq samples` and `cpuq history`: what this machine and its runs did; and
+//! `cpuq clean`, which the recorder runs hourly.
 const std = @import("std");
 const Io = std.Io;
 const policy = @import("policy.zig");
-const state = @import("state.zig");
+const pool_mod = @import("pool.zig");
 const sys = @import("sys.zig");
 const clean = @import("clean.zig");
 const history = @import("history.zig");
@@ -11,7 +12,6 @@ const table = @import("table.zig");
 const main = @import("main.zig");
 const joblog = @import("joblog.zig");
 const texts = @import("texts.zig");
-const admission = @import("admission.zig");
 const runtimes = @import("runtimes.zig");
 
 const exit_failure = main.exit_failure;
@@ -20,17 +20,14 @@ const fail = main.fail;
 const usageError = main.usageError;
 const nowSeconds = main.nowSeconds;
 const reloadConfig = main.reloadConfig;
-const openState = main.openState;
+const stateDir = main.stateDir;
 const machine = main.machine;
-const budgetNow = main.budgetNow;
 const nowFloat = joblog.nowFloat;
 const historyPath = joblog.historyPath;
-const bytesText = texts.bytesText;
 const duration = texts.duration;
 const age = texts.age;
 const pad = texts.pad;
 const dash = texts.dash;
-const lockOrFail = admission.lockOrFail;
 const aliveForHistory = runtimes.aliveForHistory;
 
 /// The recorder's samples, beside the history: a day or more of the machine every few seconds.
@@ -49,39 +46,29 @@ const JsonJob = struct {
     state: []const u8,
     pool: []const u8,
     host: ?[]const u8,
+    repo: ?[]const u8,
+    project: ?[]const u8,
     label: []const u8,
     note: []const u8,
     command: []const u8,
-    priority: []const u8,
-    exclusive: bool,
-    min: u32,
-    max: u32,
+    tasks: ?u32,
     cores: ?u32,
-    slots: ?[]const u32,
     queued: f64,
     started: ?f64,
     ended: ?f64,
     waited: ?f64,
     ran: ?f64,
     used: ?f64,
+    done: ?u32,
+    failed: ?u32,
     exit: ?u8,
     signal: ?u32,
-    /// Stopped by cpuq for using this many bytes of memory.
-    memory: ?u64 = null,
-    /// The most memory it used at once, in bytes.
-    peak: ?u64 = null,
-    /// A timing window's: CPUs of other work beside it, on average and at
-    /// most.
-    noise: ?f64 = null,
-    noise_peak: ?f64 = null,
-    /// The most cores it kept busy over a 2-second look.
-    cpu_peak: ?f64 = null,
 };
 
 /// `cpuq record`: samples this machine every few seconds into samples.jsonl beside the
 /// history, one JSON line each: `t` (Unix seconds), `cpu` (each CPU's busy share since the last
-/// sample, in percent, in the kernel's order), `load` (1-minute), `held` (cores handed out),
-/// `wait` (jobs waiting) and `gate`. It only watches: nothing in cpuq waits on it or reads it but
+/// sample, in percent, in the kernel's order), `load` (1-minute), `held` (the pool's CPUs held),
+/// `wait` (runs holding none yet) and `gate`. It only watches: nothing in cpuq waits on it or reads it but
 /// `cpuq samples`, and every command works the same without it. One runs per machine (a lock
 /// beside the file); it exits when its own binary is replaced, so the service that keeps it
 /// running starts the new one. `--install` sets up that service: a launchd agent on macOS, a
@@ -119,7 +106,7 @@ pub fn cmdRecord(ctx: *Ctx, args: []const [:0]const u8) u8 {
     const exe = std.process.executablePathAlloc(io, ctx.arena) catch null;
     const born: i96 = if (exe) |e| (if (cwd.statFile(io, e, .{})) |st| st.mtime.nanoseconds else |_| 0) else 0;
 
-    var st = openState(ctx);
+    var pool = pool_mod.Pool.open(io, ctx.arena, stateDir(ctx)) catch |err| fail("pool: {t}", .{err});
     var prev = sys.perCpuTicks(io, ctx.arena);
     var n: u64 = 0;
     std.debug.print("cpuq: recording this machine every {d:.1} s into {s}\n", .{ @as(f64, @floatFromInt(interval_ms)) / 1000, path });
@@ -145,13 +132,17 @@ pub fn cmdRecord(ctx: *Ctx, args: []const [:0]const u8) u8 {
         }
         // The next sample's baseline outlives this pass's arena.
         if (ticks) |t| prev = ctx.arena.dupe(sys.Ticks, t) catch prev;
-        lockOrFail(&st);
-        const queue = state.scanQueue(&st, a, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{});
-        const held = state.heldTokens(&st) catch 0;
-        st.unlock();
-        const m = machine(ctx);
-        const g = policy.gate(ctx.cfg, m, budgetNow(ctx, m), null, now);
-        line.print(a, "],\"load\":{d:.2},\"held\":{d},\"wait\":{d},\"gate\":\"{t}\"}}\n", .{ sys.loadAverage()[0], held, queue.len, g }) catch continue;
+        pool.lock();
+        const ops = pool.scan(a);
+        pool.unlock();
+        var held: usize = 0;
+        var waiting: usize = 0;
+        for (ops) |o| {
+            held += o.held.len;
+            if (o.held.len == 0) waiting += 1;
+        }
+        const g = policy.gate(ctx.cfg, machine(ctx));
+        line.print(a, "],\"load\":{d:.2},\"held\":{d},\"wait\":{d},\"gate\":\"{t}\"}}\n", .{ sys.loadAverage()[0], held, waiting, g }) catch continue;
         history.appendLine(io, path, line.items, samples_rotate_bytes);
         if (n % 20 == 19) {
             if (exe) |e| {
@@ -302,8 +293,17 @@ pub fn installService(ctx: *Ctx, sv: Service, install: bool) u8 {
     return 0;
 }
 
+/// A run's tasks for the history table: "40/40", "38/40 · 2 failed"; "-" for one task.
+fn tasksText(buf: []u8, j: history.Job) []const u8 {
+    const total = j.tasks orelse return "-";
+    const failed = j.failed orelse 0;
+    const ended = (j.done orelse 0) + failed;
+    if (failed == 0) return std.mem.print(buf, "{d}/{d}", .{ ended, total }) catch "?";
+    return std.mem.print(buf, "{d}/{d} · {d} failed", .{ ended, total, failed }) catch "?";
+}
+
 /// `cpuq history [--label PATTERN] [--limit N] [--json]`: finished, lost and
-/// running jobs from the history file, newest first, with a summary.
+/// running runs and leases from the history file, newest first, with a summary.
 pub fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
     var pattern: ?[]const u8 = null;
     var limit: usize = 20;
@@ -355,28 +355,23 @@ pub fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
             .state = @tagName(j.state),
             .pool = j.pool,
             .host = j.host,
+            .repo = j.repo,
+            .project = j.project,
             .label = j.label,
             .note = j.note,
             .command = j.cmd,
-            .priority = j.priority,
-            .exclusive = j.exclusive,
-            .min = j.min,
-            .max = j.max,
+            .tasks = j.tasks,
             .cores = j.cores,
-            .slots = j.slots,
             .queued = j.queued,
             .started = j.started,
             .ended = j.ended,
             .waited = j.waited(),
             .ran = j.ran(),
             .used = j.used(),
+            .done = j.done,
+            .failed = j.failed,
             .exit = j.exit,
             .signal = j.signal,
-            .memory = j.memory,
-            .peak = j.peak,
-            .noise = j.noise,
-            .noise_peak = j.noise_peak,
-            .cpu_peak = j.cpu_peak,
         }) catch {};
         std.json.Stringify.value(out.items, .{ .whitespace = .indent_2 }, w) catch {};
         w.writeAll("\n") catch {};
@@ -399,7 +394,7 @@ pub fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
     }
     var lbuf: [40]u8 = undefined;
     var pbuf: [24]u8 = undefined;
-    if (!boxed) w.print("  WHEN     {s} {s} IN USE WAITED   RAN      ACTIVE MEMORY EXIT\n", .{ pad(&lbuf, "LABEL", lw), pad(&pbuf, "POOL", pw) }) catch {};
+    if (!boxed) w.print("  WHEN     {s} {s} CPUS   TASKS    WAITED   RAN      ACTIVE EXIT\n", .{ pad(&lbuf, "LABEL", lw), pad(&pbuf, "POOL", pw) }) catch {};
     for (picked.items) |j| {
         var b1: [16]u8 = undefined;
         var b2: [16]u8 = undefined;
@@ -407,14 +402,14 @@ pub fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
         var b4: [16]u8 = undefined;
         var b5: [16]u8 = undefined;
         var b6: [24]u8 = undefined;
-        var b7: [16]u8 = undefined;
-        const mem_text = if (j.peak) |m| bytesText(&b7, m) else "-";
-        const cores_text = if (j.cores) |c| std.mem.print(&b2, "{d}", .{c}) catch "?" else if (j.max > j.min) std.mem.print(&b2, "{d}-{d}", .{ j.min, j.max }) catch "?" else "-";
+        var b7: [32]u8 = undefined;
+        const tasks_text = tasksText(&b7, j);
+        const cores_text = if (j.cores) |c| std.mem.print(&b2, "{d}", .{c}) catch "?" else "-";
         const waited_text = if (j.waited()) |x| duration(&b3, x) else "-";
         const ran_text = if (j.ran()) |x| duration(&b4, x) else "-";
         const used_text = if (j.used()) |x| std.mem.print(&b5, "{d:.1}", .{x}) catch "?" else "-";
         const exit_text: []const u8 = switch (j.state) {
-            .done => if (j.memory) |m| std.mem.print(&b6, "memory {d:.1}G", .{@as(f64, @floatFromInt(m)) / (1 << 30)}) catch "memory" else if (j.signal) |sig| std.mem.print(&b6, "signal {d}", .{sig}) catch "signal" else std.mem.print(&b6, "{d}", .{j.exit orelse 0}) catch "?",
+            .done => if (j.signal) |sig| std.mem.print(&b6, "signal {d}", .{sig}) catch "signal" else std.mem.print(&b6, "{d}", .{j.exit orelse 0}) catch "?",
             .gave_up => "gave up",
             .lost => "lost",
             .active => if (j.started != null) "running" else "waiting",
@@ -432,22 +427,22 @@ pub fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
                 .{ .text = dash(j.label), .tint = .accent },
                 .{ .text = j.pool },
                 .{ .text = a.dupe(u8, cores_text) catch "?" },
+                .{ .text = a.dupe(u8, tasks_text) catch "?", .tint = if ((j.failed orelse 0) != 0) .bad else if (j.tasks == null) .dim else null },
                 .{ .text = a.dupe(u8, waited_text) catch "?" },
                 .{ .text = a.dupe(u8, ran_text) catch "?" },
                 .{ .text = a.dupe(u8, used_text) catch "?", .tint = used_tint },
-                .{ .text = a.dupe(u8, mem_text) catch "?", .tint = if (j.peak == null) .dim else null },
                 .{ .text = a.dupe(u8, exit_text) catch "?", .tint = exit_tint },
             }) catch continue) catch {};
             continue;
         }
-        w.print("  {s:<8} {s} {s} {s:<6} {s:<8} {s:<8} {s:<6} {s:<6} {s}\n", .{
+        w.print("  {s:<8} {s} {s} {s:<6} {s:<8} {s:<8} {s:<8} {s:<6} {s}\n", .{
             age(&b1, @intFromFloat(now - j.last())), pad(&lbuf, dash(j.label), lw), pad(&pbuf, j.pool, pw),
-            cores_text,                              waited_text,                   ran_text,
-            used_text,                               mem_text,                      exit_text,
+            cores_text,                              tasks_text,                    waited_text,
+            ran_text,                                used_text,                     exit_text,
         }) catch {};
     }
 
-    // The summary: how long jobs waited, and what they used of what they got.
+    // The summary: how long runs waited, and what they used of the CPUs they held.
     var waits: std.ArrayList(f64) = .empty;
     var granted: f64 = 0;
     var used: f64 = 0;
@@ -456,7 +451,7 @@ pub fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
     for (picked.items) |j| {
         if (j.waited()) |x| waits.append(a, x) catch {};
         if (j.state == .lost) lost += 1;
-        if (j.used()) |u| if (j.cores) |c| if (std.mem.eql(u8, j.pool, "cores")) {
+        if (j.used()) |u| if (j.cores) |c| if (std.mem.eql(u8, j.pool, "cpus")) {
             used += u;
             granted += @floatFromInt(c);
             measured += 1;
@@ -467,10 +462,10 @@ pub fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
     var b1: [16]u8 = undefined;
     var b2: [16]u8 = undefined;
     var sum: std.ArrayList(u8) = .empty;
-    sum.print(a, "{d} jobs; waited {s} median, {s} longest", .{ picked.items.len, duration(&b1, history.median(waits.items)), duration(&b2, longest) }) catch {};
+    sum.print(a, "{d} runs; waited {s} median, {s} longest", .{ picked.items.len, duration(&b1, history.median(waits.items)), duration(&b2, longest) }) catch {};
     if (measured != 0) {
         const m: f64 = @floatFromInt(measured);
-        sum.print(a, "; {d:.1} active of {d:.1} cores in use on average", .{ used / m, granted / m }) catch {};
+        sum.print(a, "; {d:.1} CPUs busy of {d:.1} held on average", .{ used / m, granted / m }) catch {};
     }
     if (lost != 0) sum.print(a, "; {d} lost (the machine restarted or cpuq was killed)", .{lost}) catch {};
     if (boxed) {
@@ -480,11 +475,11 @@ pub fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
                 .{ .head = "WHEN" },
                 .{ .head = "LABEL" },
                 .{ .head = "POOL" },
-                .{ .head = "IN USE", .alignment = .right },
+                .{ .head = "CPUS", .alignment = .right },
+                .{ .head = "TASKS", .alignment = .right },
                 .{ .head = "WAITED", .alignment = .right },
                 .{ .head = "RAN", .alignment = .right },
                 .{ .head = "ACTIVE", .alignment = .right },
-                .{ .head = "MEMORY", .alignment = .right },
                 .{ .head = "EXIT", .flexible = true },
             },
             .rows = trows.items,
@@ -494,5 +489,47 @@ pub fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
         return 0;
     }
     w.print("\n{s}\n", .{sum.items}) catch {};
+    return 0;
+}
+
+/// Runs a cpuq command line on HOST through ssh: its output and exit status come back as its own.
+fn onHost(ctx: *Ctx, host: []const u8, remote: []const u8) u8 {
+    const r = std.process.run(ctx.arena, ctx.io, .{ .argv = &.{ "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, remote } }) catch return exit_failure;
+    ctx.out.writeAll(r.stdout) catch {};
+    ctx.out.flush() catch {};
+    std.debug.print("{s}", .{r.stderr});
+    return switch (r.term) {
+        .exited => |c| c,
+        else => exit_failure,
+    };
+}
+
+/// `cpuq clean [--dry-run] [--older AGE] [--host HOST]`: removes what jobs left here (copies,
+/// pack versions, job records) once unused for AGE (the config's `clean_after`, 3d).
+pub fn cmdClean(ctx: *Ctx, args: []const [:0]const u8) u8 {
+    var dry = false;
+    var older: ?u32 = null;
+    var host: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg: []const u8 = args[i];
+        if (std.mem.eql(u8, arg, "--dry-run")) {
+            dry = true;
+        } else if (std.mem.eql(u8, arg, "--older") and i + 1 < args.len) {
+            i += 1;
+            older = policy.parseAge(args[i]) orelse return usageError("--older takes a time such as 3d, 36h or 90m, not '{s}'", .{args[i]});
+        } else if (std.mem.eql(u8, arg, "--host") and i + 1 < args.len) {
+            i += 1;
+            host = args[i];
+        } else return usageError("clean takes --dry-run, --older AGE and --host HOST", .{});
+    }
+    if (host) |h| return onHost(ctx, h, ctx.arena.print("cpuq clean{s}{s}", .{ if (dry) " --dry-run" else "", if (older) |o| ctx.arena.print(" --older {d}", .{o}) catch "" else "" }) catch return exit_failure);
+    const after = older orelse ctx.cfg.clean_after_s;
+    if (after == 0) {
+        ctx.out.writeAll("cpuq clean: clean_after is off here; --older AGE to clean anyway\n") catch {};
+        ctx.out.flush() catch {};
+        return 0;
+    }
+    _ = clean.run(ctx.arena, ctx.io, ctx.env, nowSeconds(ctx.io), .{ .older_s = after, .dry_run = dry }, ctx.out);
     return 0;
 }

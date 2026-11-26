@@ -4,6 +4,10 @@
 //! with the corrected form, so the queue is enforced where agents act rather
 //! than asked for in AGENTS.md.
 //!
+//! Every task of a `cpuq run` has one CPU, so what it runs is held to one job: `zig build -j1`,
+//! `make` with no -j, `go build -p 1`, `pytest` with no -n. Linux pins a task to its CPU; macOS
+//! can't, and there a build left to its own parallelism takes every CPU from one slot.
+//!
 //! It reads the command's text, and what the caller knows (through an Advisor): whether a `cpuq
 //! run`'s work goes faster elsewhere. Nothing it cannot parse is refused. A line that ends in the
 //! comment `# cpuq: skip` runs as it is.
@@ -17,35 +21,44 @@ pub const Refusal = struct {
 };
 
 /// Judges a `cpuq run`'s work by its history: a refusal when it would finish far sooner elsewhere.
-/// Asked only for a run on this machine of a kind that could go elsewhere (not --on, --exclusive,
-/// --opaque, …).
+/// Asked only for a run on this machine (not --on or --tethered).
 pub const Advisor = struct {
     ctx: *anyopaque,
     /// `cmd`: the command after `--`, its words joined by spaces.
     advise: *const fn (ctx: *anyopaque, cmd: []const u8) ?Refusal,
 };
 
-/// Checks one shell command line. `cpus` is the machine's CPU count, for
-/// requests over half of it; `project` names the job in suggested labels.
-pub fn check(a: std.mem.Allocator, command: []const u8, cpus: u32, project: []const u8, advisor: ?Advisor) ?Refusal {
-    const ctx: Ctx = .{ .a = a, .cpus = cpus, .project = project, .advisor = advisor };
+/// Checks one shell command line. `project` names the job in suggested labels.
+pub fn check(a: std.mem.Allocator, command: []const u8, project: []const u8, advisor: ?Advisor) ?Refusal {
+    const ctx: Ctx = .{ .a = a, .project = project, .advisor = advisor };
     return ctx.script(command, null, 0);
 }
 
-/// The largest fixed request (or minimum) that doesn't wait for a nearly empty machine: half the
-/// CPUs, and at least 2, which fits even a small machine.
-pub fn maxAsk(cpus: u32) u32 {
-    return @max(cpus / 2, 2);
-}
+/// The `cpuq run` and `cpuq lease` options that take a value (`-n 8`, or `--label=app:test`).
+pub const run_value_options = [_][]const u8{ "--label", "--note", "--host", "--slots", "--return", "--on", "--include", "--repo", "-n", "-c", "-x", "-t", "-r", "--wait-max" };
 
-/// The `cpuq run` and `cpuq lease` options that take a value (`--cores 2-6`, or `--cores=2-6`).
-pub const run_value_options = [_][]const u8{ "--cores", "--priority", "--label", "--note", "--max-wait", "--qos", "--host", "--slots", "--return", "--on", "--include", "--repo" };
+/// The options `cpuq run` and `cpuq lease` don't take, each with what replaces it, as cpuq says
+/// when given one.
+pub const removed_options = [_][2][]const u8{
+    .{ "--cores", "--cores is gone: every task gets one CPU. Run M tasks with -n M (at most -c C CPUs at once); a build runs on one CPU" },
+    .{ "--priority", "--priority is gone: --urgent puts a run's first CPU ahead of the line; there is no low" },
+    .{ "--max-wait", "--max-wait is now --wait-max" },
+    .{ "--exclusive", "--exclusive is gone: `cpuq drain -- CMD` empties the machine and runs CMD alone" },
+    .{ "--no-load-check", "--no-load-check is gone: the pool limits CPU work, and outside load is measured" },
+    .{ "--qos", "--qos is gone: tasks run as they are" },
+    .{ "--opaque", "--opaque is gone: every task holds its one CPU, inside a container or not" },
+};
 
-/// What one check knows: the machine, the project for suggested labels, and the advisor for the
-/// `cpuq run`s on this machine.
+/// `--exclusive`, given to `cpuq lease`.
+pub const lease_exclusive = "--exclusive is gone: `cpuq lease NAME -- cpuq drain -- CMD` holds the lease and runs CMD alone on the emptied machine";
+
+/// The removed options that took a value: skipped with it.
+const removed_value_options = [_][]const u8{ "--cores", "--priority", "--max-wait", "--qos" };
+
+/// What one check knows: the project for suggested labels, and the advisor for the `cpuq run`s on
+/// this machine.
 const Ctx = struct {
     a: std.mem.Allocator,
-    cpus: u32,
     project: []const u8,
     advisor: ?Advisor,
 
@@ -61,7 +74,7 @@ const Ctx = struct {
         const w = stripWrappers(cmd.words);
         if (w.len == 0) return null;
         const prog = std.fs.path.basename(w[0]);
-        if (std.mem.eql(u8, prog, "cpuq")) return checkCpuq(a, cmd, w, ctx.cpus, if (host == null) ctx.advisor else null);
+        if (std.mem.eql(u8, prog, "cpuq")) return checkCpuq(a, cmd, w, if (host == null) ctx.advisor else null);
         if (std.mem.eql(u8, prog, "ssh")) {
             const remote = sshRemote(a, w) orelse return null;
             // `ssh HOST <<EOF`: the heredoc is the script HOST runs.
@@ -74,10 +87,7 @@ const Ctx = struct {
         }
         const heavy_prog = heavyName(w) orelse return null;
         // "zig build", "cargo test": the program and its subcommand.
-        const heavy = if (std.mem.eql(u8, heavy_prog, prog) and w.len > 1 and w[1].len > 0 and w[1][0] != '-' and isSubTool(prog))
-            a.print("{s} {s}", .{ prog, w[1] }) catch heavy_prog
-        else
-            heavy_prog;
+        const heavy = if (std.mem.eql(u8, heavy_prog, prog)) toolLabel(a, w) else heavy_prog;
         const where = if (host) |h| a.print(" on {s}, through {s}'s cpuq", .{ h, h }) catch "" else "";
         return .{
             .reason = a.print("`{s}` runs outside cpuq{s}, so the other sessions' work can't be scheduled around it, and it uses as many CPUs as it likes", .{ heavy, where }) catch "a heavy command runs outside cpuq",
@@ -97,23 +107,18 @@ const Simple = struct {
     skip: bool = false,
 };
 
-/// A `cpuq run` (or lease): the grant must reach the command, not the shell
-/// that types it; a large fixed request waits for an empty machine; work in a
-/// container or simulator needs --opaque.
-fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32, advisor: ?Advisor) ?Refusal {
+/// A `cpuq run` (or lease): no removed option and no `$CPUQ_CORES`, one job for each task's one
+/// CPU, and `--driver` only for a test runner.
+fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, advisor: ?Advisor) ?Refusal {
     if (w.len < 2) return null;
-    const sub = w[1];
-    if (!std.mem.eql(u8, sub, "run") and !std.mem.eql(u8, sub, "lease")) return null;
-    if (expandsEarly(cmd.text)) return .{
-        .reason = "`$CPUQ_CORES` is expanded by your shell before cpuq sets it, so the command gets nothing there (and `make -j` with nothing after it has no limit)",
-        .instead = quotedInside(a, cmd.text),
-    };
-    var opaque_flag = false;
+    const lease = std.mem.eql(u8, w[1], "lease");
+    if (!lease and !std.mem.eql(u8, w[1], "run")) return null;
+    var removed: ?[]const u8 = null;
     var elsewhere = false;
-    var pinned = false;
-    var min_cores: ?u32 = null;
+    var tethered = false;
+    var driver = false;
     // A lease's name comes first.
-    var i: usize = if (std.mem.eql(u8, sub, "lease")) 3 else 2;
+    var i: usize = if (lease) 3 else 2;
     while (i < w.len) : (i += 1) {
         const o = w[i];
         if (std.mem.eql(u8, o, "--")) {
@@ -121,101 +126,167 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32
             break;
         }
         if (o.len == 0 or o[0] != '-') break;
-        if (std.mem.eql(u8, o, "--opaque")) opaque_flag = true;
-        // Sent to another machine: its size, not this one's, judges the request.
-        if (std.mem.eql(u8, o, "--on") or std.mem.startsWith(u8, o, "--on=")) elsewhere = true;
-        // Of a kind that runs only here.
-        if (std.mem.eql(u8, o, "--exclusive") or std.mem.eql(u8, o, "--opaque") or std.mem.eql(u8, o, "--tethered") or std.mem.eql(u8, o, "--hold")) pinned = true;
-        const value: ?[]const u8 = if (std.mem.startsWith(u8, o, "--cores=")) o["--cores=".len..] else if (std.mem.eql(u8, o, "--cores") and i + 1 < w.len) w[i + 1] else null;
-        if (value) |v| min_cores = std.fmt.parseInt(u32, std.mem.sliceTo(v, '-'), 10) catch null;
+        const name = std.mem.sliceTo(o, '=');
+        if (removed == null) removed = removedWhy(name, lease);
+        // Sent to another machine, or what --on runs there: not this machine's history.
+        if (std.mem.eql(u8, name, "--on")) elsewhere = true;
+        if (std.mem.eql(u8, name, "--tethered")) tethered = true;
+        if (std.mem.eql(u8, name, "--driver")) driver = true;
         // Options that take a value skip it.
-        for (run_value_options) |takes| {
-            if (std.mem.eql(u8, o, takes)) i += 1;
-        }
+        if (name.len == o.len and takesValue(name)) i += 1;
     }
-    if (min_cores) |m| if (!elsewhere and m > maxAsk(cpus)) return .{
-        .reason = a.print("asking for at least {d} cores on a {d}-CPU machine: a request over half the CPUs waits until the machine is nearly empty", .{ m, cpus }) catch "too many cores asked for",
-        .instead = "ask for a range the job can shrink to, such as --cores 2-6, and pass \"$CPUQ_CORES\" on; run big jobs on the larger machine",
+    if (removed) |why| return .{ .reason = why, .instead = fixRun(a, w, false).text };
+    if (mentionsCores(cmd.text)) return .{
+        .reason = "cpuq gives each task one CPU; $CPUQ_CORES no longer exists",
+        .instead = fixRun(a, w, false).text,
     };
     if (i >= w.len) return null;
     const inner = stripWrappers(w[i..]);
     if (inner.len == 0) return null;
-    const script: []const u8 = if (isShell(std.fs.path.basename(inner[0]))) shellScript(inner) orelse "" else std.mem.join(a, " ", inner) catch "";
-    const inner_cmds = split(a, script) catch return null;
-    for (inner_cmds) |ic| {
+    const cmds = innerCommands(a, inner, cmd.heredoc) orelse return null;
+    if (driver) {
+        if (checkDriver(a, w, cmds)) |r| return r;
+    } else for (cmds) |ic| {
         const iw = stripWrappers(ic.words);
-        if (iw.len == 0) continue;
-        const prog = std.fs.path.basename(iw[0]);
-        if (!opaque_flag and hidesWork(iw)) return .{
-            .reason = a.print("`{s}` does its work in processes cpuq can't see (a container or a simulator), so it would count the job as idle and hand its cores out again", .{prog}) catch "hidden work",
-            .instead = "add --opaque and a fixed --cores: cpuq run --label P:T --cores 4 --opaque -- …",
-        };
-        if (std.mem.eql(u8, prog, "zig") and iw.len >= 2 and std.mem.eql(u8, iw[1], "build") and !hasJobs(iw)) return .{
-            .reason = "`zig build` without -j starts a thread for every CPU, however few cores the job was granted",
-            .instead = "cpuq run --label P:T --cores 2-6 -- sh -c 'zig build -j\"$CPUQ_CORES\" …' (single quotes)",
-        };
-        if (heavyName(iw) != null) if (fixedJobs(iw, min_cores orelse 1)) |flag| return .{
-            .reason = a.print("`{s}` fixes its own parallelism, however few cores the job was granted", .{flag}) catch "a fixed jobs count",
-            .instead = if (std.mem.eql(u8, prog, "make") or std.mem.eql(u8, prog, "gmake"))
-                "drop the -j: make takes its slots from cpuq's jobserver"
+        if (iw.len == 0 or heavyName(iw) == null) continue;
+        const what = tooParallel(a, iw) orelse continue;
+        const fixed = fixRun(a, w, false);
+        const more = " (or split the work into tasks with -n M)";
+        return .{
+            .reason = a.print("{s}, but a task has one CPU (and macOS can't pin it there)", .{what}) catch "a task has one CPU",
+            .instead = if (fixed.whole)
+                a.print("{s}{s}", .{ fixed.text, more }) catch fixed.text
             else
-                "pass the grant on, inside single quotes: sh -c '… -j\"$CPUQ_CORES\"' (or -n, -p, -jobs for the tool)",
+                a.print("`{s}` in its script{s}", .{ joinQuoted(a, oneJob(a, iw)), more }) catch "one job: -j1",
         };
     }
     // Long work that finishes far sooner elsewhere, of a run that may move.
-    if (advisor) |ad| if (std.mem.eql(u8, sub, "run") and !elsewhere and !pinned) {
+    if (advisor) |ad| if (!lease and !elsewhere and !tethered) {
         return ad.advise(ad.ctx, std.mem.join(a, " ", inner) catch return null);
     };
     return null;
 }
 
-/// The same `cpuq run` with its command moved inside `sh -c '…'`, so the
-/// job's shell expands `$CPUQ_CORES`.
-fn quotedInside(a: std.mem.Allocator, text: []const u8) []const u8 {
-    const generic = "put the command in single quotes inside the job: cpuq run --label P:T --cores 2-6 -- sh -c 'make -j\"$CPUQ_CORES\"'";
-    const at = std.mem.find(u8, text, " -- ") orelse return generic;
-    const inner = std.mem.trim(u8, text[at + 4 ..], " ");
-    if (std.mem.findScalar(u8, inner, '\'') != null or std.mem.startsWith(u8, inner, "sh ") or std.mem.startsWith(u8, inner, "bash ")) return generic;
-    var fixed: std.ArrayList(u8) = .empty;
-    var rest = inner;
-    while (std.mem.find(u8, rest, "$CPUQ_CORES")) |i| {
-        // Quoted for the inner shell: -j"$CPUQ_CORES".
-        const bare = i == 0 or rest[i - 1] != '"';
-        fixed.appendSlice(a, rest[0..i]) catch return generic;
-        fixed.appendSlice(a, if (bare) "\"$CPUQ_CORES\"" else "$CPUQ_CORES") catch return generic;
-        rest = rest[i + "$CPUQ_CORES".len ..];
-    }
-    fixed.appendSlice(a, rest) catch return generic;
-    return a.print("{s} -- sh -c '{s}'", .{ std.mem.trimEnd(u8, text[0..at], " "), fixed.items }) catch generic;
+/// What cpuq says of a removed option, or null.
+fn removedWhy(name: []const u8, lease: bool) ?[]const u8 {
+    if (lease and std.mem.eql(u8, name, "--exclusive")) return lease_exclusive;
+    for (removed_options) |r| if (std.mem.eql(u8, name, r[0])) return r[1];
+    return null;
 }
 
-/// Whether `$CPUQ_CORES` appears where the typing shell expands it: outside
-/// single quotes and not escaped.
-fn expandsEarly(text: []const u8) bool {
-    var single = false;
-    var i: usize = 0;
-    while (i < text.len) : (i += 1) {
-        const ch = text[i];
-        if (single) {
-            if (ch == '\'') single = false;
-            continue;
-        }
-        switch (ch) {
-            '\\' => i += 1,
-            '\'' => single = true,
-            '$' => {
-                const rest = text[i + 1 ..];
-                if (std.mem.startsWith(u8, rest, "CPUQ_CORES") or std.mem.startsWith(u8, rest, "{CPUQ_CORES")) return true;
-            },
-            else => {},
-        }
+fn takesValue(name: []const u8) bool {
+    for (run_value_options) |v| if (std.mem.eql(u8, name, v)) return true;
+    for (removed_value_options) |v| if (std.mem.eql(u8, name, v)) return true;
+    return false;
+}
+
+/// Whether a command uses `$CPUQ_CORES` (or `${CPUQ_CORES}`), quoted or not.
+fn mentionsCores(text: []const u8) bool {
+    return std.mem.find(u8, text, "$CPUQ_CORES") != null or std.mem.find(u8, text, "${CPUQ_CORES") != null;
+}
+
+/// A word with every `$CPUQ_CORES` in it, quoted or not, made 1: one job.
+fn noCores(a: std.mem.Allocator, x: []const u8) []const u8 {
+    var out = x;
+    for ([_][]const u8{ "\"$CPUQ_CORES\"", "\"${CPUQ_CORES}\"", "${CPUQ_CORES}", "$CPUQ_CORES" }) |form| {
+        if (std.mem.find(u8, out, form) == null) continue;
+        out = std.mem.replaceOwned(u8, a, out, form, "1") catch return out;
+    }
+    return out;
+}
+
+/// The simple commands a run's command is: a shell's script (`sh -c '…'`, `sh <<EOF`), else
+/// the command itself.
+fn innerCommands(a: std.mem.Allocator, inner: []const []const u8, heredoc: ?[]const u8) ?[]const Simple {
+    if (isShell(std.fs.path.basename(inner[0]))) {
+        if (shellScript(inner)) |s| return split(a, s) catch null;
+        if (inner.len == 1) if (heredoc) |body| return split(a, body) catch null;
+    }
+    const one = a.alloc(Simple, 1) catch return null;
+    one[0] = .{ .words = inner, .text = "" };
+    return one;
+}
+
+/// `--driver`: a test runner that starts its own `cpuq run`s, holding no CPU itself. A build
+/// under it would run on no CPU at all.
+fn checkDriver(a: std.mem.Allocator, w: []const []const u8, cmds: []const Simple) ?Refusal {
+    var runner = false;
+    for (cmds) |ic| {
+        const iw = stripWrappers(ic.words);
+        if (iw.len == 0) continue;
+        if (isBuildTool(iw) or heavyName(iw) != null) return .{
+            .reason = a.print("`{s}` under --driver: --driver holds no CPU; run builds as tasks", .{toolLabel(a, iw)}) catch "--driver holds no CPU; run builds as tasks",
+            .instead = fixRun(a, w, true).text,
+        };
+        if (isRunner(iw)) runner = true;
+    }
+    if (runner) return null;
+    return .{
+        .reason = "--driver is for a test runner that starts its own `cpuq run`s (swarm, rip, a script under test/, run, run.sh, run-tests…), and holds no CPU itself",
+        .instead = a.print("{s} (one task, on one CPU)", .{fixRun(a, w, true).text}) catch "cpuq run --label P:T -- CMD",
+    };
+}
+
+/// A program that builds: never a driver.
+fn isBuildTool(w: []const []const u8) bool {
+    const prog = std.fs.path.basename(w[0]);
+    for ([_][]const u8{ "zig", "make", "gmake", "cargo", "go", "swift", "xcodebuild", "ninja", "cmake", "cc", "c++", "gcc", "g++", "clang", "clang++", "rustc" }) |p| {
+        if (std.mem.eql(u8, prog, p)) return true;
     }
     return false;
 }
 
-fn hasJobs(w: []const []const u8) bool {
-    for (w) |x| if (std.mem.startsWith(u8, x, "-j")) return true;
+/// A known test runner: swarm or rip, or a script under a test/ folder or named run, run.sh or
+/// run-tests…, run directly or by its interpreter (`bash test/run.sh`).
+fn isRunner(w: []const []const u8) bool {
+    const prog = std.fs.path.basename(w[0]);
+    var path = w[0];
+    if (isShell(prog) or isPython(prog) or std.mem.eql(u8, prog, "node") or std.mem.eql(u8, prog, "ruby") or std.mem.eql(u8, prog, "perl")) {
+        path = for (w[1..]) |x| {
+            if (x.len != 0 and x[0] != '-') break x;
+        } else return false;
+    }
+    const base = std.fs.path.basename(path);
+    for ([_][]const u8{ "swarm", "rip", "run", "run.sh" }) |r| if (std.mem.eql(u8, base, r)) return true;
+    if (std.mem.startsWith(u8, base, "run-tests")) return true;
+    var dirs = std.mem.splitScalar(u8, path, '/');
+    while (dirs.next()) |d| {
+        if (dirs.peek() == null) break;
+        if (std.mem.eql(u8, d, "test") or std.mem.eql(u8, d, "tests")) return true;
+    }
     return false;
+}
+
+/// How a heavy command runs more than one job at once, or null when it runs one (or sets a count
+/// it can't read, such as `-j"$N"`).
+fn tooParallel(a: std.mem.Allocator, w: []const []const u8) ?[]const u8 {
+    const tool = toolOf(w);
+    var i: usize = 1;
+    while (i < w.len) : (i += 1) {
+        if (std.mem.eql(u8, w[i], "--")) break;
+        const j = jobsAt(tool, w, i) orelse continue;
+        const text = std.mem.join(a, " ", w[i .. i + j.words]) catch w[i];
+        if (std.fmt.parseInt(u32, j.value, 10)) |n| {
+            // `pytest -n 0` runs the tests in its own process.
+            if (n == 1 or (n == 0 and isSerial(tool))) return null;
+            if (n == 0) return a.print("`{s}` sets no limit on jobs", .{text}) catch text;
+            return a.print("`{s}` runs {d} jobs at once", .{ text, n }) catch text;
+        } else |_| {
+            if (j.value.len == 0 or std.mem.eql(u8, j.value, "auto") or std.mem.eql(u8, j.value, "logical"))
+                return a.print("`{s}` sets no limit on jobs", .{text}) catch text;
+            return null;
+        }
+    }
+    const oj = oneJobOption(w) orelse return null;
+    return a.print("`{s}` without {s} runs a job for every CPU", .{ toolLabel(a, w), std.mem.join(a, " ", oj.option) catch "-j1" }) catch "a job for every CPU";
+}
+
+/// "zig build", "cargo test", "cmake --build": the program and its subcommand, for messages.
+fn toolLabel(a: std.mem.Allocator, w: []const []const u8) []const u8 {
+    const prog = std.fs.path.basename(w[0]);
+    if (w.len > 1 and w[1].len > 0 and (isSubTool(prog) and w[1][0] != '-' or std.mem.eql(u8, prog, "cmake")))
+        return a.print("{s} {s}", .{ prog, w[1] }) catch prog;
+    return prog;
 }
 
 /// The tool a heavy command runs: `pytest` for `python3 -m pytest`, else the program.
@@ -225,9 +296,62 @@ fn toolOf(w: []const []const u8) []const u8 {
     return prog;
 }
 
+/// A tool that runs one job unless told otherwise: its jobs option is dropped, not set to 1.
+fn isSerial(tool: []const u8) bool {
+    for ([_][]const u8{ "make", "gmake", "pytest", "py.test", "ctest" }) |t| if (std.mem.eql(u8, tool, t)) return true;
+    return false;
+}
+
+/// A tool that runs a job for every CPU unless told otherwise: the option that holds it to one,
+/// and whether it goes right after the subcommand (`go build -p 1 ./...`) or at the end.
+const OneJob = struct { tool: []const u8, sub: []const u8 = "", option: []const []const u8, after_sub: bool = false };
+
+const one_job = [_]OneJob{
+    .{ .tool = "zig", .sub = "build", .option = &.{"-j1"} },
+    .{ .tool = "cargo", .option = &.{ "-j", "1" }, .after_sub = true },
+    .{ .tool = "swift", .option = &.{ "-j", "1" }, .after_sub = true },
+    .{ .tool = "go", .option = &.{ "-p", "1" }, .after_sub = true },
+    .{ .tool = "bazel", .option = &.{"--jobs=1"}, .after_sub = true },
+    .{ .tool = "bazelisk", .option = &.{"--jobs=1"}, .after_sub = true },
+    .{ .tool = "meson", .sub = "compile", .option = &.{ "-j", "1" }, .after_sub = true },
+    .{ .tool = "ninja", .option = &.{ "-j", "1" } },
+    .{ .tool = "cmake", .option = &.{ "-j", "1" } },
+    .{ .tool = "xcodebuild", .option = &.{ "-jobs", "1" } },
+};
+
+fn oneJobOption(w: []const []const u8) ?OneJob {
+    const tool = toolOf(w);
+    for (one_job) |oj| {
+        if (!std.mem.eql(u8, oj.tool, tool)) continue;
+        if (oj.sub.len != 0 and !(w.len > 1 and std.mem.eql(u8, w[1], oj.sub))) continue;
+        return oj;
+    }
+    return null;
+}
+
+/// Where a tool's subcommand is: `cargo +nightly build` has its toolchain first.
+fn subAt(w: []const []const u8) usize {
+    return if (std.mem.eql(u8, std.fs.path.basename(w[0]), "cargo") and w.len >= 2 and std.mem.startsWith(u8, w[1], "+")) 2 else 1;
+}
+
 /// The words the tool's jobs option takes at `w[i]` (`-j8`: 1, `-j 8`: 2), with its value; null
 /// when `w[i]` is none. A bare `-j` (make's no limit) has the value "".
-const Jobs = struct { words: usize, value: []const u8 };
+const Jobs = struct {
+    words: usize,
+    value: []const u8,
+    flag: []const u8,
+    form: enum { equals, attached, separate, bare },
+
+    /// The same option set to one job.
+    fn one(j: Jobs, a: std.mem.Allocator) []const []const u8 {
+        const joined = switch (j.form) {
+            .equals => a.print("{s}=1", .{j.flag}) catch return &.{},
+            .attached => a.print("{s}1", .{j.flag}) catch return &.{},
+            .separate, .bare => if (std.mem.eql(u8, j.flag, "-j")) "-j1" else return a.dupe([]const u8, &.{ j.flag, "1" }) catch &.{},
+        };
+        return a.dupe([]const u8, &.{joined}) catch &.{};
+    }
+};
 
 fn jobsAt(tool: []const u8, w: []const []const u8, i: usize) ?Jobs {
     const x = w[i];
@@ -238,6 +362,7 @@ fn jobsAt(tool: []const u8, w: []const []const u8, i: usize) ?Jobs {
         .{ .tool = "pytest", .flag = "--numprocesses" },
         .{ .tool = "xcodebuild", .flag = "-jobs" },
         .{ .tool = "cmake", .flag = "--parallel" },
+        .{ .tool = "ctest", .flag = "--parallel" },
         .{ .tool = "", .flag = "-j" },
         .{ .tool = "", .flag = "--jobs" },
     };
@@ -247,49 +372,147 @@ fn jobsAt(tool: []const u8, w: []const []const u8, i: usize) ?Jobs {
         const rest = x[f.flag.len..];
         if (rest.len != 0) {
             // `-j8`, `--jobs=8`; a short flag's value may be attached, a long one's follows `=`.
-            if (rest[0] == '=') return .{ .words = 1, .value = rest[1..] };
-            if (f.flag[1] != '-' and f.flag.len == 2) return .{ .words = 1, .value = rest };
+            if (rest[0] == '=') return .{ .words = 1, .value = rest[1..], .flag = f.flag, .form = .equals };
+            if (f.flag[1] != '-' and f.flag.len == 2) return .{ .words = 1, .value = rest, .flag = f.flag, .form = .attached };
             continue;
         }
         // The value in the next word, unless that is another option or (for -j) a target.
         if (i + 1 < w.len and w[i + 1].len != 0 and w[i + 1][0] != '-') {
             const v = w[i + 1];
             const numeric = std.fmt.parseInt(u32, v, 10) catch null;
-            if (numeric != null or std.mem.find(u8, v, "CPUQ_CORES") != null or !std.mem.eql(u8, f.flag, "-j")) return .{ .words = 2, .value = v };
+            if (numeric != null or mentionsCores(v) or !std.mem.eql(u8, f.flag, "-j")) return .{ .words = 2, .value = v, .flag = f.flag, .form = .separate };
         }
-        return .{ .words = 1, .value = "" };
+        return .{ .words = 1, .value = "", .flag = f.flag, .form = .bare };
     }
     return null;
 }
 
-/// A jobs option set to a fixed count over `allowed`, the least the job is granted (or to no
-/// limit: a bare `make -j`, `ninja -j0`, `pytest -n auto`), which overrides the grant: its text,
-/// else null.
-fn fixedJobs(w: []const []const u8, allowed: u32) ?[]const u8 {
+/// A heavy command held to one job: its jobs option dropped (make, pytest: one job is their
+/// own default) or set to 1, or the option that holds it to one added.
+fn oneJob(a: std.mem.Allocator, w: []const []const u8) []const []const u8 {
     const tool = toolOf(w);
-    var i: usize = 1;
+    var out: std.ArrayList([]const u8) = .empty;
+    var found = false;
+    var args_end: ?usize = null;
+    var i: usize = 0;
     while (i < w.len) : (i += 1) {
-        if (std.mem.eql(u8, w[i], "--")) return null;
-        const j = jobsAt(tool, w, i) orelse continue;
-        const v = j.value;
-        const fixed = if (std.fmt.parseInt(u32, v, 10)) |n| n == 0 or n > allowed else |_| v.len == 0 or std.mem.eql(u8, v, "auto") or std.mem.eql(u8, v, "logical");
-        if (fixed) return w[i];
-        i += j.words - 1;
+        if (i > 0 and args_end == null) if (jobsAt(tool, w, i)) |j| {
+            found = true;
+            i += j.words - 1;
+            if (!isSerial(tool)) out.appendSlice(a, j.one(a)) catch {};
+            continue;
+        };
+        if (args_end == null and std.mem.eql(u8, w[i], "--")) args_end = out.items.len;
+        out.append(a, w[i]) catch return w;
     }
-    return null;
+    if (!found) if (oneJobOption(w)) |oj| {
+        // Before the redirections (`zig build >log 2>&1`) and the arguments after `--`.
+        const end = @min(firstRedirect(out.items), args_end orelse out.items.len);
+        const at = if (oj.after_sub) @min(subAt(w) + 1, end) else end;
+        out.insertSlice(a, at, oj.option) catch return w;
+    };
+    return out.items;
 }
 
-/// Work done where cpuq's process-tree measurement can't see it.
-fn hidesWork(w: []const []const u8) bool {
-    const prog = std.fs.path.basename(w[0]);
-    const sub = if (w.len >= 2) w[1] else "";
-    for ([_][]const u8{ "incus", "lxc", "docker", "podman", "nerdctl" }) |c| {
-        if (std.mem.eql(u8, prog, c) and (std.mem.eql(u8, sub, "exec") or std.mem.eql(u8, sub, "run"))) return true;
+/// A corrected `cpuq run` (or lease): its removed options dropped or replaced (`--exclusive`
+/// becomes `cpuq drain`), `$CPUQ_CORES` made 1, and its command held to one job. `whole`: the
+/// command itself was corrected, not left in a script of several commands.
+const FixedRun = struct { text: []const u8, whole: bool };
+
+fn fixRun(a: std.mem.Allocator, w: []const []const u8, drop_driver: bool) FixedRun {
+    const lease = std.mem.eql(u8, w[1], "lease");
+    var opts: std.ArrayList([]const u8) = .empty;
+    var drain = false;
+    var label: ?[]const u8 = null;
+    var wait: ?[]const u8 = null;
+    var i: usize = if (lease) @min(3, w.len) else 2;
+    while (i < w.len) : (i += 1) {
+        const o = w[i];
+        if (std.mem.eql(u8, o, "--")) {
+            i += 1;
+            break;
+        }
+        if (o.len == 0 or o[0] != '-') break;
+        const name = std.mem.sliceTo(o, '=');
+        const attached = name.len != o.len;
+        var value: ?[]const u8 = if (attached) o[name.len + 1 ..] else null;
+        if (!attached and takesValue(name) and i + 1 < w.len) {
+            i += 1;
+            value = w[i];
+        }
+        if (std.mem.eql(u8, name, "--exclusive")) {
+            drain = true;
+            continue;
+        }
+        if (std.mem.eql(u8, name, "--max-wait")) {
+            wait = value;
+            if (value) |v| opts.appendSlice(a, &.{ "--wait-max", v }) catch {};
+            continue;
+        }
+        if (removedWhy(name, false) != null) continue;
+        if (drop_driver and std.mem.eql(u8, name, "--driver")) continue;
+        if (std.mem.eql(u8, name, "--label")) label = value;
+        opts.append(a, o) catch {};
+        if (!attached) if (value) |v| opts.append(a, v) catch {};
     }
-    if (std.mem.eql(u8, prog, "xcodebuild")) {
-        for (w) |x| if (std.mem.find(u8, x, "Simulator") != null) return true;
+    const fixed = fixInner(a, w[i..]);
+    var words: std.ArrayList([]const u8) = .empty;
+    if (drain and !lease) {
+        // A run held alone: `cpuq drain`, which takes a label and a time to wait.
+        words.appendSlice(a, &.{ "cpuq", "drain" }) catch {};
+        if (label) |l| words.appendSlice(a, &.{ "--label", l }) catch {};
+        if (wait) |s| words.appendSlice(a, &.{ "--max", a.print("{s}s", .{s}) catch s }) catch {};
+    } else {
+        words.appendSlice(a, w[0..if (lease) @min(3, w.len) else 2]) catch {};
+        words.appendSlice(a, opts.items) catch {};
     }
-    return false;
+    if (fixed.words.len != 0) {
+        words.append(a, "--") catch {};
+        if (drain and lease) words.appendSlice(a, &.{ "cpuq", "drain", "--" }) catch {};
+        words.appendSlice(a, fixed.words) catch {};
+    }
+    return .{ .text = joinQuoted(a, words.items), .whole = fixed.whole };
+}
+
+const FixedCommand = struct { words: []const []const u8, whole: bool };
+
+/// A run's command with `$CPUQ_CORES` made 1 and held to one job. A script of one plain command
+/// (`sh -c 'zig build test'`) is unwrapped to it; a script of several is kept.
+fn fixInner(a: std.mem.Allocator, cmd: []const []const u8) FixedCommand {
+    const out = a.alloc([]const u8, cmd.len) catch return .{ .words = cmd, .whole = false };
+    for (cmd, out) |x, *o| o.* = noCores(a, x);
+    const inner = stripWrappers(out);
+    if (inner.len == 0) return .{ .words = out, .whole = true };
+    const prefix = out[0 .. out.len - inner.len];
+    if (isShell(std.fs.path.basename(inner[0]))) {
+        const s = shellScript(inner) orelse return .{ .words = out, .whole = true };
+        const words = unwrapped(a, s) orelse return .{ .words = out, .whole = false };
+        const f = fixInner(a, words);
+        return .{ .words = std.mem.concat(a, []const u8, &.{ prefix, f.words }) catch out, .whole = f.whole };
+    }
+    if (heavyName(inner) == null) return .{ .words = out, .whole = true };
+    return .{ .words = std.mem.concat(a, []const u8, &.{ prefix, oneJob(a, inner) }) catch out, .whole = true };
+}
+
+/// The words of a script that is one command and nothing else the shell would expand or join to
+/// it, or null.
+fn unwrapped(a: std.mem.Allocator, script: []const u8) ?[]const []const u8 {
+    if (std.mem.findAny(u8, script, "$`*?[~{\n") != null) return null;
+    const cmds = split(a, script) catch return null;
+    if (cmds.len != 1 or cmds[0].heredoc != null) return null;
+    // `a &`, `a # note`: more than the command.
+    if (!std.mem.eql(u8, std.mem.trim(u8, cmds[0].text, " \t"), std.mem.trim(u8, script, " \t"))) return null;
+    return cmds[0].words;
+}
+
+/// Words joined into a line the shell reads back as them.
+fn joinQuoted(a: std.mem.Allocator, words: []const []const u8) []const u8 {
+    var line: std.ArrayList(u8) = .empty;
+    for (words, 0..) |x, n| {
+        if (n != 0) line.append(a, ' ') catch {};
+        line.appendSlice(a, quoteWord(a, x)) catch {};
+    }
+    return line.items;
 }
 
 /// The heavy command a simple command is, by its program and first word;
@@ -541,64 +764,18 @@ fn singleQuoted(a: std.mem.Allocator, text: []const u8) []const u8 {
     return out.items;
 }
 
-/// How a tool takes the grant: the option, and whether it goes right after the subcommand
-/// (`go build -p N ./...`) or at the end of the arguments.
-const Grant = struct { tool: []const u8, option: []const u8, after_sub: bool = false };
-
-const grants = [_]Grant{
-    .{ .tool = "zig", .option = "-j\"$CPUQ_CORES\"" },
-    .{ .tool = "cargo", .option = "-j \"$CPUQ_CORES\"", .after_sub = true },
-    .{ .tool = "swift", .option = "-j \"$CPUQ_CORES\"", .after_sub = true },
-    .{ .tool = "go", .option = "-p \"$CPUQ_CORES\"", .after_sub = true },
-    .{ .tool = "pytest", .option = "-n \"$CPUQ_CORES\"" },
-    .{ .tool = "ninja", .option = "-j \"$CPUQ_CORES\"" },
-    .{ .tool = "cmake", .option = "-j \"$CPUQ_CORES\"" },
-    .{ .tool = "xcodebuild", .option = "-jobs \"$CPUQ_CORES\"" },
-};
-
-/// What to run instead: the command under cpuq, its own jobs option replaced by the grant (make
-/// takes its slots from cpuq's jobserver and needs none).
+/// What to run instead: the command under cpuq, held to one job for its task's one CPU.
 fn suggest(a: std.mem.Allocator, w: []const []const u8, project: []const u8, host: ?[]const u8) []const u8 {
     const tool = toolOf(w);
     const testing = std.mem.eql(u8, tool, "pytest") or std.mem.eql(u8, tool, "py.test") or std.mem.eql(u8, tool, "ctest") or for (w[1..@min(w.len, 4)]) |x| {
         if (std.mem.eql(u8, x, "test") or std.mem.eql(u8, x, "t") or std.mem.eql(u8, x, "nextest")) break true;
     } else false;
     const label = a.print("{s}:{s}", .{ if (project.len != 0) project else "proj", if (testing) "test" else "build" }) catch "proj:build";
-    // The words less their own jobs option.
-    var kept: std.ArrayList([]const u8) = .empty;
-    var i: usize = 0;
-    while (i < w.len) : (i += 1) {
-        if (i > 0) if (jobsAt(tool, w, i)) |j| {
-            i += j.words - 1;
-            continue;
-        };
-        kept.append(a, w[i]) catch return "cpuq run --label P:T --cores 2-6 -- CMD";
-    }
-    const words = kept.items;
-    // The grant goes before the redirections (`zig build >log 2>&1`), not after them.
-    const k = firstRedirect(words);
-    const grant: ?Grant = for (grants) |g| {
-        if (std.mem.eql(u8, g.tool, tool)) break g;
-    } else null;
-    var line: std.ArrayList(u8) = .empty;
-    for (words, 0..) |x, n| {
-        if (grant) |g| if ((g.after_sub and n == 2) or (!g.after_sub and n == k)) {
-            line.appendSlice(a, " ") catch {};
-            line.appendSlice(a, g.option) catch {};
-        };
-        if (n != 0) line.appendSlice(a, " ") catch {};
-        line.appendSlice(a, quoteWord(a, x)) catch {};
-    }
-    if (grant) |g| if ((g.after_sub and words.len <= 2) or (!g.after_sub and k == words.len)) {
-        line.appendSlice(a, " ") catch {};
-        line.appendSlice(a, g.option) catch {};
-    };
-    const inner = if (grant != null) a.print("sh -c {s}", .{singleQuoted(a, line.items)}) catch line.items else line.items;
-    const opaque_opt = if (hidesWork(w)) " --opaque" else "";
-    const run = a.print("cpuq run --label {s} --cores 2-6{s} -- {s}", .{ label, opaque_opt, inner }) catch "cpuq run --label P:T --cores 2-6 -- CMD";
+    const inner = joinQuoted(a, oneJob(a, w));
+    const run = a.print("cpuq run --label {s} -- {s}", .{ label, inner }) catch "cpuq run --label P:T -- CMD";
     // On another machine: sent there by cpuq, the repo copied over, or through that machine's own.
-    const sent = a.print("cpuq run --on {s} --label {s} --cores 2-6{s} -- {s}", .{ host orelse "", label, opaque_opt, inner }) catch run;
-    return if (host) |h| a.print("{s} (it copies this repo to {s}; or ssh {s} 'cd … && {s}', the inner quotes as needed)", .{ sent, h, h, run }) catch run else run;
+    const h = host orelse return run;
+    return a.print("cpuq run --on {s} --label {s} -- {s} (it copies this repo to {s}; or ssh {s} 'cd … && {s}', the inner quotes as needed)", .{ h, label, inner, h, h, run }) catch run;
 }
 
 /// A heredoc opened on a line (`<<EOF`, `<<-EOF`, `<<'EOF'`, `<<"EOF"`): where its delimiter
@@ -798,28 +975,18 @@ fn split(a: std.mem.Allocator, script: []const u8) ![]Simple {
 fn refused(command: []const u8) bool {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    return check(arena.allocator(), command, 10, "app", null) != null;
+    return check(arena.allocator(), command, "app", null) != null;
 }
 
-test "a plain cpuq run is never refused for where it runs" {
-    try std.testing.expect(!refused("cpuq run --label app:test --cores 2 -- make test"));
-    try std.testing.expect(!refused("cpuq run --on burst --cores 2 -- make test"));
-    try std.testing.expect(!refused("ssh pup 'cd repo && cpuq run --cores 2 -- make'"));
-    try std.testing.expect(!refused("cpuq lease w --host pup --exclusive -- ./bench"));
-}
-
-test "a minimum of 2 cores fits even a small machine" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expect(check(a, "cpuq run --cores 2-6 -- make", 3, "app", null) == null);
-    try std.testing.expect(check(a, "cpuq run --cores 3 -- make", 4, "app", null) != null);
+fn refusal(a: std.mem.Allocator, command: []const u8) Refusal {
+    return check(a, command, "app", null) orelse .{ .reason = "", .instead = "" };
 }
 
 test "heavy commands outside cpuq are refused" {
     try std.testing.expect(refused("zig build test"));
     try std.testing.expect(refused("cd x && cargo test --release"));
     try std.testing.expect(refused("FOO=1 nice -n 5 make -j8"));
+    try std.testing.expect(refused("make"));
     try std.testing.expect(refused("xcodebuild test -scheme App"));
     try std.testing.expect(refused("python3 -m pytest -q"));
     try std.testing.expect(refused("ssh pup 'cd repo && zig build'"));
@@ -833,23 +1000,22 @@ test "light and wrapped commands pass" {
     try std.testing.expect(!refused("xcodebuild -list"));
     try std.testing.expect(!refused("swift build --show-bin-path"));
     try std.testing.expect(!refused("cargo fmt"));
-    try std.testing.expect(refused("pytest -n 4"));
-    try std.testing.expect(!refused("cpuq lease pup-bench --host pup --exclusive --label kit -- ./bench.sh"));
     try std.testing.expect(!refused("cpuq status --json"));
+    try std.testing.expect(!refused("cpuq drain -- ./bench"));
+    try std.testing.expect(!refused("cpuq lease pup-bench --host pup -- cpuq drain -- ./bench.sh"));
     try std.testing.expect(!refused("echo 'zig build'"));
     try std.testing.expect(!refused("grep -r 'cargo build' ."));
+    try std.testing.expect(!refused("grep -rn CPUQ_CORES src/"));
     try std.testing.expect(!refused("zig build # cpuq: skip"));
-    try std.testing.expect(!refused("cpuq run --label app:build --cores 2-6 -- sh -c 'zig build -j\"$CPUQ_CORES\" test'"));
+    try std.testing.expect(!refused("cpuq run --label app:build -- zig build -j1 test"));
     try std.testing.expect(!refused("cpuq run --label app:build -- make"));
     try std.testing.expect(!refused("ssh pup 'cd repo && cpuq run --label app:build -- make'"));
-    try std.testing.expect(!refused("cpuq run --label lede:test --cores 4 --opaque -- nice xcodebuild test -destination 'platform=iOS Simulator,id=X' -jobs 4"));
-    // A request for a bigger machine is judged by that machine, not this one.
-    try std.testing.expect(!refused("cpuq run --on burst --label proj:matrix --cores 8-32 -- sh -c 'zig build -j\"$CPUQ_CORES\"'"));
+    try std.testing.expect(!refused("cpuq run --on burst --label proj:matrix -n 32 -- sh -c 'zig build -j1 -Dcase=\"$CPUQ_TASK\"'"));
     // cpuq cap limits a program but doesn't queue it: heavy work inside it is still refused.
     try std.testing.expect(refused("cpuq cap --time 600s -- zig build test"));
     try std.testing.expect(refused("cpuq cap --mem=2G -- make"));
     try std.testing.expect(!refused("cpuq cap --mem 2G --time 120s -- ./a.out"));
-    try std.testing.expect(!refused("cpuq run --label app:test --cores 1 -- cpuq cap --mem 2G -- ./a.out"));
+    try std.testing.expect(!refused("cpuq run --label app:test -- cpuq cap --mem 2G -- ./a.out"));
 }
 
 test "a heredoc's body is data unless a shell reads it" {
@@ -858,7 +1024,7 @@ test "a heredoc's body is data unless a shell reads it" {
         \\python3 - <<'EOF'
         \\s = "the machine's load"
         \\EOF
-        \\cpuq run --label cpuq:build --cores 2-6 -- sh -c 'zig build -j"$CPUQ_CORES" && zig build test -j"$CPUQ_CORES"'
+        \\cpuq run --label cpuq:build -- sh -c 'zig build -j1 && zig build test -j1'
     ));
     // Documentation in a body is not a command.
     try std.testing.expect(!refused(
@@ -874,41 +1040,185 @@ test "a heredoc's body is data unless a shell reads it" {
     try std.testing.expect(refused("cat <<EOF | bash\nmake -j8\nEOF"));
     try std.testing.expect(refused("ssh pup <<'EOF'\ncd repo && zig build\nEOF"));
     try std.testing.expect(!refused("ssh pup <<'EOF'\ncd repo && cpuq run --label a:b -- make\nEOF"));
+    try std.testing.expect(refused("cpuq run --label a:b -- sh <<'EOF'\nmake -j8\nEOF"));
     // Not heredocs: a here-string, and an arithmetic shift.
     try std.testing.expect(!refused("cat <<< 'zig build'"));
     try std.testing.expect(refused("echo $((1<<2)); zig build"));
 }
 
-test "misused cpuq runs are refused" {
-    // The grant expanded by the typing shell.
-    try std.testing.expect(refused("cpuq run --cores 2-6 -- make -j$CPUQ_CORES"));
-    try std.testing.expect(refused("cpuq run --cores 2-6 -- sh -c \"zig build -j$CPUQ_CORES\""));
-    // zig build with no -j.
-    try std.testing.expect(refused("cpuq run --label a:b -- zig build"));
-    try std.testing.expect(refused("cpuq run --label a:b -- sh -c 'cd x; zig build test'"));
-    // Over half the CPUs, fixed or as a minimum.
-    try std.testing.expect(refused("cpuq run --cores 10 -- make"));
-    try std.testing.expect(refused("cpuq run --cores=8-10 -- make"));
-    // Hidden work without --opaque.
-    try std.testing.expect(refused("cpuq run --cores 4 -- incus exec ydb -- make"));
-    try std.testing.expect(refused("cpuq run --cores 4 -- xcodebuild test -destination 'platform=iOS Simulator,name=iPhone 17'"));
-}
-
-test "a suggested jobs flag goes before the redirections" {
+test "a suggestion runs the command as typed, under cpuq, at one job" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expectEqualStrings(
-        "cpuq run --label app:build --cores 2-6 -- sh -c 'zig build -j\"$CPUQ_CORES\" >/dev/null 2>&1'",
-        suggest(a, &.{ "zig", "build", ">/dev/null", "2>&1" }, "app", null),
-    );
-    try std.testing.expectEqualStrings(
-        "cpuq run --label app:test --cores 2-6 -- sh -c 'zig build test -j\"$CPUQ_CORES\" 2>log'",
-        suggest(a, &.{ "zig", "build", "test", "2>log" }, "app", null),
-    );
+    const cases = [_][2][]const u8{
+        .{ "zig build", "cpuq run --label app:build -- zig build -j1" },
+        .{ "zig build -j8 test", "cpuq run --label app:test -- zig build -j1 test" },
+        .{ "zig build >/dev/null 2>&1", "cpuq run --label app:build -- zig build -j1 >/dev/null 2>&1" },
+        .{ "zig build test -- --verbose", "cpuq run --label app:test -- zig build test -j1 -- --verbose" },
+        .{ "make -j8 all", "cpuq run --label app:build -- make all" },
+        .{ "make -j all", "cpuq run --label app:build -- make all" },
+        .{ "cargo test 2>&1", "cpuq run --label app:test -- cargo test -j 1 2>&1" },
+        .{ "cargo build -j16", "cpuq run --label app:build -- cargo build -j1" },
+        .{ "go build ./...", "cpuq run --label app:build -- go build -p 1 ./..." },
+        .{ "swift build -c release", "cpuq run --label app:build -- swift build -j 1 -c release" },
+        .{ "pytest -n 8 -q", "cpuq run --label app:test -- pytest -q" },
+        .{ "python3 -m pytest -n auto", "cpuq run --label app:test -- python3 -m pytest" },
+        .{ "ninja -C out", "cpuq run --label app:build -- ninja -C out -j 1" },
+        .{ "cmake --build build", "cpuq run --label app:build -- cmake --build build -j 1" },
+        .{ "xcodebuild test -scheme App -jobs 8", "cpuq run --label app:test -- xcodebuild test -scheme App -jobs 1" },
+        .{ "zig build -Dname='a b'", "cpuq run --label app:build -- zig build \"-Dname=a b\" -j1" },
+        .{ "zig build '-Dx=$HOME'", "cpuq run --label app:build -- zig build '-Dx=$HOME' -j1" },
+        .{ "zig build -j\"$CPUQ_CORES\"", "cpuq run --label app:build -- zig build -j1" },
+    };
+    for (cases) |c| try std.testing.expectEqualStrings(c[1], refusal(a, c[0]).instead);
+    // Each suggestion passes.
+    for (cases) |c| try std.testing.expect(!refused(c[1]));
 }
 
-test "a run here is put to the advisor, with its command; one sent or pinned never is" {
+test "heavy work over ssh is pointed to --on" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = refusal(arena.allocator(), "ssh burst 'cd repo && zig build test'");
+    try std.testing.expect(std.mem.startsWith(u8, r.instead, "cpuq run --on burst --label app:test -- zig build test -j1 (it copies this repo to burst;"));
+}
+
+test "inside cpuq run, a task runs one job" {
+    // More than one, or no limit.
+    try std.testing.expect(refused("cpuq run --label a:b -- make -j8"));
+    try std.testing.expect(refused("cpuq run --label a:b -- make -j"));
+    try std.testing.expect(refused("cpuq run --label a:b -- make -j install"));
+    try std.testing.expect(refused("cpuq run --label a:b -- sh -c 'zig build -j16 test'"));
+    try std.testing.expect(refused("cpuq run --label a:b -- cargo build -j 16"));
+    try std.testing.expect(refused("cpuq run --label a:b -- pytest -n auto"));
+    try std.testing.expect(refused("cpuq run --label a:b -- python3 -m pytest -n 4"));
+    try std.testing.expect(refused("cpuq run --label a:b -- ninja -j0"));
+    try std.testing.expect(refused("cpuq run --label a:b -- bazel build --jobs=8 //..."));
+    // A tool that runs a job for every CPU unless told otherwise.
+    try std.testing.expect(refused("cpuq run --label a:b -- zig build"));
+    try std.testing.expect(refused("cpuq run --label a:b -- sh -c 'cd x; zig build test'"));
+    try std.testing.expect(refused("cpuq run --label a:b -- env -u X sh -c 'zig build'"));
+    try std.testing.expect(refused("cpuq run --label a:b -- go build ./..."));
+    try std.testing.expect(refused("cpuq run --label a:b -- cargo test"));
+    try std.testing.expect(refused("cpuq run --label a:b -- xcodebuild test -scheme App"));
+    try std.testing.expect(refused("cpuq run --on burst --label a:b -- zig build"));
+    // One job.
+    try std.testing.expect(!refused("cpuq run --label a:b -- zig build -j1 test"));
+    try std.testing.expect(!refused("cpuq run --label a:b -- sh -c 'cd x && zig build -j1 test'"));
+    try std.testing.expect(!refused("cpuq run --label a:b -- make"));
+    try std.testing.expect(!refused("cpuq run --label a:b -- make -j1"));
+    try std.testing.expect(!refused("cpuq run --label a:b -- cargo build -j 1"));
+    try std.testing.expect(!refused("cpuq run --label a:b -- go build -p 1 ./..."));
+    try std.testing.expect(!refused("cpuq run --label a:b -- pytest -q"));
+    try std.testing.expect(!refused("cpuq run --label a:b -- pytest -n 0"));
+    try std.testing.expect(!refused("cpuq run --label a:b -- xcodebuild test -scheme App -jobs 1"));
+    // A count it can't read is left alone.
+    try std.testing.expect(!refused("cpuq run --label a:b -- sh -c 'make -j\"$N\"'"));
+    // A lease's command is held to one job too.
+    try std.testing.expect(refused("cpuq lease w -- make -j8"));
+}
+
+test "a run's every option value is skipped" {
+    try std.testing.expect(refused("cpuq run -n 4 -c 50% -x 2 -t 30s -r 1 --wait-max 9 --label a:b -- zig build"));
+    try std.testing.expect(refused("cpuq run --note x --label a:b -- zig build"));
+    try std.testing.expect(refused("cpuq run --repo X --urgent -- zig build"));
+    try std.testing.expect(refused("cpuq run -c=4 --label=a:b -- zig build"));
+    try std.testing.expect(!refused("cpuq run -n 8 -c 4 --label a:b -- sh -c './case \"$CPUQ_TASK\"'"));
+    try std.testing.expect(!refused("cpuq lease w --host pup --slots 2 --label a:b -- ./bench"));
+}
+
+test "the fix for too many jobs is one job, or tasks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var r = refusal(a, "cpuq run --label a:b -- zig build test");
+    try std.testing.expectEqualStrings("`zig build` without -j1 runs a job for every CPU, but a task has one CPU (and macOS can't pin it there)", r.reason);
+    try std.testing.expectEqualStrings("cpuq run --label a:b -- zig build test -j1 (or split the work into tasks with -n M)", r.instead);
+    r = refusal(a, "cpuq run --label a:b -- make -j8 all");
+    try std.testing.expectEqualStrings("`-j8` runs 8 jobs at once, but a task has one CPU (and macOS can't pin it there)", r.reason);
+    try std.testing.expectEqualStrings("cpuq run --label a:b -- make all (or split the work into tasks with -n M)", r.instead);
+    r = refusal(a, "cpuq run --label a:b -- sh -c 'zig build test -j 16'");
+    try std.testing.expectEqualStrings("cpuq run --label a:b -- zig build test -j1 (or split the work into tasks with -n M)", r.instead);
+    // In a script of several commands, the command to change.
+    r = refusal(a, "cpuq run --label a:b -- sh -c 'cd x && go test ./...'");
+    try std.testing.expectEqualStrings("`go test -p 1 ./...` in its script (or split the work into tasks with -n M)", r.instead);
+}
+
+test "$CPUQ_CORES is refused, with the run at one job" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_][2][]const u8{
+        .{ "cpuq run --label a:b -- sh -c 'make -j\"$CPUQ_CORES\"'", "cpuq run --label a:b -- make" },
+        .{ "cpuq run --label a:b -- sh -c 'zig build -j\"$CPUQ_CORES\" test'", "cpuq run --label a:b -- zig build -j1 test" },
+        .{ "cpuq run --label a:b -- make -j$CPUQ_CORES", "cpuq run --label a:b -- make" },
+        .{ "cpuq run --label a:b -- sh -c 'pytest -n \"${CPUQ_CORES}\" -q'", "cpuq run --label a:b -- pytest -q" },
+        .{ "cpuq run --label a:b -- sh -c 'go build -p \"$CPUQ_CORES\" ./...'", "cpuq run --label a:b -- go build -p 1 ./..." },
+        .{ "cpuq run --label a:b -- sh -c 'cd x && zig build -j\"$CPUQ_CORES\"'", "cpuq run --label a:b -- sh -c \"cd x && zig build -j1\"" },
+    };
+    for (cases) |c| {
+        const r = refusal(a, c[0]);
+        try std.testing.expectEqualStrings("cpuq gives each task one CPU; $CPUQ_CORES no longer exists", r.reason);
+        try std.testing.expectEqualStrings(c[1], r.instead);
+        try std.testing.expect(!refused(c[1]));
+    }
+}
+
+test "removed options are refused as cpuq refuses them, with the run they become" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_][3][]const u8{
+        .{ "cpuq run --label app:build --cores 2-6 -- sh -c 'zig build -j\"$CPUQ_CORES\" test'", "--cores", "cpuq run --label app:build -- zig build -j1 test" },
+        .{ "cpuq run --cores=4 -- make", "--cores", "cpuq run -- make" },
+        .{ "cpuq run --priority high --label a:b -- ./x", "--priority", "cpuq run --label a:b -- ./x" },
+        .{ "cpuq run --max-wait 60 --label a:b -- ./x", "--max-wait", "cpuq run --wait-max 60 --label a:b -- ./x" },
+        .{ "cpuq run --exclusive --label rig:bench --max-wait 90 -- ./bench", "--exclusive", "cpuq drain --label rig:bench --max 90s -- ./bench" },
+        .{ "cpuq run --no-load-check -- ./x", "--no-load-check", "cpuq run -- ./x" },
+        .{ "cpuq run --qos none -- ./x", "--qos", "cpuq run -- ./x" },
+        .{ "cpuq run --label e:t --cores 4 --opaque -- incus exec c -- make", "--cores", "cpuq run --label e:t -- incus exec c -- make" },
+        .{ "ssh pup 'cd repo && cpuq run --cores 2 -- make'", "--cores", "cpuq run -- make" },
+    };
+    for (cases) |c| {
+        const r = refusal(a, c[0]);
+        // The first removed option given is the one named.
+        try std.testing.expectEqualStrings(removedWhy(c[1], false).?, r.reason);
+        try std.testing.expectEqualStrings(c[2], r.instead);
+        try std.testing.expect(!refused(c[2]));
+    }
+    // A lease held alone: the lease, then cpuq drain inside it.
+    const r = refusal(a, "cpuq lease w --host pup --exclusive -- ./bench");
+    try std.testing.expectEqualStrings(lease_exclusive, r.reason);
+    try std.testing.expectEqualStrings("cpuq lease w --host pup -- cpuq drain -- ./bench", r.instead);
+    try std.testing.expect(refused("cpuq lease w --priority low -- ./bench"));
+    // After `--` an option is the command's.
+    try std.testing.expect(!refused("cpuq run --label a:b -- ./x --cores 4"));
+}
+
+test "--driver runs only a test runner, never a build" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expect(!refused("cpuq run --driver --label rig:test -- swarm test/rig.rip"));
+    try std.testing.expect(!refused("cpuq run --driver -- rip test/all.rip"));
+    try std.testing.expect(!refused("cpuq run --driver -- ./test/run -j 8"));
+    try std.testing.expect(!refused("cpuq run --driver -- bash test/run.sh t_hook"));
+    try std.testing.expect(!refused("cpuq run --driver -- ./scripts/run-tests.sh"));
+    try std.testing.expect(!refused("cpuq run --driver -- ./run"));
+    try std.testing.expect(!refused("cpuq run --driver -- sh -c 'cd sub && ./tests/check.py'"));
+    // A build under --driver would hold no CPU.
+    var r = refusal(a, "cpuq run --driver --label a:b -- zig build test");
+    try std.testing.expectEqualStrings("`zig build` under --driver: --driver holds no CPU; run builds as tasks", r.reason);
+    try std.testing.expectEqualStrings("cpuq run --label a:b -- zig build test -j1", r.instead);
+    try std.testing.expect(refused("cpuq run --driver -- make test"));
+    try std.testing.expect(refused("cpuq run --driver -- cc -O2 x.c"));
+    try std.testing.expect(refused("cpuq run --driver -- sh -c './test/run && cargo test'"));
+    // Anything else is a task.
+    r = refusal(a, "cpuq run --driver --label a:b -- ./bench");
+    try std.testing.expect(std.mem.startsWith(u8, r.reason, "--driver is for a test runner"));
+    try std.testing.expectEqualStrings("cpuq run --label a:b -- ./bench (one task, on one CPU)", r.instead);
+}
+
+test "a run here is put to the advisor, with its command; one sent elsewhere never is" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -922,38 +1232,14 @@ test "a run here is put to the advisor, with its command; one sent or pinned nev
     };
     var seen: Seen = .{};
     const ad: Advisor = .{ .ctx = &seen, .advise = Seen.advise };
-    const r = check(a, "cpuq run --cores 2 --label rig:test -- sh -c './test/run -j \"$CPUQ_CORES\"'", 10, "app", ad);
+    const r = check(a, "cpuq run --driver --label rig:test -- sh -c './test/run -j 8'", "app", ad);
     try std.testing.expectEqualStrings("slow here", r.?.reason);
-    try std.testing.expectEqualStrings("sh -c ./test/run -j \"$CPUQ_CORES\"", seen.cmd);
-    // Sent elsewhere, held for timing or hidden work: not asked.
-    try std.testing.expect(check(a, "cpuq run --on burst --label rig:test -- make", 10, "app", ad) == null);
-    try std.testing.expect(check(a, "cpuq run --exclusive --label rig:bench -- ./bench", 10, "app", ad) == null);
-    try std.testing.expect(check(a, "cpuq run --opaque --cores 4 --label e:t -- incus exec c -- make", 10, "app", ad) == null);
+    try std.testing.expectEqualStrings("sh -c ./test/run -j 8", seen.cmd);
+    // Sent elsewhere, or a lease: not asked.
+    try std.testing.expect(check(a, "cpuq run --on burst --label rig:test -- make", "app", ad) == null);
+    try std.testing.expect(check(a, "cpuq lease w --label rig:bench -- ./bench", "app", ad) == null);
     // On another machine, through its own cpuq: not this machine's history.
-    try std.testing.expect(check(a, "ssh pup 'cd repo && cpuq run --label rig:test -- make'", 10, "app", ad) == null);
-}
-
-test "heavy work over ssh is pointed to --on" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const r = check(arena.allocator(), "ssh burst 'cd repo && zig build test'", 10, "app", null).?;
-    try std.testing.expect(std.mem.startsWith(u8, r.instead, "cpuq run --on burst --label app:test --cores 2-6 -- sh -c 'zig build test -j\"$CPUQ_CORES\"'"));
-}
-
-fn suggested(a: std.mem.Allocator, command: []const u8) []const u8 {
-    return (check(a, command, 10, "app", null) orelse return "").instead;
-}
-
-test "a suggestion runs as typed: redirections whole, quotes kept, the tool's own grant" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expectEqualStrings("cpuq run --label app:test --cores 2-6 -- sh -c 'cargo test -j \"$CPUQ_CORES\" 2>&1'", suggested(a, "cargo test 2>&1"));
-    try std.testing.expectEqualStrings("cpuq run --label app:build --cores 2-6 -- sh -c 'go build -p \"$CPUQ_CORES\" ./...'", suggested(a, "go build ./..."));
-    try std.testing.expectEqualStrings("cpuq run --label app:test --cores 2-6 -- sh -c 'pytest -q -n \"$CPUQ_CORES\"'", suggested(a, "pytest -n 8 -q"));
-    try std.testing.expectEqualStrings("cpuq run --label app:build --cores 2-6 -- make all", suggested(a, "make -j8 all"));
-    try std.testing.expectEqualStrings("cpuq run --label app:build --cores 2-6 -- sh -c 'zig build \"-Dname=a b\" -j\"$CPUQ_CORES\"'", suggested(a, "zig build -Dname='a b'"));
-    try std.testing.expectEqualStrings("cpuq run --label app:build --cores 2-6 -- sh -c 'zig build '\\''-Dx=$HOME'\\'' -j\"$CPUQ_CORES\"'", suggested(a, "zig build '-Dx=$HOME'"));
+    try std.testing.expect(check(a, "ssh pup 'cd repo && cpuq run --label rig:test -- make'", "app", ad) == null);
 }
 
 test "shell keywords, groupings and substitutions in double quotes hide nothing" {
@@ -982,27 +1268,11 @@ test "wrappers are read with their own options" {
 test "a skip comment counts only as a comment, for its own line" {
     try std.testing.expect(!refused("make && zig build # cpuq: skip"));
     try std.testing.expect(!refused("zig build   # cpuq: skip  "));
+    try std.testing.expect(!refused("cpuq run --cores 4 -- make # cpuq: skip"));
     try std.testing.expect(refused("echo '# cpuq: skip'; zig build"));
     try std.testing.expect(refused("git log --grep='# cpuq: skip' && make"));
     try std.testing.expect(refused("ls # cpuq: skip\nmake"));
     // A comment on a heredoc's line still sets its body aside.
     try std.testing.expect(!refused("cat <<EOF # note\nmake\nEOF"));
     try std.testing.expect(refused("sh <<EOF # run it\nmake\nEOF"));
-}
-
-test "inside cpuq run, every option's value is skipped and a fixed jobs count is refused" {
-    try std.testing.expect(refused("cpuq run --repo X --cores 2 -- zig build"));
-    try std.testing.expect(refused("cpuq run --note x --label a:b -- zig build"));
-    try std.testing.expect(refused("cpuq run --cores 2 -- make -j16"));
-    try std.testing.expect(refused("cpuq run --cores 2 -- make -j"));
-    try std.testing.expect(refused("cpuq run --cores 2 -- sh -c 'zig build -j16 test'"));
-    try std.testing.expect(refused("cpuq run --cores 2 -- cargo build -j 16"));
-    try std.testing.expect(refused("cpuq run --cores 2 -- pytest -n auto"));
-    try std.testing.expect(refused("cpuq run --cores 2 -- env -u X sh -c 'zig build'"));
-    try std.testing.expect(!refused("cpuq run --cores 2 -- sh -c 'pytest -n \"$CPUQ_CORES\"'"));
-    try std.testing.expect(!refused("cpuq run --cores 1 -- make -j1"));
-    try std.testing.expect(refused("cpuq run --cores 2 -- make -j install"));
-    try std.testing.expect(refused("cpuq run --cores 2-6 -- make -j4"));
-    try std.testing.expect(!refused("cpuq run --cores 4 -- make -j4"));
-    try std.testing.expect(!refused("cpuq run --cores 2-6 -- sh -c 'go build -p \"$CPUQ_CORES\" ./...'"));
 }

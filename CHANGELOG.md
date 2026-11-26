@@ -2,6 +2,114 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.30.0 — 2026-11-26
+
+**One CPU per task, from a pool shared through a fair line.** cpuq no longer reserves cores by
+request or admits by measured use. Every task of a `cpuq run` gets exactly one CPU of the
+machine's pool, for as long as it runs, and parallel work is many tasks (README, "cpuq run" and
+"How CPUs are shared").
+
+Why: reservations sat idle. On burst at 04:53 UTC, 74 of its 94 cores were granted while about 9
+were busy, and waiters queued behind the other 65. A task can't hold a CPU it doesn't use, since a
+run holds exactly the CPUs its running tasks are on. Builds lose little: bin/rig built in 156.3 s
+on one CPU of pup (taskset) against 159.7 s on six, and on the Mac its CPU time is about its wall
+time, so a build runs at one job (`zig build -j1`) as one task.
+
+- **`cpuq run [-n M] [-c C] [-x K] [-t T] [-r N] -- CMD`.** `-n M` runs M tasks, each with
+  `CPUQ_TASK`, `CPUQ_TASKS`, `CPUQ_CPU`, `CPUQ_OP`, `CPUQ_ATTEMPT` and `CPUQ_ATTEMPTS`, each task's
+  output in a file under `~/.local/state/cpuq/runs/`, a plan line first and a summary with the
+  failed tasks' last lines at the end; exit 0 when all passed, else 1. `-c` caps the CPUs held
+  (a count or a percentage of the pool), `-x` puts K tasks on each CPU for work that mostly waits,
+  `-t` limits each task (TERM, then KILL 5 s later; exit 124 for one task; the config's `timeout`,
+  1 hour, when no `-t`), `-r` retries a failed task. `cpuq run -- CMD` is one task, with the
+  terminal, as before.
+- **The pool** (`/tmp/cpuq-UID/v2/`): a token file per CPU, held by flock by the run's cpuq alone,
+  never by its tasks. Linux pins each task to its CPU. The pool's CPUs come from the machine (one
+  thread per core first, isolated CPUs and a container's CPU set respected) or the new `cpus`
+  key; `budget` keeps the first N, and defaults to every CPU.
+- **The line:** a free CPU goes to an `--urgent` run's first CPU, then a run holding nothing, then
+  the project holding the fewest CPUs for its weight (new `weights` key), then the run holding the
+  fewest, then the older ticket. Whoever frees a CPU promises it to the head at once and wakes it.
+- **Giving CPUs back at task boundaries:** when the head waits and nothing is free, one run stops
+  filling one CPU and hands it over when its last task ends; at most as many CPUs are emptied as
+  the head still wants, a giver never gives a CPU that would come straight back to it, and a run
+  that gives one takes a fresh ticket. While a CPU empties, its tasks move into free places on the
+  run's other CPUs.
+- **Outside load** is measured from the kernel's CPU ticks, never the load average: a CPU goes out
+  only when one is idle. The memory and disk gates stay.
+- **`cpuq drain [--max T] -- CMD`** empties the machine at task boundaries and runs CMD alone, for
+  timing. **`cpuq kill TICKET|PID|LABEL`** ends a run.
+- **Ctrl-Z** on a run stops its tasks and gives back every CPU; `fg` takes CPUs again.
+- **A dead run's leftovers** are killed by whoever takes its CPU next, by process group and the
+  leader's start time; on Linux each task also dies with its run (`PR_SET_PDEATHSIG`).
+- **Nesting** is detected by `CPUQ_OP` or, when the environment was cleared, by an ancestor that
+  is a run's cpuq; a nested run runs on its task's CPU.
+- **`--driver`** runs a test runner that starts `cpuq run`s of its own: it holds no CPU, and on
+  Linux it gets the delegated cgroup scope for `cpuq cap` that every run used to get.
+- **`cpuq status`** shows who holds which CPU, the line and why each run waits, and each project's
+  share against its fair share; it flags runs whose CPUs are under half busy or over 1.2, and
+  stopped runs. `--json` is schema 2 (README, "cpuq status"). `cpuq history` shows each run's most
+  CPUs held and its tasks done and failed.
+- **`cpuq hook`** suggests runs at one job (`cpuq run --label app:build -- zig build -j1`),
+  refuses a run whose command would start more than one job, rewrites removed options and
+  `$CPUQ_CORES`, and accepts `--driver` only for a test runner.
+- **A removed option, config key, spec field or command fails with one line naming what replaces
+  it** (exit 2), so agents' notes learn the new form.
+- **`cpuq test` runs a spec's tasks one per CPU of the pool,** as `cpuq run -n COUNT -- cpuq
+  _task FOLDER`, beside every other run (README, "A test's tasks"). A task file's work, output and
+  `==` line are as before; exit 0 goes to `done/`, anything else to `fail/`, and a task cut off
+  stays in `todo/`. A run of many writes its progress to `CPUQ_PROGRESS`, which `cpuq job` shows.
+
+**Removed.** Run and lease options `--cores`, `--priority`, `--max-wait` (now `--wait-max`),
+`--exclusive` (`cpuq drain`; for a lease, `cpuq lease NAME -- cpuq drain -- CMD`),
+`--no-load-check`, `--qos`, `--opaque`. Variables `CPUQ_CORES`, `CPUQ_CPUS`, `CPUQ_TOKEN`,
+`CPUQ_WINDOW_OWNER` and the make jobserver in `MAKEFLAGS`; `CPUQ_PROGRESS` is set only for a
+submitted job. Commands `cpuq first`, `start`, `cancel`, `pause`, `resume`, `stop` (`cpuq kill`,
+Ctrl-Z), `note` (`--note`), `doctor` (`cpuq status`), `qos`; `cpuq jobs run`, `status`, `watch`,
+`set`, `pause`, `resume`, `stop` and `reset` (a folder of task files: `cpuq test`, or `cpuq run -n`),
+`cpuq agent` and `cpuq attach` (the pool shares the machine by itself; `cpuq jobs` lists submitted
+jobs). Stop an installed 0.29 agent: `launchctl bootout gui/$UID/com.github.shreeve.cpuq.agent`
+(macOS), `systemctl --user disable --now cpuq-agent` (Linux). Config keys `admit`, `target`,
+`settle`, `right_size`, `poll`, `aging`, `note`, `backfill`, `window_backfill`, `patience`,
+`exclusive`, `window_gap`, `window_lend`, `lend`, `lend_after`, `cpu_weights`, `affinity`,
+`load_check`, `load_margin`, `active_cap`, `qos`, `max_memory` (`cpuq cap --mem`). A spec's
+`cores`: its job runs as one task. Timing windows, lending, reservation mode, measured admission,
+history sizing, and a cgroup scope per run.
+
+**What each project must change** before its machines are cut over (from a grep of each repo):
+
+- **Every machine's config:** remove the keys above. pop's has `admit`, `active_cap`,
+  `load_check`, `lend_after`, `patience`, `max_memory`, `exclusive` and `target`; with them every
+  command fails. Pack recipes (`~/.config/cpuq/packs.json`) build with `-j"$CPUQ_CORES"`: make
+  them `-j1`.
+- **Rig:** `test/rig.rip` takes swarm's workers and zig's `-j` from `CPUQ_CORES`; run the suite as
+  `cpuq run --driver -- swarm test/rig.rip` once swarm wraps each case in `cpuq run --`, and build
+  with `-j1`. `test/lanes/*.py`, `test/cli/*_grid.sh` and `bench/json/*` default their jobs to
+  `$CPUQ_CORES` or 2: make the parallel ones `-n` tasks, the rest one job. `test/matrix.py`'s
+  `cpuq cap` use is unchanged, but its kernel memory limit on Linux needs `--driver`.
+- **Trig:** about 50 `cpuq run --cores N` in 40 files of `tools/` (oracle builds with `GOFLAGS=-p=2`:
+  `cpuq run --label trig:oracle -- go build -p 1 …`; benches with `--cores 1`: drop it;
+  `checker/bench`'s `--local`). `tools/gate-burst` re-runs itself inside
+  `cpuq run --cores 16`, `tools/gate-merge` runs swarm `-w 24` under `--cores 24` and builds under
+  `--cores 32` with `UNITS=32`, and `bench/pr-measure` and `race-build` pass `--cores $cores`:
+  each becomes `--driver` around its runner, `-n` tasks, or one-job builds. The copies under
+  `.claude/worktrees/` carry the same calls.
+- **Rip:** swarm wraps each case in `cpuq run --` (with `CPUQ_TASK` per case), so a suite under
+  `cpuq run --driver -- swarm …` takes a CPU per running case from the line.
+- **Em and emdb:** `em/cpuq/{crash,flakes,locks}.json` and `emdb-model/cpuq/*.json` have `cores`
+  (refused) and `-j"$CPUQ_CORES"`; `sqlcmp/cpuq/stage1.json` has `cores` and
+  `-j $((CPUQ_CORES / 2))`. `em/test/run`, `oracle`, `hunt-flakes`, `crash-trials`, `lib/bcdiff`
+  and `mits/runners/all.sh` default their jobs to `$CPUQ_CORES`, else every CPU, which under one
+  task means every CPU's work on one CPU: make them tasks (`-n`) or `--driver` runners. `em/test/mvts`
+  builds with a bare `zig build` when `CPUQ_CORES` is unset: `-j1`. In `emdb-gates/gates/`:
+  `--cores` throughout, `mac-steps.sh` and `lib.sh` require `$CPUQ_CORES`,
+  `race.sh` holds `cpuq lease pup-bench --exclusive --max-wait 300` (now
+  `cpuq lease pup-bench --wait-max 300 -- … cpuq drain -- …`), and `race.sh` and `crashlab.sh`
+  parse `cpuq status`'s `waiters` and `leases` sections, which are gone (`cpuq status --json`:
+  `waiters`). `emdb-crashlab` (`--cores 4`, `-j"${CPUQ_CORES:-4}"`, `lab.py --jobs`),
+  `emdb-arm64/lab` and `emdb-model/runq.sh` (`MAXJ=${CPUQ_CORES:-1}`) likewise.
+- **Nexus:** no cpuq calls; only its pack recipe, above.
+
 ## 0.29.0 — 2026-11-03
 
 - **`cpuq jobs`: a job is a folder of task files run by a driver of its own** (README, "Jobs").
