@@ -368,7 +368,7 @@ lines.
 | `memory` | bytes: `total`, `used`, `swap_total`, `swap_used`; null when unreadable |
 | `gate` | `state` (`open`, `pressure`, `low_memory`, `low_disk`, `drain` or `outside_load`), `load`, `available`, `disk_free`, `disk_path`, `text` |
 | `next_free` | seconds until a CPU is expected to free, when none is free |
-| `holders[]` | running runs: `ticket`, `pid` (its cpuq), `project`, `weight`, `label`, `command`, `since`, `cpus` (held), `cores` (how many), `slots` (their places in the pool), `emptying`, `want`, `overload`, `limit`, `tasks`, `done`, `failed`, `running`, `using` (CPUs busy), `urgent`, `paused` (stopped), `exclusive` (a drain), `progress`, `left`, `left_from`, `flags` |
+| `holders[]` | running runs: `ticket`, `pid` (its cpuq), `project`, `weight`, `label`, `command`, `since`, `cpus` (held), `cores` (how many), `slots` (their places in the pool), `emptying`, `want`, `overload`, `limit`, `tasks`, `done`, `failed`, `running`, `running_tasks` (each task running now: `task`, `attempt`, `cpu`, `pid`, `since`), `using` (CPUs busy), `urgent`, `paused` (stopped), `exclusive` (a drain), `progress`, `left`, `left_from`, `flags` |
 | `waiters[]` | in line order: `order` (1 first), `ticket`, `pid`, `project`, `label`, `command`, `since`, `holds`, `cores` (CPUs it waits for), `max` (its limit), `urgent`, `exclusive` (a drain), `why`, `gate`, `eta` (the first's, seconds) |
 | `projects[]` | `name`, `weight`, `ops`, `held`, `want`, `fair` |
 | `outside[]`, `outside_total` | the busiest processes outside cpuq (`pid`, `name`, `using`), and their total |
