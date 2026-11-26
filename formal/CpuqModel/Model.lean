@@ -122,6 +122,9 @@ structure Rules where
   /-- One giver, as src/pool.zig's `giver` picks it: the project holding the most for its
   weight, then the operation keeping the most, then the newest ticket. -/
   oneGiver : Bool := false
+  /-- A grant to a stopped operation stays valid (its file stays locked), even when it is out of
+  the line. -/
+  stoppedGrants : Bool := false
   /-- A drain no longer owed is cancelled (`Act.undrain`). src/pool.zig never cancels one. -/
   undrains : Bool := true
   deriving Repr
@@ -157,6 +160,10 @@ def pool : Rules :=
 `behindAfter` compares with the ticket the giver will have once it gives the CPU back, and a
 stopped operation is out of the line. -/
 def poolFixed : Rules := { pool with behindFresh := true, stoppedWaits := false }
+
+/-- The code with both fixes as they landed (d14d347, 0d315ed): a stopped operation wants
+nothing, but a grant made to it before it stopped stays valid. -/
+def poolNow : Rules := { poolFixed with stoppedGrants := true }
 
 end Rules
 
@@ -221,6 +228,10 @@ def room (cfg : Cfg) (s : St) (o : Nat) : Nat :=
 
 def ceilDiv (a b : Nat) : Nat := (a + b - 1) / b
 
+/-- A grant to `h` still counts: `h` is in the line's eyes, or (with `stoppedGrants`) stopped. -/
+def grantLive (cfg : Cfg) (s : St) (h : Nat) : Bool :=
+  liveOp cfg s h || (cfg.rules.stoppedGrants && (s.op h).phase == .stopped)
+
 /-- Slots `o` wants: no more than its ceiling C allows (slots and grants count), and no more
 than its pending tasks need beyond the room it has (packing, rule 3). -/
 def demand (cfg : Cfg) (s : St) (o : Nat) : Nat :=
@@ -232,7 +243,7 @@ def demand (cfg : Cfg) (s : St) (o : Nat) : Nat :=
 def validGrantC (cfg : Cfg) (s : St) (x : Cpu) : Bool :=
   match x.grant with
   | none => false
-  | some h => !cfg.rules.validGrant || liveOp cfg s h
+  | some h => !cfg.rules.validGrant || grantLive cfg s h
 
 /-- A token anyone may hand out: no flock, and no grant that still counts. -/
 def freeC (cfg : Cfg) (s : St) (x : Cpu) : Bool := x.lock.isNone && !validGrantC cfg s x

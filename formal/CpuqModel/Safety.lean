@@ -488,8 +488,8 @@ theorem freeC_lock {cfg : Cfg} {s : St} {x : Cpu} (f : freeC cfg s x = true) : x
   simp only [freeC, Bool.and_eq_true, Option.isNone_iff_eq_none] at f; exact f.1
 
 theorem freeC_grant {cfg : Cfg} {s : St} {x : Cpu} {g : Nat} (f : freeC cfg s x = true)
-    (hg : x.grant = some g) : liveOp cfg s g = false := by
-  cases l : liveOp cfg s g
+    (hg : x.grant = some g) : grantLive cfg s g = false := by
+  cases l : grantLive cfg s g
   · rfl
   · simp only [freeC, validGrantC, hg, l, Bool.and_eq_true, Bool.not_eq_true', Bool.or_true] at f
     exact absurd f.2 (by decide)
@@ -511,7 +511,8 @@ theorem Inv.grantOne {cfg : Cfg} {s : St} (h : Inv cfg s) (c : Nat) : Inv cfg (C
         have w := head_waiter hh
         have hlive := waiter_live w
         have hroom := waiter_room w
-        have hold : (s.cpu c).grant ≠ some g := fun e => by rw [freeC_grant f e] at hlive; cases hlive
+        have hold : (s.cpu c).grant ≠ some g := fun e => by
+          have := freeC_grant f e; simp [grantLive, hlive] at this
         apply h.withCpu hc
         · intro o e; simp [hl] at e
         · intro sl hs hal; have := h.ownerLock c sl hs hal; rw [hl] at this; cases this

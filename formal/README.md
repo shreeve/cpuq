@@ -50,7 +50,8 @@ hands them out.
 FINAL-PLAN's (`plan`), the plan read loosely (`planLoose`), the plan with this model's two
 fixes (`fixed`), the rules the code implements on branch `slots` (`pool`, from `ahead`,
 `handOut`, `firstWaiter`, `giver` and `behindAfter` in src/pool.zig, and the loop in src/op.zig),
-and those with this model's two fixes for the code (`poolFixed`).
+those with this model's two fixes for the code (`poolFixed`), and the code as those fixes
+landed (`poolNow`).
 
 `pool` differs from `fixed` where the code does what the plan doesn't say: the giver's ticket is
 renewed when it gives its CPU back, not when it starts to drain (`renewAtRelease`); one giver
@@ -210,3 +211,12 @@ Fix (`stoppedWaits` off): a stopped operation wants nothing until it continues.
 
 The doc comment on `Op.want` says "beyond those it holds and is promised". `wantMore` leaves
 promises out, and the line subtracts them, so the code is right and the comment is wrong.
+
+Both landed: finding 4 in d14d347, finding 5 in 0d315ed.
+
+**6. (src/op.zig) A promise made before a stop still idles its CPU.** Since 0d315ed a stopped
+operation wants nothing and gets no new promises. But `promises` keeps any promise to an
+operation whose file is locked, and `suspend_` doesn't drop the operation's own. A waits; B
+releases a CPU and promises it to A; A is stopped before its loop takes it; the CPU idles until A
+continues (`poolNow`, the urgent scenario). Fix: in `suspend_`, under the lock and before the
+hand-out, drop every promise to the operation's ticket.

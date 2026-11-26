@@ -56,11 +56,14 @@ theorem isAlive_congr {s t : St} (h : s.ops = t.ops) (o : Nat) : s.isAlive o = t
 theorem liveOp_congr {cfg : Cfg} {s t : St} (h : s.ops = t.ops) (o : Nat) : liveOp cfg s o = liveOp cfg t o := by
   simp [liveOp, St.isAlive, St.op, h]
 
+theorem phase_of_ops' {s t : St} (h : s.ops = t.ops) (o : Nat) : (s.op o).phase = (t.op o).phase := by
+  simp [St.op, h]
+
 theorem validGrantC_congr {cfg : Cfg} {s t : St} (h : s.ops = t.ops) (x : Cpu) :
     validGrantC cfg s x = validGrantC cfg t x := by
   unfold validGrantC; split
   · rfl
-  · rw [liveOp_congr h]
+  · simp only [grantLive, liveOp_congr h, phase_of_ops' h]
 
 theorem freeC_congr {cfg : Cfg} {s t : St} (h : s.ops = t.ops) (x : Cpu) :
     freeC cfg s x = freeC cfg t x := by
@@ -116,7 +119,7 @@ theorem handoutOver_conserves {cfg : Cfg} (cs : List Nat) :
             unfold grantOne; rw [ite_eq_left f0, hh]; simp only
             rw [St.cpu_setCpu]; simp [hlen]
           have nf : freeC cfg (grantOne cfg s c) ((grantOne cfg s c).cpu c) = false := by
-            rw [g1]; simp [freeC, validGrantC, liveOp_congr (grantOne_ops cfg s c), ha]
+            rw [g1]; simp [freeC, validGrantC, grantLive, liveOp_congr (grantOne_ops cfg s c), ha]
           obtain ⟨k, _⟩ := handoutOver_keeps cs nf
           rw [k, freeC_congr (handoutOver_keeps cs nf).2, nf] at hf; cases hf
         · have nf : freeC cfg (grantOne cfg s c) ((grantOne cfg s c).cpu c) = false := by
