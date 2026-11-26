@@ -167,6 +167,8 @@ const Run = struct {
     seen_ms: i64 = 0,
     /// First in line at its last look: it alone looks every second.
     head: bool = false,
+    /// Tasks ended when it last wrote its progress.
+    last_progress: u32 = std.math.maxInt(u32),
     /// Its history: the record, when it entered the line, and the most CPUs it held at once.
     job: joblog.JobLog = undefined,
     queued_t: f64 = 0,
@@ -217,8 +219,22 @@ const Run = struct {
         }) catch break;
         r.rec.tasks_now = now.items;
         r.pool.write(r.file, r.rec) catch {};
+        // A run of many reports its own progress where its caller asked (CPUQ_PROGRESS):
+        // `DONE TOTAL FAILING`, whole, by a rename.
+        if (!r.single) if (r.ctx.env.get("CPUQ_PROGRESS")) |path| writeProgress(r, path);
     }
 };
+
+fn writeProgress(r: *Run, path: []const u8) void {
+    const ended = r.rec.done + r.rec.failed;
+    if (ended == r.last_progress) return;
+    r.last_progress = ended;
+    var buf: [64]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "{d} {d} {d}\n", .{ ended, r.total, r.rec.failed }) catch return;
+    const tmp = std.fmt.allocPrint(r.a, "{s}.tmp", .{path}) catch return;
+    Io.Dir.cwd().writeFile(r.ctx.io, .{ .sub_path = tmp, .data = text }) catch return;
+    Io.Dir.cwd().rename(tmp, Io.Dir.cwd(), path, r.ctx.io) catch {};
+}
 
 /// Runs an operation and returns its exit status (or dies by its command's signal).
 pub fn run(ctx: *Ctx, o: Opts) u8 {
