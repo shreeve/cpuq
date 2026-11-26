@@ -115,13 +115,13 @@ def progressAct : Act → Bool
   | .crash _ | .kill _ | .tstp _ => false
   | _ => true
 
-/-- The weak-fairness class of a step, or none for steps nothing forces: an arrival, a
-timeout (optional), a crash, a kill, a Ctrl-Z. A task's exit is one class whether it passes or
+/-- The weak-fairness class of a step, or none for steps nothing forces: an arrival (a drain's
+begins with `enter`), a timeout (optional), a crash, a kill, a Ctrl-Z. A task's exit is one class whether it passes or
 fails (A-term: every task ends). A SIGCONT is weakly fair while one is owed (A-cont: whoever
 sent a Ctrl-Z continues the run). -/
 def fairKey : Act → Option Act
   | .exit o i _ => some (.exit o i true)
-  | .timeout _ _ | .arrive _ | .crash _ | .kill _ | .tstp _ => none
+  | .timeout _ _ | .arrive _ | .enter _ | .crash _ | .kill _ | .tstp _ => none
   | a => some a
 
 structure Report where

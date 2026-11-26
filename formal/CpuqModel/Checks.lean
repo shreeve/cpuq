@@ -68,6 +68,11 @@ def drainCrash (r : Rules) : Cfg :=
     ops := [{ proj := 0, tasks := 2, K := 2, forever := true }, drainOn 3 1,
             { proj := 2, tasks := 1, forever := true }] }
 
+/-- 2 CPUs, an operation with endless work and a drain, one Ctrl-Z. -/
+def drainZ (r : Rules) : Cfg :=
+  { cpus := 2, rules := r, stops := true
+    ops := [{ proj := 0, tasks := 2, forever := true }, drainOn 2 1] }
+
 /-- 2 CPUs, two operations with endless work, two Ctrl-Z. -/
 def ctrlZ (r : Rules) : Cfg :=
   { cpus := 2, rules := r, stops := true, ctrlZ := 2
@@ -275,6 +280,13 @@ urgent: ok: 300171 states, 1932428 steps
   row "timeout" (timeout .releasedFixed)
   row "herd" (herd .releasedFixed)
   row "urgent" (urgent .releasedFixed)
+
+-- A stopped drain idles the pool until it continues (Finding 9).
+/--
+info: drain, Ctrl-Z: FAILED (905 states): L2 idle
+-/
+#guard_msgs in
+#eval row "drain, Ctrl-Z" (drainZ .releasedFixed)
 
 -- An urgent operation with endless work starves an operation of its own project (Finding 7).
 /--

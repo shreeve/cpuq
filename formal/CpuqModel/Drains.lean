@@ -666,9 +666,34 @@ structure DCtx (cfg : Cfg) (d : Nat) (s : St) : Prop where
   others : ∀ g c, drainOp cfg g = true → g ≠ d → (s.cpu c).lock ≠ some g ∧ (s.cpu c).grant ≠ some g
   kept : ∀ c, (s.cpu c).slot ≠ some { owner := d, draining := true }
 
-/-- What a step may do to one CPU: lower its rank, or keep it and not raise what is left on it. -/
-def Better (d : Nat) (s t : St) : Prop :=
-  ∀ c, rank d t c ≤ rank d s c ∧ (rank d t c = rank d s c → inner d t c ≤ inner d s c)
+/-- One CPU after a step: what the step may do to it. -/
+def BetterAt (d : Nat) (s t : St) (c : Nat) : Prop :=
+  rank d t c ≤ rank d s c ∧
+    (rank d t c = rank d s c →
+      inner d t c ≤ inner d s c ∧ (t.cpu c).lock = (s.cpu c).lock ∧
+      (rank d s c ≠ 2 → (t.cpu c).grant = (s.cpu c).grant) ∧
+      (inner d t c = inner d s c → ∀ g i, (s.cpu c).lock = some g → g ≠ d →
+        drainingC (s.cpu c) = true → wOn c (t.task g i) = wOn c (s.task g i)))
+
+/-- What a step may do to each CPU: lower its rank; or keep it, not raise what is left on it,
+and, while that holds too, change neither who holds it or was granted it nor what any task
+weighs on it. -/
+def Better (d : Nat) (s t : St) : Prop := ∀ c, BetterAt d s t c
+
+theorem betterAt_of {d : Nat} {s t : St} {c : Nat} (hc : t.cpu c = s.cpu c)
+    (hr : rank d t c ≤ rank d s c)
+    (ht : ∀ g, (s.cpu c).lock = some g → (t.op g).tasks = (s.op g).tasks) : BetterAt d s t c := by
+  refine ⟨hr, fun _ => ⟨Nat.le_of_eq (inner_congr hc ht), by rw [hc], fun _ => by rw [hc], ?_⟩⟩
+  intro _ g i hg _ _
+  simp only [St.task, ht g hg]
+
+theorem betterAt_same {d : Nat} {s t : St} {c : Nat} (hc : t.cpu c = s.cpu c)
+    (hp : ∀ h, (t.op h).phase = (s.op h).phase)
+    (ht : ∀ g, (s.cpu c).lock = some g → (t.op g).tasks = (s.op g).tasks) : BetterAt d s t c :=
+  betterAt_of hc (Nat.le_of_eq (rank_congr hc hp)) ht
+
+theorem betterAt_lt {d : Nat} {s t : St} {c : Nat} (h : rank d t c < rank d s c) : BetterAt d s t c :=
+  ⟨Nat.le_of_lt h, fun e => absurd e (Nat.ne_of_lt h)⟩
 
 /-- A step that changes one task. -/
 theorem taskStep_ctx {cfg : Cfg} {d : Nat} {s : St} {o i : Nat} {y : Task} (x : DCtx cfg d s)
@@ -690,11 +715,17 @@ theorem taskStep_ctx {cfg : Cfg} {d : Nat} {s : St} {o i : Nat} {y : Task} (x : 
     · have : ((s.setTask o i y).op d).tasks = (s.op d).tasks := St.tasks_setTask_ne _ _ _ _ _ e
       simp only [St.pendingN, this]; exact x.work
   · intro c
-    refine ⟨Nat.le_of_eq (rank_congr rfl hph), fun _ => ?_⟩
     have k := inner_setTask (d := d) (c := c) (x := y) ho hi
-    split at k
-    · rename_i hc; have := hw c hc.1 hc.2.1 hc.2.2; omega
-    · omega
+    refine ⟨Nat.le_of_eq (rank_congr rfl hph), fun _ => ⟨?_, rfl, fun _ => rfl, fun he g j hg hgd hdr => ?_⟩⟩
+    · split at k
+      · rename_i hc; have := hw c hc.1 hc.2.1 hc.2.2; omega
+      · omega
+    · rw [St.task_setTask]
+      split
+      · rename_i z; obtain ⟨e1, e2, -, -⟩ := z; subst e1; subst e2
+        rw [ite_eq_left ⟨hg, hgd, hdr⟩, ite_eq_left ⟨hg, hgd, hdr⟩] at k
+        omega
+      · rfl
 
 theorem handout_len (cfg : Cfg) (s : St) : (handout cfg s).cpus.length = s.cpus.length := by
   unfold Cpuq.handout; generalize List.range s.cpus.length = cs
@@ -711,7 +742,8 @@ theorem rank_handout {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drai
     inner d (handout cfg s) c = inner d s c ∧
     ((handout cfg s).cpu c).lock = (s.cpu c).lock ∧
     ((handout cfg s).cpu c).slot = (s.cpu c).slot ∧
-    (((handout cfg s).cpu c).grant = (s.cpu c).grant ∨ ((handout cfg s).cpu c).grant = some d) := by
+    (((handout cfg s).cpu c).grant = (s.cpu c).grant ∨ ((handout cfg s).cpu c).grant = some d) ∧
+    (¬(rank d s c = 2 ∧ c < s.cpus.length) → (handout cfg s).cpu c = s.cpu c) := by
   have hops := (handout_order_ops cfg s).2
   have hph : ∀ p, ((handout cfg s).op p).phase = (s.op p).phase := fun p => phase_of_ops hops p
   by_cases hc : c < s.cpus.length
@@ -738,7 +770,7 @@ theorem rank_handout {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drai
     · have r2 := hfr.1 f
       have hl := ((freeC_iff hR _ _).1 f).1
       have e' : (handout cfg s).cpu c = { s.cpu c with grant := some d } := by rw [e, ite_eq_left f]
-      refine ⟨?_, ?_, by rw [e'], by rw [e'], .inr (by rw [e'])⟩
+      refine ⟨?_, ?_, by rw [e'], by rw [e'], .inr (by rw [e']), fun z => absurd ⟨r2, hc⟩ z⟩
       · rw [ite_eq_left (⟨r2, hc⟩ : rank d s c = 2 ∧ c < s.cpus.length)]
         unfold rank; rw [e']; simp [hl, hph, ha]
       · exact inner_congr' (by rw [e']) (by rw [e']; simp [drainingC])
@@ -747,14 +779,14 @@ theorem rank_handout {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drai
       have : ¬(rank d s c = 2 ∧ c < s.cpus.length) := fun x => f (hfr.2 x.1)
       rw [ite_eq_right this]
       exact ⟨rank_congr e' hph, inner_congr e' (fun g _ => by simp [St.op, hops]), by rw [e'],
-        by rw [e'], .inl (by rw [e'])⟩
+        by rw [e'], .inl (by rw [e']), fun _ => e'⟩
   · have hlen : (handout cfg s).cpus.length = s.cpus.length := handout_len cfg s
     have e1 : (handout cfg s).cpu c = {} := St.cpu_default _ _ (by rw [hlen]; exact hc)
     have e0 : s.cpu c = {} := St.cpu_default _ _ hc
     have : ¬(rank d s c = 2 ∧ c < s.cpus.length) := fun x => hc x.2
     rw [ite_eq_right this]
     exact ⟨rank_congr (by rw [e1, e0]) hph, inner_congr (by rw [e1, e0]) (fun g _ => by simp [St.op, hops]),
-      by rw [e1, e0], by rw [e1, e0], .inl (by rw [e1, e0])⟩
+      by rw [e1, e0], by rw [e1, e0], .inl (by rw [e1, e0]), fun _ => by rw [e1, e0]⟩
 
 theorem wOn_zero {c : Nat} {t : Task} (hs : ∀ c', t.st ≠ .running c') (hd : t.dying = none) :
     wOn c t = 0 := by
@@ -946,11 +978,11 @@ theorem drain_frame {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drain
         · rw [z]; exact (x.others g c hg hne).2
         · rw [z]; intro w; cases w; exact hne rfl
       · intro c; obtain ⟨-, -, -, hsl, -⟩ := k c; rw [hsl]; exact x.kept c
-      · intro c; obtain ⟨k1, k2, -⟩ := k c
-        rw [k1, k2]
-        split
-        · rename_i z; rw [z.1]; exact ⟨by omega, fun w => by omega⟩
-        · exact ⟨Nat.le_refl _, fun _ => Nat.le_refl _⟩
+      · intro c
+        obtain ⟨k1, -, -, -, -, k6⟩ := k c
+        by_cases z : rank d s c = 2 ∧ c < s.cpus.length
+        · apply betterAt_lt; rw [k1, ite_eq_left z, z.1]; omega
+        · exact betterAt_same (k6 z) (fun p => phase_of_ops hops p) (fun g _ => by simp [St.op, hops])
     · cases e
   | accept o c0 =>
     simp only [Cpuq.step] at e
@@ -987,10 +1019,9 @@ theorem drain_frame {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drain
           have r1 : rank d s c0 = if o = d then 1 else 5 := by unfold rank; simp [hl, hg, ha']
           have r2 : rank d (taken s o c0) c0 = if o = d then 0 else 4 := by
             unfold rank; rw [taken_cpu, ite_eq_left (⟨rfl, hc0⟩ : c0 = c0 ∧ c0 < s.cpus.length)]; simp [takenCpu, drainingC]
-          rw [r1, r2]; split <;> exact ⟨by omega, fun w => by omega⟩
+          apply betterAt_lt; rw [r1, r2]; split <;> omega
         · have hc : (taken s o c0).cpu c = s.cpu c := by rw [taken_cpu, ite_eq_right (fun z => ec z.1)]
-          refine ⟨Nat.le_of_eq (rank_congr hc hph), fun _ => Nat.le_of_eq (inner_congr hc ?_)⟩
-          intro g' hg'
+          refine betterAt_same hc hph (fun g' hg' => ?_)
           rw [hopa g' (by rw [(h.lockOwner c g' hg').2]; decide)]
     · cases e
   | drain o c0 =>
@@ -1026,10 +1057,9 @@ theorem drain_frame {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drain
           have r1 : rank d s c0 = 4 := by unfold rank; simp [hl, hne, hsl, drainingC]
           have r2 : rank d (drainEff cfg s o c0) c0 = 3 := by
             unfold rank; rw [hcpu, ite_eq_left (⟨rfl, hc0⟩ : c0 = c0 ∧ c0 < s.cpus.length)]; simp [hl, hne, drainingC]
-          rw [r1, r2]; exact ⟨by omega, fun w => by omega⟩
+          apply betterAt_lt; rw [r1, r2]; omega
         · have hc : (drainEff cfg s o c0).cpu c = s.cpu c := by rw [hcpu, ite_eq_right (fun z => ec z.1)]
-          exact ⟨Nat.le_of_eq (rank_congr hc (fun p => phase_of_ops hops p)),
-            fun _ => Nat.le_of_eq (inner_congr hc (fun g' _ => by simp [St.op, hops]))⟩
+          exact betterAt_same hc (fun p => phase_of_ops hops p) (fun g' _ => by simp [St.op, hops])
     · cases e
   | release o c0 =>
     simp only [Cpuq.step] at e
@@ -1098,20 +1128,20 @@ theorem drain_frame {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drain
           · simp
           · exact x.kept c
         · intro c
-          obtain ⟨k1, k2, -⟩ := k c
-          rw [k1, k2]
+          obtain ⟨k1, -, -, -, -, k6⟩ := k c
           by_cases ec : c0 = c
           · subst ec
             have r1 : rank d s1 c0 = 2 := by unfold rank; rw [hc1, ite_eq_left (⟨rfl, hc0⟩ : c0 = c0 ∧ c0 < s.cpus.length)]
             have r0 : 3 ≤ rank d s c0 := by
               unfold rank; simp only [hl, hne, ite_false]; split <;> omega
-            rw [ite_eq_left (⟨r1, by rw [hlen1]; exact hc0⟩ : rank d s1 c0 = 2 ∧ c0 < s1.cpus.length)]
-            exact ⟨by omega, fun w => by omega⟩
+            apply betterAt_lt
+            rw [k1, ite_eq_left (⟨r1, by rw [hlen1]; exact hc0⟩ : rank d s1 c0 = 2 ∧ c0 < s1.cpus.length)]
+            omega
           · have hc : s1.cpu c = s.cpu c := by rw [hc1, ite_eq_right (fun z => ec z.1)]
-            rw [rank_congr hc hph1, inner_congr hc (fun g _ => by simp [St.op, hops1])]
-            split
-            · rename_i z; rw [z.1]; exact ⟨by omega, fun w => by omega⟩
-            · exact ⟨Nat.le_refl _, fun _ => Nat.le_refl _⟩
+            by_cases z : rank d s1 c = 2 ∧ c < s1.cpus.length
+            · apply betterAt_lt; rw [k1, ite_eq_left z]; rw [rank_congr hc hph1] at z; omega
+            · exact betterAt_same ((k6 z).trans hc) (fun p => (phase_of_ops hops p).trans (hph1 p))
+                (fun g _ => by simp [St.op, hops, hops1])
       · cases e
     · cases e
   | finish o =>
@@ -1177,17 +1207,587 @@ theorem drain_frame {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drain
         show ((handout cfg (s.setPhase o .over)).cpu c).slot ≠ _
         rw [hsl']; exact x.kept c
       · intro c
-        obtain ⟨k1, k2, -⟩ := k c
+        obtain ⟨k1, -, -, -, -, k6⟩ := k c
         have le1 := rank_setPhase_le (d := d) (s := s) hne c
-        have i1 : inner d (s.setPhase o .over) c = inner d s c :=
-          inner_congr rfl (fun g _ => hops1 g)
-        show rank d (handout cfg (s.setPhase o .over)) c ≤ rank d s c ∧
-          (rank d (handout cfg (s.setPhase o .over)) c = rank d s c →
-            inner d (handout cfg (s.setPhase o .over)) c ≤ inner d s c)
-        rw [k1, k2, i1]
-        split
-        · rename_i z; rw [z.1] at le1; exact ⟨by omega, fun w => by omega⟩
-        · exact ⟨le1, fun _ => Nat.le_refl _⟩
+        show BetterAt d s (handout cfg (s.setPhase o .over)) c
+        by_cases z : rank d (s.setPhase o .over) c = 2 ∧ c < (s.setPhase o .over).cpus.length
+        · apply betterAt_lt; rw [k1, ite_eq_left z]; rw [z.1] at le1; omega
+        · refine betterAt_of (k6 z) (by rw [k1, ite_eq_right z]; exact le1) ?_
+          intro g _
+          rw [show ((handout cfg (s.setPhase o .over)).op g).tasks = ((s.setPhase o .over).op g).tasks by
+            simp [St.op, hops]]
+          exact hops1 g
     · cases hu
+
+/-! ### Progress: the fair step each CPU waits for -/
+
+theorem move_wild {cfg : Cfg} {s : St} (hl : s.poolLock = none) (a : Act)
+    (ha : (∃ o c, a = .accept o c) ∨ a = .handout ∨ (∃ o c, a = .drain o c) ∨
+      (∃ o c, a = .release o c) ∨ (∃ o i b, a = .exit o i b) ∨ (∃ o i, a = .gone o i)) :
+    move cfg s a = step cfg s a := by
+  rcases ha with ⟨o, c, rfl⟩ | rfl | ⟨o, c, rfl⟩ | ⟨o, c, rfl⟩ | ⟨o, i, b, rfl⟩ | ⟨o, i, rfl⟩ <;>
+    simp [Cpuq.move, hl, needsLock]
+
+theorem fairKey_class {a b : Act} (hs : fairKey a = some a) (ha : ∀ o i ok, a ≠ .exit o i ok)
+    (h : fairKey b = fairKey a) : b = a := by
+  rw [hs] at h
+  cases b with
+  | exit o i ok => simp [fairKey] at h; exact absurd h.symm (ha o i true)
+  | timeout _ _ | arrive _ | enter _ | crash _ | kill _ | tstp _ => simp [fairKey] at h
+  | _ => simpa [fairKey] using h
+
+theorem fairKey_exit {b : Act} {o i : Nat} (h : fairKey b = fairKey (.exit o i true)) :
+    ∃ ok, b = .exit o i ok := by
+  cases b <;> simp_all [fairKey]
+
+theorem rank_le (d : Nat) (s : St) (c : Nat) : rank d s c ≤ 5 := by
+  unfold rank; split
+  · split
+    · omega
+    · split <;> omega
+  · split
+    · split
+      · split <;> omega
+      · omega
+    · omega
+
+theorem lex_trans {a b c : Nat × Nat} (h1 : a.1 < b.1 ∨ (a.1 = b.1 ∧ a.2 ≤ b.2))
+    (h2 : b.1 < c.1 ∨ (b.1 = c.1 ∧ b.2 ≤ c.2)) : a.1 < c.1 ∨ (a.1 = c.1 ∧ a.2 ≤ c.2) := by
+  omega
+
+
+/-! ### Along a sequence of steps that are each `Better` -/
+
+theorem rank_three {d : Nat} {s : St} {c g : Nat} (hr : rank d s c = 3) (hl : (s.cpu c).lock = some g) :
+    g ≠ d ∧ drainingC (s.cpu c) = true := by
+  unfold rank at hr; rw [hl] at hr; simp only at hr
+  split at hr
+  · cases hr
+  · rename_i hne; split at hr
+    · rename_i hdr; exact ⟨hne, hdr⟩
+    · cases hr
+
+section seq
+variable {d : Nat} {σ : Nat → St} (hb : ∀ k, Better d (σ k) (σ (k + 1)))
+include hb
+
+theorem seq_mono (c k j : Nat) :
+    rank d (σ (k + j)) c < rank d (σ k) c ∨
+    (rank d (σ (k + j)) c = rank d (σ k) c ∧ inner d (σ (k + j)) c ≤ inner d (σ k) c) := by
+  induction j with
+  | zero => exact .inr ⟨rfl, Nat.le_refl _⟩
+  | succ j ih =>
+    rw [← Nat.add_assoc]
+    obtain ⟨h1, h2⟩ := hb (k + j) c
+    by_cases e : rank d (σ (k + j + 1)) c = rank d (σ (k + j)) c
+    · have := (h2 e).1; omega
+    · omega
+
+theorem seq_still (c k : Nat)
+    (hc : ∀ j, rank d (σ (k + j)) c = rank d (σ k) c ∧ inner d (σ (k + j)) c = inner d (σ k) c)
+    (j : Nat) :
+    ((σ (k + j)).cpu c).lock = ((σ k).cpu c).lock ∧
+    (rank d (σ k) c ≠ 2 → ((σ (k + j)).cpu c).grant = ((σ k).cpu c).grant) ∧
+    (∀ g i, ((σ k).cpu c).lock = some g → g ≠ d → drainingC ((σ k).cpu c) = true →
+      wOn c ((σ (k + j)).task g i) = wOn c ((σ k).task g i)) := by
+  induction j with
+  | zero => exact ⟨rfl, fun _ => rfl, fun _ _ _ _ _ => rfl⟩
+  | succ j ih =>
+    obtain ⟨i1, i2, i3⟩ := ih
+    obtain ⟨r0, n0⟩ := hc j
+    obtain ⟨r1, n1⟩ := hc (j + 1)
+    rw [← Nat.add_assoc] at r1 n1 ⊢
+    obtain ⟨-, h2⟩ := hb (k + j) c
+    obtain ⟨-, b2, b3, b4⟩ := h2 (by rw [r1, r0])
+    refine ⟨b2.trans i1, fun h => (b3 (by rw [r0]; exact h)).trans (i2 h), fun g i hg hgd hdr => ?_⟩
+    have hg' : ((σ (k + j)).cpu c).lock = some g := by rw [i1]; exact hg
+    have r3 : rank d (σ k) c = 3 := by unfold rank; simp [hg, hgd, hdr]
+    have hdr' : drainingC ((σ (k + j)).cpu c) = true := (rank_three (by rw [r0, r3]) hg').2
+    exact (b4 (by rw [n1, n0]) g i hg' hgd hdr').trans (i3 g i hg hgd hdr)
+
+end seq
+
+/-! ### What the fair steps do to a CPU -/
+
+theorem handoutOver_lock (cfg : Cfg) (s : St) (cs : List Nat) (c : Nat) :
+    ((handoutOver cfg s cs).cpu c).lock = (s.cpu c).lock ∧
+    ((handoutOver cfg s cs).cpu c).slot = (s.cpu c).slot := by
+  induction cs generalizing s with
+  | nil => exact ⟨rfl, rfl⟩
+  | cons c' cs ih =>
+    simp only [handoutOver]
+    obtain ⟨a, b⟩ := ih (grantOne cfg s c')
+    have k : ((grantOne cfg s c').cpu c).lock = (s.cpu c).lock ∧
+        ((grantOne cfg s c').cpu c).slot = (s.cpu c).slot := by
+      unfold grantOne; split
+      · split
+        · rw [St.cpu_setCpu]; split
+          · rename_i z; obtain ⟨rfl, -⟩ := z; exact ⟨rfl, rfl⟩
+          · exact ⟨rfl, rfl⟩
+        · exact ⟨rfl, rfl⟩
+      · exact ⟨rfl, rfl⟩
+    exact ⟨a.trans k.1, b.trans k.2⟩
+
+theorem move_accept {cfg : Cfg} {s t : St} {o c : Nat} (hl : s.poolLock = none)
+    (hr : cfg.rules.reclaim = true) (e : move cfg s (.accept o c) = some t) :
+    (t.cpu c).lock = some o := by
+  rw [move_wild hl _ (.inl ⟨o, c, rfl⟩)] at e
+  simp only [Cpuq.step] at e; split at e
+  · rename_i g; cases e
+    simp only [Bool.and_eq_true, beq_iff_eq, Option.isNone_iff_eq_none] at g
+    have hc := s.lt_of_grant c (by rw [g.1.2]; simp)
+    rw [takeTok_eq cfg s o c hr, taken_cpu, ite_eq_left (⟨rfl, hc⟩ : c = c ∧ c < s.cpus.length)]; rfl
+  · cases e
+
+theorem move_drain {cfg : Cfg} {s t : St} {o c : Nat} (hl : s.poolLock = none)
+    (e : move cfg s (.drain o c) = some t) :
+    (t.cpu c).lock = (s.cpu c).lock ∧ drainingC (t.cpu c) = true := by
+  rw [move_wild hl _ (.inr (.inr (.inl ⟨o, c, rfl⟩)))] at e
+  simp only [Cpuq.step] at e; split at e
+  · rename_i g; cases e
+    unfold canDrain at g; simp only [Bool.and_eq_true, beq_iff_eq] at g
+    have hc := s.lt_of_slot c (by rw [g.1.2]; simp)
+    have : (drainEff cfg s o c).cpu c = { s.cpu c with slot := some { owner := o, draining := true } } := by
+      rw [show (drainEff cfg s o c).cpu c = (s.setCpu c _).cpu c from rfl, St.cpu_setCpu,
+        ite_eq_left (⟨rfl, hc⟩ : c = c ∧ c < s.cpus.length)]
+    rw [this]; exact ⟨rfl, rfl⟩
+  · cases e
+
+theorem move_release {cfg : Cfg} {s t : St} {o c : Nat} (hl : s.poolLock = none)
+    (e : move cfg s (.release o c) = some t) : (t.cpu c).lock = none := by
+  rw [move_wild hl _ (.inr (.inr (.inr (.inl ⟨o, c, rfl⟩))))] at e
+  simp only [Cpuq.step] at e; split at e
+  · rename_i sl hsl
+    split at e
+    · cases e
+      have hc := s.lt_of_slot c (by rw [hsl]; simp)
+      rw [Cpuq.handout, (handoutOver_lock ..).1]
+      show ((s.setCpu c {}).cpu c).lock = none
+      rw [St.cpu_setCpu, ite_eq_left (⟨rfl, hc⟩ : c = c ∧ c < s.cpus.length)]
+    · cases e
+  · cases e
+
+theorem move_exit {cfg : Cfg} {s t : St} {o i : Nat} {ok : Bool} (hl : s.poolLock = none)
+    (hs : cfg.rules.standing = true) (ha : (s.op o).phase = .alive) (h : Inv cfg s)
+    (e : move cfg s (.exit o i ok) = some t) (c : Nat) : wOn c (t.task o i) = 0 := by
+  rw [move_wild hl _ (.inr (.inr (.inr (.inr (.inl ⟨o, i, ok, rfl⟩)))))] at e
+  simp only [Cpuq.step] at e; split at e
+  · rename_i c0 hr
+    have hi := s.lt_of_task o i (by rw [hr]; simp)
+    have ho := s.lt_of_task_op o i (by rw [hr]; simp)
+    have hdy := dying_none_of_running h hr
+    rw [ite_eq_left (by simp [ha])] at e
+    cases e
+    unfold reap; rw [tryOnce_standing hs, St.task_setTask, ite_eq_left (⟨rfl, rfl, ho, hi⟩ : o = o ∧ i = i ∧ o < s.ops.length ∧ i < (s.op o).tasks.length)]
+    apply wOn_zero
+    · intro c'; split
+      · exact afterOk_st _ _ _ _
+      · exact afterFail_st _ _ _ _
+    · split
+      · rw [afterOk_dying, hdy]
+      · rw [afterFail_dying, hdy]
+  · cases e
+
+theorem move_gone {cfg : Cfg} {s t : St} {o i : Nat} (hl : s.poolLock = none) (h : Inv cfg s)
+    (e : move cfg s (.gone o i) = some t) (c : Nat) : wOn c (t.task o i) = 0 := by
+  rw [move_wild hl _ (.inr (.inr (.inr (.inr (.inr ⟨o, i, rfl⟩)))))] at e
+  simp only [Cpuq.step] at e; split at e
+  · rename_i c0 hdy
+    cases e
+    have ht := h.dyingTimedOut o i (by rw [hdy]; simp)
+    have hi := s.lt_of_task o i (by rw [ht]; simp)
+    have ho := s.lt_of_task_op o i (by rw [ht]; simp)
+    rw [St.task_setTask, ite_eq_left (⟨rfl, rfl, ho, hi⟩ : o = o ∧ i = i ∧ o < s.ops.length ∧ i < (s.op o).tasks.length)]
+    apply wOn_zero
+    · intro c'; split
+      · exact afterFail_st _ _ _ _
+      · show (s.task o i).st ≠ _; rw [ht]; simp
+    · split
+      · rw [afterFail_dying]
+      · rfl
+  · cases e
+
+theorem sum_pos_mem {l : List Task} {f : Task → Nat} (h : 0 < (l.map f).sum) : ∃ x ∈ l, 0 < f x := by
+  induction l with
+  | nil => simp at h
+  | cons y l ih =>
+    simp only [List.map_cons, List.sum_cons] at h
+    by_cases hy : 0 < f y
+    · exact ⟨y, List.mem_cons_self .., hy⟩
+    · obtain ⟨x, hx, hf⟩ := ih (by omega)
+      exact ⟨x, List.mem_cons_of_mem _ hx, hf⟩
+
+theorem sum_zero_mem {l : List Task} {f : Task → Nat} (h : (l.map f).sum = 0) : ∀ x ∈ l, f x = 0 := by
+  induction l with
+  | nil => intro x hx; simp at hx
+  | cons y l ih =>
+    simp only [List.map_cons, List.sum_cons] at h
+    intro x hx
+    rcases List.mem_cons.1 hx with e | e
+    · subst e; omega
+    · exact ih (by omega) x e
+
+theorem rank_zero {d : Nat} {s : St} {c : Nat} (h : rank d s c = 0) : (s.cpu c).lock = some d := by
+  unfold rank at h; split at h
+  · rename_i g hg; split at h
+    · rename_i e; rw [hg, e]
+    · split at h <;> cases h
+  · split at h
+    · split at h
+      · split at h <;> cases h
+      · cases h
+    · cases h
+
+theorem rank_one {d : Nat} {s : St} {c : Nat} (h : rank d s c = 1) :
+    (s.cpu c).lock = none ∧ (s.cpu c).grant = some d := by
+  unfold rank at h; split at h
+  · split at h
+    · cases h
+    · split at h <;> cases h
+  · rename_i hl; split at h
+    · rename_i x hx; split at h
+      · split at h
+        · rename_i e; exact ⟨hl, by rw [hx, e]⟩
+        · cases h
+      · cases h
+    · cases h
+
+theorem rank_lock {d : Nat} {s : St} {c g : Nat} (hl : (s.cpu c).lock = some g) (hne : g ≠ d) :
+    rank d s c = if drainingC (s.cpu c) then 3 else 4 := by
+  unfold rank; rw [hl]; simp [hne]
+
+theorem rank_four {d : Nat} {s : St} {c : Nat} (h : rank d s c = 4) :
+    ∃ g, (s.cpu c).lock = some g ∧ g ≠ d ∧ drainingC (s.cpu c) = false := by
+  unfold rank at h; split at h
+  · rename_i g hg; split at h
+    · cases h
+    · rename_i hne; split at h
+      · cases h
+      · rename_i hdr; exact ⟨g, hg, hne, by simpa using hdr⟩
+  · split at h
+    · split at h
+      · split at h <;> cases h
+      · cases h
+    · cases h
+
+theorem rank_three' {d : Nat} {s : St} {c : Nat} (h : rank d s c = 3) :
+    ∃ g, (s.cpu c).lock = some g := by
+  unfold rank at h; split at h
+  · rename_i g hg; exact ⟨g, hg⟩
+  · split at h
+    · split at h
+      · split at h <;> cases h
+      · cases h
+    · cases h
+
+theorem rank_five {d : Nat} {s : St} {c : Nat} (h : rank d s c = 5) :
+    (s.cpu c).lock = none ∧ ∃ x, (s.cpu c).grant = some x ∧ (s.op x).phase = .alive ∧ x ≠ d := by
+  unfold rank at h; split at h
+  · split at h
+    · cases h
+    · split at h <;> cases h
+  · rename_i hl; split at h
+    · rename_i x hx; split at h
+      · rename_i ha; split at h
+        · cases h
+        · rename_i hne; exact ⟨hl, x, hx, ha, hne⟩
+      · cases h
+    · cases h
+
+theorem rank_alive {d : Nat} {s : St} {c x : Nat} (h : rank d s c = 5) (hx : (s.cpu c).grant = some x) :
+    (s.op x).phase = .alive := by
+  obtain ⟨-, y, hy, ha, -⟩ := rank_five h
+  rw [hx] at hy; cases hy; exact ha
+
+theorem wOn_le (c : Nat) (t : Task) : wOn c t ≤ 3 := by
+  unfold wOn; split <;> split <;> omega
+
+theorem wOn_running {c : Nat} {t : Task} (h : 2 ≤ wOn c t) : t.st = .running c := by
+  unfold wOn at h; split at h
+  · rename_i e; simpa [runningC] using e
+  · split at h <;> omega
+
+theorem wOn_dying {c : Nat} {t : Task} (h : wOn c t = 1) : t.dying = some c := by
+  unfold wOn at h; split at h
+  · split at h <;> omega
+  · split at h
+    · rename_i e; simpa using e
+    · omega
+
+/-! ### The drain is served -/
+
+/-- `cpuq drain` is served: in a weakly fair run, from a time `T` after which no operation
+arrives or crashes, at which `d` is the first drain, alive and waiting to run, holding its mark,
+with the pool lock free and no later drain holding a CPU or granted one, `d` ends up holding
+every CPU of the pool (its command then runs: `refill` needs exactly that). -/
+theorem drain_served {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drainOp cfg d = true)
+    (hcap : (cfg.op d).cap = cfg.cpus) (hst : cfg.stops = false) (hk : cfg.kills = false)
+    (r : Run cfg) (fair : r.Fair) {T : Nat} (calm : r.Calm T) (x0 : DCtx cfg d (r.st T)) :
+    ∃ m, T ≤ m ∧ (r.st m).owned d = cfg.cpus := by
+  refine Classical.byContradiction fun hno => ?_
+  have hfew : ∀ k, (r.st (T + k)).owned d < cfg.cpus := by
+    intro k
+    have hle : (r.st (T + k)).owned d ≤ cfg.cpus := by
+      rw [← ((r.reach (T + k)).inv hR.safe).len]; exact List.countP_le_length
+    have hne : (r.st (T + k)).owned d ≠ cfg.cpus := fun e => hno ⟨T + k, by omega, e⟩
+    omega
+  have ctx : ∀ k, DCtx cfg d (r.st (T + k)) := by
+    intro k
+    induction k with
+    | zero => exact x0
+    | succ k ih =>
+      rw [← Nat.add_assoc]
+      cases ha : r.act (T + k) with
+      | none => rw [r.stays _ ha]; exact ih
+      | some a =>
+        exact (drain_frame hR hd hcap hst hk ih (hfew k) (calm _ (by omega) a ha)
+          (r.moves _ a ha)).1
+  have hb : ∀ k, Better d (r.st (T + k)) (r.st (T + (k + 1))) := by
+    intro k
+    show Better d (r.st (T + k)) (r.st (T + k + 1))
+    cases ha : r.act (T + k) with
+    | none =>
+      rw [r.stays _ ha]; intro c
+      exact betterAt_same rfl (fun _ => rfl) (fun _ _ => rfl)
+    | some a =>
+      exact (drain_frame hR hd hcap hst hk (ctx k) (hfew k) (calm _ (by omega) a ha)
+        (r.moves _ a ha)).2
+  have hinv : ∀ k, Inv cfg (r.st (T + k)) := fun k => (r.reach (T + k)).inv hR.safe
+  have hlen : ∀ k, (r.st (T + k)).cpus.length = cfg.cpus := fun k => (hinv k).len
+  -- Each CPU not yet d's moves, at some time, lower or emptier.
+  have prog : ∀ c, c < cfg.cpus → ∀ k, rank d (r.st (T + k)) c ≠ 0 → ∃ j,
+      rank d (r.st (T + (k + j))) c < rank d (r.st (T + k)) c ∨
+      (rank d (r.st (T + (k + j))) c = rank d (r.st (T + k)) c ∧
+        inner d (r.st (T + (k + j))) c < inner d (r.st (T + k)) c) := by
+    intro c hc k hk0
+    refine Classical.byContradiction fun hnot => ?_
+    have const : ∀ j, rank d (r.st (T + (k + j))) c = rank d (r.st (T + k)) c ∧
+        inner d (r.st (T + (k + j))) c = inner d (r.st (T + k)) c := by
+      intro j
+      have m := seq_mono (σ := fun k => r.st (T + k)) hb c k j
+      have n := fun w => hnot ⟨j, w⟩
+      rcases m with m | ⟨m1, m2⟩
+      · exact absurd (.inl m) n
+      · refine ⟨m1, ?_⟩
+        rcases Nat.lt_or_eq_of_le m2 with m3 | m3
+        · exact absurd (.inr ⟨m1, m3⟩) n
+        · exact m3
+    have st := seq_still (σ := fun k => r.st (T + k)) hb c k const
+    -- The state at time T + k + j, and the move from it.
+    have at_ : ∀ m, T + k ≤ m → r.st m = r.st (T + (k + (m - (T + k)))) := by
+      intro m hm; congr 1; omega
+    -- A fair step enabled from T + k on is taken at some time from then on.
+    have fire : ∀ a, (fairKey a).isSome = true → (∀ j, Enabled cfg (r.st (T + (k + j))) a) →
+        ∃ j b, fairKey b = fairKey a ∧ move cfg (r.st (T + (k + j))) b = some (r.st (T + (k + j) + 1)) := by
+      intro a hs hen
+      obtain ⟨m, hm, b, hb', hk'⟩ := fair a hs (T + k) (fun m hm => by rw [at_ m hm]; exact hen _)
+      refine ⟨m - (T + k), b, hk', ?_⟩
+      have e := r.moves m b hb'
+      rw [show T + (k + (m - (T + k))) = m by omega]; exact e
+    have lockFree : ∀ j, (r.st (T + (k + j))).poolLock = none := fun j => (ctx (k + j)).lockFree
+    have rk : ∀ j, rank d (r.st (T + (k + j))) c = rank d (r.st (T + k)) c := fun j => (const j).1
+    -- After the step at time T + k + j, the CPU's key is the same again.
+    have rk1 : ∀ j, rank d (r.st (T + (k + j) + 1)) c = rank d (r.st (T + k)) c := fun j => (const (j + 1)).1
+    have lk1 : ∀ j, ((r.st (T + (k + j) + 1)).cpu c).lock = ((r.st (T + k)).cpu c).lock :=
+      fun j => (st (j + 1)).1
+    have hR5 := rank_le d (r.st (T + k)) c
+    -- Cases on the rank.
+    rcases (by omega : rank d (r.st (T + k)) c = 1 ∨ rank d (r.st (T + k)) c = 2 ∨
+        rank d (r.st (T + k)) c = 3 ∨ rank d (r.st (T + k)) c = 4 ∨ rank d (r.st (T + k)) c = 5)
+      with h1 | h2 | h3 | h4 | h5
+    · -- granted to d: d accepts it
+      obtain ⟨hl, hg⟩ := rank_one h1
+      obtain ⟨j, b, hkb, e⟩ := fire (.accept d c) rfl (fun j => by
+        have l := (st j).1; have g := (st j).2.1 (by omega)
+        rw [hl] at l; rw [hg] at g
+        unfold Enabled; rw [move_wild (lockFree j) _ (.inl ⟨d, c, rfl⟩)]
+        simp [Cpuq.step, St.isAlive, (ctx (k + j)).alive, l, g])
+      rw [fairKey_class rfl (by intro o i ok w; cases w) hkb] at e
+      have := move_accept (lockFree j) hR.safe.reclaim e
+      rw [lk1, hl] at this; cases this
+    · -- free: a pass grants it to d
+      have hcl : c < (r.st (T + k)).cpus.length := by rw [hlen]; exact hc
+      have pass : ∀ j, rank d (handout cfg (r.st (T + (k + j)))) c = 1 := by
+        intro j
+        have x := ctx (k + j)
+        have k1 := (rank_handout hR hd hcap (hinv (k + j)) x.drainer x.alive x.idle x.work c).1
+        rw [k1, ite_eq_left (⟨by rw [rk, h2], by rw [hlen]; exact hc⟩ :
+          rank d (r.st (T + (k + j))) c = 2 ∧ c < (r.st (T + (k + j))).cpus.length)]
+      obtain ⟨j, b, hkb, e⟩ := fire .handout rfl (fun j => by
+        unfold Enabled; rw [move_wild (lockFree j) _ (.inr (.inl rfl))]
+        have ne : handout cfg (r.st (T + (k + j))) ≠ r.st (T + (k + j)) := by
+          intro w; have := pass j; rw [w, rk, h2] at this; cases this
+        simp [Cpuq.step, ne])
+      rw [fairKey_class rfl (by intro o i ok w; cases w) hkb,
+        move_wild (lockFree j) _ (.inr (.inl rfl))] at e
+      simp only [Cpuq.step] at e
+      split at e
+      · have e2 : handout cfg (r.st (T + (k + j))) = r.st (T + (k + j) + 1) := Option.some.inj e
+        have := rk1 j; rw [← e2, pass j, h2] at this; cases this
+      · cases e
+    · -- being emptied by g
+      obtain ⟨g, hl⟩ := rank_three' h3
+      obtain ⟨hne, hdr⟩ := rank_three h3 hl
+      have lj : ∀ j, ((r.st (T + (k + j))).cpu c).lock = some g := fun j => by rw [(st j).1, hl]
+      have alj : ∀ j, (r.st (T + (k + j))).isAlive g = true := fun j => by
+        simp [St.isAlive, ((hinv (k + j)).lockOwner c g (lj j)).2]
+      have drj : ∀ j, drainingC ((r.st (T + (k + j))).cpu c) = true := fun j =>
+        (rank_three (by rw [rk, h3]) (lj j)).2
+      have wj : ∀ j i, wOn c ((r.st (T + (k + j))).task g i) = wOn c ((r.st (T + k)).task g i) :=
+        fun j i => (st j).2.2 g i hl hne hdr
+      have inner_eq : ∀ j, inner d (r.st (T + (k + j))) c =
+          (((r.st (T + (k + j))).op g).tasks.map (wOn c)).sum := by
+        intro j; unfold inner; rw [lj j]; simp [hne, drj j]
+      by_cases hz : inner d (r.st (T + k)) c = 0
+      · -- nothing left on it: g gives it back
+        have hzj : ∀ j, ∀ t ∈ ((r.st (T + (k + j))).op g).tasks, wOn c t = 0 := by
+          intro j; apply sum_zero_mem; rw [← inner_eq j, (const j).2, hz]
+        obtain ⟨j, b, hkb, e⟩ := fire (.release g c) rfl (fun j => by
+          have h := hinv (k + j)
+          obtain ⟨b0, hb0⟩ := (ownsC_iff _ _).1 ((h.lockOwner c g (lj j)).1)
+          have hb1 : b0 = true := by have := drj j; simpa [drainingC, hb0] using this
+          subst hb1
+          have hr0 : (r.st (T + (k + j))).runningOn g c = 0 := by
+            apply countP_zero_of
+            intro t ht
+            have := hzj j t ht
+            unfold wOn at this
+            cases e : runningC c t
+            · rfl
+            · simp [e] at this
+          have hdy0 : ∀ t ∈ ((r.st (T + (k + j))).op g).tasks, t.dying ≠ some c := by
+            intro t ht w; have := hzj j t ht; simp [wOn, w] at this
+          have hnd : drainOp cfg g = false := by
+            cases e2 : drainOp cfg g
+            · rfl
+            · exact absurd (lj j) ((ctx (k + j)).others g c e2 hne).1
+          have hall : ((r.st (T + (k + j))).op g).tasks.all (fun t => t.dying != some c) = true :=
+            List.all_eq_true.2 (fun t ht => by simpa using hdy0 t ht)
+          have ha : ((r.st (T + (k + j))).op g).phase = .alive := by simpa [St.isAlive] using alj j
+          unfold Enabled; rw [move_wild (lockFree j) _ (.inr (.inr (.inr (.inl ⟨g, c, rfl⟩))))]
+          simp [Cpuq.step, hb0, St.isAlive, ha, hr0, hall, hnd])
+        rw [fairKey_class rfl (by intro o i ok w; cases w) hkb] at e
+        have := move_release (lockFree j) e
+        rw [lk1, hl] at this; cases this
+      · -- a task still on it: it ends (or its dying attempt exits)
+        obtain ⟨y, hy, hwy⟩ := sum_pos_mem (by rw [← inner_eq 0]; simp only [Nat.add_zero] at *; omega)
+        simp only [Nat.add_zero] at hy
+        obtain ⟨i, hi⟩ := mem_tasks_task hy
+        subst hi
+        by_cases hrun : 2 ≤ wOn c ((r.st (T + k)).task g i)
+        · obtain ⟨j, b, hkb, e⟩ := fire (.exit g i true) rfl (fun j => by
+            have hr := wOn_running (by rw [wj j]; exact hrun)
+            unfold Enabled; rw [move_wild (lockFree j) _ (.inr (.inr (.inr (.inr (.inl ⟨g, i, true, rfl⟩)))))]
+            simp only [Cpuq.step, hr]
+            have : ((r.st (T + (k + j))).op g).phase = .alive := by simpa [St.isAlive] using alj j
+            simp [this])
+          obtain ⟨ok, rfl⟩ := fairKey_exit hkb
+          have := move_exit (lockFree j) hR.standing (by simpa [St.isAlive] using alj j)
+            (hinv (k + j)) e c
+          have w1 := (st (j + 1)).2.2 g i hl hne hdr
+          rw [show T + (k + (j + 1)) = T + (k + j) + 1 by omega, this] at w1
+          omega
+        · have h1 : wOn c ((r.st (T + k)).task g i) = 1 := by omega
+          obtain ⟨j, b, hkb, e⟩ := fire (.gone g i) rfl (fun j => by
+            have hdyj := wOn_dying (by rw [wj j]; exact h1)
+            unfold Enabled; rw [move_wild (lockFree j) _ (.inr (.inr (.inr (.inr (.inr ⟨g, i, rfl⟩)))))]
+            simp [Cpuq.step, hdyj])
+          rw [fairKey_class rfl (by intro o i ok w; cases w) hkb] at e
+          have := move_gone (lockFree j) (hinv (k + j)) e c
+          have w1 := (st (j + 1)).2.2 g i hl hne hdr
+          rw [show T + (k + (j + 1)) = T + (k + j) + 1 by omega, this] at w1
+          omega
+    · -- kept by g: g empties it for the drain
+      obtain ⟨g, hl, hne, hdr⟩ := rank_four h4
+      have lj : ∀ j, ((r.st (T + (k + j))).cpu c).lock = some g := fun j => by rw [(st j).1, hl]
+      obtain ⟨j, b, hkb, e⟩ := fire (.drain g c) rfl (fun j => by
+        have h := hinv (k + j)
+        have x := ctx (k + j)
+        have ha := (h.lockOwner c g (lj j)).2
+        obtain ⟨b0, hb0⟩ := (ownsC_iff _ _).1 ((h.lockOwner c g (lj j)).1)
+        have hdr' : drainingC ((r.st (T + (k + j))).cpu c) = false := by
+          have := rank_lock (lj j) hne; rw [rk, h4] at this
+          cases hq : drainingC ((r.st (T + (k + j))).cpu c)
+          · rfl
+          · rw [hq] at this; simp at this
+        have hb1 : b0 = false := by simpa [drainingC, hb0] using hdr'
+        subst hb1
+        have hnd : drainOp cfg g = false := by
+          cases e2 : drainOp cfg g
+          · rfl
+          · exact absurd (lj j) (x.others g c e2 hne).1
+        have hm : (r.st (T + (k + j))).marks ≠ 0 := by
+          intro w; have := x.mark; rw [w] at this; simp [bit] at this
+        unfold Enabled; rw [move_wild (lockFree j) _ (.inr (.inr (.inl ⟨g, c, rfl⟩)))]
+        simp [Cpuq.step, canDrain, St.isAlive, ha, hb0, hnd, hm])
+      rw [fairKey_class rfl (by intro o i ok w; cases w) hkb] at e
+      obtain ⟨l2, d2⟩ := move_drain (lockFree j) e
+      have := rank_lock (l2.trans (lj j)) hne
+      rw [d2, rk1, h4] at this; simp at this
+    · -- granted to another: it accepts
+      obtain ⟨hl, x, hx, -, hne⟩ := rank_five h5
+      obtain ⟨j, b, hkb, e⟩ := fire (.accept x c) rfl (fun j => by
+        have l := (st j).1; have g := (st j).2.1 (by omega)
+        rw [hl] at l; rw [hx] at g
+        have ha := rank_alive (by rw [rk, h5]) g
+        unfold Enabled; rw [move_wild (lockFree j) _ (.inl ⟨x, c, rfl⟩)]
+        simp [Cpuq.step, St.isAlive, ha, l, g])
+      rw [fairKey_class rfl (by intro o i ok w; cases w) hkb] at e
+      have := move_accept (lockFree j) hR.safe.reclaim e
+      rw [lk1, hl] at this; cases this
+  -- So each CPU ends up d's.
+  have zero : ∀ c, c < cfg.cpus → ∀ N R, R ≤ N → ∀ M I, I ≤ M → ∀ k,
+      rank d (r.st (T + k)) c = R → inner d (r.st (T + k)) c = I → ∃ k', rank d (r.st (T + k')) c = 0 := by
+    intro c hc N
+    induction N with
+    | zero => intro R hR M I hI k e1 _; exact ⟨k, by omega⟩
+    | succ N ihN =>
+      intro R hR M
+      induction M with
+      | zero =>
+        intro I hI k e1 e2
+        by_cases h0 : R = 0
+        · exact ⟨k, by omega⟩
+        obtain ⟨j, hj⟩ := prog c hc k (by omega)
+        rcases hj with a | ⟨_, b⟩
+        · exact ihN _ (by omega) _ _ (Nat.le_refl _) (k + j) rfl rfl
+        · omega
+      | succ M ihM =>
+        intro I hI k e1 e2
+        by_cases h0 : R = 0
+        · exact ⟨k, by omega⟩
+        obtain ⟨j, hj⟩ := prog c hc k (by omega)
+        rcases hj with a | ⟨a, b⟩
+        · exact ihN _ (by omega) _ _ (Nat.le_refl _) (k + j) rfl rfl
+        · exact ihM _ (by omega) (k + j) (by omega) rfl
+  have stay : ∀ c k0, rank d (r.st (T + k0)) c = 0 → ∀ k1, k0 ≤ k1 → rank d (r.st (T + k1)) c = 0 := by
+    intro c k0 h0 k1 h1
+    have := seq_mono (σ := fun k => r.st (T + k)) hb c k0 (k1 - k0)
+    rw [show k0 + (k1 - k0) = k1 by omega] at this
+    omega
+  have all : ∀ n, n ≤ cfg.cpus → ∃ K, ∀ c, c < n → rank d (r.st (T + K)) c = 0 := by
+    intro n
+    induction n with
+    | zero => intro _; exact ⟨0, fun c hc => absurd hc (Nat.not_lt_zero _)⟩
+    | succ n ih =>
+      intro hn
+      obtain ⟨K, hK⟩ := ih (by omega)
+      obtain ⟨k', hk'⟩ := zero n (by omega) _ _ (Nat.le_refl _) _ _ (Nat.le_refl _) 0 rfl rfl
+      refine ⟨max K k', fun c hc => ?_⟩
+      rcases Nat.lt_succ_iff_lt_or_eq.1 hc with hc | hc
+      · exact stay c K (hK c hc) _ (Nat.le_max_left _ _)
+      · subst hc; exact stay _ k' hk' _ (Nat.le_max_right _ _)
+  obtain ⟨K, hK⟩ := all cfg.cpus (Nat.le_refl _)
+  have h := hinv K
+  have hown : (r.st (T + K)).owned d = cfg.cpus := by
+    rw [St.owned, ← h.len]
+    apply List.countP_eq_length.2
+    intro x hx
+    obtain ⟨j, hj, rfl⟩ := List.mem_iff_getElem.1 hx
+    have ej : (r.st (T + K)).cpu j = (r.st (T + K)).cpus[j] := by
+      simp [St.cpu, List.getD_eq_getElem?_getD, List.getElem?_eq_getElem hj]
+    rw [← ej]
+    exact (h.lockOwner j d (rank_zero (hK j (by rw [← h.len]; exact hj)))).1
+  exact absurd hown (Nat.ne_of_lt (hfew K))
 
 end Cpuq

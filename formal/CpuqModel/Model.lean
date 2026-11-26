@@ -2,10 +2,11 @@
 cpuq's CPU-sharing protocol (FINAL-PLAN.md, "How CPUs are shared" and "Robustness"), as one
 executable step function over finite data.
 
-The same `step` is searched exhaustively at small sizes (`Explore.lean`, `Checks.lean`) and
-proved about in general (`Safety.lean`, `Liveness.lean`). `Rules` switches between the rules
-FINAL-REPORT-1 wrote (review2-formal.md's state machine, which its counterexamples break),
-FINAL-PLAN's rules, and two further fixes this model found it needs.
+The same `move` is searched exhaustively at small sizes (`Explore.lean`, `Checks.lean`) and
+proved about in general (`Safety.lean`, `Liveness.lean`, `Locks.lean`, `Drains.lean`). `Rules`
+switches between the rules FINAL-REPORT-1 wrote (review2-formal.md's state machine, which its
+counterexamples break), FINAL-PLAN's rules, the fixes this model found they need, and the
+code's rules (`Rules.pool` and after; `Rules.released` is the code as released).
 
 What a CPU is here: its token file's flock (`lock`, the parent that holds it), its grant file
 (`grant`, the waiter it was handed to), and its record (`slot`: the operation the token file
@@ -13,9 +14,12 @@ names, and whether that slot is draining). An operation's tasks carry their own 
 processes in a slot are the tasks whose state is `running c`. A task's `dying` is an earlier
 attempt that was sent TERM by its timeout and has not yet exited.
 
-Each action is one atomic step. Steps that change shared state run under the admission lock in
-cpuq, and their on-disk effect is a single rename, so atomic steps are faithful to them; a
-parent's own steps (refill, reap) are atomic in that parent.
+Each action is one atomic step. `step` is the effect of one critical section under the pool
+lock, or of a parent's own step (refill, reap); a critical section publishes under the lock or
+by one rename, so an atomic step is faithful to it while nothing in it waits for another
+process. `move` adds the pool lock, a drain's mark and Ctrl-Z as the code receives them: the one
+critical section that takes a second lock, a drain's registration, is two moves (`enter`,
+`mark`), so a wait inside it shows.
 -/
 
 namespace Cpuq
