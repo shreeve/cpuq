@@ -171,9 +171,10 @@ t_pack() {
 }
 
 t_cpus_limit() {
-  # -c C or -c P%: the most CPUs a run holds, against the pool (here 4), at least 1, and never
-  # more than its tasks need; the plan line says it, and the tasks keep to it.
-  setup cpus-limit "budget = 4"
+  # -c C or -c P%: the most CPUs a run holds, against the pool (here 4, named, so a machine with
+  # fewer CPUs has the same pool), at least 1, and never more than its tasks need; the plan line
+  # says it, and the tasks keep to it.
+  setup cpus-limit "budget = 4" "cpus = 0-3"
   local got="" spread=1 c n
   for c in 1 2 50% 25% 10% 100% 9; do
     n=$("$CPUQ" run -n 8 -c "$c" --label c:x -- sh -c 'echo "$CPUQ_CPU" >>"$1"; sleep 0.1' sh "$T/cpus.$c" 2>&1 >/dev/null | sed -n 's/^cpuq: 8 tasks, up to \([0-9]*\) CPUs*,.*/\1/p')
