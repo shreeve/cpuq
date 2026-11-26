@@ -50,8 +50,8 @@ hands them out.
 FINAL-PLAN's (`plan`), the plan read loosely (`planLoose`), the plan with this model's two
 fixes (`fixed`), the rules the code implements on branch `slots` (`pool`, from `ahead`,
 `handOut`, `firstWaiter`, `giver` and `behindAfter` in src/pool.zig, and the loop in src/op.zig),
-those with this model's two fixes for the code (`poolFixed`), and the code as those fixes
-landed (`poolNow`).
+those with this model's fixes for the code (`poolFixed`, which is the code on `slots` at
+8f997ec), and the code at 0d315ed (`pool0d315ed`).
 
 `pool` differs from `fixed` where the code does what the plan doesn't say: the giver's ticket is
 renewed when it gives its CPU back, not when it starts to drain (`renewAtRelease`); one giver
@@ -218,5 +218,6 @@ Both landed: finding 4 in d14d347, finding 5 in 0d315ed.
 operation wants nothing and gets no new promises. But `promises` keeps any promise to an
 operation whose file is locked, and `suspend_` doesn't drop the operation's own. A waits; B
 releases a CPU and promises it to A; A is stopped before its loop takes it; the CPU idles until A
-continues (`poolNow`, the urgent scenario). Fix: in `suspend_`, under the lock and before the
-hand-out, drop every promise to the operation's ticket.
+continues (`pool0d315ed`, the urgent scenario). Fix: in `suspend_`, under the lock and before the
+hand-out, drop every promise to the operation's ticket. Landed in 8f997ec: with it, the code is
+`poolFixed`, and every scenario passes.

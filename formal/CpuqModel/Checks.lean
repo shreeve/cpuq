@@ -195,12 +195,12 @@ urgent: ok: 186614 states, 1389637 steps
   row "herd" (herd .poolFixed)
   row "urgent" (urgent .poolFixed)
 
--- The code with both fixes as they landed (d14d347, 0d315ed): a grant made to an operation
--- before it stops still idles its CPU while it is stopped (README, Finding 6).
+-- The code at 0d315ed: a grant made to an operation before it stops still idles its CPU while it
+-- is stopped (README, Finding 6). 8f997ec fixes it; the code there is `poolFixed`, above.
 /--
 info: urgent: FAILED (202583 states): L2 idle
 -/
 #guard_msgs in
-#eval row "urgent" (urgent .poolNow)
+#eval row "urgent" (urgent .pool0d315ed)
 
 end Cpuq.Checks

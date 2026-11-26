@@ -156,14 +156,15 @@ def pool : Rules :=
   { fixed with renewAtRelease := true, stoppedWaits := true, liveCounts := true, oneGiver := true,
                undrains := false }
 
-/-- `pool` with the two fixes this model proposes for it (README, "Findings" 4 and 5):
+/-- `pool` with the fixes this model proposes for it (README, "Findings" 4, 5 and 6), which is
+the code on `slots` at 8f997ec:
 `behindAfter` compares with the ticket the giver will have once it gives the CPU back, and a
 stopped operation is out of the line. -/
 def poolFixed : Rules := { pool with behindFresh := true, stoppedWaits := false }
 
-/-- The code with both fixes as they landed (d14d347, 0d315ed): a stopped operation wants
-nothing, but a grant made to it before it stopped stays valid. -/
-def poolNow : Rules := { poolFixed with stoppedGrants := true }
+/-- The code at 0d315ed: a stopped operation wants nothing, but a grant made to it before it
+stopped stays valid. (8f997ec drops those grants: the code there is `poolFixed`.) -/
+def pool0d315ed : Rules := { poolFixed with stoppedGrants := true }
 
 end Rules
 
