@@ -14,8 +14,8 @@ no other dependencies.
 cd formal && cpuq run --label cpuq:lean -- lake build
 ```
 
-`lake build` checks every proof and runs every search in `Checks.lean` (about 8 minutes on pop,
-most of it the `urgent` scenarios). Every warning is an error. A search whose result changes
+`lake build` checks every proof and runs every search in `Checks.lean` (the searches take about
+a minute on pop; a clean build checks the proofs first, several minutes more). Every warning is an error. A search whose result changes
 fails the build.
 
 ## Layout
