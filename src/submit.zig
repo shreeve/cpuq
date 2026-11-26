@@ -14,6 +14,7 @@
 //! Every file lives under the state directory (`~/.local/state/cpuq/jobs/ID/`), on both sides.
 
 const std = @import("std");
+const tasks_mod = @import("tasks.zig");
 const builtin = @import("builtin");
 const Io = std.Io;
 const c = std.c;
@@ -94,7 +95,8 @@ const Spec = struct {
     /// The job, one command (`cpuq submit`); a spec has this or `tasks`.
     run: ?[]const u8 = null,
     /// A command that writes the job's tasks, one file each, into `$CPUQ_TODO`, after `setup`
-    /// (`cpuq test`): `cpuq jobs run` then runs them, each with `$CPUQ_CODE`, the copy's path.
+    /// (`cpuq test`): they then run one per CPU of the pool (tasks.zig), each with `$CPUQ_CODE`,
+    /// the copy's path.
     tasks: ?[]const u8 = null,
     setup: ?[]const u8 = null,
     /// Read only to refuse it, with what replaces it.
@@ -1624,9 +1626,9 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
     // A test's tasks: setup, then its tasks command filling the job folder's todo/.
     var folder: []const u8 = "";
     if (p.tasks != null) {
-        const state = @import("jobs.zig").stateDir(cx.a, cx.env) orelse return hostDone(cx, id, p, .cpuq_error, null, "no HOME on the host: not your code", started);
+        const state = tasks_mod.stateDir(cx.a, cx.env) orelse return hostDone(cx, id, p, .cpuq_error, null, "no HOME on the host: not your code", started);
         var stamp_buf: [15]u8 = undefined;
-        folder = cx.a.print("{s}/jobs/{s}/{s}", .{ state, p.job, @import("jobs.zig").stampNow(&stamp_buf, now(cx.io)) }) catch return 125;
+        folder = cx.a.print("{s}/jobs/{s}/{s}", .{ state, p.job, tasks_mod.stampNow(&stamp_buf, now(cx.io)) }) catch return 125;
         Io.Dir.cwd().createDirPath(cx.io, cx.a.print("{s}/todo", .{folder}) catch "") catch {};
         writeFile(cx, jobFile(cx, id, "folder"), folder);
         env.put("CPUQ_TODO", cx.a.print("{s}/todo", .{folder}) catch "") catch {};
@@ -1642,17 +1644,26 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
 
     const log = jobFile(cx, id, "output.log");
     var code = runLogged(cx, id, argv.items, &env, copy, log, false);
-    // The tasks, by their own driver: outside any grant (the agent shares the machine among
-    // jobs), under the spec's time and memory limits, the pack tools on PATH.
+    // The tasks, one per CPU of the pool (tasks.zig), under the spec's time and memory limits
+    // for them all, the pack tools on PATH; then their verdict, after the run's own lines.
     if (p.tasks != null and code != null and code.? == 0 and !cancelled(cx, id)) {
         if (dirs.items.len != 0) env.put("PATH", cx.a.print("{s}{s}", .{ dirs.items, env.get("PATH") orelse "/usr/bin:/bin" }) catch "") catch {};
-        env.put("CPUQ_PROGRESS", jobFile(cx, id, "progress")) catch {};
-        var driver: std.ArrayList([]const u8) = .empty;
-        driver.appendSlice(cx.a, &.{ cx.self, "cap" }) catch {};
-        if (p.time) |t| driver.appendSlice(cx.a, &.{ "--time", t }) catch {};
-        if (p.mem) |m| driver.appendSlice(cx.a, &.{ "--mem", m }) catch {};
-        driver.appendSlice(cx.a, &.{ "--", cx.self, "jobs", "run" }) catch {};
-        code = runLogged(cx, id, driver.items, &env, folder, log, true);
+        const n = tasks_mod.manifest(cx.io, cx.a, folder);
+        if (n != 0) {
+            var driver: std.ArrayList([]const u8) = .empty;
+            driver.appendSlice(cx.a, &.{ cx.self, "cap" }) catch {};
+            if (p.time) |t| driver.appendSlice(cx.a, &.{ "--time", t }) catch {};
+            if (p.mem) |m| driver.appendSlice(cx.a, &.{ "--mem", m }) catch {};
+            const count_text = cx.a.print("{d}", .{n}) catch "1";
+            driver.appendSlice(cx.a, &.{ "--", cx.self, "run", "--label", p.label, "-n", count_text, "-t", "off", "--", cx.self, "_task", folder }) catch {};
+            code = runLogged(cx, id, driver.items, &env, folder, log, true);
+        }
+        // cap's own last line says when it stopped them; else the folder's verdict.
+        const stopped = std.mem.startsWith(u8, lastLine(cx, log), "cpuq cap: stopped");
+        if (!stopped) {
+            const v = tasks_mod.verdict(cx.io, cx.a, folder, log);
+            if (code != null and (code.? == 0 or code.? == 1)) code = v;
+        }
         bringFailures(cx, folder, copy);
         p.report = report_back;
     }
@@ -1679,7 +1690,6 @@ const report_back = ".cpuq/report.jsonl";
 /// worktree), and a report line per task in done/ and fail/, each failure with its last line of
 /// output.
 fn bringFailures(cx: Cx, folder: []const u8, copy: []const u8) void {
-    const jobs_mod = @import("jobs.zig");
     const back = cx.a.print("{s}/{s}", .{ copy, fail_back }) catch return;
     Io.Dir.cwd().deleteTree(cx.io, back) catch {};
     Io.Dir.cwd().createDirPath(cx.io, back) catch {};
@@ -1689,14 +1699,14 @@ fn bringFailures(cx: Cx, folder: []const u8, copy: []const u8) void {
         defer dir.close(cx.io);
         var it = dir.iterate();
         while (it.next(cx.io) catch null) |e| {
-            if (e.kind != .file or !jobs_mod.visible(e.name)) continue;
+            if (e.kind != .file or !tasks_mod.visible(e.name)) continue;
             const ok = std.mem.eql(u8, sub, "done");
             var reason: []const u8 = "";
             if (!ok) {
                 const from = cx.a.print("{s}/fail/{s}", .{ folder, e.name }) catch continue;
                 const text = readFile(cx, from) orelse "";
                 writeFile(cx, cx.a.print("{s}/{s}", .{ back, e.name }) catch continue, text);
-                var t: jobs_mod.Tally = .{};
+                var t: tasks_mod.Tally = .{};
                 t.feed(text);
                 t.finish();
                 reason = t.lastLine();
