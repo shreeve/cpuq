@@ -1,16 +1,19 @@
 import Foundation
 
-/// `cpuq status --json`, schema 1. Every field has a default, so a cpuq that
-/// leaves one out still decodes.
+/// `cpuq status --json`, schema 2: cpuq's pool, one CPU per task. Every field has a default, so a
+/// cpuq that leaves one out still decodes.
 public struct Status: Decodable, Sendable, Equatable {
     public var version = ""
     public var budget = 0
     public var held = 0
     public var load: [Double] = [0, 0, 0]
     public var memoryPressure = ""
-    /// How cpuq admits jobs: "measured" (by the CPU they use) or "cores" (by the cores they hold,
-    /// up to `budget`).
+    /// How cpuq shares CPUs: "pool" (one CPU per task).
     public var admit = ""
+    /// The pool's CPUs, by the machine's numbers.
+    public var pool: [Int] = []
+    /// Pool CPUs no one holds or is promised.
+    public var free = 0
     /// The CPUs online (`active_cores`).
     public var activeCores = 0
     /// Each CPU's time so far, `[busy, total]`, cumulative (`cpu_ticks`):
@@ -25,6 +28,8 @@ public struct Status: Decodable, Sendable, Equatable {
     public var gate = Gate()
     public var holders: [Holder] = []
     public var waiters: [Waiter] = []
+    /// Each project in the line: its weight, the CPUs it holds and wants, and its fair share.
+    public var projects: [Project] = []
     public var outside: [Outside] = []
     /// CPUs busy outside every cpuq job, in all.
     public var outsideTotal: Double?
@@ -39,16 +44,29 @@ public struct Status: Decodable, Sendable, Equatable {
     }
 
     public struct Holder: Decodable, Sendable, Equatable {
+        /// Its place in the line: what `cpuq kill` names it by.
+        public var ticket = 0
+        /// Its cpuq: what a pause (SIGTSTP) and a resume (SIGCONT) go to.
         public var pid = 0
+        public var project = ""
+        /// The project's weight (the config's `weights`).
+        public var weight = 1
+        /// The CPUs it holds, one per running task.
         public var cores = 0
-        /// Which of the budget's cores it holds, by number from 0.
+        /// Which of the pool's CPUs it holds, by number from 0.
         public var slots: [Int] = []
-        /// Paused by hand.
+        /// Its tasks (`-n`): all of them, how many ended well or not, and how many run now.
+        public var tasks = 0
+        public var done = 0
+        public var failed = 0
+        public var running = 0
+        /// Stopped (Ctrl-Z, or Pause here): its tasks stopped and its CPUs back in the pool.
         public var paused = false
+        /// What cpuq sees wrong with it, in words ("its CPU averages 0.05 busy").
+        public var flags: [String] = []
+        public var urgent = false
         public var using: Double?
         public var exclusive = false
-        /// Its work runs where cpuq can't see it (`--opaque`: a container, a VM).
-        public var opaque = false
         public var label = ""
         /// What the job is for (`--note`): shown beside the label, a band of its own in the charts.
         public var note = ""
@@ -62,10 +80,6 @@ public struct Status: Decodable, Sendable, Equatable {
         public var leftFrom = ""
         /// Its label's usual run time, in seconds, from history.
         public var typical: Double?
-        /// A job's folder (`cpuq jobs`): its actions run there, and its cores are its workers.
-        public var job: String?
-        /// A job's weight: its share of the machine against the other jobs'.
-        public var weight: Int?
     }
 
     /// A job's own count: `DONE TOTAL FAILING`.
@@ -77,7 +91,14 @@ public struct Status: Decodable, Sendable, Equatable {
 
     public struct Waiter: Decodable, Sendable, Equatable {
         public var order = 0
+        public var ticket = 0
         public var pid = 0
+        public var project = ""
+        /// The CPUs it holds already, while it waits for more.
+        public var holds = 0
+        public var urgent = false
+        /// Why it waits, in cpuq's words.
+        public var why = ""
         public var cores = 0
         public var max = 0
         public var exclusive = false
@@ -88,41 +109,14 @@ public struct Status: Decodable, Sendable, Equatable {
         public var since = 0
     }
 
-    /// A running job (`cpuq jobs run`): a folder of task files run by its own driver. The status
-    /// lists each among the holders, its workers what it reserves.
-    public struct Job: Decodable, Sendable, Equatable {
+    public struct Project: Decodable, Sendable, Equatable {
         public var name = ""
-        public var stamp = ""
-        public var path = ""
-        public var pid = 0
-        public var state = ""
-        public var workers = 0
         public var weight = 1
-        public var todo = 0
-        public var live = 0
-        public var done = 0
-        public var fail = 0
-        public var using: Double?
-        public var since = 0
-        public var left: Double?
-
-        /// As a running job: its label the name, its project the part before the first dot.
-        public var holder: Holder {
-            var h = Holder()
-            h.pid = pid
-            h.cores = workers
-            h.paused = state == "paused"
-            h.using = using
-            h.label = name.replacingOccurrences(of: ".", with: ":", options: [], range: name.range(of: "."))
-            h.command = path
-            h.job = path
-            h.weight = weight
-            h.since = since
-            h.progress = Progress(done: done + fail, total: todo + live + done + fail, failing: fail)
-            h.left = left
-            h.leftFrom = left == nil ? "" : "progress"
-            return h
-        }
+        public var ops = 0
+        public var held = 0
+        public var want = 0
+        /// Its share of the pool by weight, among the projects that want CPUs.
+        public var fair = 0.0
     }
 
     public struct Outside: Decodable, Sendable, Equatable {
@@ -176,7 +170,7 @@ extension Status {
 // Decoding with defaults: a missing key keeps the property's default.
 extension Status {
     private enum Keys: String, CodingKey {
-        case version, budget, held, load, memoryPressure, gate, holders, waiters, jobs, outside, outsideTotal, recorder, admit, activeCores, cpuTicks, bootTime, memory
+        case version, budget, held, load, memoryPressure, gate, holders, waiters, projects, outside, outsideTotal, recorder, admit, pool, free, activeCores, cpuTicks, bootTime, memory
     }
 
     public init(from decoder: any Decoder) throws {
@@ -187,14 +181,16 @@ extension Status {
         load = try c.decodeIfPresent([Double].self, forKey: .load) ?? [0, 0, 0]
         memoryPressure = try c.decodeIfPresent(String.self, forKey: .memoryPressure) ?? ""
         admit = try c.decodeIfPresent(String.self, forKey: .admit) ?? ""
+        pool = try c.decodeIfPresent([Int].self, forKey: .pool) ?? []
+        free = try c.decodeIfPresent(Int.self, forKey: .free) ?? 0
         activeCores = try c.decodeIfPresent(Int.self, forKey: .activeCores) ?? 0
         cpuTicks = try c.decodeIfPresent([[UInt64]].self, forKey: .cpuTicks)
         bootTime = try c.decodeIfPresent(Double.self, forKey: .bootTime)
         memory = try c.decodeIfPresent(Memory.self, forKey: .memory)
         gate = try c.decodeIfPresent(Gate.self, forKey: .gate) ?? Gate()
         holders = try c.decodeIfPresent([Holder].self, forKey: .holders) ?? []
-        holders += (try c.decodeIfPresent([Job].self, forKey: .jobs) ?? []).map(\.holder)
         waiters = try c.decodeIfPresent([Waiter].self, forKey: .waiters) ?? []
+        projects = try c.decodeIfPresent([Project].self, forKey: .projects) ?? []
         outside = try c.decodeIfPresent([Outside].self, forKey: .outside) ?? []
         outsideTotal = try c.decodeIfPresent(Double.self, forKey: .outsideTotal)
         recorder = try c.decodeIfPresent(Bool.self, forKey: .recorder) ?? false
@@ -212,16 +208,27 @@ extension Status.Gate {
 }
 
 extension Status.Holder {
-    private enum Keys: String, CodingKey { case pid, cores, slots, paused, using, exclusive, opaque, label, note, command, since, progress, left, typical, leftFrom }
+    private enum Keys: String, CodingKey {
+        case ticket, pid, project, weight, cores, slots, tasks, done, failed, running, paused, flags, urgent
+        case using, exclusive, label, note, command, since, progress, left, typical, leftFrom
+    }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
+        ticket = try c.decodeIfPresent(Int.self, forKey: .ticket) ?? 0
         pid = try c.decodeIfPresent(Int.self, forKey: .pid) ?? 0
+        project = try c.decodeIfPresent(String.self, forKey: .project) ?? ""
+        weight = try c.decodeIfPresent(Int.self, forKey: .weight) ?? 1
         cores = try c.decodeIfPresent(Int.self, forKey: .cores) ?? 0
         slots = try c.decodeIfPresent([Int].self, forKey: .slots) ?? []
+        tasks = try c.decodeIfPresent(Int.self, forKey: .tasks) ?? 0
+        done = try c.decodeIfPresent(Int.self, forKey: .done) ?? 0
+        failed = try c.decodeIfPresent(Int.self, forKey: .failed) ?? 0
+        running = try c.decodeIfPresent(Int.self, forKey: .running) ?? 0
         paused = try c.decodeIfPresent(Bool.self, forKey: .paused) ?? false
+        flags = try c.decodeIfPresent([String].self, forKey: .flags) ?? []
+        urgent = try c.decodeIfPresent(Bool.self, forKey: .urgent) ?? false
         using = try c.decodeIfPresent(Double.self, forKey: .using)
         exclusive = try c.decodeIfPresent(Bool.self, forKey: .exclusive) ?? false
-        opaque = try c.decodeIfPresent(Bool.self, forKey: .opaque) ?? false
         label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
         note = try c.decodeIfPresent(String.self, forKey: .note) ?? ""
         command = try c.decodeIfPresent(String.self, forKey: .command) ?? ""
@@ -234,11 +241,16 @@ extension Status.Holder {
 }
 
 extension Status.Waiter {
-    private enum Keys: String, CodingKey { case order, pid, cores, max, exclusive, label, note, command, since }
+    private enum Keys: String, CodingKey { case order, ticket, pid, project, holds, urgent, why, cores, max, exclusive, label, note, command, since }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         order = try c.decodeIfPresent(Int.self, forKey: .order) ?? 0
+        ticket = try c.decodeIfPresent(Int.self, forKey: .ticket) ?? 0
         pid = try c.decodeIfPresent(Int.self, forKey: .pid) ?? 0
+        project = try c.decodeIfPresent(String.self, forKey: .project) ?? ""
+        holds = try c.decodeIfPresent(Int.self, forKey: .holds) ?? 0
+        urgent = try c.decodeIfPresent(Bool.self, forKey: .urgent) ?? false
+        why = try c.decodeIfPresent(String.self, forKey: .why) ?? ""
         cores = try c.decodeIfPresent(Int.self, forKey: .cores) ?? 0
         max = try c.decodeIfPresent(Int.self, forKey: .max) ?? cores
         exclusive = try c.decodeIfPresent(Bool.self, forKey: .exclusive) ?? false
@@ -249,6 +261,19 @@ extension Status.Waiter {
     }
 }
 
+
+extension Status.Project {
+    private enum Keys: String, CodingKey { case name, weight, ops, held, want, fair }
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        weight = try c.decodeIfPresent(Int.self, forKey: .weight) ?? 1
+        ops = try c.decodeIfPresent(Int.self, forKey: .ops) ?? 0
+        held = try c.decodeIfPresent(Int.self, forKey: .held) ?? 0
+        want = try c.decodeIfPresent(Int.self, forKey: .want) ?? 0
+        fair = try c.decodeIfPresent(Double.self, forKey: .fair) ?? 0
+    }
+}
 
 extension Status.Outside {
     private enum Keys: String, CodingKey { case pid, name, using, command, cwd }

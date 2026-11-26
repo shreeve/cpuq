@@ -3,6 +3,21 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.23.0
+
+- Needs cpuq 0.30.0 or later, which gives each task one CPU from a pool shared by a fair line.
+- **Jobs:** a line of each project's CPUs against its fair share by weight; each job's tasks done
+  of all, what cpuq sees wrong with it (in orange, as `cpuq status` words it), and its
+  project's **WEIGHT** (the config's `weights`). A waiting job says why it waits, in cpuq's words.
+- Pause and Resume are Ctrl-Z and fg: a paused job's CPUs go back to the line. Stop and Cancel
+  end a job with `cpuq kill`. Move to Front and Start Now are gone, as is `cpuq jobs` and its
+  weight and workers menus.
+- Rose means jobs waiting while CPUs of cpuq's pool sit free. CPUs outside the pool, or busy with
+  other work, are no one's to take: waiting beside them is fair.
+- When `cpuq status` fails, the app shows cpuq's own words, such as the process holding a stuck
+  pool's lock.
+- History counts the pool's jobs, in **CPU-hours held** and **CPU-hours busy**.
+
 ## 0.22.0 — 2026-11-03
 
 - **Jobs** (`cpuq jobs`) show in the jobs list beside the queue's, their workers what they

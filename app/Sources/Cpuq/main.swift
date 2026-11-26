@@ -36,10 +36,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var idleWait = Episode()
     private var cloudIdle: [String: Episode] = [:]
     private var outsideHeavy: [String: Episode] = [:]
-    /// Per machine watched from here: jobs waiting beside idle CPUs, --opaque jobs holding cores
-    /// unused while others wait, and a machine overloaded while another has room.
+    /// Per machine watched from here: jobs waiting beside idle CPUs, and a machine overloaded
+    /// while another has room.
     private var idleWaitThere: [String: Episode] = [:]
-    private var opaqueIdle: [String: Episode] = [:]
     private var overloaded: [String: Episode] = [:]
     /// Lines waiting to be texted, and when the last text went: at most one every 30 minutes.
     private var toText: [String] = []
@@ -339,17 +338,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         p.executableURL = URL(fileURLWithPath: path)
         p.arguments = arguments
         if let folder { p.currentDirectoryURL = URL(fileURLWithPath: folder) }
-        let out = Pipe()
+        let out = Pipe(), err = Pipe()
         p.standardOutput = out
-        p.standardError = FileHandle.nullDevice
+        p.standardError = err
         do {
             try p.run()
         } catch {
             return .failure(Problem(message: "cannot run \(path): \(error.localizedDescription)"))
         }
+        // Both at once: a pipe left unread fills, and cpuq would wait on it forever.
+        let complaint = OSAllocatedUnfairLock(initialState: Data())
+        let drained = DispatchSemaphore(value: 0)
+        let errors = err.fileHandleForReading
+        DispatchQueue.global(qos: .utility).async {
+            let d = errors.readDataToEndOfFile()
+            complaint.withLock { $0 = d }
+            drained.signal()
+        }
         let data = out.fileHandleForReading.readDataToEndOfFile()
+        drained.wait()
         p.waitUntilExit()
-        guard p.terminationStatus == 0 else { return .failure(Problem(message: "cpuq \(arguments.first ?? "") failed (\(p.terminationStatus))")) }
+        guard p.terminationStatus == 0 else {
+            // cpuq's own words when it gives them, as a stuck pool's holder in `cpuq status`.
+            let line = String(decoding: complaint.withLock { $0 }, as: UTF8.self).split(separator: "\n").first.map(String.init)
+            return .failure(Problem(message: line ?? "cpuq \(arguments.first ?? "") failed (\(p.terminationStatus))"))
+        }
         return .success(data)
     }
 
@@ -406,7 +419,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             if now.needless { out.append("⚠︎ \(now.waiters.count) waiting beside idle CPUs") }
         }
         for m in remotes where m.isCloudRunning {
-            let held = m.status.map { " · \($0.held) of \(Int(m.cpus)) cores in use" } ?? ""
+            let held = m.status.map { " · \($0.held) of \(Int(m.cpus)) CPUs in use" } ?? ""
             let month = m.monthHours.map { " · " + GraphModel.hours($0) + " this month" } ?? ""
             out.append("☁︎ \(m.machine.name) running · up \(m.upFor)\(month)\(held)")
         }
@@ -423,7 +436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let clouds = remotes.filter(\.isCloudRunning)
         // "☁ 23m / 14h": up since it booted, and its hours this month.
         item.button?.title = clouds.isEmpty ? "" : " ☁ " + clouds.map { $0.upFor + ($0.monthHours.map { " / " + GraphModel.hours($0) } ?? "") }.joined(separator: "  ")
-        var tip = s.map { "cpuq: \($0.held) of \($0.capacity) cores in use" + ($0.waiters.isEmpty ? "" : " · \($0.waiters.count) waiting") } ?? "cpuq: \(problem ?? "cannot read cpuq")"
+        var tip = s.map { "cpuq: \($0.held) of \($0.capacity) CPUs in use" + ($0.waiters.isEmpty ? "" : " · \($0.waiters.count) waiting") } ?? "cpuq: \(problem ?? "cannot read cpuq")"
         for line in alerts() { tip += "\n" + line }
         item.button?.toolTip = tip
         checkAlerts()
@@ -447,8 +460,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     /// What is worth an interruption, each once it has lasted: cpuq's gate shut (30 s), jobs
-    /// waiting beside idle CPUs (a minute), --opaque jobs holding cores while others wait (2
-    /// minutes), heavy work outside cpuq (3 minutes), a job that looks stuck or a machine
+    /// waiting beside idle CPUs (a minute), heavy work outside cpuq (3 minutes), a job that looks stuck or a machine
     /// overloaded while another has room (10 minutes), and a cloud machine up with nothing to do
     /// (15 minutes: its own 10-minute idle stop failed, and it is billing). Those that need the
     /// owner are texted too.
@@ -501,7 +513,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                         let what = h.label + (h.note.isEmpty ? "" : " " + h.note)
                         let count = h.progress.map { " Its count has stood at \($0.done) of \($0.total) for 10 minutes." } ?? ""
                         notify("hung-\(key)", "\(name): \(what) looks stuck",
-                               String(format: "Almost no CPU (%.1f of %d reserved) for 10 minutes.%@ Running %@; its owner can stop it with cpuq stop %d.", h.using ?? 0, h.cores, count, duration(now.timeIntervalSince1970 - Double(h.since)), h.pid), text: true)
+                               String(format: "Almost no CPU (%.1f of the %d it holds) for 10 minutes.%@ Running %@; its owner can stop it with cpuq kill %d.", h.using ?? 0, h.cores, count, duration(now.timeIntervalSince1970 - Double(h.since)), h.ticket), text: true)
                     }
                 } else {
                     t.still = nil
@@ -517,24 +529,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             var e = idleWaitThere[c.machine.id] ?? Episode()
             track(&e, m.needless, after: 60, now) {
                 notify("idle-\(c.machine.id)", "\(c.machine.name): \(m.waiters.count) waiting beside idle CPUs",
-                       String(format: "%.1f of %.0f CPUs free, and nothing starts: a job may be stuck, or holding cores it doesn't use (an --opaque job whose work cpuq could see).", m.free, m.cpus))
+                       String(format: "%.1f of %.0f CPUs free, and nothing starts: a run may be stuck holding CPUs it doesn't use.", m.free, m.cpus))
             }
             idleWaitThere[c.machine.id] = e
-        }
-        // --opaque jobs holding cores they don't use while others wait: counted whole until the
-        // machine's own busy time shows otherwise, a job marked --opaque whose work cpuq can see
-        // anyway (a VM it starts itself) holds the queue.
-        for (id, name, s) in machines {
-            let idleOpaque = s.holders.filter { $0.opaque && !$0.paused && now.timeIntervalSince1970 - Double($0.since) >= 180 && ($0.using ?? 1) < 0.1 * Double($0.cores) }
-            var e = opaqueIdle[id] ?? Episode()
-            track(&e, !idleOpaque.isEmpty && !s.waiters.isEmpty, after: 120, now) {
-                let held = idleOpaque.reduce(0) { $0 + $1.cores }
-                let used = idleOpaque.reduce(0.0) { $0 + ($1.using ?? 0) }
-                let who = Set(idleOpaque.map(\.label)).sorted().prefix(3).joined(separator: ", ")
-                notify("opaque-\(id)", "\(name): --opaque jobs hold \(held) cores, using \(String(format: "%.1f", used))",
-                       "\(s.waiters.count) waiting meanwhile. \(who): if cpuq can see their work (a VM they start themselves), --opaque is wrong for them.", text: true)
-            }
-            opaqueIdle[id] = e
         }
         // A machine overloaded (1-minute load over 1.5 times its CPUs, with jobs waiting) for 10
         // minutes while another watched from here has room: portable work belongs there. Load
@@ -893,9 +890,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         // shrinks it, and everything in it fits, the charts sharing what height there is.
         let host = NSHostingView(rootView: GraphsView(models: [graphs] + remotes, control: { [weak self] machine, action, pid, who in
             self?.perform(action, pid: String(pid), who: who, on: machine)
-        }, start: { [weak self] model in self?.startMachine(model) }, jobControl: { [weak self] machine, folder, args, who in
-            self?.performJob(args, in: folder, who: who, on: machine)
-        }))
+        }, start: { [weak self] model in self?.startMachine(model) }))
         host.sizingOptions = []
         // The minimum as constraints the window cannot break: contentMinSize alone let a
         // drag, a tile or an accessibility resize take the window down to a sliver.
@@ -967,11 +962,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
     }
 
+    /// An action on a run: "stop" and "cancel" end it (`cpuq kill TICKET`, the id its ticket);
+    /// "pause" and "resume" are Ctrl-Z and fg (SIGTSTP and SIGCONT to its cpuq, the id its pid).
     func perform(_ action: String, pid: String, who: String, on machine: Machine = .local) {
         let ask: (String, String, String)? = switch action {
-        case "start": ("Start \(who) now?", "It starts past the queue and the budget, so the load goes up until other jobs finish.", "Start Now")
-        case "stop": ("Stop \(who)?", "Its work so far is lost; it gets SIGTERM and can clean up.", "Stop")
-        case "cancel": ("Cancel \(who)?", "It leaves the queue and never runs; whoever started it sees it give up (exit 75).", "Cancel Job")
+        case "stop": ("Stop \(who)?", "Its tasks get SIGTERM and can clean up; its work so far is lost.", "Stop")
+        case "cancel": ("Cancel \(who)?", "It leaves the line and never runs; whoever started it sees it end by SIGTERM (exit 143).", "Cancel Run")
         default: nil
         }
         if let (title, detail, yes) = ask {
@@ -984,33 +980,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
         let host: String? = machine.isLocal ? nil : machine.id
-        Task.detached(priority: .userInitiated) {
-            if let host { _ = Self.remote(host, [action, pid]) } else { _ = Self.run([action, pid]) }
-            await MainActor.run {
-                self.poll()
-                self.pollRemotes()
-            }
+        let signal: String? = switch action {
+        case "pause": "TSTP"
+        case "resume": "CONT"
+        default: nil
         }
-    }
-
-    /// `cpuq jobs ARGS...` in a job's folder: its knobs, pause, resume, and stop (asked first).
-    func performJob(_ args: [String], in folder: String, who: String, on machine: Machine = .local) {
-        if args.first == "stop" {
-            let alert = NSAlert()
-            alert.messageText = "Stop \(who)?"
-            alert.informativeText = "Its running tasks go back to todo/ and nothing else starts; run it again to finish."
-            alert.addButton(withTitle: "Stop")
-            alert.addButton(withTitle: "Cancel")
-            NSApp.activate()
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
-        }
-        let host: String? = machine.isLocal ? nil : machine.id
         Task.detached(priority: .userInitiated) {
-            if let host {
-                let quoted = (["cd", folder, "&&", "cpuq", "jobs"] + args).map { $0 == "&&" ? $0 : "'" + $0.replacingOccurrences(of: "'", with: #"'\''"#) + "'" }
-                _ = Self.remoteCommand(host, quoted.joined(separator: " "))
+            if let signal {
+                // Its CPUs go back to the line while it is paused; resumed, it waits for CPUs again.
+                if let host { _ = Self.remoteCommand(host, "kill -\(signal) \(pid)") } else if let n = Int32(pid) {
+                    _ = kill(n, signal == "TSTP" ? SIGTSTP : SIGCONT)
+                }
+            } else if let host {
+                _ = Self.remote(host, ["kill", pid])
             } else {
-                _ = Self.run(["jobs"] + args, in: folder)
+                _ = Self.run(["kill", pid])
             }
             await MainActor.run {
                 self.poll()
