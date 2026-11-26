@@ -73,6 +73,7 @@ never write them.
 | `run` | `sh -c RUN cpuq ARGS...` at the copy's top, as one task; `-- ARGS` become `"$@"` (`cpuq submit`) | `run` or `tasks` |
 | `tasks` | `sh -c TASKS cpuq ARGS...` after `setup`, writing one task file per task into `$CPUQ_TODO` (its work up to the first blank line, run with `sh`); `cpuq jobs run` then runs them on the host, each with `$CPUQ_CODE`, the copy's path (`cpuq test`) | `run` or `tasks` |
 | `setup` | run first, in the same job | none |
+| `driver` | `true`: the job is a runner (`cpuq run --driver`): it holds no CPU, and each `cpuq run` it starts takes its own, so `run` may fan out with `cpuq run -n M` | `false`: one task on one CPU |
 | `time` | wall time from the job's start on its CPU, enforced by `cpuq cap --time` around setup and run; required on a host with `remote_start` | 2h there, none here |
 | `mem` | memory of the whole job, by `cpuq cap --mem` (the kernel's memory.max inside a Linux job) | none |
 | `tools` | `{"zig": "0.17.0"}`: `zig version` etc. checked on the host before the run; a mismatch is NOT RUN | none |
@@ -89,9 +90,10 @@ never write them.
 - **Defaults:** the directory is the git top of the spec's repo, and its realpath must be under
   `submit_roots` (default `~/Data/Code`).
 - **Spec errors:** one line naming the field, exit 2. A spec with `cores` is refused: its job runs
-  as one task.
-- **One CPU:** `setup` and `run` share the job's one CPU, so they run at one job (`zig build -j1`).
-  A `cpuq run -n M` inside them is nested and runs on that same CPU. A suite that needs many CPUs
+  as one task, or as a runner with `driver`.
+- **One CPU:** without `driver`, `setup` and `run` share the job's one CPU, so they run at one job
+  (`zig build -j1`), and a `cpuq run -n M` inside them is nested and runs on that same CPU. A
+  runner sets `driver`, so its `cpuq run -n M` takes M CPUs from the pool; a suite of task files
   is a spec with `tasks`, run by `cpuq test`.
 - **Refused directories:** one holding `.env*`, `*.pem`, `id_*`, `.netrc` or `.npmrc` that isn't
   excluded.
@@ -181,10 +183,10 @@ never write them.
    - The environment: `env`, `caches` and a `TMPDIR` of the job's own.
    - Output goes to the job's `output.log`, and the report is truncated first.
    - `tools` are checked before anything runs.
-   - The job is a `cpuq run` like any other: it waits in the host's line for its CPU and lands in
-     history. cap enforces `time` from the job's start, and `mem` by reading the job's process
-     tree once a second. The task's time limit is the host's `timeout` (1 hour by default), so a
-     host that runs longer jobs sets `timeout` above its longest `time`.
+   - The job is a `cpuq run` like any other (`--driver` with `driver`): it waits in the host's
+     line for its CPU and lands in history. Its time limit is the spec's `time`, which cap
+     enforces from the job's start, not the host's per-task `timeout`; cap enforces `mem` by
+     reading the job's process tree once a second.
 5. **Finish on the host.**
    - The verdict comes from the exit code and cap's last line, with the report read for counts and
      failures.
