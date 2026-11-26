@@ -11,6 +11,7 @@ const runopts = @import("runopts.zig");
 const repos = @import("repos.zig");
 const runner = @import("runner.zig");
 const timing = @import("timing.zig");
+const tok = @import("tok.zig");
 
 const Ctx = main.Ctx;
 const RunOptions = runopts.RunOptions;
@@ -28,6 +29,8 @@ pub const Lease = struct {
     /// then runs at background priority, so a lender that gets busy again
     /// has its CPUs back at once.
     borrowed: u32 = 0,
+    /// The pool tokens (`cpuq tok`'s) held for the grant, given back with it.
+    parked: tok.Parked = .{},
 };
 
 /// The history's record of the job this cpuq runs: its id and the fields

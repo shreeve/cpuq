@@ -18,6 +18,7 @@ const runner = @import("runner.zig");
 const leasing = @import("leasing.zig");
 const runtimes = @import("runtimes.zig");
 const statusjson = @import("statusjson.zig");
+const tok = @import("tok.zig");
 
 const exit_timeout = main.exit_timeout;
 const Ctx = main.Ctx;
@@ -149,6 +150,11 @@ pub fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             if (std.mem.eql(u8, e.name, ticket_name)) break i;
         } else fail("ticket {s} vanished from the queue", .{ticket_name});
 
+        // `cpuq tok` jobs share the cores: while one holds some of its tokens and fights for
+        // the rest, or the first waiter needing several is one of theirs, nobody is admitted
+        // here (tok.zig, the deadlock rule).
+        const tok_ok = named or tok.runsMay(st, a);
+
         // Waiting to hold a lease for someone who has gone (their
         // connection dropped): give up rather than hold it for nobody.
         if (sys.StdinWatch.gone(runner.hold_quiet_ms)) {
@@ -220,7 +226,9 @@ pub fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             // backfill off, nothing starts ahead of the head.
             const saturated = cfg.load_check and o.load_check and if (mach.busy) |b| b >= 0.97 else false;
             const machine_open = policy.gate(cfg, mach, 0, null, now) == .open and !saturated;
-            if (!named and !o.exclusive and cfg.admit == .measured and cfg.backfill and !queue[0].record.exclusive and machine_open) {
+            if (!tok_ok) {
+                // Behind a tok job that goes first: nothing starts ahead.
+            } else if (!named and !o.exclusive and cfg.admit == .measured and cfg.backfill and !queue[0].record.exclusive and machine_open) {
                 if (run_times == null) run_times = RunTimes.load(ctx, ctx.arena);
                 const m = measuredLoad(ctx, st, a, &run_times.?, mach.busy, mach.active);
                 // Work cpuq cannot freeze never starts in a lending window.
@@ -233,6 +241,7 @@ pub fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
                     const head_waited: f64 = @floatFromInt(now - head.since);
                     if (mine <= room and (mine + head_need <= room or head_waited < @as(f64, @floatFromInt(cfg.patience_s)))) {
                         if (state.takeTokens(st, ctx.arena, req, false, poolCap(ctx), poolCap(ctx), false, 0, 0) catch |err| fail("tokens: {t}", .{err})) |grant| {
+                            park_want = parkFor(mine, grant);
                             std.debug.print("cpuq: starting ahead of {s} on {d} {s}: the CPUs have room\n", .{ if (head.label.len != 0) head.label else head.cmd, grant.files.len, if (grant.files.len == 1) "core" else "cores" });
                             return admitted(ctx, st, o, &rec, grant, ticket, ticket_name, job, now, true);
                         }
@@ -243,7 +252,7 @@ pub fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
                 var v = st.readValve();
                 const g = policy.gate(cfg, mach, budget, if (o.load_check) &v else null, now);
                 if (g == .open) if (goAhead(ctx, st, a, o, queue, pos, budget, now, &run_times)) |req| {
-                    const got = state.takeTokens(st, ctx.arena, req, false, budget, @max(cores, budget), false, 0, 0) catch |err| fail("tokens: {t}", .{err});
+                    const got = parkStrict(ctx, st, o, rec.ticket, state.takeTokens(st, ctx.arena, req, false, budget, @max(cores, budget), false, 0, 0) catch |err| fail("tokens: {t}", .{err}));
                     if (got) |grant| {
                         const head = queue[0].record;
                         std.debug.print("cpuq: starting ahead of {s}, which waits for {d} cores, on {d} of the free ones\n", .{ if (head.label.len != 0) head.label else head.cmd, head.cores, grant.files.len });
@@ -271,7 +280,8 @@ pub fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
         last_gate = if (named) .open else policy.gate(cfg, mach, budget, if (valved or o.exclusive and o.load_check) &valve else null, now);
         const check_load = !named and o.load_check and cfg.load_check and (cfg.admit == .cores or o.exclusive);
         if (check_load) st.writeValve(valve);
-        if (last_gate == .open and !named and !o.exclusive and cfg.admit == .measured) {
+        const open = last_gate == .open and tok_ok;
+        if (open and !named and !o.exclusive and cfg.admit == .measured) {
             // Measured admission: count each running job at what it uses (at
             // its expected use while it settles) and start while that leaves
             // room for this one, unless the CPUs are measured all but full.
@@ -285,11 +295,12 @@ pub fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             const saturated = ctx.cfg.load_check and o.load_check and if (mach.busy) |b| b >= 0.97 else false;
             if (!m.exclusive and !(o.hidden and m.lent) and (m.charged == 0 or (mine <= room and !saturated))) {
                 if (state.takeTokens(st, ctx.arena, req, false, poolCap(ctx), poolCap(ctx), false, 0, 0) catch |err| fail("tokens: {t}", .{err})) |grant| {
+                    park_want = parkFor(mine, grant);
                     if (o.cores_given == false and grant.files.len != 2) std.debug.print("cpuq: {d} {s} for {s}, from its history\n", .{ grant.files.len, if (grant.files.len == 1) "core" else "cores", if (o.label.len != 0) o.label else "this job" });
                     return admitted(ctx, st, o, &rec, grant, ticket, ticket_name, job, now, false);
                 }
             }
-        } else if (last_gate == .open) {
+        } else if (open) {
             const exclusive_running = (state.scanLeases(st, a, true) catch @as([]state.Entry, &.{})).len != 0;
             // Leave the next waiter's minimum free when this grant can spare it.
             const reserve: u32 = if (queue.len > 1 and !queue[1].record.exclusive) @min(queue[1].record.cores, budget) else 0;
@@ -297,6 +308,9 @@ pub fn waitTurn(ctx: *Ctx, st: *state.State, asked: RunOptions) Lease {
             // A job paused by hand runs nothing: a quiet window may open beside it.
             const paused_cores: u32 = if (o.exclusive) pausedCores(st, a) else 0;
             var got = state.takeTokens(st, ctx.arena, o.request, o.exclusive, budget, @max(cores, budget), exclusive_running, reserve, paused_cores) catch |err| fail("tokens: {t}", .{err});
+            // Within the budget, the grant's tokens in the pool too, all or none; an exclusive
+            // run takes what is free, as it takes the cores.
+            if (!o.exclusive) got = parkStrict(ctx, st, o, rec.ticket, got);
             // Not enough free: borrow the cores the holders have left idle for
             // a minute, on top of the budget. Only idle cores are lent, so the
             // work running stays within the budget; should a lender get busy
@@ -425,6 +439,8 @@ fn measuredLoad(ctx: *Ctx, st: *state.State, a: std.mem.Allocator, rt: *const Ru
         const measured: ?f64 = if (u.at_ms != 0) asks else null;
         charged += policy.charge(expected, measured, now_s - l.record.since, ctx.cfg.settle_s, l.record.cores);
     }
+    // `cpuq tok` jobs, each token a CPU.
+    charged += @floatFromInt(state.tokHeld(st));
     if (hidden_grants.items.len != 0) {
         const unexplained = (busy orelse 1) * @as(f64, @floatFromInt(cpus)) - seen_total;
         charged += policy.hiddenCharge(hidden_grants.items, hidden_seen.items, unexplained);
@@ -502,6 +518,11 @@ fn jobCpus(ctx: *Ctx, st: *state.State, o: RunOptions, cores: u32, now: i64) []c
         const settled = u.at_ms != 0 and now - l.record.since >= ctx.cfg.settle_s;
         placed.append(a, .{ .cpus = cpus, .use = if (settled) u.avg else @floatFromInt(l.record.cores) }) catch break;
     }
+    // A `cpuq tok` job keeps a CPU busy per token, on the CPU it is confined to.
+    for (tok.tokCpus(st, a, online)) |cpu| {
+        const one = a.dupe(u32, &.{cpu}) catch break;
+        placed.append(a, .{ .cpus = one, .use = 1 }) catch break;
+    }
     return policy.cpuListText(a, policy.pickCpus(a, online, placed.items, cores) catch return "");
 }
 
@@ -527,12 +548,50 @@ fn admitted(ctx: *Ctx, st: *state.State, o: RunOptions, rec: *state.Record, gran
             else => fail("lease: {t}", .{err}),
         };
     } else fail("lease: no free lease name", .{});
+    // The grant's tokens in the `cpuq tok` pool: taken already (all or none), or now, as many
+    // as are free. A named lease has no pool.
+    const parked: tok.Parked = if (o.lease != null) .{} else parked_now orelse tok.park(st, ctx.arena, tok.limitFor(ctx), lease_name, park_want orelse rec.cores, false) orelse .{};
+    parked_now = null;
+    park_want = null;
     st.queue.deleteFile(io, ticket_name) catch {};
     st.dropControl(ticket_name);
     ticket.close(io);
     st.unlock();
     logAndArm(ctx, job, "started", .{ .cores = rec.cores, .slots = grant.slots, .ahead = if (ahead) true else null, .lent = if (runner.lent_now > 0) runner.lent_now else null, .forced = if (runner.forced_now) true else null }, "ended", rec.cores);
-    return .{ .record = rec.*, .name = lease_name, .file = lease, .tokens = grant.files, .job = job };
+    return .{ .record = rec.*, .name = lease_name, .file = lease, .tokens = grant.files, .job = job, .parked = parked };
+}
+
+/// The pool tokens a grant taken by `takeTokens` already holds (`parkStrict`), for `admitted`.
+var parked_now: ?tok.Parked = null;
+
+/// How many pool tokens `admitted` takes for a grant under measured admission: what the job
+/// is charged now, not its whole grant. Null: the grant.
+var park_want: ?u32 = null;
+
+/// Under measured admission a job holds pool tokens for what it is expected to use, rounded
+/// up: at least one, at most its grant.
+fn parkFor(mine: f64, grant: state.Grant) u32 {
+    const want: u32 = @intFromFloat(@max(@ceil(mine), 1));
+    return @min(want, @as(u32, @intCast(@max(grant.files.len, 1))));
+}
+
+/// Takes the pool tokens for a grant within the budget, all or none: with fewer free (a
+/// `cpuq tok` took one meanwhile), the grant is given back and the run waits on. Call with the
+/// admission lock held.
+fn parkStrict(ctx: *Ctx, st: *state.State, o: RunOptions, ticket: u64, got: ?state.Grant) ?state.Grant {
+    const grant = got orelse return null;
+    if (o.lease != null) return grant;
+    var buf: [16]u8 = undefined;
+    const name = state.leaseName(&buf, ticket, o.exclusive);
+    if (tok.park(st, ctx.arena, tok.limitFor(ctx), name, @intCast(grant.files.len), true)) |p| {
+        parked_now = p;
+        return grant;
+    }
+    for (grant.files) |f| {
+        f.unlock(ctx.io);
+        f.close(ctx.io);
+    }
+    return null;
 }
 
 /// Backfill: whether this waiter, behind the head, may start now on cores
@@ -679,6 +738,7 @@ pub fn rewriteRecord(io: Io, f: Io.File, r: state.Record) void {
 /// cores free while the lease still counts them.
 pub fn release(io: Io, st: *state.State, lease: Lease) void {
     lockOrFail(st);
+    tok.unpark(st, lease.parked);
     for (lease.tokens) |t| {
         t.unlock(io);
         t.close(io);

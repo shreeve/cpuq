@@ -520,6 +520,19 @@ pub fn heldTokens(s: *State) !u32 {
     return held;
 }
 
+/// Tokens `cpuq tok` jobs hold (`tok/live`, see tok.zig): held cores to `cpuq run`. 0 where
+/// there is no pool, as in a named lease's state directory.
+pub fn tokHeld(s: *State) u32 {
+    var dir = s.dir.openDir(s.io, "tok/live", .{ .iterate = true }) catch return 0;
+    defer dir.close(s.io);
+    var n: u32 = 0;
+    var it = dir.iterate();
+    while (it.next(s.io) catch null) |e| {
+        if (e.name[0] != '.') n += 1;
+    }
+    return n;
+}
+
 pub fn ticketName(buf: []u8, priority: policy.Priority, ticket: u64) []const u8 {
     return std.mem.print(buf, "{d}-{d:0>10}", .{ @backingInt(priority), ticket }) catch unreachable;
 }
@@ -581,6 +594,8 @@ pub fn takeTokens(s: *State, arena: std.mem.Allocator, req: policy.Request, excl
             f.close(s.io);
         }
     }
+    // Cores `cpuq tok` jobs hold are held too.
+    held += tokHeld(s);
     const counted = if (exclusive) held -| aside else held;
     const admitted = policy.admit(req, exclusive, budget, counted, exclusive_running, reserve) orelse 0;
     // Beside cores set aside, an exclusive run takes all that is free.

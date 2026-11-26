@@ -2440,7 +2440,47 @@ print(s["schema"], s["version"] == sys.argv[1].split()[1], s["gate"]["state"], s
   check "status shows memory in use" "[[ '$s' == *'memory  '*' GB used'* ]]"
 }
 
-TESTS=${*:-budget affinity job_affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cap_link cgroups note progress submit test submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_needs submit_mem submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean jobs jobs_qos jobs_kill jobs_control agent status}
+t_tok() {
+  setup tok
+  local out rc t p
+  out=$("$CPUQ" tok --label t:one -- sh -c 'echo "cores=$CPUQ_CORES token=${CPUQ_TOKEN%%-*}"')
+  check "a tok job runs with its tokens in CPUQ_CORES ('$out')" "[ '$out' = 'cores=1 token=tok' ]"
+  "$CPUQ" tok 3 -- sh -c 'exit 7'; rc=$?
+  check "its exit status is its command's ($rc)" "[ $rc = 7 ]"
+  "$CPUQ" tok 2 --timeout 0.5 -- sleep 30; rc=$?
+  check "--timeout stops it, exit 124 ($rc)" "[ $rc = 124 ]"
+  out=$("$CPUQ" tok -- "$CPUQ" tok 4 -- sh -c 'echo "$CPUQ_CORES"')
+  check "a tok inside a tok runs at once, within it ('$out')" "[ '$out' = 1 ]"
+  # Tokens tok jobs hold are held cores to cpuq run; status shows them.
+  "$CPUQ" tok 7 --label t:seven -- sleep 4 & t=$!
+  local i=0; while [ "$(ls "$CPUQ_DIR/tok/live" | wc -l | tr -d ' ')" != 7 ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+  "$CPUQ" run --cores 3 --max-wait 1 -- true 2>/dev/null; rc=$?
+  check "a run needing more than the tokens left waits ($rc)" "[ $rc = 75 ]"
+  out=$("$CPUQ" run --cores 2 --max-wait 1 -- sh -c 'ls "$CPUQ_DIR/tok/runs" | wc -l | tr -d " "')
+  check "one that fits starts, its grant's tokens taken from the pool ('$out')" "[ '$out' = 2 ]"
+  out=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys
+t = json.load(sys.stdin)["tok"]
+print(t["tokens"], t["tok"], t["free"], len(t["holders"]), t["holders"][0]["label"], t["holders"][0]["tokens"])')
+  check "status --json shows the pool and its holder ('$out')" "[ '$out' = '9 7 2 1 t:seven 7' ]"
+  out=$("$CPUQ" status --no-usage)
+  check "status shows the tok holder" "[[ '$out' == *'tok holders (1)'*t:seven* ]]"
+  wait $t
+  # TERM goes to the command's group, and its status comes back.
+  "$CPUQ" tok -- sh -c 'trap "exit 3" TERM; sleep 10 & wait' & p=$!
+  sleep 0.5; kill -TERM $p; wait $p; rc=$?
+  check "TERM reaches the command's group ($rc)" "[ $rc = 3 ]"
+  # Killed outright, a tok's tokens stay with its command until its group is gone, then go back.
+  "$CPUQ" tok 5 -- sleep 1 & p=$!
+  i=0; while [ "$(ls "$CPUQ_DIR/tok/held" | wc -l | tr -d ' ')" != 1 ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+  sleep 0.2; kill -KILL $p; wait $p 2>/dev/null
+  local t0; t0=$(now)
+  "$CPUQ" tok 9 -- true; rc=$?
+  local took; took=$(python3 -c "print(int(($(now) - $t0) * 10))")
+  check "a killed tok's tokens come back once its command ends ($rc, after ${took} tenths)" "[ $rc = 0 ] && [ $took -ge 4 ] && [ $took -le 40 ]"
+  check "the pool is whole again" "[ \"\$(ls '$CPUQ_DIR/tok/free' | wc -l | tr -d ' ')\" = 9 ]"
+}
+
+TESTS=${*:-budget tok affinity job_affinity kill_holder kill_cpuq_only leaked_descendant kill_waiter exit_status direct_sigint terminal_sigint ignored_signals order aging no_starvation exclusive exclusive_off exclusive_paused cancel_exclusive window_gap window_lend window_noise nested elastic reserve usage lease lease_host lease_host_hold hold_gone last_words measured measured_backfill eta_measured opaque cpu_weights hook doctor fair cpu_peak backfill_exclusive window_backfill_off lease_exclusive wait history zombie fixed_hint backfill backfill_known lend config_reload controls right_size outside eta status_host lost_seq max_wait waiters_cpu qos jobserver long_command max_memory peak_memory min_available min_disk on include_git on_check on_gitignore tethered record cap cap_quiet_crash cap_link cgroups note progress submit test submit_moved submit_abandon submit_cancel_running submit_slots submit_on submit_needs submit_mem submit_tmp submit_progress packs stack_limit usual_by_command exclusive_off_waiting clean jobs jobs_qos jobs_kill jobs_control agent status}
 for t in $TESTS; do
   if declare -F "t_$t" >/dev/null; then "t_$t"; else echo "no such test: $t"; FAIL=$((FAIL+1)); FAILED+=" $t?"; fi
 done

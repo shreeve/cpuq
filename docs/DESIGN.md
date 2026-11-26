@@ -37,6 +37,7 @@ written, cpuq fails; it never falls back to another directory.
     tokens/NNNN         one file per core handed out; an exclusive lock is a held core
     leases/NNNNNNNNNN   one record per running job (suffix .x: an exclusive run)
     named/NAME/         a named lease: a state directory of its own, one token per slot
+    tok/                the token pool of `cpuq tok` (see "Tokens" below)
 
 There are as many token files as the most cores ever handed out at once: the machine's CPUs,
 the budget, or under measured admission up to four times `target`. Token files are never
@@ -363,6 +364,74 @@ a line per finding.
 newlines, parentheses and `$(…)`, unquotes words, skips assignments and wrappers (`nice`, `env`,
 `time`, `timeout`…), follows `sh -c` scripts and `ssh HOST CMD`, and checks each simple command;
 quoting is tracked for `$CPUQ_CORES` expanded outside single quotes.
+
+## Tokens (`cpuq tok`)
+
+`cpuq tok` takes no lock to hold a CPU. The pool is a directory of token files in `tok/`:
+
+    tok/free/NNNN                       a free token
+    tok/live/NNNN-PID-START             held by a cpuq tok: its pid, and when it started
+    tok/runs/NNNN-PID-START-LEASE       held for a cpuq run's grant, LEASE its lease
+    tok/wait/C-TICKET-N-PID-START       a tok job waiting for N tokens, C its priority class
+    tok/held/C-TICKET-N-PID-START       the same job running (its record: label, command, child)
+    tok/reserve                         flocked by the one waiter holding part of what it needs
+    tok/made                            how many token files exist
+
+**Taking and giving back.** A token is taken by `rename(free/NNNN, live/NNNN-PID-START)`, which
+one taker wins; a loser tries the next free token. Given back, it is renamed home. Token files
+are only ever made, under the admission lock, for numbers never made before, so a token on its
+way between two directories is never made twice. A pool that shrinks leaves its higher numbers
+in `free/`, unused; takers take only numbers below the pool's size.
+
+**Size and the shared budget.** The pool's size is the budget (`admit = cores`), or the target
+rounded up (measured). A `cpuq run` grant parks its tokens in `runs/`, under the admission lock
+as it takes its cores: within the budget all or none (`parkStrict`; with fewer free, the grant
+is given back and the head waits on), lent and exclusive grants as many as are free, and under
+measured admission as many as the job is expected to use, rounded up. `takeTokens` counts the
+tokens in `live/` as held cores and `measuredLoad` counts each as a CPU used. A run gives its
+tokens back in `release`, before its cores.
+
+**Liveness.** A tok holder is alive while its pid names a process that started at the time its
+name says (macOS `proc_bsdinfo`'s start time, Linux `/proc/PID/stat`'s), so a reused pid is not
+trusted. A tok whose process is gone still holds its tokens while its command's process group
+(its pid in the `held/` record) has a process: a group's id is not reused while the group
+exists. A run's tokens are alive while its cpuq is, or its lease is still locked (its command
+holds it). `Pool.reap` returns the tokens of holders that are gone and removes the files of
+dead waiters; every tok waiter runs it once a second, a `cpuq run` head before it parks, and
+`cpuq status` as it looks.
+
+**Order and deadlock.** A tok waiter takes a ticket from `seq`, under the admission lock, so
+tok and run waiters share one order: (priority class, ticket); aging and fair turns are
+`cpuq run`'s alone. A one-token job that finds a token free and nobody waiting takes it without
+a ticket. A *blocker* is a live run waiter (its ticket still locked) or a live tok waiter
+needing more than one token; `Pool.plan` lists the waiters and finds the first blocker.
+
+- A one-token waiter takes a token while it is ahead of the first blocker and fewer one-token
+  waiters are ahead of it than there are free tokens. A run waiter that has waited less than
+  `patience` holds back only waiters needing several (as backfill lets jobs go ahead of a young
+  head); after that, tokens freed are kept for it.
+- A waiter needing N > 1 tries for `tok/reserve` (an flock) once it is the first blocker, and
+  takes tokens only while it holds it, keeping them until it has N; then it lets the reserve go
+  and runs. Holding the reserve is sticky: a blocker that arrives ahead of it later (a higher
+  class) waits for it.
+- `cpuq run` admits nobody while the reserve is held or the first blocker is a tok waiter
+  (`runsMay`, checked under the admission lock by the head and by every waiter that would start
+  ahead of it). Its grants are all or nothing.
+
+So at most one waiter holds part of what it needs, and no cycle of waits can form: the one
+fighting waits only for tokens; run waiters wait only for it or each other, as before. Every
+holder ends and gives back, and each token given back goes to the one fighting or to one of the
+one-token waiters ahead of it in line, of which there are finitely many, since tickets only
+grow. So it gets its N. Each waiter in its class becomes the first blocker in turn, so none
+starves; a higher class goes first by design. A waiter stopped by a signal (`^Z`) holds its
+place and those behind it, as a stopped `cpuq run` head does.
+
+**Signals and the end.** The tool takes HUP, INT, QUIT and TERM: while waiting it gives back
+what it holds and dies by the signal; while CMD runs it sends the signal to CMD's group, whose
+end it waits for. CMD is in a group of its own, so the terminal's `^C` reaches it only through
+the tool. `--timeout` sends SIGTERM to the group, SIGKILL `grace_ms` (10 s) later, and on the
+end SIGKILL to whatever of the group is left, then exits 124. When CMD ends, the tool gives its
+tokens back and removes its `held/` file, then exits with CMD's status, or dies by its signal.
 
 ## Jobs of task files
 

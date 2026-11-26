@@ -14,6 +14,7 @@ const leasing = @import("leasing.zig");
 const timing = @import("timing.zig");
 const remotes = @import("remotes.zig");
 const statusjson = @import("statusjson.zig");
+const tok = @import("tok.zig");
 
 const exit_usage = main.exit_usage;
 const exit_noexec = main.exit_noexec;
@@ -94,6 +95,11 @@ pub var own_lease: ?struct { st: *state.State, name: []const u8 } = null;
 pub fn nestedGrant(ctx: *Ctx) bool {
     const token = ctx.env.get("CPUQ_TOKEN") orelse return false;
     if (token.len == 0 or std.mem.findScalar(u8, token, '/') != null) return false;
+    // `tok-PID-START`: inside a `cpuq tok` job, while that cpuq lives.
+    if (std.mem.cutPrefix(u8, token, "tok-")) |rest| {
+        const t = tok.parseTaken(ctx.arena.print("0-{s}", .{rest}) catch return false) orelse return false;
+        return t.holder.alive();
+    }
     const path = std.mem.concat(ctx.arena, u8, &.{ stateDir(ctx), "/leases/", token }) catch return false;
     const f = Io.Dir.cwd().openFile(ctx.io, path, .{}) catch return false;
     defer f.close(ctx.io);

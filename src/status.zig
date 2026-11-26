@@ -15,6 +15,7 @@ const records = @import("records.zig");
 const runtimes = @import("runtimes.zig");
 const statusjson = @import("statusjson.zig");
 const jobs_mod = @import("jobs.zig");
+const tok = @import("tok.zig");
 
 const version = main.version;
 const exit_failure = main.exit_failure;
@@ -104,6 +105,8 @@ const StatusView = struct {
     /// For another host's status: its name and its cpuq's version.
     host: ?[]const u8 = null,
     version: ?[]const u8 = null,
+    /// The `cpuq tok` pool, its holders and its waiters.
+    pool: tok.JsonPool = .{},
 };
 
 /// Whether outside load is worth showing: a core or more of it, or a gate
@@ -266,6 +269,49 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
         t.boxed(a, w, width, color) catch {};
     }
 
+    if (v.pool.holders.len + v.pool.waiters.len != 0) {
+        var rows: std.ArrayList([]const C) = .empty;
+        for (v.pool.holders) |h| {
+            var b: [16]u8 = undefined;
+            rows.append(a, a.dupe(C, &.{
+                .{ .text = dash(h.label), .tint = .accent },
+                .{ .text = a.print("{d}", .{h.tokens}) catch "?" },
+                .{ .text = "running", .tint = .good },
+                .{ .text = h.priority },
+                .{ .text = a.dupe(u8, age(&b, v.now - h.since)) catch "?" },
+                .{ .text = a.print("{d}{s}", .{ h.pid, if (h.holder_alive) "" else "*" }) catch "?", .tint = .dim },
+                .{ .text = h.command },
+            }) catch continue) catch {};
+        }
+        for (v.pool.waiters) |q| {
+            var b: [16]u8 = undefined;
+            rows.append(a, a.dupe(C, &.{
+                .{ .text = dash(q.label), .tint = .accent },
+                .{ .text = a.print("{d}", .{q.tokens}) catch "?" },
+                if (q.holding != 0) C{ .text = a.print("holds {d}", .{q.holding}) catch "?", .tint = .warn } else C{ .text = "waiting", .tint = .dim },
+                .{ .text = q.priority },
+                .{ .text = a.dupe(u8, age(&b, v.now - q.since)) catch "?" },
+                .{ .text = a.print("{d}", .{q.pid}) catch "?", .tint = .dim },
+                .{ .text = q.command },
+            }) catch continue) catch {};
+        }
+        const t: table.Table = .{
+            .title = a.print("tok: {d} of {d} tokens held by tok jobs, {d} by runs, {d} free", .{ v.pool.tok, v.pool.tokens, v.pool.runs, v.pool.free }) catch "tok",
+            .columns = &.{
+                .{ .head = "LABEL" },
+                .{ .head = "TOKENS", .alignment = .right },
+                .{ .head = "STATE" },
+                .{ .head = "PRIO" },
+                .{ .head = "SINCE" },
+                .{ .head = "PID", .alignment = .right },
+                .{ .head = "COMMAND", .flexible = true },
+            },
+            .rows = rows.items,
+        };
+        w.writeAll("\n") catch {};
+        t.boxed(a, w, width, color) catch {};
+    }
+
     if (v.leases.len != 0) {
         var rows: std.ArrayList([]const C) = .empty;
         for (v.leases) |l| {
@@ -333,7 +379,7 @@ fn statusBoxed(ctx: *Ctx, v: StatusView) void {
         for (groups.keys(), groups.values(), 0..) |k, n, i| line.print(a, "{s} {s} {d}", .{ if (i == 0) "" else " ·", k, n }) catch {};
         notes.append(a, line.items) catch {};
     }
-    if (v.holders.len == 0 and v.waiters.len == 0 and v.leases.len == 0) notes.append(a, "nothing in use or waiting") catch {};
+    if (v.holders.len == 0 and v.waiters.len == 0 and v.leases.len == 0 and v.pool.holders.len + v.pool.waiters.len == 0) notes.append(a, "nothing in use or waiting") catch {};
     notes.append(a, "past jobs: cpuq history · for scripts: cpuq status --json") catch {};
     if (ctx.watch_note) |n| notes.append(a, n) catch {};
     w.writeAll("\n") catch {};
@@ -584,6 +630,7 @@ fn statusRemote(ctx: *Ctx, host: []const u8, json: bool, measure: bool) u8 {
         .online = st.active_cores,
         .host = host,
         .version = st.version,
+        .pool = st.tok orelse .{},
     });
     return 0;
 }
@@ -620,7 +667,8 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
     const now = nowSeconds(io);
 
     lockOrFail(&st);
-    const held = state.heldTokens(&st) catch 0;
+    // Cores held: by runs, and by `cpuq tok` jobs (their tokens).
+    const held = (state.heldTokens(&st) catch 0) + state.tokHeld(&st);
     const leases = state.scanLeases(&st, a, false) catch @as([]state.Entry, &.{});
     const queue = servedOrder(ctx, &st, a, state.scanQueue(&st, a, null, .{}, now, ctx.cfg.aging_s) catch @as([]state.Entry, &.{}), now, true);
     var valve = st.readValve();
@@ -692,6 +740,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
         const nh = toHolders(a, nl, nullUsage(a, nl.len));
         named.append(a, .{ .name = name, .holders = nh, .waiters = toWaiters(a, nq) }) catch {};
     }
+    const pool = tok.view(ctx, &st, a);
     const pressure = @tagName(m.pressure);
     const w = ctx.out;
     if (json) {
@@ -740,6 +789,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
             .cpu_ticks = cpuTicksJson(ctx.io, a),
             .boot_time = bootSeconds(ctx.io),
             .recorder = recorderRunning(ctx),
+            .tok = pool,
         };
         std.json.Stringify.value(s, .{ .whitespace = .indent_2 }, w) catch {};
         w.writeAll("\n") catch {};
@@ -762,6 +812,7 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
             .now = now,
             .online = m.active,
             .memory = sys.memory(ctx.io),
+            .pool = pool,
         });
         return 0;
     }
@@ -782,6 +833,8 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
     var lw: usize = 5;
     for (holders) |h| lw = @max(lw, @min(withNote(ctx.arena, h.label, h.note).len, 40));
     for (waiters) |q| lw = @max(lw, @min(withNote(ctx.arena, q.label, q.note).len, 40));
+    for (pool.holders) |h| lw = @max(lw, @min(h.label.len, 40));
+    for (pool.waiters) |q| lw = @max(lw, @min(q.label.len, 40));
     var b1: [16]u8 = undefined;
     w.print("\nholders ({d})\n", .{holders.len}) catch {};
     var lbuf: [40]u8 = undefined;
@@ -811,6 +864,26 @@ fn statusOnce(ctx: *Ctx, json: bool, measure: bool) u8 {
         var cores_buf: [24]u8 = undefined;
         const cores_text = if (q.max > q.cores) std.mem.print(&cores_buf, "{d}-{d}", .{ q.cores, q.max }) catch "?" else std.mem.print(&cores_buf, "{d}", .{q.cores}) catch "?";
         w.print("  {d:<4} {s:<8} {s:<6} {s:<7} {s:<8} {s} {s}\n", .{ q.order, pid_text, cores_text, prio, age(&b1, now - q.since), pad(&lbuf, withNote(ctx.arena, q.label, q.note), lw), q.command }) catch {};
+    }
+    if (pool.tok + pool.runs + pool.holders.len + pool.waiters.len != 0) {
+        w.print("\ntok     {d} tokens: {d} held by tok jobs, {d} by runs, {d} free\n", .{ pool.tokens, pool.tok, pool.runs, pool.free }) catch {};
+        w.print("tok holders ({d})\n", .{pool.holders.len}) catch {};
+        if (pool.holders.len != 0) w.print("  PID      CMD-PID  TOKENS PRIO    SINCE    {s} COMMAND\n", .{pad(&lbuf, "LABEL", lw)}) catch {};
+        for (pool.holders) |h| {
+            var pid_buf: [16]u8 = undefined;
+            var child_buf: [16]u8 = undefined;
+            w.print("  {s:<8} {s:<8} {d:<6} {s:<7} {s:<8} {s} {s}\n", .{
+                std.mem.print(&pid_buf, "{d}{s}", .{ h.pid, if (h.holder_alive) "" else "*" }) catch "?", std.mem.print(&child_buf, "{d}", .{h.child}) catch "?", h.tokens, h.priority, age(&b1, now - h.since), pad(&lbuf, dash(h.label), lw), h.command,
+            }) catch {};
+        }
+        w.print("tok waiters ({d})\n", .{pool.waiters.len}) catch {};
+        if (pool.waiters.len != 0) w.print("  PID      TOKENS HOLDS  PRIO    WAITING  {s} COMMAND\n", .{pad(&lbuf, "LABEL", lw)}) catch {};
+        for (pool.waiters) |q| {
+            var pid_buf: [16]u8 = undefined;
+            w.print("  {s:<8} {d:<6} {d:<6} {s:<7} {s:<8} {s} {s}\n", .{
+                std.mem.print(&pid_buf, "{d}", .{q.pid}) catch "?", q.tokens, q.holding, q.priority, age(&b1, now - q.since), pad(&lbuf, dash(q.label), lw), q.command,
+            }) catch {};
+        }
     }
     if (named.items.len != 0) {
         w.print("\nleases ({d})\n", .{named.items.len}) catch {};

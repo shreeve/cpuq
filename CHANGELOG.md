@@ -2,6 +2,32 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.30.0 — unreleased
+
+- **`cpuq tok [N] -- CMD`** runs CMD once it holds N tokens (1 by default), one per CPU, and
+  gives them back when CMD ends (README, "Tokens"). A token is a file, taken by renaming it out
+  of `tok/free/` in the state directory, so most jobs start within a tenth of a second and no
+  more run than there are tokens. CMD runs in a process group of its own with `CPUQ_CORES=N`
+  and a make jobserver of N slots (and on Linux, with `affinity`, confined to a CPU per token,
+  in `CPUQ_CPUS`); INT, TERM, HUP
+  and QUIT go to that group. `--timeout DURATION` stops the group (SIGTERM, then SIGKILL 10 s
+  later) and exits 124. `--label` and `--priority` as for `cpuq run`. A `cpuq tok` or
+  `cpuq run` inside either runs at once, within it.
+- **`cpuq run` and `cpuq tok` share one budget.** The pool holds the budget's worth of tokens
+  under `admit = cores` (the target's, rounded up, under measured admission). A run's grant
+  takes its tokens from the pool too, all or none within the budget (under measured admission,
+  as many as it is expected to use); tokens tok jobs hold count as held cores to `cpuq run`,
+  and as used CPUs to measured admission. The machine's gates (memory, disk, the load valve)
+  hold tok jobs as they hold runs.
+- **No deadlock between jobs needing several tokens:** only the first waiter in line that needs
+  more than one token keeps what it takes while it fights for the rest; the others hold nothing
+  until it is their turn, and `cpuq run` admits nobody meanwhile. One-token jobs ahead of it
+  go first, in order, and may go ahead of a `cpuq run` waiter for its first `patience` seconds. A waiter or holder killed outright is passed over, and its tokens go
+  back, within a second; a `cpuq tok` killed while its command runs leaves the tokens with the
+  command until its group is gone.
+- **`cpuq status`** shows the pool (`tok`: held by tok jobs, by runs, free) with the tok jobs
+  running and waiting; `--json` has them under `tok`.
+
 ## 0.29.0 — 2026-11-03
 
 - **`cpuq jobs`: a job is a folder of task files run by a driver of its own** (README, "Jobs").

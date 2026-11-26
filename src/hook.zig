@@ -103,7 +103,8 @@ const Simple = struct {
 fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32, advisor: ?Advisor) ?Refusal {
     if (w.len < 2) return null;
     const sub = w[1];
-    if (!std.mem.eql(u8, sub, "run") and !std.mem.eql(u8, sub, "lease")) return null;
+    const is_tok = std.mem.eql(u8, sub, "tok");
+    if (!std.mem.eql(u8, sub, "run") and !std.mem.eql(u8, sub, "lease") and !is_tok) return null;
     if (expandsEarly(cmd.text)) return .{
         .reason = "`$CPUQ_CORES` is expanded by your shell before cpuq sets it, so the command gets nothing there (and `make -j` with nothing after it has no limit)",
         .instead = quotedInside(a, cmd.text),
@@ -114,6 +115,11 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32
     var min_cores: ?u32 = null;
     // A lease's name comes first.
     var i: usize = if (std.mem.eql(u8, sub, "lease")) 3 else 2;
+    // A tok's count of tokens: its cores.
+    if (is_tok and i < w.len) if (std.fmt.parseInt(u32, w[i], 10)) |n| {
+        min_cores = n;
+        i += 1;
+    } else |_| {};
     while (i < w.len) : (i += 1) {
         const o = w[i];
         if (std.mem.eql(u8, o, "--")) {
@@ -132,6 +138,7 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, cpus: u32
         for (run_value_options) |takes| {
             if (std.mem.eql(u8, o, takes)) i += 1;
         }
+        if (is_tok and std.mem.eql(u8, o, "--timeout")) i += 1;
     }
     if (min_cores) |m| if (!elsewhere and m > maxAsk(cpus)) return .{
         .reason = a.print("asking for at least {d} cores on a {d}-CPU machine: a request over half the CPUs waits until the machine is nearly empty", .{ m, cpus }) catch "too many cores asked for",
@@ -806,6 +813,14 @@ test "a plain cpuq run is never refused for where it runs" {
     try std.testing.expect(!refused("cpuq run --on burst --cores 2 -- make test"));
     try std.testing.expect(!refused("ssh pup 'cd repo && cpuq run --cores 2 -- make'"));
     try std.testing.expect(!refused("cpuq lease w --host pup --exclusive -- ./bench"));
+}
+
+test "cpuq tok is checked as cpuq run is" {
+    try std.testing.expect(!refused("cpuq tok --label app:unit -- ./one_test"));
+    try std.testing.expect(!refused("cpuq tok 4 --timeout 10m --label app:build -- sh -c 'zig build -j\"$CPUQ_CORES\"'"));
+    try std.testing.expect(refused("cpuq tok 4 -- zig build"));
+    try std.testing.expect(refused("cpuq tok 2 -- make -j$CPUQ_CORES"));
+    try std.testing.expect(refused("cpuq tok 8 -- make"));
 }
 
 test "a minimum of 2 cores fits even a small machine" {

@@ -4,6 +4,7 @@ const Io = std.Io;
 const state = @import("state.zig");
 const sys = @import("sys.zig");
 const jobs = @import("jobs.zig");
+const tok = @import("tok.zig");
 
 const main = @import("main.zig");
 const texts = @import("texts.zig");
@@ -199,6 +200,8 @@ pub const JsonStatus = struct {
     boot_time: ?i64 = null,
     /// Whether `cpuq record` is sampling this machine (`cpuq samples` has its past).
     recorder: bool = false,
+    /// The token pool `cpuq tok` jobs take from, `cpuq run` grants' tokens among them.
+    tok: ?tok.JsonPool = null,
 };
 
 /// A running job (`cpuq jobs run`): its folder, its knobs and its counts.

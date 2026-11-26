@@ -439,6 +439,56 @@ them, and frozen jobs keep their memory. `cpuq status` notes a lending window an
 jobs as paused. This suits a dedicated build or benchmark machine where those processes are the
 window's work. It needs measured admission.
 
+## Tokens: cpuq tok
+
+    cpuq tok [N] [--timeout DURATION] [--label L] [--priority P] -- CMD ARGS...
+
+`cpuq tok` runs CMD once it holds N tokens (1 by default), and gives them back when CMD ends. A
+token is a CPU: a file in `tok/free/` in the state directory, taken by renaming it into
+`tok/live/` under a name that carries the taker's pid and start time. A rename succeeds for
+one taker only, so no more jobs run than there are tokens, with no lock and no daemon. Waiters
+look every tenth of a second (with a little jitter), so a token given back is taken again at
+once. It suits many small jobs, one CPU each: a test runner's programs, a build's steps.
+`cpuq run` holds a grant for the whole run, used or not; a tok job holds what it runs on.
+
+    cpuq tok --label app:unit -- ./one_test
+    cpuq tok 8 --timeout 20m --label app:link -- sh -c 'make -j"$CPUQ_CORES" link'
+
+CMD runs in a process group of its own, with `CPUQ_CORES=N` and a GNU make jobserver of N slots
+in `MAKEFLAGS`, and on Linux with `affinity` on,
+confined to one CPU per token (by the tokens' numbers), listed in `CPUQ_CPUS`. INT, TERM, HUP
+and QUIT sent to cpuq go to CMD's group; CMD's exit status is cpuq's. `--timeout` asks the
+group to stop (SIGTERM) after that long, makes it (SIGKILL) 10 seconds on, and exits 124, as
+GNU timeout does. A `cpuq tok` or `cpuq run` inside a tok job runs at once, within its tokens.
+CMD is not in the terminal's foreground: one that reads the terminal belongs under `cpuq run`.
+
+**One budget.** The pool holds the budget's worth of tokens (`admit = cores`), or the target's,
+rounded up (measured admission). A `cpuq run` grant takes its tokens from the same pool, all or
+none within the budget; under measured admission it takes as many as the job is expected to
+use. So a CPU is held by a run or by a tok job, never both. The machine's gates hold tok jobs as
+they hold runs (memory, disk, and the load valve, in either mode, since work outside cpuq still
+runs). With a shared budget, both kinds wait in one order: `--priority` class, then arrival.
+
+**Jobs needing several tokens** keep what they take and fight on until they have N; they never
+give back and retry. Two such jobs each holding part of the pool could wait on each other for
+good, so only one may hold part of what it needs: the first waiter in line that needs more than
+one (by priority class, then arrival, `cpuq run`'s waiters included), which then holds
+`tok/reserve`. Every other waiter needing several holds nothing until its turn, and `cpuq run`
+admits nobody while it fights. One-token jobs ahead of it in line go first, in order; those
+behind it wait. A `cpuq run` waiter holds back the one-token jobs behind it only once it has
+waited `patience` seconds (30); until then they may go ahead, as backfill lets jobs go ahead of
+the head. Every holder ends and gives back, and every token given back goes to the one
+fighting or to one of the finitely many jobs ahead of it, so it gets its N; then the next in
+line has its turn.
+
+**Holders that die.** Any waiter, once a second, gives back the tokens of a holder that is gone:
+its pid names no process, or one that started at another time (the pid was reused). A
+`cpuq tok` killed outright while its command runs leaves its tokens with the command, until
+the command's process group has no process left, as a `cpuq run` killed outright leaves its
+cores with its command. Waiters that die are passed over. `cpuq status` shows the pool (tokens
+held by tok jobs, by runs, and free), and the tok jobs running and waiting, a job that holds
+some of its tokens with how many, and a holder whose cpuq is gone with a `*`.
+
 ## Jobs: a folder of task files
 
 A job too big for one command, such as a test suite of thousands of programs, is a folder that a
@@ -977,8 +1027,8 @@ In this mode a few things keep reserved cores from sitting idle:
 | `CPUQ_HOLD_QUIET` | seconds a `--hold` that has had heartbeats waits for the next before it ends (60) |
 | `CPUQ_WINDOW_OWNER` | for a `--hold --exclusive` window with `window_lend`: the PID whose process tree is its owner's work |
 | `NO_COLOR` | draw `cpuq status` and `cpuq history` without color |
-| `CPUQ_CORES` | set for CMD: its grant |
-| `CPUQ_TOKEN` | set for CMD: its hold, which makes runs inside it nested |
+| `CPUQ_CORES` | set for CMD: its grant (for `cpuq tok`, its tokens) |
+| `CPUQ_TOKEN` | set for CMD: its hold, which makes runs inside it nested (`tok-PID-START` inside `cpuq tok`) |
 | `CPUQ_PROGRESS` | set for CMD: a file it may write `DONE TOTAL FAILING` to, shown in `cpuq status` |
 | `CPUQ_LEASES` | set for CMD: the named leases it runs inside, `NAME=ID` here and `NAME@HOST=ID:PID` on HOST |
 | `MAKEFLAGS` | set for CMD: a GNU make jobserver with `CPUQ_CORES` slots; other flags kept |
@@ -987,6 +1037,7 @@ In this mode a few things keep reserved cores from sitting idle:
 |---|---|
 | CMD's own | the command ran; its exit status passes through |
 | 128+N | the command was killed by signal N (cpuq dies by the same signal) |
+| 124 | `cpuq tok --timeout` stopped the command |
 | 75 | gave up waiting (`--max-wait`, `cpuq cancel`, a `--hold` whose holder went away); the command never ran |
 | 125 | cpuq itself failed (the state directory, `status --host`, a control target that matches nothing) |
 | 126, 127 | the command is not executable, or not found |

@@ -36,6 +36,7 @@ const status = @import("status.zig");
 const jobs = @import("jobs.zig");
 const agent = @import("agent.zig");
 const lines = @import("lines.zig");
+const tok = @import("tok.zig");
 
 const cmdRun = runner.cmdRun;
 const cmdJob = runner.cmdJob;
@@ -52,6 +53,7 @@ const cmdHistory = records.cmdHistory;
 const cmdStatus = status.cmdStatus;
 
 test {
+    _ = tok;
     _ = jobs;
     _ = agent;
     _ = lines;
@@ -91,6 +93,7 @@ const usage =
     \\usage: cpuq run [run options] [--] CMD [ARGS...]
     \\       cpuq lease NAME [lease options] [--] CMD [ARGS...]
     \\       cpuq lease NAME --host HOST --hold [lease options]
+    \\       cpuq tok [N] [--timeout DURATION] [--label L] [--priority P] -- CMD [ARGS...]
     \\       cpuq wait --label PATTERN [--max-wait SECONDS]
     \\       cpuq status [--host HOST]... [--json] [--no-usage] [--watch[=SECONDS]]
     \\       cpuq history [--label PATTERN] [--limit N] [--json]
@@ -139,6 +142,13 @@ const usage =
     \\                        `held NAME@HOST ENTRY` and hold until stdin closes
     \\  --exclusive           also hold the machine alone (HOST's, with --host)
     \\  --priority, --label, --max-wait   as for run
+    \\
+    \\tok (N tokens, default 1, one per CPU, taken by rename from the pool cpuq run
+    \\grants come from too; CMD runs in a process group of its own and the tokens go
+    \\back when it ends):
+    \\  --timeout DURATION    stop CMD's group after this long (SIGTERM, SIGKILL 10 s
+    \\                        on); exit 124
+    \\  --label, --priority   as for run
     \\
     \\commands:
     \\  wait                  until no job whose label matches runs or waits
@@ -236,6 +246,7 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
     if (std.mem.eql(u8, cmd, "cap")) return cap.main(ctx.arena, args[1..], ctx.env.get("CPUQ_CGROUP"), ctx.env.get("PATH"));
     if (std.mem.eql(u8, cmd, "run")) return cmdRun(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "lease")) return cmdLease(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "tok")) return tok.cmdTok(ctx, args[1..]);
     loadConfig(ctx);
     if (std.mem.eql(u8, cmd, "status")) return cmdStatus(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "agent")) return agent.cmdAgent(ctx, args[1..]);
