@@ -8,6 +8,9 @@ User-visible changes to cpuq. Each version's section is its release notes.
   milliseconds. If status can't take the lock within 5 s, it names the process holding it, how
   long it has held it and its command, then exits 125. Each holder writes that note into the
   lock file as it takes the lock.
+- **Ctrl-Z then a quick `fg` no longer leaves a run stopped for good.** If the continue came
+  while cpuq was still busy (waiting for the pool's lock), cpuq acted on the stop afterwards and
+  stopped itself, with no continue to follow. A continue now cancels a stop not yet acted on.
 - **A test of everything at once.** For about 10 s on a pool of 2, it runs batches of tasks,
   single and urgent runs, two drains at a time, kills, Ctrl-Z and continue, and polls status
   every 0.3 s. Nothing may hang, and the pool must end empty. On 0.30.0 it catches the

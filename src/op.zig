@@ -98,7 +98,10 @@ fn onTstp(_: c.SIG) callconv(.c) void {
     _ = c.write(self_pipe[1], "z", 1);
 }
 
+/// A continue cancels a stop not yet acted on: the shell (or whoever sent both) now counts the
+/// run as running, so stopping after it would leave the run stopped for good.
 fn onCont(_: c.SIG) callconv(.c) void {
+    got_tstp.store(false, .release);
     _ = c.write(self_pipe[1], "g", 1);
 }
 

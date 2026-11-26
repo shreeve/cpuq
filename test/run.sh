@@ -80,6 +80,16 @@ since() { python3 -c "import time; print('%.2f' % (time.time() - $1))"; }
 # fl EXPR: 0 when the Python expression is true (float comparisons).
 fl() { python3 -c "import sys; sys.exit(0 if $1 else 1)"; }
 
+# tmo SECONDS CMD...: CMD with a time limit (macOS has no timeout(1)): 124 when it ran out and
+# ended on SIGTERM, 137 when it then needed SIGKILL (5 s later); else CMD's status.
+tmo() { python3 -c 'import subprocess, sys
+p = subprocess.Popen(sys.argv[2:])
+def rc(r): return 128 - r if r < 0 else r
+try: sys.exit(rc(p.wait(float(sys.argv[1]))))
+except subprocess.TimeoutExpired: pass
+p.terminate()
+try: p.wait(5); sys.exit(124)
+except subprocess.TimeoutExpired: p.kill(); p.wait(); sys.exit(137)' "$@"; }
 # poll SECONDS CONDITION: until CONDITION (evaluated) holds, about every 0.05 s; 1 if it never does.
 poll() { local i=0 n=$(($1 * 20)); until eval "$2"; do i=$((i + 1)); [ $i -ge $n ] && return 1; sleep 0.05; done; }
 holds() { "$CPUQ" status --json --no-usage | python3 -c 'import json, sys
@@ -368,7 +378,7 @@ open(sys.argv[2], "w").write("%d" % os.getpid())
 time.sleep(30)' "$CPUQ_DIR/v2/lock" "$T/holder" & local h=$!
   wait_file "$T/holder"
   local t0 out rc dt; t0=$(now)
-  out=$(timeout 20 "$CPUQ" status 2>&1); rc=$?; dt=$(since "$t0")
+  out=$(tmo 20 "$CPUQ" status 2>&1); rc=$?; dt=$(since "$t0")
   kill $h; wait $h 2>/dev/null
   echo "  $out"
   check "status names a stuck holder of the pool's lock and fails (rc $rc after ${dt}s)" \
@@ -384,7 +394,7 @@ t_storm() {
   setup storm
   local L=$T/rc; : >"$L"
   # t CMD...: run CMD with a 60 s limit, noting a hang.
-  t() { timeout -k 5 60 "$@" >/dev/null 2>&1; local rc=$?; case $rc in 124|137) echo "hang: $*" >>"$L" ;; esac; return 0; }
+  t() { tmo 60 "$@" >/dev/null 2>&1; local rc=$?; case $rc in 124|137) echo "hang: $*" >>"$L" ;; esac; return 0; }
   local end=$(( $(date +%s) + 10 )) pids=""
   ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" run -n 3 -t 20s --label s:many -- sh -c 'sleep 0.$((CPUQ_TASK * 2))'; done ) & pids="$pids $!"
   ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" run --label s:one -- sleep 0.1; done ) & pids="$pids $!"
@@ -403,7 +413,7 @@ t_storm() {
     done ) & pids="$pids $!"
   local polls=0 stuck=0
   while [ "$(date +%s)" -lt $end ]; do
-    timeout -k 2 10 "$CPUQ" status --json --no-usage >/dev/null 2>&1 || stuck=$((stuck + 1))
+    tmo 10 "$CPUQ" status --json --no-usage >/dev/null 2>&1 || stuck=$((stuck + 1))
     polls=$((polls + 1)); sleep 0.3
   done
   local t0; t0=$(now)
@@ -469,6 +479,24 @@ t_ctrl_z() {
   reap $a; ra=$?
   check "one task stopped gives its CPU back (freed: $freed), a newcomer runs (rc $rb), and continued it finishes (rc $ra, $(cat "$T/done" 2>/dev/null))" \
     "[ $freed = yes ] && [ $rb = 0 ] && [ $ra = 0 ] && [ \"\$(cat '$T/done' 2>/dev/null)\" = finished ]"
+  # A stop and a continue that both land while cpuq is busy (here: blocked on the pool's lock,
+  # held from outside), as from Ctrl-Z then a quick fg: the continue cancels the stop, and the
+  # run goes on to finish once the lock and its CPU come.
+  "$CPUQ" run --label z:hold -- sleep 4 & local h=$!
+  wait_held 1
+  dfl "$CPUQ" run -n 2 --label z:race -- true 2>/dev/null & a=$!
+  wait_waiters 1
+  python3 -c 'import fcntl, sys, time
+f = open(sys.argv[1], "r+"); fcntl.flock(f, fcntl.LOCK_EX); open(sys.argv[2], "w").write("1"); time.sleep(2.5)' "$CPUQ_DIR/v2/lock" "$T/locked" & local p=$!
+  wait_file "$T/locked"
+  sleep 1.5  # the waiter's 1 s settle blocks on the lock
+  # Apart, so cpuq's handler takes the stop first (a continue discards a stop still pending).
+  kill -TSTP $a; sleep 0.2; kill -CONT $a
+  wait $p
+  local ended=no st2=""
+  if poll 8 "! kill -0 $a 2>/dev/null"; then ended=yes; else st2=$(ps -o stat= -p $a | tr -d ' '); kill -CONT $a; fi
+  reap $a; wait $h
+  check "a stop then a continue while cpuq is busy leave the run running: it finishes (ended: $ended $st2)" "[ $ended = yes ]"
 }
 
 t_nested() {
