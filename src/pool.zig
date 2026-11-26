@@ -348,7 +348,8 @@ pub const Pool = struct {
 pub const Group = struct { pgid: i32, start: u64, alone: bool = false };
 
 /// Ends the task groups a dead holder noted on a CPU's token: each whose leader still runs with
-/// the same start time (a pgid alone may name another group by now) gets SIGKILL.
+/// the same start time (a pgid alone may name another group by now) gets SIGKILL, and is waited
+/// for.
 fn killLeftovers(text: []const u8) void {
     var lines = std.mem.tokenizeScalar(u8, text, '\n');
     while (lines.next()) |line| {
@@ -359,6 +360,13 @@ fn killLeftovers(text: []const u8) void {
         if (sys.procStart(pgid) != start) continue;
         const alone = if (f.next()) |m| std.mem.eql(u8, m, "p") else false;
         _ = std.c.kill(if (alone) pgid else -pgid, .KILL);
+        // A kill lands a moment later: wait for the leader to be gone (at most 200 ms), so the
+        // CPU's next task never shares it with what is left.
+        var waited: u32 = 0;
+        while (waited < 100 and sys.procStart(pgid) == start) : (waited += 1) {
+            var ts: std.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&ts, null);
+        }
     }
 }
 

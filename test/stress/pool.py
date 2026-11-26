@@ -15,7 +15,7 @@
 #
 # `CPUQ=path` picks the binary. It runs in a scratch state dir of its own (CPUQ_DIR), with
 # `budget` CPUs from CPUQ_BUDGET (default: every CPU). Run it outside any cpuq job.
-import glob, os, random, signal, subprocess, sys, tempfile, time
+import glob, os, random, shutil, signal, subprocess, sys, tempfile, time
 
 cpuq = os.environ.get("CPUQ", os.path.join(os.getcwd(), "bin/cpuq"))
 tasks = int(sys.argv[1]) if len(sys.argv) > 1 else 100
@@ -76,6 +76,7 @@ ends = {(l[3], l[4], l[5]): float(l[1]) for l in lines if l[0] == "E"}
 kill_at = {str(pid): t for kind, pid, t in killed if kind == "task"}
 parent_kill = next((t for kind, _, t in killed if kind == "parent"), None)
 intervals = []
+t_first = min((t0 for t0, _ in starts.values()), default=0)
 for key, (t0, cpu) in starts.items():
     proj, _, pid = key
     t1 = ends.get(key) or kill_at.get(pid)
@@ -85,6 +86,19 @@ for key, (t0, cpu) in starts.items():
         t1 = t0 + ms / 1000
     intervals.append((t0, t1, cpu, proj))
 
+# Each pair of tasks that overlapped on one CPU, with how each ended.
+how = {}
+for (proj, task, pid), (t0, cpu) in starts.items():
+    how[(t0, cpu, proj)] = "ended" if (proj, task, pid) in ends else ("killed" if pid in kill_at else ("parent killed" if proj == victim_parent else "no end"))
+overlaps = []
+by = {}
+for iv in intervals:
+    by.setdefault(iv[2], []).append(iv)
+for cpu, ivs in by.items():
+    ivs.sort()
+    for x, y in zip(ivs, ivs[1:]):
+        if y[0] < x[1]:
+            overlaps.append((cpu, x, y))
 events = sorted([(t0, 1, cpu, p) for t0, t1, cpu, p in intervals] + [(t1, -1, cpu, p) for t0, t1, cpu, p in intervals])
 running, per_cpu, peak, shared = 0, {}, 0, 0
 for t, d, cpu, p in events:
@@ -128,8 +142,14 @@ def alive_pid(pid):
 alive = [pid for (_, _, pid) in starts if alive_pid(pid)]
 print("pool: %d tasks of %d ms in 3 projects, %d kills (%s)" % (len(intervals), ms, len(killed), ", ".join(k for k, _, _ in killed)))
 print("most running at once: %d; times two tasks shared a CPU: %d" % (peak, shared))
+for cpu, x, y in overlaps[:5]:
+    print("  CPU %s: %s from %.3f to %.3f (%s), %s from %.3f (%s): %.1f ms together" % (
+        cpu, x[3], x[0] - t_first, x[1] - t_first, how[(x[0], x[2], x[3])], y[3], y[0] - t_first, how[(y[0], y[2], y[3])], 1000 * (x[1] - y[0])))
 if gaps:
     print("hand-off: median %.1f ms, p99 %.1f ms, max %.1f ms (%d hand-offs)" % (gaps[len(gaps) // 2], gaps[int(len(gaps) * .99)], gaps[-1], len(gaps)))
 print("shares while all ran: " + ", ".join("%s %.0f%%" % (p, 100 * v / total) for p, v in sorted(share.items())))
 print("left behind: %d op records, %d task processes" % (len(ops_left), len(alive)))
 print("work dir: " + work)
+
+if not os.environ.get("KEEP"):
+    shutil.rmtree(work, ignore_errors=True)
