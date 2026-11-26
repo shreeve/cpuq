@@ -2,6 +2,17 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.30.2
+
+- **`cpuq status` names a stuck pool instead of hanging.** Every step under the pool's lock takes
+  milliseconds. If status can't take the lock within 5 s, it names the process holding it, how
+  long it has held it and its command, then exits 125. Each holder writes that note into the
+  lock file as it takes the lock.
+- **A test of everything at once.** For about 10 s on a pool of 2, it runs batches of tasks,
+  single and urgent runs, two drains at a time, kills, Ctrl-Z and continue, and polls status
+  every 0.3 s. Nothing may hang, and the pool must end empty. On 0.30.0 it catches the
+  two-drain deadlock.
+
 ## 0.30.1 — 2026-11-26
 
 - **Two `cpuq drain`s at once no longer stop every cpuq on the machine.** A second drain waited

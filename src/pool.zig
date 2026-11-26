@@ -76,6 +76,43 @@ pub const Pool = struct {
 
     pub fn lock(p: *Pool) void {
         p.lock_file.lock(p.io, .exclusive) catch |err| std.debug.panic("cpuq: the pool's lock: {t}", .{err});
+        p.noteHolder();
+    }
+
+    /// Takes the lock if it comes within `ms` milliseconds. Every step under the lock is
+    /// short, so a lock held longer means its holder is stuck: see `holder`.
+    pub fn lockWithin(p: *Pool, ms: i64) bool {
+        const end = sys.monoMs() + ms;
+        while (true) {
+            if (p.lock_file.tryLock(p.io, .exclusive) catch false) {
+                p.noteHolder();
+                return true;
+            }
+            if (sys.monoMs() >= end) return false;
+            p.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        }
+    }
+
+    /// Who took the lock last, and when: the lock file's one line, `PID MS` (milliseconds of
+    /// the real clock), written by each holder as it takes the lock.
+    pub const Holder = struct { pid: i32, since_ms: i64 };
+
+    fn noteHolder(p: *Pool) void {
+        var buf: [40]u8 = undefined;
+        const ms = Io.Clock.real.now(p.io).toMilliseconds();
+        const line = std.fmt.bufPrint(&buf, "{d:>12} {d:>16}\n", .{ std.c.getpid(), ms }) catch return;
+        _ = std.c.pwrite(p.lock_file.handle, line.ptr, line.len, 0);
+    }
+
+    /// The lock's holder as its note says; null when there is no note.
+    pub fn holder(p: *Pool) ?Holder {
+        var buf: [40]u8 = undefined;
+        const n = std.c.pread(p.lock_file.handle, &buf, buf.len, 0);
+        if (n <= 0) return null;
+        var it = std.mem.tokenizeAny(u8, buf[0..@intCast(n)], " \n");
+        const pid = std.fmt.parseInt(i32, it.next() orelse return null, 10) catch return null;
+        const ms = std.fmt.parseInt(i64, it.next() orelse return null, 10) catch return null;
+        return .{ .pid = pid, .since_ms = ms };
     }
 
     pub fn unlock(p: *Pool) void {

@@ -402,6 +402,20 @@ fn whyText(a: std.mem.Allocator, place: usize, o: Op, pool: u32, gate: JsonGate,
 
 /// The pool's status, from the operations' records, the line's order and a short look at what
 /// their tasks keep busy.
+/// The pool's lock didn't come within 5 s. Each step under it takes milliseconds, so its
+/// holder is stuck, and every cpuq on the machine waits behind it: name the holder, and exit.
+fn lockStuck(ctx: *Ctx, pool: *Pool) noreturn {
+    const h = pool.holder() orelse main.fail("the pool's lock ({s}/lock) is held past 5 s by a process that left no note: every cpuq here waits for it", .{pool.path});
+    const held_s = @divTrunc(Io.Clock.real.now(ctx.io).toMilliseconds() - h.since_ms, 1000);
+    const cmd = ctx.arena.dupe(u8, sys.procCommand(ctx.arena, ctx.io, h.pid, 160)) catch main.fail("out of memory", .{});
+    for (cmd) |*ch| if (ch.* == '\n' or ch.* == '\t') {
+        ch.* = ' ';
+    };
+    main.fail("the pool's lock is held by pid {d} for {d}s{s}{s}{s}: every cpuq here waits for it, so that process is stuck. Report this line; ending that process frees the pool (its owner's call)", .{
+        h.pid, held_s, if (cmd.len != 0) " (" else "", cmd, if (cmd.len != 0) ")" else " (gone)",
+    });
+}
+
 fn collect(ctx: *Ctx, measure: bool) JsonStatus {
     const io = ctx.io;
     const a = ctx.arena;
@@ -412,7 +426,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
     const ncpu = sys.activeCpus(io);
     var pool = Pool.open(io, a, dir) catch |err| main.fail("pool {s}/v2: {t}", .{ dir, err });
 
-    pool.lock();
+    if (!pool.lockWithin(5000)) lockStuck(ctx, &pool);
     const ops = pool.scan(a);
     const given = pool.promises(a, ops, pool_cpus);
     const free = freeCpus(&pool, a, pool_cpus, ops, given);

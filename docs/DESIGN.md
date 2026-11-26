@@ -29,7 +29,8 @@ written, cpuq fails; it never falls back to another directory.
 The pool lives under a versioned folder, `v2/`, so a cpuq of another version never reads these
 files as its own, and an old and a new cpuq never hand out the same CPU (src/pool.zig):
 
-    v2/lock             the pool's lock: every scan, take, promise and release happens under it
+    v2/lock             the pool's lock: every scan, take, promise and release happens under it;
+                        its text, `PID MS`, names the last process to take it and when
     v2/seq              the last ticket number handed out
     v2/ops/C-TICKET     one per running operation, exclusively locked by its cpuq for its whole
                         life (C: 0 urgent, 1 normal); its text is the operation's record
@@ -37,10 +38,18 @@ files as its own, and an old and a new cpuq never hand out the same CPU (src/poo
     v2/cpus/N           one per pool CPU, named by the CPU's number; an exclusive lock is a
                         held CPU; its text names the task groups running on it
     v2/grants/N         a promise of CPU N to one operation: its ticket
-    v2/drain            locked while `cpuq drain` waits for or holds the machine
+    v2/drain            each `cpuq drain` holds a shared lock on it while it waits for or holds
+                        the machine
     v2/ticks            the last sample of the machine's CPU ticks, for the outside-load gate
     named/NAME/         a named lease: a queue of its own (src/state.zig)
     scopes-ok           whether systemd user scopes work here, probed at most every 10 min
+
+Nothing under the pool's lock waits on another process for long: it takes other locks only by
+trying (the token files, the op records) or on files no one holds exclusively (a new record
+under a temporary name, the drain mark), and waits at most 200 ms for a dead holder's leftover
+tasks to go. A holder that broke this would stop every cpuq on the
+machine, so `cpuq status` waits for the lock at most 5 s, then names the holder from the lock
+file's note and exits 125.
 
 An operation's record is `key=value` lines: `pid`, `urgent`, `drain`, `project`, `label`,
 `weight`, `want` (CPUs it could use now beyond those it holds), `held` (its CPUs, by number),
@@ -253,7 +262,8 @@ line for CPUs again: each stopped task gets a place, is re-pinned there on Linux
 ## cpuq drain
 
 `cpuq drain` is an operation with `drain` and `urgent` set, `want` the whole pool while its
-command hasn't started, and no time limit. It holds `v2/drain` locked for its life. While it is
+command hasn't started, and no time limit. It holds a shared lock on `v2/drain` for its life, so
+two drains never wait for each other there; they wait in the line, and run in turn. While it is
 in the line every CPU handed out goes to it (`handOut`), and every other operation, seeing
 `v2/drain` held, marks all its CPUs draining: it starts nothing new and gives each CPU back as its
 tasks end. Once the drain holds every pool CPU its command runs, unpinned, and the CPUs go back

@@ -52,7 +52,7 @@ burst runs none. The recorder (`com.github.shreeve.cpuq.record`) stays.
     cpuq status                                  # the pool, no errors from the config
     cpuq run -- true; echo $?                    # 0
     cpuq run -n 8 -- sh -c 'echo $CPUQ_TASK'     # 8 of 8 passed
-    echo '{"tool_input":{"command":"zig build"}}' | cpuq hook; echo $?   # refused (2), with the fix
+    echo '{"tool_name":"Bash","tool_input":{"command":"zig build"}}' | cpuq hook; echo $?   # refused (2), with the fix
 
 On pop also check the remotes once all three are switched:
 

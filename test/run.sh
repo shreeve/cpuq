@@ -354,6 +354,68 @@ EOF
     "[ $r1 = 0 ] && [ $r2 = 0 ] && [ $r3 = 0 ] && [ $alone = yes ]"
 }
 
+t_lock_stuck() {
+  # A process stuck holding the pool's lock stops every cpuq on the machine. cpuq status waits
+  # for the lock at most 5 s, then names the holder (from the note each holder writes) and fails
+  # (125, cpuq itself failed).
+  setup lock-stuck
+  "$CPUQ" status >/dev/null
+  python3 -c 'import fcntl, os, sys, time
+f = open(sys.argv[1], "r+")
+fcntl.flock(f, fcntl.LOCK_EX)
+os.pwrite(f.fileno(), ("%12d %16d\n" % (os.getpid(), int(time.time() * 1000) - 60000)).encode(), 0)
+open(sys.argv[2], "w").write("%d" % os.getpid())
+time.sleep(30)' "$CPUQ_DIR/v2/lock" "$T/holder" & local h=$!
+  wait_file "$T/holder"
+  local t0 out rc dt; t0=$(now)
+  out=$(timeout 20 "$CPUQ" status 2>&1); rc=$?; dt=$(since "$t0")
+  kill $h; wait $h 2>/dev/null
+  echo "  $out"
+  check "status names a stuck holder of the pool's lock and fails (rc $rc after ${dt}s)" \
+    "[ $rc = 125 ] && fl '4.5 < $dt < 8' && [[ \"\$out\" == *'held by pid $(cat "$T/holder") for 6'?'s ('* ]]"
+  local r2; "$CPUQ" status >/dev/null; r2=$?
+  check "once the holder is gone, status works (rc $r2)" "[ $r2 = 0 ]"
+}
+
+t_storm() {
+  # Everything at once on a pool of 2, for about 10 s: runs of tasks, single and urgent runs,
+  # drains (two at a time), kills, Ctrl-Z and continue, and status every 0.3 s. Nothing may hang
+  # (each command has 60 s; a hang ends in 124, or 137 when it ignores the TERM), status always answers, and the pool ends empty.
+  setup storm
+  local L=$T/rc; : >"$L"
+  # t CMD...: run CMD with a 60 s limit, noting a hang.
+  t() { timeout -k 5 60 "$@" >/dev/null 2>&1; local rc=$?; case $rc in 124|137) echo "hang: $*" >>"$L" ;; esac; return 0; }
+  local end=$(( $(date +%s) + 10 )) pids=""
+  ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" run -n 3 -t 20s --label s:many -- sh -c 'sleep 0.$((CPUQ_TASK * 2))'; done ) & pids="$pids $!"
+  ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" run --label s:one -- sleep 0.1; done ) & pids="$pids $!"
+  ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" run --urgent --label s:urgent -- sleep 0.2; sleep 0.5; done ) & pids="$pids $!"
+  for d in 1 2; do
+    ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" drain --max 30s --label s:drain$d -- sleep 0.3; sleep 0.7; done ) & pids="$pids $!"
+  done
+  ( while [ "$(date +%s)" -lt $end ]; do
+      "$CPUQ" run --label s:victim -- sleep 5 >/dev/null 2>&1 & local v=$!
+      sleep 0.4; t "$CPUQ" kill s:victim; wait $v 2>/dev/null
+    done ) & pids="$pids $!"
+  ( while [ "$(date +%s)" -lt $end ]; do
+      dfl "$CPUQ" run -n 2 --label s:tstp -- sleep 0.5 >/dev/null 2>&1 & local z=$!
+      sleep 0.3; kill -TSTP $z 2>/dev/null; sleep 0.3; kill -CONT $z 2>/dev/null
+      reap $z
+    done ) & pids="$pids $!"
+  local polls=0 stuck=0
+  while [ "$(date +%s)" -lt $end ]; do
+    timeout -k 2 10 "$CPUQ" status --json --no-usage >/dev/null 2>&1 || stuck=$((stuck + 1))
+    polls=$((polls + 1)); sleep 0.3
+  done
+  local t0; t0=$(now)
+  wait $pids
+  local tail; tail=$(since "$t0")
+  local h w; h=$(held); w=$(waiting)
+  local hangs; hangs=$(wc -l <"$L" | tr -d ' ')
+  [ "$hangs" = 0 ] || head -5 "$L"
+  check "everything at once: no command hung ($hangs), status answered $((polls - stuck)) of $polls, all done ${tail}s after the end, pool empty (held $h, waiting $w)" \
+    "[ $hangs = 0 ] && [ $stuck = 0 ] && fl '$tail < 30' && [ '$h' = 0 ] && [ '$w' = 0 ]"
+}
+
 t_kill() {
   # cpuq kill OP, by label or ticket: SIGTERM to the run's cpuq, which ends its tasks; the run
   # exits by the signal. A label of two runs, or of none, is refused.
@@ -1890,7 +1952,7 @@ f = open(sys.argv[1]); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$sp/p/held
 
 # --- cpuq jobs and the agent (until they go) -------------------------------------------------
 
-TESTS=${*:-budget tasks pack cpus_limit timeout retry wait_max share fair order drain kill ctrl_z nested driver removed \
+TESTS=${*:-budget tasks pack cpus_limit timeout retry wait_max share fair order drain lock_stuck storm kill ctrl_z nested driver removed \
   kill_holder leftovers leaked_descendant kill_waiter term_waiting lost_seq long_command waiters_cpu \
   exit_status direct_sigint terminal_sigint tasks_sigint ignored_signals stack_limit pin repin narrow \
   status progress usage zombie outside status_host history note wait record min_available min_disk hook \
