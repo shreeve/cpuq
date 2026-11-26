@@ -158,6 +158,8 @@ const Run = struct {
     started_ms: i64,
     first_cpu_ms: i64 = 0,
     last_wait: ?sys.Waited = null,
+    /// Stopped by Ctrl-Z: it wants nothing, so the line hands it nothing, until continued.
+    stopped: bool = false,
     /// Its history: the record, when it entered the line, and the most CPUs it held at once.
     job: joblog.JobLog = undefined,
     queued_t: f64 = 0,
@@ -169,6 +171,7 @@ const Run = struct {
     }
 
     fn wantMore(r: *const Run) u32 {
+        if (r.stopped) return 0;
         if (r.rec.drain) return if (r.running.items.len == 0 and r.pending() > 0) @as(u32, @intCast(r.pool_cpus.len)) -| @as(u32, @intCast(r.slots.items.len)) else 0;
         // Places free on CPUs held and kept, against tasks waiting.
         var free_places: u32 = 0;
@@ -509,6 +512,7 @@ fn suspend_(r: *Run) void {
     for (r.slots.items) |sl| r.pool.release(sl.file);
     r.slots.clearRetainingCapacity();
     for (r.running.items) |*t| t.slot = no_slot;
+    r.stopped = true;
     r.syncRecord();
     settleOthers(r);
     r.pool.unlock();
@@ -516,6 +520,7 @@ fn suspend_(r: *Run) void {
     // SIGSTOP, not TSTP: a TSTP to a process outside job control (an agent's shell) is dropped.
     _ = c.raise(.STOP);
     // Continued.
+    r.stopped = false;
     for (r.running.items) |*t| {
         _ = c.kill(if (r.single) t.pid else -t.pid, .STOP);
         // The time stopped doesn't count against its time limit.
