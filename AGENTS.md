@@ -3,86 +3,92 @@
 Working on cpuq itself? Read [HANDOFF.md](HANDOFF.md) first.
 
 This machine is shared by several agent sessions. Run every heavy command (a build, a test suite,
-a benchmark, a fuzzer, anything that keeps more than one CPU busy for more than ~10 seconds)
-under cpuq. Not git, grep, editors or quick one-off commands.
+a benchmark, a fuzzer, anything that keeps a CPU busy for more than ~10 seconds) under cpuq. Not
+git, grep, editors or quick one-off commands.
 
 ## Shape
 
-    cpuq run --label PROJECT:TASK [--cores N | --cores MIN-MAX] -- CMD ARGS...
+    cpuq run --label PROJECT:TASK [-n M] [-x K] [-t T] [-r N] -- CMD ARGS...
 
-cpuq sets `$CPUQ_CORES` (the cores granted) for CMD, not for your shell. Pass it inside
-`sh -c` with SINGLE quotes; your shell must not expand it (it is unset there, and `make -j` with
-nothing after it has no limit):
+Every task gets one CPU. `cpuq run -- CMD` is one task: CMD runs with your terminal, and its exit
+status is cpuq's. Run it at one job:
 
-    cpuq run --label app:build --cores 2-6 -- sh -c 'zig build -j"$CPUQ_CORES" test'
-    cpuq run --label app:build --cores 2-6 -- make         # plain make: it uses cpuq's jobserver
-    cpuq run --label rs:build  --cores 2-6 -- sh -c 'cargo build -j "$CPUQ_CORES"'
-    cpuq run --label py:test   --cores 2-6 -- sh -c 'pytest -n "$CPUQ_CORES"'
-    cpuq run --label sw:build  --cores 2-6 -- sh -c 'swift build -j "$CPUQ_CORES"'
-    cpuq run --label go:build  --cores 2-6 -- sh -c 'go build -p "$CPUQ_CORES" ./...'
-    cpuq run --label app:unit  --cores 1   -- ./single_threaded_tests
+    cpuq run --label app:build -- zig build -j1
+    cpuq run --label app:build -- make                    # no -j
+    cpuq run --label rs:build  -- cargo build -j 1
+    cpuq run --label go:build  -- go build -p 1 ./...
+    cpuq run --label sw:build  -- swift build -j 1
+    cpuq run --label py:test   -- pytest                  # no -n
+    cpuq run --label app:unit  -- ./single_threaded_tests
 
-A bare `zig build` uses every CPU: always give it `-j"$CPUQ_CORES"`.
+A bare `zig build`, `cargo`, `go build` or `swift build` starts a job per CPU of the machine, all on
+one task's CPU. Always give the one-job option. Linux pins a task to its CPU; macOS can't.
 
-Work that runs inside a container or VM (`incus exec`, `docker exec`) is invisible to cpuq's
-measurements: add `--opaque` and a fixed `--cores`, so it counts at its whole grant until the
-machine's own busy time says otherwise. Only for those: a VM or program the command starts itself
-(`qemu`, a local server) is in its process tree, and `--opaque` there holds cores it never uses.
+## Parallel work: -n M tasks
 
-## Cores
+Split parallel work into tasks. `-n M` runs CMD M times, each task on a CPU of its own, as many at
+once as the pool gives. Each gets `CPUQ_TASK` (1 to M) and `CPUQ_TASKS` to pick its piece. cpuq sets
+them for CMD, not for your shell: use `sh -c` with SINGLE quotes.
 
-- Same label, run before: omit `--cores`; its history sizes the job.
-- Single-threaded: `--cores 1`. Parallel: a range, `--cores 2-6`.
-- Never more than half the CPUs; never a big fixed count "to be safe".
-- One job per phase: compile with `--cores 2-6`, then test with `--cores 1`.
+    cpuq run --label app:test -n 16 -- sh -c './test/shard "$CPUQ_TASK" "$CPUQ_TASKS"'
+    cpuq run --label app:fuzz -n 500 -t 2m -- sh -c './fuzz "$(sed -n "${CPUQ_TASK}p" cases.txt)"'
+
+- Each task's output goes to a file of its own. The summary at the end names the failed tasks with
+  their last lines, and the folder. Exit 0 when every task passed, else 1.
+- `-x K`: K tasks share each CPU. Only for work that mostly waits (network, sleep, a server):
+  K = 1 + time waiting ÷ time computing. Never for computing.
+- `-t T`: each task's time limit, about ten times its usual time (`-t 30s`; default 1h).
+- `-r N`: try a failed task up to N more times (`CPUQ_ATTEMPT` says which try). Flaky work only.
+- `-c C`: hold at most C CPUs, or `-c 25%`. Usually leave it out.
+- One run per phase: build with one task, then test with `-n M`.
 
 ## Labels
 
 `project:task`, lowercase, the same on every run (`app:test`, `db:build`). No run ids, dates or
-branch names: history sizes jobs and estimates waits by label.
+branch names: history is kept by label.
 
 ## Waiting
 
 - Usually under a second; can be minutes. Your tool's timeout may kill the wait: run long jobs
-  in the background, or pass `--max-wait SECONDS` below your tool's timeout.
-- `--max-wait` gives up with exit 75, and the command never ran. Rerun it later; never retry in
+  in the background, or pass `--wait-max SECONDS` below your tool's timeout.
+- `--wait-max` gives up with exit 75, and the command never ran. Rerun it later; never retry in
   a loop.
-- `cpuq status --json` shows the queue and each waiter's `eta` in seconds.
-- `cpuq wait --label 'proj:*' --max-wait 600` waits until no job with a matching label runs or
+- `cpuq status` shows who holds which CPU and why each waiter waits; `--json` for programs.
+- `cpuq wait --label 'proj:*' --max-wait 600` waits until no run with a matching label runs or
   waits.
+- `--urgent` puts a run's first CPU ahead of the line: only for a rebuild a human is waiting on.
+
+## Timing
+
+    cpuq drain --label app:bench --max 10m -- ./bench
+
+Every run gives its CPUs back as its tasks end; then CMD runs alone, unpinned, and the CPUs go back
+when it ends. `--max` gives up with exit 75. It stops everyone: only for real timing.
 
 ## Another machine
 
 `cpuq run` always runs here. `--on HOST` sends it to HOST, one of this machine's remotes
-(`grep remotes ~/.config/cpuq/config`), for work too big for this machine, not to skip its queue:
+(`grep remotes ~/.config/cpuq/config`), for work too big for this machine, not to skip its line:
 
-    cpuq run --on burst --label app:build --cores 8-32 -- sh -c 'zig build -j"$CPUQ_CORES" test'
+    cpuq run --on burst --label app:build -- zig build -j1
+    cpuq run --on burst --label app:test -n 64 -t 10m -- sh -c './test/shard "$CPUQ_TASK" 64'
 
-The repo is copied there by rsync, the job waits in HOST's own queue, a stopped cloud machine is
-started first, and its output and exit status come back as usual. The command must stay inside
-the repo: absolute paths here (a scratchpad file) don't exist there. `--return zig-out` copies a
-build's output back. Gitignored inputs the job needs (a vendored tree, `.git` for `git ls-files`)
-go in the repo's `.cpuqinclude` (beside `.gitignore`, a path a line), or `--include PATH`. `.git`
-goes trimmed to git's own parts, a worktree's included. Environment variables set here don't
-travel, so set them inside the command.
+The repo is copied there by rsync, the run waits in HOST's own line, a stopped cloud machine is
+started first, and its output and exit status come back as usual. The copy persists, so the second
+run finds the first's build. The command must stay inside the repo: absolute paths here (a
+scratchpad file) don't exist there. `--return zig-out` copies a build's output back. Gitignored
+inputs the job needs (a vendored tree, `.git` for `git ls-files`) go in the repo's `.cpuqinclude`
+(beside `.gitignore`, a path a line), or `--include PATH`. `.git` goes trimmed to git's own parts,
+a worktree's included. Environment variables set here don't travel, so set them inside the command.
+A task's output file stays on HOST.
 
-Never run work on another machine outside cpuq (`ssh HOST 'make'`): its queue can't share what it
+Never run work on another machine outside cpuq (`ssh HOST 'make'`): its line can't share what it
 doesn't see.
 
-A big job for a cloud host, run in the background:
-
-    cpuq run --on burst --label proj:matrix --cores 8-32 --return .zig-cache/gate.log -- sh -c '
-      : >.zig-cache/gate.log; mkdir -p "$HOME/cpuq/caches/proj/results"
-      zig build -j"$CPUQ_CORES" >>.zig-cache/gate.log 2>&1 &&
-      PROJ_RESULTS_CACHE=$HOME/cpuq/caches/proj/results timeout 90m ./test/run -j "$CPUQ_CORES" >>.zig-cache/gate.log 2>&1
-      rc=$?; grep -E "^(fail|FAIL)" .zig-cache/gate.log | head -20; tail -2 .zig-cache/gate.log
-      rm -rf .zig-cache/proj-test; exit $rc'
-
 - **The label** stays the same on every run, never a branch name.
-- **The cores:** at most a third of the host's CPUs.
 - **Caches** go under `$HOME/cpuq/caches/PROJECT/`, outside the per-worktree copy, so every
   branch shares them.
-- **A time limit** inside the command.
+- **A time limit:** `-t` on every run there.
 - **Scratch** is deleted at the end, with relative paths.
 - **Tools the host lacks** are pinned by commit under that cache, never fetched unpinned.
 
@@ -112,20 +118,26 @@ Where a repo keeps specs in `cpuq/*.json`, heavy work goes through them:
   `--replace`. For a repro beside a full run, use `--again`.
 - **Tools a spec names in `packs`** (zig, rig, nexus at a version) are on the job's PATH there;
   `cpuq packs --host burst` lists what a host has.
-- **Never** edit or write specs, add -j, --cores, hosts or rm -rf to them, loop on a verdict
-  that isn't about your code, or cancel another worktree's job.
+- **Never** edit or write specs, add -j, hosts or rm -rf to them, loop on a verdict that isn't
+  about your code, or cancel another worktree's job.
 
 ## Test runners
 
-A runner that starts many programs limits each with `cpuq cap`, never with a watchdog that lists
-every process (`ps`):
+A runner whose tests are independent runs them as tasks:
 
-    cpuq run --label proj:test --cores 2-6 -- sh -c './test/run -j "$CPUQ_CORES"'
-    cpuq cap --mem 2G --time 120s --output 1M --pids 512 -- PROGRAM ARGS...   # in the runner, per program
+    cpuq run --label proj:test -n "$(./test/count)" -t 2m -- sh -c './test/one "$CPUQ_TASK"'
 
-- **cap is a limit, not a queue:** it takes no cores, and the hook judges what it runs as if typed
+A runner that starts a `cpuq run` per test (swarm, `test/run`) runs under `--driver`: it holds no
+CPU, and each run it starts takes its own. Limit each program it starts with `cpuq cap`, never with
+a watchdog that lists every process (`ps`):
+
+    cpuq run --label proj:test --driver -- ./test/run
+    cpuq run --label proj:case -- cpuq cap --mem 2G --time 120s --output 1M --pids 512 -- PROGRAM ARGS...   # in the runner
+
+- **`--driver` is for a test runner only.** A build under it holds no CPU; the hook refuses it.
+- **cap is a limit, not a queue:** it takes no CPU, and the hook judges what it runs as if typed
   alone.
-- **Put it inside `cpuq run`, never around it:** its `--time` would count the time spent queued.
+- **Put it inside `cpuq run`, never around it:** its `--time` would count the time spent waiting.
 - **Exit:**
   - PROGRAM's own status, or 128+N if signal N killed it (with `--no-crash-report` on macOS, cap
     exits 128+N itself rather than dying by the signal);
@@ -134,49 +146,41 @@ every process (`ps`):
   - 2 on bad usage, before PROGRAM runs.
 - **`--output`** needs stdout and stderr redirected to files or /dev/null. A pipe (`| tee`) exits
   2: don't count that as a test failure.
-- **`--mem` on Linux inside a job** counts page cache and tmpfs too, so a limit tuned on the Mac
-  can trip on Linux.
+- **`--mem` on Linux** inside a `--driver` runner is the kernel's limit, and counts page cache and
+  tmpfs too, so a limit tuned on the Mac can trip on Linux. Elsewhere cap reads memory once a
+  second.
 - **A test that panics on purpose:** add `--no-crash-report`, so no crash report is made for it
   (macOS's .ips, Linux's apport, which takes seconds a crash). Only on the program meant to
   crash: what it starts inherits it, and a real crash there (a compiler's) must still be
   reported.
 
-A runner that knows its test count reports progress, so status shows how far it is and the time
-left (`4210/12629 33% · 3 failing · ~9m left`): one line, `DONE TOTAL FAILING`, written whole at
-most once a second and once at the end:
+Inside a submitted job, a runner that knows its test count reports progress, so status shows how
+far it is and the time left: one line, `DONE TOTAL FAILING`, written whole at most once a second
+and once at the end:
 
     printf '%d %d %d\n' "$done" "$total" "$failing" > "$CPUQ_PROGRESS.tmp" && mv "$CPUQ_PROGRESS.tmp" "$CPUQ_PROGRESS"
 
 ## Exit status
 
-- CMD's own status passes through; 128+N: CMD was killed by signal N.
-- 75: gave up waiting (`--max-wait`, or `cpuq cancel`); CMD never ran.
-- 125: cpuq itself failed. 126/127: CMD is not executable / not found. 2: usage or config error.
-
-## Timing (benchmarks only)
-
-`--exclusive` drains the machine and holds it alone; use it only for real timing. If cpuq warns
-that work outside the window is using CPUs (stderr, and `noise` in `cpuq history --json`), the
-timings may be noisy: rerun them. Where
-`exclusive = off`, it runs as an ordinary job (it says so on stderr) and your numbers are not
-quiet; `cpuq status --no-usage | grep 'exclusive runs are off'` finds out first. Time on a
-machine that allows it:
-
-    ssh buildbox 'cd repo && cpuq run --exclusive --label app:bench -- ./bench'
+- One task: CMD's own status passes through; 128+N: CMD was killed by signal N; 124: CMD reached
+  its time limit (`-t`).
+- `-n M`: 0 when every task passed, else 1.
+- 75: gave up waiting (`--wait-max`); CMD never ran.
+- 125: cpuq itself failed. 126/127: CMD is not executable / not found. 2: usage or config error,
+  or a removed option (the line names its replacement).
 
 ## The hook
 
 Where `cpuq hook` is installed (Claude Code's PreToolUse hook), a heavy command run outside cpuq,
-or a misused `cpuq run`, is refused with the corrected command: run that instead. Mark a command
-`# cpuq: skip` only when it truly must run as it is.
+a removed option, or a `cpuq run` whose command would start more than one job, is refused with
+the corrected command: run that instead. Mark a command `# cpuq: skip` only when it truly must
+run as it is.
 
 ## Don't
 
-- `--priority high` (except a release gate a human is waiting on), `--no-load-check`,
-  `--qos none`.
-- `cpuq first`/`start`/`cancel`/`pause`/`resume`/`stop` on jobs you did not start; they act on
-  anyone's. Never `start` or `first` your own job to skip the queue.
+- `--urgent` (except a rebuild a human is waiting on), `cpuq drain` for anything but timing.
+- `cpuq kill` on runs you did not start: it acts on anyone's.
 - Kill a waiting cpuq to retry it, or wrap a whole session or interactive shell in `cpuq run`.
 
-A `cpuq run` inside a running one starts at once, within the parent's grant: its `--cores` is
-ignored and `$CPUQ_CORES` stays the parent's. More: [README.md](README.md).
+A `cpuq run` inside a task starts at once on that task's CPU: `-n M` there runs its tasks `-x` at
+a time on that one CPU. More: [README.md](README.md).

@@ -5,15 +5,16 @@
 <h1 align="center">cpuq</h1>
 
 <p align="center">
-  A machine-wide jobserver for builds, tests, benchmarks and coding agents, on macOS and Linux.
+  A machine-wide CPU pool for builds, tests, benchmarks and coding agents, on macOS and Linux.
 </p>
 
-cpuq is a CPU queue (say "CPU queue" or, lovingly, "see puke"). Heavy commands started from many shells, sessions and agents wait their
-turn for room on the CPUs, then run in the foreground. One binary, no daemon: every hold is a
-`flock(2)` on a file, so the kernel releases it however its holder dies.
+cpuq is a CPU queue (say "CPU queue" or, lovingly, "see puke"). Every task started under it, from
+any shell, session or agent, gets one CPU of the machine's pool, handed out through one fair line.
+One binary, no daemon: every hold is a `flock(2)` on a file, so the kernel releases it however its
+holder dies.
 
-The queue is per user. "Machine-wide" means across every process that user runs on the machine;
-another user on the same machine has a queue of their own.
+The pool is per user. "Machine-wide" means across every process that user runs on the machine;
+another user on the same machine has a pool of their own.
 
 <p align="center">
   <img src="assets/screenshots/cpuq-app.gif" width="760" alt="Cpuq.app's window, live: ten CPU cells filling with each project's color, the last hour stacked by project with rose where a job waited beside idle CPUs, and the running jobs with what each uses and reserves">
@@ -24,14 +25,14 @@ another user on the same machine has a queue of their own.
 
     curl -fsSL https://raw.githubusercontent.com/shreeve/cpuq/main/install.sh | bash
 
-    cpuq run --label app:test --cores 1 -- ./run-tests
-    cpuq run --label app:build --cores 2-6 -- sh -c 'zig build -j"$CPUQ_CORES"'
+    cpuq run --label app:build -- zig build -j1
+    cpuq run --label app:test -n 40 -- sh -c './test/shard "$CPUQ_TASK" 40'
     cpuq status
 
-The first runs a single-threaded test suite once there is room. The second asks for 2 to 6
-cores, gets as many as there is room for, and passes the count to the build: cpuq sets
-`$CPUQ_CORES` for the command, so it must be expanded inside `sh -c '…'`, in single quotes, not
-by the shell you type in. The third shows what runs and what waits.
+The first is one task: it waits for a CPU, then runs the build on it, at one job, with the
+terminal. The second runs 40 tasks, each on a CPU of its own, as many at once as the pool gives;
+each learns which it is from `$CPUQ_TASK`, which cpuq sets for the command, so it is expanded
+inside `sh -c '…'`, in single quotes. The third shows who holds which CPU and who waits, and why.
 
 Agents: read [AGENTS.md](AGENTS.md).
 
@@ -49,21 +50,20 @@ With Homebrew: `brew install shreeve/tap/cpuq`. From source, with Zig 0.17.0:
 
 ## Why
 
-A job knows how many CPUs it can use: a test binary is single-threaded, a compile runs in
-parallel. It cannot know how many it should use, because that depends on everything else the
-machine runs, and no single process sees that.
+A job knows how much parallel work it has. It cannot know how many CPUs it should use, because
+that depends on everything else the machine runs, and no single process sees that.
 
 - **Each job tuning itself to the CPU count** assumes it owns every CPU. With several sessions
   and agents each starting `-j10` builds on a 10-CPU machine, that is 30 or more threads on 10
   CPUs, and every job crawls.
-- **Each job tuning itself to the load** (`make -l`) races: every job checks at the same moment,
-  sees an idle machine and starts, and the load average lags by a minute.
+- **Each job reserving cores by guess** leaves them idle: a job that asks for 16 and keeps 2 busy
+  holds 14 that nobody else may use.
 
-cpuq is the shared piece: one count for the machine, taken atomically, with a queue, priorities
-and estimates, a view of what runs, and a history of what each kind of job really used. On one
-10-CPU Mac shared by three agent sessions, it took the load average from 36-120 down to 5-9,
-with most jobs starting at once. It earns its keep when independent jobs share a machine; one
-person running one job at a time gains little from it.
+cpuq gives each task exactly one CPU, for as long as the task runs, and no more. Parallel work is
+many tasks. A task can't hold a CPU it doesn't use for long, since its CPU goes back when it ends,
+and the CPUs a run holds are always the CPUs its running tasks are on. Runs share the pool through
+one line, by project, and a run with more tasks than CPUs gives a CPU back at a task boundary
+whenever someone else is owed one.
 
 **Hasn't someone solved this already?** Pieces of it, many times over: global make jobservers,
 job spoolers, Google's Borg, Meta's Buck2, benchmark locks, and in 2026 a wave of build locks for
@@ -75,139 +75,254 @@ borrows, and what is new here.
 | word | meaning |
 |---|---|
 | CPU | a logical processor, as the OS counts them |
-| job | one `cpuq run` (or `cpuq lease`) and the command it runs |
-| waiter | a job still in the queue |
-| `--cores` request | how many CPUs a job's tools may keep busy: `K`, or a range `MIN-MAX`; what it gets is its *grant*, in `$CPUQ_CORES` |
-| label | a job's name, `project:task`; history is kept by label |
-| measured use | the CPU a job's whole process tree gets, in CPUs (2.0: two CPUs busy) |
-| target | how many CPUs of measured use cpuq fills; by default every active CPU |
-| gate | a machine check that holds the whole queue: memory pressure, low memory, the load valve |
-| exclusive run | a job that has the machine to itself, for timing |
+| pool | the CPUs cpuq hands out: by default every CPU online (see [The pool](#the-pool)) |
+| run | one `cpuq run` (status calls it an operation, `OP`): M tasks of one command |
+| task | one process of a run, on one CPU of the pool |
+| place | room for one task on a held CPU: one per CPU, or K with `-x K` |
+| line | the order in which waiting runs get the next free CPU |
+| ticket | a run's number in the line, renewed each time it gives a CPU up |
+| project | the repo a run is started in (a worktree counts as its repo), else its label's project |
+| weight | a project's share of the pool, relative to others (config `weights`; default 1) |
+| emptying | a held CPU its run fills no more, to give it up once its tasks end |
+| label | a run's name, `project:task`; history is kept by label |
+| gate | a machine check that holds every free CPU: memory pressure, low memory, low disk |
+| drain | `cpuq drain`: the whole machine, emptied, for one command, for timing |
 | named lease | a queue for something that is not CPUs: a database, a device, another machine |
 
-## How jobs are admitted
+## cpuq run
 
-cpuq admits jobs by measured use (`admit = measured`, the default). The first waiter starts when
-its expected use fits under `target` beside what the running jobs use. A running job counts at
-its expected use for its first 20 seconds (`settle`), then at what it is measured using. So a job
-that holds 4 cores and sleeps leaves the room to others within seconds, and a build that keeps 6
-CPUs busy counts as 6, whatever it asked for.
+    cpuq run [-n M] [-c C] [-x K] [-t T] [-r N] [--label PROJECT:TASK] [--note TEXT]
+             [--urgent] [--wait-max S] [--driver] [--on HOST ...] [--] CMD ARGS...
 
-A job's expected use is the 75th percentile of its label's recent runs, once there are three;
-until then, its whole grant. A waiter behind the first starts at once when it fits too and
-leaves the first its room (or the first has waited less than `patience`). A grant never changes
-once its job starts.
-
-The older model, admission by the cores each job holds out of a fixed budget, is still there:
-see [Reservation mode](#reservation-mode-admit--cores).
-
-## Using it
-
-    cpuq run [--cores K|MIN-MAX] [--label PROJECT:TASK] [--priority high|normal|low]
-             [--max-wait SECONDS] [--exclusive] [--opaque] [--no-load-check] [--qos none|auto]
-             -- CMD ARGS...
-
-`cpuq run` waits its turn, then runs CMD in the foreground: stdin, stdout and stderr are
-inherited (a terminal stays a terminal), signals are forwarded, and CMD's exit status is cpuq's.
-While it waits it prints a line to stderr about once a minute, saying who it waits behind.
-
-CMD's environment gets `CPUQ_CORES` (its grant), a GNU make jobserver of that size in
-`MAKEFLAGS`, and `CPUQ_TOKEN` (its hold, which makes runs inside it nested).
-
-**Work cpuq can't see.** cpuq measures a job by its command's process tree. Work that runs in a
-container or a VM (`incus exec`, `docker exec`) belongs to the container's own processes, so the
-job measures idle and its cores would be handed out again. Give such a job `--opaque` and a
-`--cores` count: it counts at its whole grant while it settles; after that (measured admission),
-the `--opaque` jobs together count for the machine's busy CPUs that nothing measured explains,
-where a container's work on this machine still shows, shared by their grants: each at least what
-its own processes are seen to use and at most its grant. Work outside cpuq counts there too, so it
-errs toward counting them whole; an idle container, or a job marked `--opaque` whose work cpuq
-can see anyway (a qemu it starts itself), doesn't hold the queue behind idle CPUs. It is never
-started inside a lending timing window (it couldn't be frozen), and `cpuq pause`/`stop` say they
-reach only the command cpuq started. A VM or program cpuq starts as a child is no container: leave
-`--opaque` off, and it is measured as it is.
-
-**A cgroup per job (Linux).** With `cgroups` (on by default), each job runs in a systemd user
-scope of its own, delegated to the user, and its command in that scope's `job/`. `$CPUQ_CGROUP`
-names the scope, so `cpuq cap` can give each program a test runner starts a cgroup of its own
-beside `job/`, with limits the kernel enforces. Where `systemd-run --user` doesn't work, jobs run
-as they are, and `cpuq cap` watches the slow way.
-
-**CPU weights (Linux).** With `cpu_weights = on`, each job's scope also has a CPU weight equal to
-its grant. On a crowded machine CPU time
-then divides in proportion to grants, so a job that starts more threads than it was granted
-(`zig build` without `-j`) slows only itself; on a quiet one a job can still use every CPU.
-Where `systemd-run --user` doesn't work, jobs run as they are. Work in a container stays in the
-container's own cgroup.
-
-### How many cores
-
-- `--cores K` asks for exactly K. Use `--cores 1` for single-threaded work.
-- `--cores MIN-MAX` starts with MIN once there is room, and takes up to MAX of the room there
-  is. Once the label has three finished runs, MAX is capped near what it used (its 75th
-  percentile plus 0.3, rounded, never below MIN). This suits any tool that takes a job count.
-- Without `--cores`, the label's history decides: from 1 up to its 75th percentile plus 0.3,
-  rounded, at most half the machine's CPUs, as room allows. A label with fewer than three
-  finished runs, or no label, gets 2.
-
-A small fixed `--cores N` (2 or more) for a command that takes its width from cpuq (`"$CPUQ_CORES"` inside
-it) is widened once its runs show it used what it had: to twice N when it kept all N busy, else
-to what it used, never past half the CPUs. stderr says so. Jobs are sized by their work's own
-measured use when it has three runs or more, else by their label's.
-
-A request can be at most four times `target`. Under `admit = cores` a request is clamped to the
-budget, a job without `--cores` gets 2, and only `right_size` caps a range. Size a job by what
-its tools can use, not by the machine: `cpuq history` shows each job's active cores.
-
-### Passing the grant on
-
-Most tools use every CPU unless told otherwise, so pass `$CPUQ_CORES` on. cpuq sets it in CMD's
-environment, not in the shell you type in: in `cpuq run -- make -j$CPUQ_CORES` your shell
-expands `$CPUQ_CORES` before cpuq runs, to nothing, and `make -j` with no number has no limit.
-Wrap the command in `sh -c` with single quotes, so the inner shell expands it after cpuq has
-set it:
-
-| tool | after `cpuq run --label … --cores 2-6 --` |
+| option | meaning |
 |---|---|
-| make | `make` (no `-j`: make takes its job slots from the jobserver in `MAKEFLAGS`) |
-| zig | `sh -c 'zig build -j"$CPUQ_CORES"'` |
-| cargo | `sh -c 'cargo build -j "$CPUQ_CORES"'` |
-| ninja | `sh -c 'ninja -j "$CPUQ_CORES"'` |
-| swift | `sh -c 'swift build -j "$CPUQ_CORES"'` |
-| go | `sh -c 'go build -p "$CPUQ_CORES" ./...'` |
-| pytest-xdist | `sh -c 'pytest -n "$CPUQ_CORES"'` |
+| `-n M` | M tasks of CMD; each gets `CPUQ_TASK` (1 to M) and `CPUQ_TASKS`, and its output goes to a file of its own. Without `-n`, one task, with the terminal |
+| `-c C`, `-c P%` | hold at most C CPUs, or P% of the pool (at least 1); default 100% |
+| `-x K` | K tasks per CPU, for tasks that mostly wait (default 1) |
+| `-t T` | each task's time limit: `30s`, `10m`, `2h`, or `off`; default the config's `timeout` (1h) |
+| `-r N` | try a failed task up to N more times; `CPUQ_ATTEMPT` says which try it is |
+| `--label PROJECT:TASK` | the run's name in status and history |
+| `--note TEXT` | what the run is for, kept beside its label in history |
+| `--urgent` | its first CPU goes ahead of the line: a rebuild someone is waiting on |
+| `--wait-max S` | give up (exit 75) if no CPU comes within S seconds; nothing runs. `0`: now or not |
+| `--driver` | a test runner that starts `cpuq run`s of its own: it holds no CPU |
+| `--on HOST` | run on HOST, one of this machine's remotes (see [Other machines](#other-machines---on-host)) |
 
-A bare `zig build` uses every CPU. `zig build -jN` limits the build runner to N concurrent steps;
-it has no jobserver client and does not pass `-j` to the compiler processes it starts, so a step
-can still use more. GNU make 4.x lets a `-j` on its own command line override the jobserver.
+### One task
 
-On Linux a job is also confined to as many CPUs as its grant, those the running jobs use least
-(`CPUQ_CPUS` lists them), so a program that sizes its threads by the CPUs it sees starts as many
-as its grant.
+`cpuq run -- CMD` waits for a CPU, then runs CMD on it in the foreground: stdin, stdout and stderr
+are inherited (a terminal stays a terminal), it shares cpuq's process group (so `^C` reaches it),
+signals sent to cpuq are forwarded, and CMD's exit status is cpuq's. When CMD dies by a signal,
+cpuq dies by the same one. At its time limit CMD gets SIGTERM, and cpuq exits 124.
 
-### Labels
+A task has one CPU, so run what it runs at one job:
 
-Give every job a label, `project:task`, the same on every run: `app:build`, `app:test`,
-`site:deploy`. A label is parts split by `:`, each of lowercase letters, digits, `.`, `_` and `-`,
-none starting with `.`; anything else is a usage error. History sizes jobs, sets their expected
-use and estimates waits by label, so a label with a run id, date or branch name in it never has
-a history. `cpuq status` sums the cores in use by project, the label up to its first `:`, and a
-new label's wait estimate uses its project's.
+| tool | after `cpuq run --label … --` |
+|---|---|
+| zig | `zig build -j1` |
+| make | `make` (no `-j`) |
+| cargo | `cargo build -j 1` |
+| go | `go build -p 1 ./...` |
+| swift | `swift build -j 1` |
+| ninja | `ninja -j 1` |
+| pytest | `pytest` (no `-n`) |
 
-### One job per phase
+A bare `zig build`, `cargo`, `go build` or `swift build` starts a job for every CPU of the machine.
+On Linux they all share the task's one CPU, since a task is pinned to it; macOS can't pin, so there
+they take CPUs from every other task. Parallel work is tasks: `-n M`.
 
-A grant is fixed for the whole run. A script that compiles in parallel and then runs
-single-threaded tests is best run as one job per phase, each sized for its phase:
+### Many tasks: -n M
 
-    cpuq run --label app:build --cores 2-6 -- make
-    cpuq run --label app:test --cores 1 -- ./run-tests
+`cpuq run -n M -- CMD` runs CMD M times. It holds up to `-c` CPUs, fills each to K tasks (`-x K`)
+before taking another, and starts the next task the moment a place frees, until all M have run:
+
+    cpuq run --label app:test -n 40 -- sh -c './test/shard "$CPUQ_TASK" 40'
+    cpuq run --label app:fuzz -n 500 -t 2m -r 1 -- sh -c './fuzz "$(sed -n "${CPUQ_TASK}p" cases.txt)"'
+    cpuq run --label app:fetch -n 200 -x 4 -- sh -c 'curl -fsS "$(sed -n "${CPUQ_TASK}p" urls)" >/dev/null'
+
+- **Before it starts** it says what it will do, so a misread `-n` shows at once:
+  `cpuq: 40 tasks, up to 10 CPUs, overload 1, timeout 3600s`.
+- **Each task** runs in a process group of its own, with stdin from `/dev/null` and stdout and
+  stderr to `~/.local/state/cpuq/runs/PROJECT/STAMP-PID/N` (a retry's to `N.ATTEMPT`). When a task
+  ends, whatever it left running in its group is killed.
+- **At the end** it prints a summary on stderr, then each failed task's last five lines (the first
+  five failed tasks):
+
+      cpuq: 38 of 40 tasks passed, 2 failed (1 at the time limit), in 41.3s; output in ~/.local/state/cpuq/runs/app/1795675001-92874
+      cpuq: task 17 (attempt 1) exited 1; the end of ~/.local/state/cpuq/runs/app/1795675001-92874/17:
+          ...
+
+- **Exit status:** 0 when every task passed, else 1. A run stopped by a signal (`^C`, `cpuq kill`)
+  passes it to every task, kills what is left 5 seconds later, and dies by that signal.
+- **`-x K`** puts K tasks on each CPU, for work that mostly waits (network, a server, sleeps):
+  about 1 + time waiting ÷ time computing. Tasks that compute only slow each other at K > 1.
+- **`-t T`** limits each task: at T it gets SIGTERM, then SIGKILL 5 seconds later; it counts as
+  failed (124), and its place goes to the next task. A run's time stopped (Ctrl-Z) doesn't count.
+  A sensible T is about ten times the task's usual time. With no `-t`, the config's `timeout`
+  (1 hour) applies, so no task holds a CPU forever.
+- **`-r N`** tries a task that failed (non-zero exit or its time limit) up to N more times, at the
+  next free place, before tasks not yet started. Tasks stopped by a signal are not tried again.
+- **`-c C`** caps the CPUs held, as a count or a percentage of the pool, worked out when the run
+  starts. It is a ceiling, never a claim: a run never holds more CPUs than it has tasks to put on
+  them.
+
+### Environment
+
+Each task gets `CPUQ_TASK` (1 to M, 1 for a single task), `CPUQ_TASKS`, `CPUQ_CPU` (the CPU it
+runs on), `CPUQ_OP` (its run's ticket), `CPUQ_ATTEMPT` and `CPUQ_ATTEMPTS` (`-r` + 1). On Linux each
+task is pinned to its CPU (`sched_setaffinity`) before it runs, and everything it starts inherits
+that. macOS can't pin: `CPUQ_CPU` there only names the place.
+
+### --wait-max, --urgent
+
+`--wait-max S` gives up after S seconds while the run holds no CPU and runs no task, with exit 75;
+the command never ran. `--wait-max 0` starts now or not at all.
+
+`--urgent` puts the run's first CPU ahead of everything else in the line, once per project at a
+time (while another of its project's urgent runs holds a CPU, it waits its turn). It never takes a
+CPU from a running task: it gets the next one that frees, and while none is free, a CPU is emptied
+for it at the next task boundary. Use it for a rebuild someone is waiting on.
+
+### --driver: a test runner
+
+A test runner that starts a `cpuq run` per test (swarm, a `test/run` script) runs under
+`--driver`: it holds no CPU and takes no turn, and each run it starts takes its own. It runs with
+the terminal, and its exit status (or signal) is cpuq's. On Linux, with `cgroups` (on by default),
+it runs in a delegated systemd user scope of its own, its command in the scope's `job/`, and
+`$CPUQ_CGROUP` names the scope, so `cpuq cap` can give each program it starts a cgroup beside
+`job/`, with limits the kernel enforces. Whatever it leaves in the scope is killed when it ends.
+Where `systemd-run --user` doesn't work, it runs as it is, and `cpuq cap` watches the slow way.
+
+`cpuq hook` accepts `--driver` only for a test runner (swarm, rip, a script named `run`, `run.sh`
+or `run-tests*`, or one under `test/` or `tests/`): a build under it would hold no CPU.
 
 ### Nested runs
 
-A `cpuq run` inside a running job (a `CPUQ_TOKEN` in its environment whose hold is alive) starts
-at once and runs CMD unchanged: its `--cores` and other options are ignored, and `CPUQ_CORES`
-and `MAKEFLAGS` stay the parent's. So a script run under cpuq may call others that use cpuq. A
-token whose hold has ended is ignored, and the run queues as usual.
+A `cpuq run` inside a task (`CPUQ_CPU` and `CPUQ_OP` naming a live run, or, when the environment
+was cleared, an ancestor process that is a run's cpuq) starts at once on that task's CPU, with no
+line. One task replaces the nested cpuq (exec); `-n M` runs its M tasks `-x` at a time on that one
+CPU, with the terminal, and exits 0 when all passed, else 1. So a script run under cpuq may call
+others that use cpuq. Parallel work goes at the top: `cpuq run -n M`, or `--driver`.
+
+### Labels
+
+Give every run a label, `project:task`, the same on every run: `app:build`, `app:test`,
+`site:deploy`. A label is parts split by `:`, each of lowercase letters, digits, `.`, `_` and `-`,
+none starting with `.`; anything else is a usage error. History is kept by label, so a label with a
+run id, date or branch name in it never has a history. A run with no label is named after its
+command.
+
+## How CPUs are shared
+
+### The pool
+
+The pool is the CPUs cpuq hands out, in a fixed order that every cpuq on the machine works out the
+same way:
+
+- `cpus = LIST` in the config (a Linux CPU list, `12-19,2`) is the pool, in that order: on pup, its
+  E-cores, say.
+- Otherwise, on Linux: the CPUs online, less those isolated from the scheduler, within the CPUs the
+  machine's init may use (a container's CPU set); one hyperthread of each physical core first,
+  then their siblings. On macOS: CPU 0 to the active count less one.
+- `budget = N` (or `CPUQ_BUDGET`) keeps the first N. `cpuq budget` prints the pool's size.
+
+Each pool CPU is a token file; a run holds a CPU by an exclusive flock on its token. Only the run's
+own cpuq holds it (the descriptor is close-on-exec), never its tasks, so no leftover process can
+keep a CPU after its run is gone.
+
+### The line
+
+A free CPU goes to the first run in the line that wants one, in this order:
+
+1. **Urgent:** an `--urgent` run's first CPU, while its project holds no urgent CPU.
+2. **Holding nothing:** a run with no CPU goes before every run that holds one.
+3. **The project's share:** the project holding the fewest CPUs for its weight.
+4. **The run's own share:** the run holding the fewest CPUs.
+5. **The ticket:** the older first.
+
+CPUs are handed out one at a time and the line is ranked again after each, so free CPUs spread
+over the projects by weight. Whoever frees a CPU hands it out at once, under the pool's lock, as a
+promise to the first in line, and wakes that run; a promise to a run that has since died is void.
+A run that wants no more CPUs is not in the line.
+
+Weights are per project, `weights = rig:2 trig:1` in the config: rig's runs together get twice
+trig's share while both want more than the pool has. A project not named weighs 1.
+
+### Giving CPUs back at task boundaries
+
+A run never stops a task to give its CPU away. While nobody waits, it keeps every CPU it holds
+full. When the first run in the line wants a CPU and none is free, one run is chosen to give one
+up: it stops filling one of its CPUs, and when that CPU's last task ends, the CPU goes to the
+first in line.
+
+- **Who may give:** a run whose project, after giving one, still holds at least as many for its
+  weight as the waiter's would after taking it: (waiter's + 1) ÷ its weight ≤ (giver's − 1) ÷ the
+  giver's weight. A waiter that holds nothing may take from anyone. A run never gives a CPU that
+  would come straight back to it: the waiter must stay ahead of it in the line after the move.
+- **Which one:** of those, the run whose project holds the most for its weight, then the one
+  holding the most CPUs, then the newest.
+- **How many:** CPUs owed are counted across every run, so many runs don't all empty a CPU for
+  one waiter: at most as many are emptied as the first waiter still wants.
+- **Which CPU:** an empty one if there is one, else the one with the fewest tasks, then the one
+  whose newest task started longest ago, so it frees soonest.
+- **A fresh ticket:** a run that gives a CPU back takes a new ticket, behind every other, so runs
+  that hold one CPU each take turns with a newcomer.
+- **Consolidation:** while a CPU is being emptied, a place freeing on another of the run's CPUs
+  takes a task from it (Linux moves the task's processes there), so the emptied CPU frees sooner.
+
+So ten runs of one task each on a ten-CPU Mac give a newcomer a CPU when the first of them ends,
+and a 5,000-task run that fills a machine gives way, a CPU at a time, to a second project, until
+the two hold their fair shares.
+
+### Outside load and the gates
+
+**Outside load.** cpuq hands out a free CPU only when the machine has one idle: it hands out at
+most the CPUs online less the larger of the CPUs busy (from the kernel's CPU ticks, over the last
+second or so) and the CPUs held. So work cpuq doesn't run (Spotlight, a build typed outside cpuq)
+holds back CPUs while it runs, and so does a task that uses more than its one CPU (which macOS
+can't stop). It never reads the load average, which counts threads waiting on I/O and lags a
+minute.
+
+**The gates** hold every free CPU while they are closed; runs keep the CPUs they hold, and keep
+filling them:
+
+- **memory pressure** (`pressure_check`): macOS's critical level; on Linux, `some avg10` in
+  `/proc/pressure/memory` at `pressure_psi` (10) or more;
+- **low memory** (`min_available`, off by default): available memory under that size;
+- **low disk** (`min_disk`, 5G): less than that free on the filesystem holding `$HOME`, the one
+  holding cpuq's state directory (the temp directory), or, where it is a filesystem of its own,
+  `~/cpuq`, where jobs sent here keep their copies, caches and scratch. A full disk fails every
+  task and every tool that writes a file, so the pool holds new ones until there is room.
+
+### Ctrl-Z, kill and a dead run
+
+- **Ctrl-Z** on a run stops every task, gives back every CPU (and every CPU promised to it), and
+  then stops cpuq. While stopped it wants nothing, so the line passes it by. Continued (`fg`), it
+  joins the line again, and each stopped task continues once it has a place on a CPU (on Linux,
+  pinned there). Time stopped doesn't count against a task's limit.
+- **`cpuq kill TICKET|PID|LABEL`** ends a run on this machine, waiting or running: its cpuq gets
+  SIGTERM, passes it to every task, and kills what is left 5 seconds later. A label that names
+  several runs lists them, to be named by ticket. It acts on anyone's runs, not only the caller's.
+- **A run whose cpuq dies** (SIGKILL, a tool's timeout) loses its CPUs at once: the kernel drops
+  its flocks. On Linux each task dies with it (`PR_SET_PDEATHSIG`). Each CPU's token names the
+  process groups running on it, with each leader's start time; whoever takes the CPU next first
+  kills those groups still running (a group whose leader has a different start time is someone
+  else's by now), so a CPU is never shared with an orphan.
+
+## cpuq drain: timing
+
+    cpuq drain [--max T] [--label L] [--] CMD ARGS...
+
+For timing, nothing else. A drain goes first in the line. While it waits, every run stops filling
+its CPUs and gives each back as its tasks end, and every CPU freed goes to the drain. Once it holds
+the whole pool, CMD runs alone, unpinned, with no time limit, and the CPUs go back when it ends,
+however it ends. `--max T` (`90s`, `10m`) gives up if the machine isn't empty by then (exit 75),
+and nothing runs. Its own builds and helpers run inside it as nested runs. A drain that spans
+several commands wraps them in one: `cpuq drain --label app:bench -- ./bench.sh`.
+
+Draining a busy machine stops everyone, so time where that is fair: a quiet machine, or another
+machine through a named lease (`cpuq lease bench --host buildbox -- ssh buildbox 'cd repo && cpuq
+drain -- ./bench'`). Work outside cpuq (system services) still runs; `cpuq status` shows it.
 
 ## Watching
 
@@ -215,59 +330,65 @@ token whose hold has ended is ignored, and the run queues as usual.
 
     cpuq status [--host HOST]... [--json] [--no-usage] [--watch[=SECONDS]]
 
-`cpuq status` shows the cores handed out, the load, memory pressure and the gate; every running
-job (label, cores in use, cores active, priority, how long, pid, command); every waiter (order,
-cores asked for, priority, how long, ETA, command); and the named leases. On a terminal it draws
-boxed tables in color (`NO_COLOR` drops the color): a job keeping fewer than half its cores
-active shows in yellow, since it asks for too much. Under measured admission they count the
-cores handed out against the CPUs online (`CPUS`); under `admit = cores`, against the budget. Anywhere else it prints plain text, with a
-line `admit   by measured use, up to N CPUs`. A running job marked `*` is one whose cpuq is
-gone while its command still runs. When work outside cpuq uses a CPU or more, or a gate is
-closed, status names the busiest such processes.
+`cpuq status` shows the pool and who holds which CPU, the line and why each run in it waits:
+
+- **The machine:** the pool (its size and CPUs), CPUs held, free and being emptied; CPUs busy of
+  those online, split into cpuq's tasks and work outside; the load, memory pressure and the gate;
+  memory and swap. When work outside cpuq uses a CPU or more, or a gate is closed, the busiest
+  such processes.
+- **Held:** each running run's ticket (`OP`), pid, project, label, tasks done of total and failed,
+  tasks running, its CPUs (`×K` with `-x`, and how many it is emptying), CPU busy per CPU held, how
+  long, an estimate of the time left, and its command. A note under it flags a run whose CPUs are
+  under half busy (`-x could be higher`, for a run of many tasks), one over 1.2 CPUs per CPU held,
+  and one stopped (Ctrl-Z).
+- **Waiting:** in line order, each run's ticket, project, label, the CPUs it holds and still wants,
+  and why it waits: `1st in line; 1 CPU is being emptied for it`, a closed gate, outside load.
+- **Projects:** each project's weight, runs, CPUs held and wanted, and its fair share.
+
+On a terminal it draws boxed tables in color (`NO_COLOR` drops the color); anywhere else, plain
+lines.
 
 - `--json` is for programs (below). `--watch` redraws on a terminal every 2 seconds
   (`--watch=N`: every N) until `^C`; it refuses to run without a terminal or with `--json`.
-- `--no-usage` skips the half-second sample of what each job uses.
+- `--no-usage` skips the half-second sample of what each run uses.
 - `--host HOST` shows HOST's status, fetched over ssh; it repeats, and `--host local` is this
   machine, so `cpuq status --host local --host buildbox` is one view of both.
 
 `cpuq status --json` is one object (with several `--host`s, one per host, keyed by host). Its
-`schema` (1) changes only when a field is removed or changes meaning; new fields may appear.
+`schema` (2) changes only when a field is removed or changes meaning; new fields may appear.
 
 | field | meaning |
 |---|---|
-| `version`, `dir` | cpuq's version and the state directory |
-| `admit`, `target` | `measured` or `cores`; the target in CPUs (null under `cores`) |
-| `budget`, `held`, `free` | the budget, and the cores handed out and left of it |
+| `schema`, `version`, `dir`, `admit` | 2, cpuq's version, the pool's directory, and `pool` |
+| `pool`, `budget` | the pool's CPUs, and its size |
+| `held`, `free`, `promised`, `emptying` | CPUs held, free, promised to a waiter, and being emptied |
+| `busy`, `tasks_busy` | CPUs busy on the machine, and of those, cpuq's tasks |
 | `cores`, `active_cores` | the machine's CPUs, and those active now |
 | `load`, `memory_pressure` | the 1-, 5- and 15-minute load; `normal`, `high`, `unknown` or `off` |
-| `memory` | bytes: `total`, `used` (Activity Monitor's Memory Used on macOS; the total less MemAvailable on Linux), `swap_total`, `swap_used`; null when unreadable |
-| `gate` | `state` (`open`, `pressure`, `low_memory`, `low_disk`, `load` or `spacing`), `load`, `available`, `disk_free`, `disk_path`, `text`, and the valve's `trip`, `reopen` and `busy_trip` |
-| `holders[]` | running jobs: `pid` (its cpuq), `holder_alive`, `child` (the command), `cores`, `slots`, `using` (cores active), `paused`, `priority`, `exclusive`, `label`, `command`, `since`, `ticket` |
-| `waiters[]` | in order: `order` (1 first), `cores` and `max` (the request), `priority`, `class` (after aging), `eta` (seconds; null when unknown), `exclusive`, `pid`, `label`, `command`, `since`, `ticket` |
-| `leases[]` | named leases held or waited for: `name`, `holders`, `waiters` |
-| `outside[]` | the busiest processes outside cpuq: `pid`, `name`, `using` |
+| `memory` | bytes: `total`, `used`, `swap_total`, `swap_used`; null when unreadable |
+| `gate` | `state` (`open`, `pressure`, `low_memory`, `low_disk`, `drain` or `outside_load`), `load`, `available`, `disk_free`, `disk_path`, `text` |
+| `next_free` | seconds until a CPU is expected to free, when none is free |
+| `holders[]` | running runs: `ticket`, `pid` (its cpuq), `project`, `weight`, `label`, `command`, `since`, `cpus` (held), `cores` (how many), `slots` (their places in the pool), `emptying`, `want`, `overload`, `limit`, `tasks`, `done`, `failed`, `running`, `using` (CPUs busy), `urgent`, `paused` (stopped), `exclusive` (a drain), `progress`, `left`, `left_from`, `flags` |
+| `waiters[]` | in line order: `order` (1 first), `ticket`, `pid`, `project`, `label`, `command`, `since`, `holds`, `cores` (CPUs it waits for), `max` (its limit), `urgent`, `exclusive` (a drain), `why`, `gate`, `eta` (the first's, seconds) |
+| `projects[]` | `name`, `weight`, `ops`, `held`, `want`, `fair` |
+| `outside[]`, `outside_total` | the busiest processes outside cpuq (`pid`, `name`, `using`), and their total |
 | `cpu_ticks` | each CPU's time so far, `[busy, total]`, cumulative: two statuses give each CPU's use between them |
 | `boot_time` | when the machine booted, Unix seconds |
 | `recorder` | whether `cpuq record` is sampling this machine |
-
-A waiter's ETA plays the queue forward with each label's typical run time from history; it is
-unknown while anything ahead of it has no history.
 
 ### cpuq history
 
     cpuq history [--label PATTERN] [--limit N] [--json]
 
-Every job is recorded as it queues, starts and ends, in `~/.local/state/cpuq/history.jsonl`
-(`$XDG_STATE_HOME/cpuq/` when set; beside the state directory when `CPUQ_DIR` is set;
-`CPUQ_HISTORY` names the file outright). `cpuq history` lists the last 20 jobs (`--limit N`),
-newest first: label, pool (`cores` or a lease's name), cores in use, how long each waited and
-ran, its active cores (its CPU time over its run time), its peak memory, and how it ended: an exit
-status, `signal N`, `memory 42.0G` (stopped by `max_memory`), `gave up` (`--max-wait`,
-`cpuq cancel`, or killed while it waited), or `lost` (its cpuq died uncaught, or the machine
-restarted). A summary follows: the median and longest wait, and active cores against cores in
-use on average, which says how to size `--cores`. `--label` filters (`app:*` for a prefix), and
-`--json` gives the jobs to a program.
+Every run is recorded as it enters the line, starts and ends, in
+`~/.local/state/cpuq/history.jsonl` (`$XDG_STATE_HOME/cpuq/` when set; beside the state directory
+when `CPUQ_DIR` is set; `CPUQ_HISTORY` names the file outright). `cpuq history` lists the last 20
+runs (`--limit N`), newest first: label, pool (`cpus`, a lease's name, or `remote` for `--on`), the
+most CPUs it held at once, tasks done of total (and failed), how long it waited and ran, its active
+CPUs (its tasks' CPU time over its run time), and how it ended: an exit status, `signal N`,
+`gave up` (`--wait-max`), or `lost` (its cpuq died uncaught, or the machine restarted). A summary
+follows: the median and longest wait, and CPUs busy against CPUs held on average. `--label` filters
+(`app:*` for a prefix), and `--json` gives the runs to a program.
 
 ### cpuq record
 
@@ -276,16 +397,16 @@ use on average, which says how to size `--cores`. `--label` filters (`app:*` for
     cpuq samples [--since UNIX-SECONDS]   # default: the last hour
 
 An optional recorder. Every 3 seconds it writes one JSON line to `samples.jsonl` beside the
-history: each CPU's busy share since the last line, the 1-minute load, cores handed out, jobs
-waiting, and the gate. The file moves to `samples.jsonl.1` past 12 MB, so the two together hold
-at least a day even for 96 CPUs. Only one recorder runs per machine; a second exits at once.
+history: each CPU's busy share since the last line, the 1-minute load, the pool's CPUs held, runs
+waiting, and the gate. The file moves to `samples.jsonl.1` past 12 MB, so the two together hold at
+least a day even for 96 CPUs. Only one recorder runs per machine; a second exits at once.
 `cpuq status --json` says whether one is running (`recorder`). It only watches: nothing waits on
 it, and every other command works the same without it.
 
 `--install` keeps one running as a launchd agent (macOS) or a systemd user service (Linux,
 lingering where `loginctl` allows, so it runs without a login), restarted if it stops. It exits
-when its binary is replaced, so an upgrade restarts it on the new one. Cpuq.app reads its
-samples to draw the hour before the app was opened, on each machine.
+when its binary is replaced, so an upgrade restarts it on the new one. It also runs `cpuq clean`
+every hour. Cpuq.app reads its samples to draw the hour before the app was opened, on each machine.
 
 ### cpuq cap
 
@@ -293,14 +414,16 @@ samples to draw the hour before the app was opened, on each machine.
 
 For a test runner that starts thousands of programs: it runs one under limits, so the runner
 needn't watch each one itself. A runner that lists every process (`ps`) for each program it runs
-can spend a large part of a big machine doing nothing else: one did, about 17 of 96 CPUs.
+can spend a large part of a big machine doing nothing else: one did, about 17 of 96 CPUs. cap takes
+no CPU of the pool: put it inside `cpuq run` (`cpuq run -- cpuq cap --time 2m -- PROGRAM`), never
+around it, where its `--time` would count the time spent waiting.
 
 | limit | what happens |
 |---|---|
 | `--mem SIZE` | PROGRAM and everything it started are stopped above SIZE (`2G`, `512M`) |
 | `--time DURATION` | stopped after DURATION (`120`, `120s`, `2m`, `500ms`) |
 | `--output SIZE` | stopped once it has written more than SIZE to stdout and stderr, which must be files or `/dev/null`; a pipe is refused. Checked about every 0.1 s |
-| `--pids N` | at most N processes and threads at once, inside a job on Linux; elsewhere not enforced, and a job that can't give it a cgroup says so on stderr |
+| `--pids N` | at most N processes and threads at once, inside a `--driver` runner on Linux; elsewhere not enforced |
 | `--link FD` | stopped at once, exit 123, when the other end of the pipe whose read end is FD closes: whoever started it (a job's driver) is gone |
 | `--no-crash-report` | no crash report when PROGRAM crashes on purpose, a test that panics. macOS: cap answers PROGRAM's crashes itself, so neither the user's ReportCrash (~/Library/Logs/DiagnosticReports) nor the system's (/Library/Logs/DiagnosticReports) files one, and cap exits 128+N for a death by signal N rather than dying by it (a shell sees the same status). Linux: a core limit of exactly 1, so the kernel passes it to no `core_pattern` handler (Ubuntu's apport, seconds per crash); it still dies by its signal. What PROGRAM starts inherits it, so wrap the program meant to crash, never a compiler before it |
 
@@ -314,130 +437,48 @@ A limit of 0 is refused: no limit is the option left out.
   memory, 124 for time and 121 for output, each with one line on stderr. 2 is a usage error,
   125 cap's own failure, 126 PROGRAM can't be run, 127 PROGRAM wasn't found. PROGRAM can exit
   with any of these itself; the stderr line is what tells them apart.
-- **Inside a cpuq job on Linux:** PROGRAM is born in a cgroup of its own beside the job's
-  (`clone3` into it, with no write to `cgroup.procs`, which would stall every fork on the
-  machine). The cgroup has `memory.max`, no swap and `memory.oom.group`, so the kernel stops it
-  at the limit: within milliseconds, with nothing polling. Everything it started is stopped with
-  it, even what left its process group. A cap killed before it could clean up (SIGKILL) leaves
-  its cgroup; the job's next cap removes it, with whatever is still running in it.
-- **Elsewhere** (macOS, or Linux outside a job): PROGRAM gets its own process group, and its
-  memory is read once a second from its own process tree, never from a list of every process.
+- **Inside a `--driver` runner on Linux** (its scope in `$CPUQ_CGROUP`): PROGRAM is born in a
+  cgroup of its own beside the runner's (`clone3` into it, with no write to `cgroup.procs`, which
+  would stall every fork on the machine). The cgroup has `memory.max`, no swap and
+  `memory.oom.group`, so the kernel stops it at the limit: within milliseconds, with nothing
+  polling. Everything it started is stopped with it, even what left its process group. A cap
+  killed before it could clean up (SIGKILL) leaves its cgroup; the runner's next cap removes it,
+  with whatever is still running in it.
+- **Elsewhere** (macOS, or Linux outside such a runner): PROGRAM gets its own process group, and
+  its memory is read once a second from its own process tree, never from a list of every process.
   Stopping it kills that tree, then the group. On Linux cap is the tree's subreaper, so orphans
-  stay in it; macOS has none, so a process that leaves both the tree and the group (a double
-  fork with `setsid`) is out of cap's reach, its memory uncounted and left running.
+  stay in it; macOS has none, so a process that leaves both the tree and the group (a double fork
+  with `setsid`) is out of cap's reach, its memory uncounted and left running.
 - **Either way:** PROGRAM's end wakes cpuq at once, and anything PROGRAM left running is stopped.
   It costs about half a millisecond a call.
 
-### Progress: CPUQ_PROGRESS
+### Progress
 
-A job that knows how much work it has (a test runner with 12,629 tests) can say how far it is:
-cpuq gives every job a file, `$CPUQ_PROGRESS`, to write one line to, `DONE TOTAL FAILING`:
+`cpuq status` shows a run of many tasks with its tasks done of total, failing, and the time left
+at its rate so far: `4210/12629 33% · 3 failing · ~9m left`.
+
+A submitted job (`cpuq submit`) that knows how much work it has can say how far it is: its command
+gets a file, `$CPUQ_PROGRESS`, to write one line to, `DONE TOTAL FAILING`:
 
     printf '%d %d %d\n' "$done" "$total" "$failing" > "$CPUQ_PROGRESS.tmp" && mv "$CPUQ_PROGRESS.tmp" "$CPUQ_PROGRESS"
 
-- **Write it whole:** to `.tmp`, then rename it over, so no reader sees half a line. Write it at
-  most once a second, and once more at the end.
-- **What it shows:** `cpuq status` puts it under the job, with the time left from its rate so
-  far: `12m · 4210/12629 33% · 3 failing · ~9m left`. The `--json` holder has `progress`
-  (`done`, `total`, `failing`), `left` in seconds, `left_from` (`progress`) and `typical`.
-- **A job that writes nothing** shows its usual time instead, from earlier runs of the same
-  command (numbers aside: a different seed or count is the same work), with `left_from` `history`.
-  A command not run before has none, whatever else ran under its label.
-- **Inside another machine's job** (`cpuq run --on`, `cpuq submit`) the file is that machine's, and
-  `cpuq status --host HOST` (and Cpuq.app) shows it there. `cpuq submit` prints it as it follows.
-- The file is removed when the job ends.
+Write it whole, to `.tmp` and renamed over, at most once a second and once more at the end.
+`cpuq submit` prints it as it follows the job, and `cpuq job` shows it.
 
 ### Cpuq.app (macOS)
 
 [`app/`](app/) holds Cpuq.app. Its window has a page per machine: this Mac (⌘1), then each remote
 in the config (⌘2, ⌘3…), read over ssh while the window is open. Each page shows the CPUs
 busy right now with each project's share and who waits and why; the last hour, Stacked by project
-and Per Core (one lane per CPU) together, rose where jobs waited beside idle CPUs; the jobs, with
+and Per Core (one lane per CPU) together, rose where runs waited beside idle CPUs; the runs, with
 their actions on right-click; and `cpuq history` summed by project. Every section's height drags.
 While the window is open it is an ordinary app (Dock icon, menu bar, ⌘Tab); closed, only its
 menu bar chip remains, which stays calm while all is well, turns orange when the gate is shut or
-jobs wait beside idle CPUs, and shows ☁ with uptime and this month's hours while a cloud machine
-runs. It notifies, once each, when the gate stays shut, jobs wait beside idle CPUs, `--opaque`
-jobs hold cores while others wait, heavy work runs outside cpuq, a job looks stuck, a machine is
-overloaded while another has room, or a cloud machine sits idle and billing; the urgent ones are
-also texted. It reads `cpuq status`, `history` and `samples`, and runs the job actions you pick.
-Install it with `brew install --cask shreeve/tap/cpuq-app`.
-
-## Waiting and order
-
-Waiters are served high before normal before low (`--priority`). Within a class, projects take
-turns: a waiter's turn is the number of its project's jobs running or ahead of it in line (the
-project is the label before its colon), lowest first, then arrival order. So one project's ten
-queued jobs don't all go ahead of another project's one. A waiter moves up one class per `aging`
-seconds (600) of waiting, so low is never starved. Named leases are served in arrival order.
-On macOS `--priority low` runs at nice 10 with its QoS class left alone: background QoS would
-confine it to the efficiency cores even with the performance cores idle.
-Behind the first waiter, others start as soon as they fit (see
-[How jobs are admitted](#how-jobs-are-admitted)).
-
-`--max-wait SECONDS` gives up after that long, with exit status 75; the command never ran. With
-`--max-wait 0`, the first waiter takes the room there is now or gives up; any other waiter gives
-up at once. A run with no `--max-wait` and no terminal (an agent's tool call, a script) is told
-once that its caller's own timeout may end the wait first.
-
-The gates hold the whole queue while they are closed:
-
-- **memory pressure** (`pressure_check`): macOS's critical level; on Linux, `some avg10` in
-  `/proc/pressure/memory` at `pressure_psi` (10) or more;
-- **low memory** (`min_available`, off by default): available memory under that size;
-- **low disk** (`min_disk`, 5G): less than that free on the filesystem holding `$HOME`, the one
-  holding cpuq's state directory (the temp directory), or, where it is a filesystem of its own,
-  `~/cpuq`, where jobs sent here keep their copies, caches and scratch. A full disk fails every job and every tool
-  that writes a file, so the queue holds new ones until there is room;
-- **the load valve** (`load_check`): the 1-minute load over the budget plus `load_margin` while
-  the CPUs are at least 90% busy. Under measured admission it gates only exclusive runs, though
-  `cpuq status` shows it either way. `--no-load-check` skips it for one run.
-
-The command also runs in a scheduling class by priority. On macOS, high and normal leave it
-unchanged and low runs at background QoS (on Apple silicon, the efficiency cores, with throttled
-I/O). On Linux, high, normal and low run at nice 0, 5 and 15. `--qos none` leaves the class
-unchanged (`--qos auto`, the default, maps it). Exclusive runs and named leases never change it.
-`cpuq qos` prints the calling process's class.
-
-## Exclusive runs
-
-`cpuq run --exclusive` is for timing, nothing else. At its turn it waits until no job holds any
-cores, then takes the budget's worth of cores (`CPUQ_CORES`) and admits nothing else until it
-exits, however it exits. While it waits at the front, a job behind it may start only when
-history says that job ends before the running work does (`backfill`; `window_backfill = off`
-keeps even those waiting, on a machine kept for timing). Its own builds and
-helpers run inside it as nested runs. A window that spans several commands wraps them in one:
-`cpuq run --exclusive --label app:bench -- ./bench.sh`, or an interactive
-`cpuq run --exclusive -- $SHELL`.
-
-Draining a busy machine stops everyone, so a shared machine can refuse: with `exclusive = off`
-in its config, `--exclusive` runs as an ordinary job, alongside the others, and says so on
-stderr. Timings taken there are not quiet. Time on a machine that allows exclusive runs (a
-named lease with `--host HOST --exclusive` asks HOST, whose own config decides). Plain-text
-`cpuq status` (not on a terminal) notes `exclusive runs are off here`.
-
-With `window_gap = SECONDS`, for that long after an exclusive run ends the exclusive runs still
-waiting go behind the other waiters (`cpuq status` lists them so), so work that queued during
-the window gets its turn before the next one empties the machine again.
-
-**Other work beside a window.** cpuq holds back only cpuq's jobs. While a window runs, its cpuq
-watches every other process too (system services such as Spotlight or photo analysis, work
-started outside cpuq). It warns on stderr when they pass a CPU (`work outside this timing window
-is using 2.3 CPUs (mediaanalysisd 1.8, ...): its timings may be noisy`). At the end it says how
-much they used if that reached half a CPU. History keeps it as `noise` and `noise_peak` (CPUs,
-average and peak). Rerun a window whose noise was high.
-
-**Lending an idle window.** With `window_lend = SECONDS`, a window held with no command of its
-own (`cpuq lease NAME --hold --exclusive`, the far end of `--host … --exclusive`) lends the
-machine to waiting jobs once its owner has done nothing for that long. The owner's work is this
-user's processes that started after the window opened, other than the jobs it lent to (or, with
-`CPUQ_WINDOW_OWNER=PID`, that process's tree). Idle means under 0.1 CPU and no process waiting
-on a disk. The moment the owner works again (0.2 CPU, or a process waiting on a disk, checked
-every second), the lent jobs are frozen (SIGSTOP) until the owner idles that long again or the
-window ends; then they continue. The first second or so of the owner's next step can overlap
-them, and frozen jobs keep their memory. `cpuq status` notes a lending window and shows frozen
-jobs as paused. This suits a dedicated build or benchmark machine where those processes are the
-window's work. It needs measured admission.
+runs wait beside idle CPUs, and shows ☁ with uptime and this month's hours while a cloud machine
+runs. It notifies, once each, when the gate stays shut, runs wait beside idle CPUs, heavy work
+runs outside cpuq, a run looks stuck, a machine is overloaded while another has room, or a cloud
+machine sits idle and billing; the urgent ones are also texted. It reads `cpuq status`, `history`
+and `samples`. Install it with `brew install --cask shreeve/tap/cpuq-app`.
 
 ## Jobs: a folder of task files
 
@@ -462,11 +503,10 @@ and the third death goes to `fail/`. Retrying is running again: `mv fail/* todo/
 | `cpuq jobs reset` | every file back in `todo/` holding only its work; refused while it runs |
 
 `cpuq jobs` lists every job folder on this host, then this worktree's submitted jobs (`--all`:
-every worktree's). Each task runs under `cpuq cap --link` in a process group of its own, at a
-normal job's priority, with its file (locked) as its stdout and stderr: every task ends with its
-driver, and a driver started again files what a dead one left in `live/` as `died: lost`.
-`cpuq status` and Cpuq.app show a running job with its workers as what it reserves, and the app
-sets its workers and weight from its row.
+every worktree's). Each task runs under `cpuq cap --link` in a process group of its own, with its
+file (locked) as its stdout and stderr: every task ends with its driver, and a driver started
+again files what a dead one left in `live/` as `died: lost`. A job's driver takes no CPU of the
+pool.
 
 **The agent** (`cpuq agent`, kept running by `cpuq agent --install`) keeps the machine at its
 target load and shares it among the running jobs by weight: each second it measures what each
@@ -481,25 +521,25 @@ terminal (or `ssh HOST cpuq attach`) to the agent: `jobs` lists the jobs, and
 
     cpuq run --on HOST [run options] [--return PATH]... [--include PATH]... -- CMD ARGS...
 
-`cpuq run` always runs here. `--on HOST` runs the job on HOST instead, one of this machine's
-remotes, whatever this machine's state. Each machine's own config lists the machines it can reach
-and send work to:
+`cpuq run` always runs here. `--on HOST` runs it on HOST instead, one of this machine's remotes,
+whatever this machine's state, with the same options (`-n`, `-x`, `-t`, `-r`, `--urgent`,
+`--driver`, `--wait-max`). Each machine's own config lists the machines it can reach and send work
+to:
 
     remotes = burst, pup
     remote_start.burst = ~/Data/Code/runbooks/host-gcp-burst/start
     remote_env.pup = PATH=$HOME/.local/bin:$PATH
 
 So the Mac may list burst and pup, pup only burst, and burst (a cloud machine that can see
-neither) none. `--on` this machine itself runs the job here; a host not listed is a usage error.
-The job goes at once when HOST has room, else into HOST's queue; HOST is started first when it is
-stopped and has a `remote_start` command. A HOST that neither answers nor can be started is an
-error (exit 125), never a quiet run here.
+neither) none. `--on` this machine itself runs here; a host not listed is a usage error. The run
+waits in HOST's line; HOST is started first when it is stopped and has a `remote_start` command. A
+HOST that neither answers nor can be started is an error (exit 125), never a quiet run here.
 
 `cpuq hook` refuses a spec's work run as `cpuq run` when it is long (ten minutes or more here)
 and would finish in half the time elsewhere, with each host's time by the spec's results and the
 `cpuq submit` line. Heavy work typed over `ssh HOST` is pointed to `cpuq run --on HOST`.
 
-Before the job runs there, the repo (git's top level, else the working directory) is copied to
+Before the run starts there, the repo (git's top level, else the working directory) is copied to
 `HOST:cpuq/worktrees/PROJECT/NAME-HASH` (PROJECT the repo's name, NAME its directory here, one
 copy per repo or worktree here) with rsync, honoring `.gitignore` and leaving `.git` behind.
 Each repo and worktree keeps its own copy there, so build caches stay warm between runs. A new
@@ -509,12 +549,12 @@ the folder), so rsync sends only what differs: a Rig copy to burst took 5 s
 instead of 33. Each file of the clone is dated 30 years back (each still apart from the others),
 so rsync compares every file it ships, and an output another branch built there (a make or cargo
 target) is older than every source and is built again; a cache that goes by content (zig's)
-stays warm. The job
+stays warm. The run
 starts in the same subdirectory, with the same options; its output streams back, and its exit
-status is cpuq's. `--return PATH` copies a path (relative to the working directory) back
-afterwards, for a build's output; it repeats.
+status is cpuq's. A task's output file (`-n`) stays on HOST. `--return PATH` copies a path
+(relative to the working directory) back afterwards, for a build's output; it repeats.
 
-- **Gitignored paths a job needs** (a vendored tree its tests read, or `.git` for `git ls-files`)
+- **Gitignored paths a run needs** (a vendored tree its tests read, or `.git` for `git ls-files`)
   go too when listed in `.cpuqinclude` at the repo's top (beside `.gitignore`), a path a line
   (`#` comments), or given with `--include PATH`. A gitignored path not listed never ships, and never leaves the host's copy
   either, whether or not it's here: a build cache there (`.zig-cache`) stays warm from one run to
@@ -530,22 +570,22 @@ afterwards, for a build's output; it repeats.
 - **The copy is read back** by each file's checksum after rsync makes it. rsync's own quick check
   (size and mtime) never sends again a file damaged there that kept both, so a run would go on
   using it. A file that differs is sent again and checked once more; if the copy still differs,
-  the job doesn't run there (it fails with exit 125), and
+  the run doesn't start there (it fails with exit 125), and
   stderr names the files.
 - **Tools under `~/.local`** are off the PATH of a command run over ssh, whose shell reads no login
   profile. `remote_env.HOST = PATH=$HOME/.local/go/bin:$PATH` in the config is exported on HOST
-  before the job: shell assignments, expanded there.
+  before the run: shell assignments, expanded there.
 - **The command must not reach outside the repo.** Absolute paths here (a scratch directory, a
   file in another checkout) do not exist on the other machine, and nothing writes back except
   `--return`.
-- **The job stays tied to this cpuq.** It sends heartbeats down the connection, and the job on the
+- **The run stays tied to this cpuq.** It sends heartbeats down the connection, and the run on the
   other machine stops when they stop: when this cpuq is killed, or the connection is lost.
-- **A machine that goes away mid-job** (a Spot VM reclaimed, the network down) is noticed: when
-  the connection fails or the job dies by a signal and the machine then stops answering, HOST is
-  started again and the job reruns there once; if HOST can't be brought back, the run ends with
-  exit 125, and never falls back to this machine, since a job sized for HOST would swamp it.
+- **A machine that goes away mid-run** (a Spot VM reclaimed, the network down) is noticed: when
+  the connection fails or the run dies by a signal and the machine then stops answering, HOST is
+  started again and the run reruns there once; if HOST can't be brought back, the run ends with
+  exit 125, and never falls back to this machine, since a run sized for HOST would swamp it.
 - **Only work that doesn't need this OS** belongs on `--on`: the other machine may run Linux.
-- The other machines need cpuq 0.28 or later, and ssh to them must work without a prompt.
+- The other machines need this version of cpuq, and ssh to them must work without a prompt.
 
 ### cpuq submit: a spec, and cpuq does the rest
 
@@ -557,7 +597,7 @@ A spec in the repo (`cpuq/matrix.json`) says what a job runs and needs, never wh
 that submits it picks the host. cpuq does the rest:
 
 - **places it** among this machine's remotes (here when it has none) where it should finish
-  first, by the spec's past results on each (another host's scaled by its cores when it has none
+  first, by the spec's past results on each (another host's scaled by its CPUs when it has none
   there): a host that's up and free before a paid one that must be started, which is started only
   for work of ten minutes or more and only when clearly sooner. Work never seen goes to the first
   host with room, else the first stopped one, started. A host is passed over when it has too
@@ -565,22 +605,21 @@ that submits it picks the host. cpuq does the rest:
   the host (one of the remotes, or this machine); a full host queues it;
 - **runs a test suite as a job of task files** with `cpuq test SPEC` and a spec whose `tasks`
   command (after `setup`) writes a file per test into `$CPUQ_TODO`: the host runs them with
-  `cpuq jobs run` (README, "Jobs"), its agent sharing the machine, each task with `$CPUQ_CODE`,
-  the copy's path. A worktree has one test at a time: the same code attaches to it, changed code
-  replaces it. The failures are listed by name with their last line, and their files come back
-  to `.cpuq/fail/`, which git ignores;
+  `cpuq jobs run` (see [Jobs](#jobs-a-folder-of-task-files)), its agent sharing the machine, each
+  task with `$CPUQ_CODE`, the copy's path. A worktree has one test at a time: the same code
+  attaches to it, changed code replaces it. The failures are listed by name with their last line,
+  and their files come back to `.cpuq/fail/`, which git ignores;
 - **syncs a snapshot** of the work there with rsync, moving only what changed, then reads the copy
   back by checksum (as `cpuq run --on` does);
-- **runs it, owned by that host,** so the agent's session, or this machine sleeping, doesn't stop
-  it;
+- **runs it, owned by that host,** as one task (`cpuq run -- cpuq cap ...`), so the agent's
+  session, or this machine sleeping, doesn't stop it;
 - **reports:** progress while it runs, then a verdict that names the code it tested.
 
 ```json
 {
   "label": "proj:suite",
-  "run": "./test/run -j $CPUQ_CORES \"$@\"",
-  "setup": "zig build -j$CPUQ_CORES",
-  "cores": "8-32",
+  "run": "./test/run \"$@\"",
+  "setup": "zig build -j1",
   "time": "60m",
   "exclude": [".zig-cache", "zig-out"],
   "caches": { "PROJ_RESULTS_CACHE": "results" },
@@ -626,7 +665,6 @@ that submits it picks the host. cpuq does the rest:
   HEAD's). `cpuq job ID --json` includes it, finished or not, so a tool can bind a verdict to
   cpuq's own record of what ran.
 - **The note:** `--note`, or else the worktree's branch, shows beside the label everywhere.
-  `cpuq note PID|LABEL TEXT [--host HOST]` changes a running job's note.
 - **What travels:**
   - everything in the repo but `exclude` and `.git`;
   - `"git": true` ships the repo's git, git's own parts only (a worktree's too), for a job that
@@ -655,19 +693,19 @@ mise does:
   (vX.Y.Z), `0.2.9` that tag, and a hash that commit, pushed or not. Each is resolved when the job
   is submitted, so the job's identity holds the exact version and `latest` moves as main does.
 - **In the job:** each pack is on `PATH` and in `$NAME`, its binary (`$RIG`, `$ZIG`, `$GO`).
-- **Installed once, by the first job that needs it,** inside that job's grant and under a lock
-  per version: zig downloaded from ziglang.org, any other built from the source of its commit,
-  which cpuq ships from its checkout here (`git archive`) when the host lacks it. A version never
-  changes after; `latest` and `stable` are links to what they last were.
+- **Installed once, by the first job that needs it,** inside that job's task, on its CPU, and
+  under a lock per version: zig downloaded from ziglang.org, any other built from the source of
+  its commit, which cpuq ships from its checkout here (`git archive`) when the host lacks it. A
+  version never changes after; `latest` and `stable` are links to what they last were.
 - **Recipes** say how to build each, in `~/.config/cpuq/packs.json` beside the config:
 
   ```json
   {
     "nexus": { "git": "https://github.com/shreeve/nexus", "local": "~/Data/Code/nexus",
-               "build": "zig build -Doptimize=safe -j\"$CPUQ_CORES\"", "bin": "bin/nexus",
+               "build": "zig build -Doptimize=safe -j1", "bin": "bin/nexus",
                "packs": { "zig": "0.17.0" } },
     "rig":   { "git": "https://github.com/shreeve/rig", "local": "~/Data/Code/rig",
-               "build": "zig build -j\"$CPUQ_CORES\" -Dnexus=\"$NEXUS\"", "bin": "bin/rig",
+               "build": "zig build -j1 -Dnexus=\"$NEXUS\"", "bin": "bin/rig",
                "packs": { "zig": "0.17.0", "nexus": "latest" } }
   }
   ```
@@ -678,30 +716,28 @@ mise does:
   over a recipe's.
 - **On PATH** goes each pack's bin directory, so go brings gofmt.
 - **`cpuq packs [--host HOST]`** lists a store; **`cpuq packs install rig@stable --host burst`**
-  installs ahead of a job, under that host's queue. Hosts need cpuq 0.21 for packs.
+  installs ahead of a job, in that host's line.
 
-The full design, fields and rules are in [docs/SUBMIT.md](docs/SUBMIT.md). Hosts need cpuq 0.18.
+The full design, fields and rules are in [docs/SUBMIT.md](docs/SUBMIT.md).
 
 ### Big jobs on a cloud host
 
-A test suite that takes an hour on a laptop takes minutes on a 96-CPU cloud machine, if each run
-goes there whole, keeps its caches warm, and cleans up after itself. This is how an agent sends
-one:
+A test suite that takes an hour on a laptop takes minutes on a 96-CPU cloud machine, if its tests
+go there as tasks, keep their caches warm, and clean up after themselves. This is how an agent
+sends one:
 
-    cpuq run --on burst --label proj:matrix --cores 8-32 --return .zig-cache/gate.log -- sh -c '
-      : >.zig-cache/gate.log
-      mkdir -p "$HOME/cpuq/caches/proj/results"
-      zig build -j"$CPUQ_CORES" >>.zig-cache/gate.log 2>&1 &&
-      PROJ_RESULTS_CACHE=$HOME/cpuq/caches/proj/results timeout 90m ./test/run -j "$CPUQ_CORES" >>.zig-cache/gate.log 2>&1
-      rc=$?
-      grep -E "^(fail|FAIL)" .zig-cache/gate.log | head -20; tail -2 .zig-cache/gate.log
-      rm -rf .zig-cache/proj-test
-      exit $rc'
+    cpuq run --on burst --label proj:build -t 30m -- zig build -j1
+    cpuq run --on burst --label proj:matrix -n 4000 -t 5m --return .zig-cache/fail -- sh -c '
+      mkdir -p "$HOME/cpuq/caches/proj/results" .zig-cache/fail
+      PROJ_RESULTS_CACHE=$HOME/cpuq/caches/proj/results ./test/one "$CPUQ_TASK" >.zig-cache/out-$CPUQ_TASK 2>&1
+      rc=$?; [ $rc = 0 ] || cp .zig-cache/out-$CPUQ_TASK .zig-cache/fail/
+      rm -f .zig-cache/out-$CPUQ_TASK; exit $rc'
 
-- **The same label every time** (`proj:matrix`, `proj:suite`): history sizes the request and
-  estimates waits by label. Never a branch name.
-- **A core range sized to share:** at most a third of the host's CPUs each, so three runs fit at
-  once and more queue on the host. Every tool inside takes `$CPUQ_CORES`.
+- **The same label every time** (`proj:build`, `proj:matrix`): history is kept by label. Never a
+  branch name.
+- **One run per phase:** the build is one task; the tests are `-n` tasks, each on a CPU of its own,
+  as many at once as the host's line gives. The copy persists between runs, so the second run
+  finds the first's build.
 - **Caches outside the copy.** Each worktree gets its own copy on the host, so a cache inside it
   is cold for every new branch. A path under `$HOME/cpuq/caches/PROJECT/`, outside every copy,
   is shared by all of a project's runs there. A results cache keyed by content then carries a
@@ -710,16 +746,14 @@ one:
     compiler's own hash, flags, and toolchain.
   - Entries are written by renaming into place, since runs share the cache.
   - Nothing evicts these caches yet, so watch their size (`du -sh ~/cpuq/caches/*` on the host).
-- **A fresh log each run:** the copy keeps the last one, so the command empties it first. Without
-  that, a failed build would report the previous run's failures.
-- **A time limit inside the command** (`timeout 90m`): a hung test otherwise keeps a billing
-  machine busy, and its idle stop never comes.
+- **A time limit on each task** (`-t`): a hung test otherwise keeps a billing machine busy, and its
+  idle stop never comes.
 - **Scratch deleted at the end**, after the status is saved, in the same command. The copy
   persists between runs, so whatever a run leaves stays on the host's disk. Paths are relative to
   the copy: never `rm -rf "$X/…"` with a variable that might be empty.
-- **A short report:** the failures and the summary line on the terminal. `--return` brings the
-  full log back; otherwise it stays on the host. The exit status is the run's own.
-- **Run it as a background command.** It waits in the host's queue, then runs as long as it
+- **A short report:** the summary names the failed tasks with their last lines. `--return` brings
+  more back; otherwise it stays on the host.
+- **Run it as a background command.** It waits in the host's line, then runs as long as it
   takes, often past an agent tool's timeout.
 - **Tools the host lacks** are built there, pinned, under the project's cache
   (`$HOME/cpuq/caches/PROJECT/tools/NAME-COMMIT`), so later runs find them already built, and no
@@ -730,8 +764,6 @@ one:
 - **Per-program limits** in a test runner come from `cpuq cap`, never from a watchdog listing
   every process.
 - **Only work that doesn't need this OS** goes there.
-- **The hook judges an `--on` request by the host it goes to**, so `--cores 8-32` for a
-  96-CPU machine isn't refused on a 10-CPU laptop.
 - **The first run of a branch is cold:** it copies the repo and builds from scratch. Later runs
   move only what changed.
 
@@ -748,7 +780,7 @@ worktree syncs only what changed, and keeps pack versions. Left alone they pile 
 worktree ever sent there leaves a copy of up to tens of GB. `cpuq clean` removes them once
 unused for `clean_after` (3 days); `cpuq record`, where it's installed, runs it every hour.
 
-- **Copies of repos** (`~/cpuq/worktrees/PROJECT/…`) go by when a `cpuq run --on` job last ran in one or
+- **Copies of repos** (`~/cpuq/worktrees/PROJECT/…`) go by when a `cpuq run --on` run last ran in one or
   a submitted job last synced it, never while a job holds the copy's lock.
 - **Submitted jobs' scratch** (`~/cpuq/tmp/ID`, their TMPDIR) that a killed job left behind.
 - **Pack versions** go by when a job last used one, never one `latest` or `stable` names.
@@ -760,21 +792,17 @@ unused for `clean_after` (3 days); `cpuq record`, where it's installed, runs it 
 
 ## Named leases
 
-    cpuq lease NAME [--slots N] [--exclusive] [--priority P] [--label L] [--max-wait S] -- CMD...
-    cpuq lease NAME --host HOST [same options] -- CMD ARGS...
-    cpuq lease NAME --host HOST --hold [same options]
+    cpuq lease NAME [--slots N] [--label L] [--wait-max S] [--] CMD ARGS...
+    cpuq lease NAME --host HOST [--slots N] [--label L] [--wait-max S] [--] CMD ARGS...
+    cpuq lease NAME --host HOST --hold [--slots N] [--label L] [--wait-max S]
 
 `cpuq lease NAME -- CMD` runs CMD holding NAME, a first-come, first-served lock on anything that
-is not CPUs: a benchmark machine, a database, one build per cache. It is a queue like the CPUs'
-one, with one holder at a time, or N with `--slots N` (every caller of one lease passes the same
-N). Priorities, aging, `--label`, `--max-wait` and `cpuq status` work as for `cpuq run`, strictly
-in order, and the kernel frees the lease however its holder ends. A lease checks no gates and
-leaves the command's cores, jobserver and scheduling class alone. A name is letters, digits,
-`.`, `_` and `-`. CMD gets `CPUQ_LEASES`, the leases it runs inside, so a `cpuq lease` of the
-same name within it starts at once.
-
-`--exclusive` also takes the machine's cores, as an exclusive run does, once NAME is held, and
-keeps both until CMD ends; its claim on the cores goes to the front of the queue.
+is not CPUs: a benchmark machine, a database, one build per cache. One holder at a time, or N with
+`--slots N` (every caller of one lease passes the same N), strictly in order, and the kernel frees
+the lease however its holder ends. `--wait-max S` gives up with 75. A lease checks no gates and
+holds no CPU: work CMD runs goes under `cpuq run` inside it. A name is letters, digits, `.`, `_` and
+`-`. CMD gets `CPUQ_LEASES`, the leases it runs inside, so a `cpuq lease` of the same name within it
+starts at once.
 
 **On another machine.** `--host HOST` holds the lease on HOST's cpuq and runs CMD here: cpuq
 starts `ssh HOST cpuq lease NAME --hold`, waits for HOST to grant the lease, runs CMD, then closes
@@ -786,11 +814,10 @@ over ssh and work started on HOST itself then share one queue:
 
 HOST needs cpuq on the `PATH` of a non-interactive ssh command, and an ssh login that does not
 ask for a password. A `cpuq lease NAME --host HOST` inside CMD starts at once, and a command on
-HOST that carries CMD's `CPUQ_LEASES` sees the lease as its own. With `--exclusive`, HOST's
-`cpuq run`s wait for the lease's window unless they carry its `CPUQ_LEASES`; this line, in
-CMD's script, runs inside the window at once:
+HOST that carries CMD's `CPUQ_LEASES` sees the lease as its own. For timing on HOST, hold the lease
+and drain HOST inside it:
 
-    ssh HOST "cd repo && CPUQ_LEASES='$CPUQ_LEASES' cpuq run --label app:bench -- ./bench"
+    cpuq lease bench --host buildbox -- ssh buildbox 'cd repo && cpuq drain --label app:bench -- ./bench'
 
 **Held by a script.** `--hold` with `--host` and no command takes the lease for a script that
 holds it partway through its run. Once HOST grants the lease, cpuq prints
@@ -810,49 +837,11 @@ closing ends within a minute (`CPUQ_HOLD_QUIET`). In any bash, 3.2 included:
 Inside a hold of the same lease, `--hold` prints the entry already held and holds nothing, so a
 script can take the lease without knowing whether its caller already has.
 
-**Waiting for others.** `cpuq wait --label PATTERN [--max-wait SECONDS]` returns once no job
-whose label matches (`PATTERN*` for a prefix) runs or waits, for cores or a lease, so a script
-can wait for another session's work without polling `cpuq status`. `--max-wait` gives up with
-75.
+**Waiting for others.** `cpuq wait --label PATTERN [--max-wait SECONDS]` returns once no run
+whose label matches (`PATTERN*` for a prefix) runs or waits, so a script can wait for another
+session's work without polling `cpuq status`. `--max-wait` gives up with 75.
 
-## Managing the queue
-
-    cpuq first  LABEL|PID     move a waiting job to the front
-    cpuq start  LABEL|PID     start a waiting job now, past the queue and the gates
-    cpuq cancel LABEL|PID     take a waiting job out of the queue (it exits 75)
-    cpuq pause  LABEL|PID     stop a running job's whole process tree (SIGSTOP)
-    cpuq resume LABEL|PID     continue it (SIGCONT)
-    cpuq stop   LABEL|PID     end a running job (SIGTERM to its whole process tree)
-
-These act on anyone's jobs in the queue, not only the caller's, so use them on jobs you did not
-start only when you mean to. They act on jobs for cores, not on named leases. PID is the job's
-cpuq; LABEL may end in `*` for a prefix. A target that matches several jobs needs `--all` (else
-exit 2); one that matches nothing exits 125. `--host HOST` acts through that machine's cpuq, on a
-job sent there (`cpuq stop 1751518 --host burst`).
-
-A waiter takes its order at its next look: the first eight within 2 seconds, the rest within a
-minute. `start` never starts a job into a running exclusive run, and pause, resume and stop leave
-an exclusive run alone. A job started by hand is marked `"forced": true` in history. A paused job
-counts for nothing (its cores are lent at once under `admit = cores`) and shows `paused` in
-`cpuq status --json`; it keeps its memory and its cores, and a network peer may time out on it,
-so pausing suits builds and tests best.
-
-## Checking up: doctor and the agent hook
-
-    cpuq doctor [--host HOST]
-
-`cpuq doctor` reports what cpuq can see but not stop, one line each, and exits 1 when there is
-anything (0 and `ok` when not):
-
-- heavy work outside cpuq (a process using a CPU or more that no job accounts for);
-- a job using far more CPU than its grant, or with far more threads ready to run than it was
-  granted (a build without `-j"$CPUQ_CORES"`);
-- a job holding cores for over ten minutes while using almost none (parked on something; it
-  also blocks timing windows);
-- a waiter asking for more than half the CPUs, which waits for a nearly empty machine;
-- a waiter held for over five minutes while the CPUs are under 60% busy.
-
-`--host HOST` runs it on HOST over ssh.
+## The agent hook
 
     cpuq hook
 
@@ -862,16 +851,18 @@ instead, and exits 2, which refuses the command and shows the agent the fix. It 
 
 - a heavy command (`zig build`, `cargo build/test/…`, `make`, `ninja`, `cmake --build`,
   `xcodebuild`, `swift build/test`, `go build/test`, `pytest`, `gradle`, `mvn`, `bazel`,
-  `buck2`) outside `cpuq run`, here or through `ssh HOST`;
-- a `cpuq run` whose `$CPUQ_CORES` the typing shell expands (outside single quotes);
-- `zig build` without `-j` inside a job;
-- a request for more than half the CPUs;
-- work in a container or simulator (`incus`/`docker exec`, `xcodebuild` on a Simulator) without
-  `--opaque`.
+  `buck2`) outside `cpuq run`, here or through `ssh HOST`, with the run that does it at one job
+  (`cpuq run --label app:build -- zig build -j1`);
+- a `cpuq run` whose command would start more than one job: a jobs count above 1, no limit
+  (`make -j`, `-n auto`), or a tool that uses every CPU without its one-job option, with the fix
+  "or split the work into tasks with -n M";
+- a removed option (`--cores`, `--priority`, `--max-wait`, `--exclusive`, `--no-load-check`,
+  `--qos`, `--opaque`) or `$CPUQ_CORES`, with the command rewritten;
+- `--driver` on anything but a test runner.
 
-Help, version, dry-run and listing invocations pass, as does any command marked `# cpuq: skip`
-and everything when `CPUQ_HOOK=off`. It reads only the command's text; anything it can't parse
-passes. Install it for every session in `~/.claude/settings.json`:
+Help, version, dry-run and listing invocations pass, as does any command marked `# cpuq: skip`,
+everything inside a task, and everything when `CPUQ_HOOK=off`. It reads only the command's text;
+anything it can't parse passes. Install it for every session in `~/.claude/settings.json`:
 
     {"hooks": {"PreToolUse": [{"matcher": "Bash",
        "hooks": [{"type": "command", "command": "cpuq hook"}]}]}}
@@ -883,11 +874,12 @@ Every machine is laid out the same way, the Mac you work on and the hosts it sen
 ```
 ~/.local/bin/cpuq        the binary
 ~/.config/cpuq/config    the config, same shape; only lines about that machine differ
-~/.local/state/cpuq/     cpuq's own records (history, samples, job logs)
+~/.local/state/cpuq/     cpuq's own records (history, samples, job logs, runs/: tasks' output)
 ~/cpuq/packs/            tools jobs ask for (zig, rig, nexus)
 ~/cpuq/worktrees/        copies of repos sent from another machine
 ~/cpuq/caches/PROJECT/   build caches shared across branches
 ~/cpuq/tmp/              scratch
+/tmp/cpuq-UID/v2/        the pool: its lock, token files, runs and promises
 ```
 
 Work started on a machine runs in its own checkout, not a copy: `~/cpuq/worktrees/` there holds
@@ -899,72 +891,27 @@ The config file is `CPUQ_CONFIG`, default `~/.config/cpuq/config`: `key = value`
 at most once. `#` starts a comment at the start of a line or after a space or tab, so a value may
 hold one (`a#b`). Numbers are plain decimal digits, within a range the error gives. HOST in
 `remote_start.HOST` and `remote_env.HOST` is one of `remotes`. An invalid line is an error naming
-the file and line (exit 2). A run already waiting re-reads the file when it changes; an invalid
-edit keeps the settings in force and says so.
+the file and line (exit 2); a removed key's error names what replaces it. A long-running cpuq
+(the recorder) re-reads the file when it changes; an invalid edit keeps the settings in force and
+says so.
 
 | key | default | meaning |
 |---|---|---|
-| `admit` | measured | `measured`: by the CPU jobs use; `cores`: by the cores they hold |
-| `target` | active CPUs | the CPUs' worth of measured use to fill (measured only) |
-| `settle` | 20 | seconds a new job counts at its expected use (measured only) |
-| `patience` | 30 | the least seconds the first waiter lets others start ahead of it when they would delay it |
-| `aging` | 600 | seconds of waiting per one-class promotion; 0 turns it off |
-| `poll` | 0.5 | seconds between the first waiter's looks |
-| `note` | 60 | seconds between "waiting" lines |
-| `qos` | on | map priorities to scheduling classes |
-| `pressure_check` | on | admit nothing under memory pressure |
+| `budget` | every pool CPU | keep only the first this many CPUs of the pool (`CPUQ_BUDGET` overrides) |
+| `cpus` | worked out | the pool's CPUs, in order, as a Linux CPU list (`12-19,2`) |
+| `timeout` | 1h | each task's time limit when a run gives no `-t`; off: none |
+| `weights` | none | project weights for sharing the pool, `rig:2 trig:1`; a project not named weighs 1 |
+| `pressure_check` | on | hand out no CPU under memory pressure |
 | `pressure_psi` | 10 | Linux: the `some avg10` percentage that counts as pressure |
-| `min_available` | off | admit nothing while available memory is under this (e.g. `6G`) |
+| `min_available` | off | hand out no CPU while available memory is under this (e.g. `6G`) |
+| `min_disk` | 5G | hand out no CPU while `$HOME`'s, the temp directory's or `~/cpuq`'s filesystem has less free than this; off turns it off |
+| `cgroups` | on | Linux: run each `--driver` runner in a delegated systemd scope, its command in `job/`, for `cpuq cap` |
 | `clean_after` | 3d | what jobs left on this machine (copies of jobs sent here, pack versions no link names, job records after a week) is removed once unused this long, by `cpuq record` hourly and `cpuq clean`; off keeps everything |
-| `min_disk` | 5G | admit nothing while `$HOME`'s, the temp directory's or `~/cpuq`'s filesystem has less free than this; off turns it off |
-| `max_memory` | off | stop a job whose processes together use more memory than this (e.g. `16G`) |
 | `remotes` | none | ssh hosts this machine sends work to (`cpuq run --on`, `cpuq submit`), in order (commas or spaces) |
 | `submit_slots` | 3 | copies of a worktree a submitted job may use on its host (1–8): so many of its jobs run at once |
+| `submit_roots` | `~/Data/Code` | directories `cpuq submit` may ship and take `deps` from (commas or spaces) |
 | `remote_start.HOST` | none | a command (run with sh) that starts HOST when it is stopped; it returns once ssh works |
 | `remote_env.HOST` | none | shell assignments a job sent there exports on HOST, e.g. `PATH=$HOME/.local/go/bin:$PATH` |
-| `exclusive` | on | grant `--exclusive`; off, it runs as an ordinary job |
-| `window_gap` | 0 | seconds after an exclusive run ends during which waiting ones go behind other work |
-| `cgroups` | on | Linux: run each job in a delegated systemd scope, its command in `job/`, for `cpuq cap` |
-| `cpu_weights` | off | Linux: weight each job's scope by its grant |
-| `window_lend` | 0 | seconds a `--hold --exclusive` window's owner idles before it lends the machine (measured only; 0: never) |
-| `budget` | active CPUs - 2 | cores an exclusive run takes; under `admit = cores`, the cores to hand out |
-| `active_cap` | on | cap the budget by the CPUs active now |
-| `load_check` | on | the load valve (under measured admission, for exclusive runs only) and the 97%-busy check; off ignores the machine's load |
-| `load_margin` | 4 | the valve trips above budget + margin; as `load_check` |
-| `backfill` | on | let a job start ahead of the first waiter when both fit (measured), or on cores the first cannot use yet (`admit = cores`, and behind an exclusive first waiter) |
-| `window_backfill` | on | behind a timing window waiting at the front, let a job known to end before the machine drains start meanwhile; off on a timing machine (nothing starts ahead of a waiting window) |
-| `lend` | on | `admit = cores` only: lend the first waiter the cores a running job leaves idle |
-| `lend_after` | 60 | `admit = cores` only: seconds a core must stay idle before it is lent |
-| `right_size` | on | `admit = cores` only: cap a range near what its label has used (measured admission always does) |
-
-With `max_memory`, a job over the limit is asked to stop (SIGTERM to its whole process tree),
-made to 10 seconds later (SIGKILL), and recorded as stopped for its memory. One job that
-balloons would otherwise fill the swap and shut the memory gate on everyone.
-
-## Reservation mode (admit = cores)
-
-With `admit = cores`, each job counts at the cores it holds, out of a fixed budget. The budget
-is `CPUQ_BUDGET`, else `budget` in the config, else the active CPUs minus 2 (8 on a 10-CPU Mac),
-leaving a reserve for the owner's own work; it is capped by the CPUs active now unless
-`active_cap = off`, which lets it oversubscribe the machine on purpose. `cpuq budget` prints it.
-A request is clamped to the budget.
-
-In this mode a few things keep reserved cores from sitting idle:
-
-- **The first waiter** takes up to its maximum of the free cores but leaves the next waiter's
-  minimum free when it can still get its own.
-- **Backfill** lets a waiter start ahead of the first on cores the first cannot use yet, when
-  history says it ends before the first could start, or while the first has waited less than its
-  patience.
-- **Lending** gives the first waiter cores that a running job has left idle for `lend_after`
-  seconds, on top of the budget, while the CPUs have room to spare.
-- **Right-sizing** caps a range near what its label has used.
-- **The load valve** holds every admission while the 1-minute load is over budget +
-  `load_margin` and the CPUs are at least 90% busy, and spaces admissions while the load is over
-  the budget. The budget schedules the work; the valve catches load from outside cpuq and jobs
-  that use more CPUs than they were granted.
-
-[docs/DESIGN.md](docs/DESIGN.md) has the exact rules.
 
 ## Environment and exit status
 
@@ -972,39 +919,78 @@ In this mode a few things keep reserved cores from sitting idle:
 |---|---|
 | `CPUQ_DIR` | the state directory, an absolute path (default `/tmp/cpuq-UID`) |
 | `CPUQ_CONFIG` | the config file (default `~/.config/cpuq/config`) |
-| `CPUQ_BUDGET` | the budget in cores, over the config file |
+| `CPUQ_BUDGET` | keep only the first this many CPUs of the pool, over the config file |
 | `CPUQ_HISTORY` | the history file |
 | `CPUQ_HOLD_QUIET` | seconds a `--hold` that has had heartbeats waits for the next before it ends (60) |
-| `CPUQ_WINDOW_OWNER` | for a `--hold --exclusive` window with `window_lend`: the PID whose process tree is its owner's work |
+| `CPUQ_HOOK` | `off` turns `cpuq hook` off |
 | `NO_COLOR` | draw `cpuq status` and `cpuq history` without color |
-| `CPUQ_CORES` | set for CMD: its grant |
-| `CPUQ_TOKEN` | set for CMD: its hold, which makes runs inside it nested |
-| `CPUQ_PROGRESS` | set for CMD: a file it may write `DONE TOTAL FAILING` to, shown in `cpuq status` |
-| `CPUQ_LEASES` | set for CMD: the named leases it runs inside, `NAME=ID` here and `NAME@HOST=ID:PID` on HOST |
-| `MAKEFLAGS` | set for CMD: a GNU make jobserver with `CPUQ_CORES` slots; other flags kept |
+| `CPUQ_TASK`, `CPUQ_TASKS` | set for each task: which task it is (1 to M), and M |
+| `CPUQ_CPU` | set for each task: the pool CPU it runs on |
+| `CPUQ_OP` | set for each task: its run's ticket, which makes runs inside it nested |
+| `CPUQ_ATTEMPT`, `CPUQ_ATTEMPTS` | set for each task: which try this is (1 first), and `-r` + 1 |
+| `CPUQ_CGROUP` | set for a `--driver` runner on Linux: its delegated scope, for `cpuq cap` |
+| `CPUQ_PROGRESS` | set for a submitted job's command: a file it may write `DONE TOTAL FAILING` to |
+| `CPUQ_LEASES` | set for a lease's CMD: the named leases it runs inside, `NAME=ID` here and `NAME@HOST=ID:PID` on HOST |
 
 | status | meaning |
 |---|---|
-| CMD's own | the command ran; its exit status passes through |
+| CMD's own | one task ran; its exit status passes through |
+| 124 | one task reached its time limit (`-t`) |
+| 0 or 1 | `-n M`: every task passed, or not |
 | 128+N | the command was killed by signal N (cpuq dies by the same signal) |
-| 75 | gave up waiting (`--max-wait`, `cpuq cancel`, a `--hold` whose holder went away); the command never ran |
-| 125 | cpuq itself failed (the state directory, `status --host`, a control target that matches nothing) |
+| 75 | gave up waiting (`--wait-max`, `drain --max`, a `--hold` whose holder went away); the command never ran |
+| 125 | cpuq itself failed (the state directory, `status --host`) |
 | 126, 127 | the command is not executable, or not found |
-| 2 | a usage error or an invalid config file |
+| 2 | a usage error, an invalid config file, or a removed option, key or command |
 
 `cpuq --version` prints the version.
 
+## Removed
+
+Each removed option, config key, spec field and command fails with one line naming its
+replacement (exit 2), so a script or an agent's notes that still use one learn what to write
+instead. The removed variables are simply not set; `cpuq hook` rewrites a `cpuq run` that uses
+`$CPUQ_CORES`.
+
+| removed | instead |
+|---|---|
+| `--cores K`, `--cores MIN-MAX` | one CPU per task; parallel work as `-n M` tasks, at most `-c C` CPUs at once |
+| `$CPUQ_CORES`, `$CPUQ_CPUS`, `$CPUQ_TOKEN`, the make jobserver in `MAKEFLAGS` | one job per task (`zig build -j1`, `make`); `CPUQ_TASK` picks a task's work |
+| `--priority high\|normal\|low` | `--urgent` for a run's first CPU; no low |
+| `--max-wait` (run, lease) | `--wait-max` |
+| `--exclusive` (run) | `cpuq drain -- CMD` |
+| `--exclusive` (lease) | `cpuq lease NAME -- cpuq drain -- CMD` |
+| `--no-load-check` | outside load is measured, never the load average |
+| `--qos` | tasks run as they are |
+| `--opaque` | every task holds its one CPU, in a container or not |
+| `cpuq first` | `--urgent` |
+| `cpuq start` | a free CPU goes to the first in the line |
+| `cpuq cancel`, `cpuq stop` | `cpuq kill TICKET` |
+| `cpuq pause`, `cpuq resume` | Ctrl-Z on a run, then `fg` |
+| `cpuq note` | `cpuq run --note TEXT` |
+| `cpuq doctor` | `cpuq status` flags runs over or under their CPUs, and work outside cpuq |
+| `cpuq qos` | tasks run as they are |
+| config `admit`, `target`, `settle`, `right_size`, `poll`, `aging`, `note`, `backfill`, `window_backfill`, `patience`, `lend`, `lend_after` | the pool hands out one CPU per task through the line (`weights` for shares) |
+| config `exclusive`, `window_gap`, `window_lend` | `cpuq drain` |
+| config `cpu_weights`, `affinity` | each task is pinned to its own CPU on Linux |
+| config `load_check`, `load_margin` | outside load is measured |
+| config `active_cap` | the pool is the CPUs online; `budget` or `cpus` narrows it |
+| config `qos` | tasks run as they are |
+| config `max_memory` | `cpuq cap --mem` |
+| spec `cores` | a spec's job runs as one task |
+
 ## Limits
 
-- Cooperative only: cpuq holds cores by convention. Work not run under cpuq is seen only as
-  load, and a job uses as many CPUs as its tools take; `CPUQ_CORES` and the jobserver are how a
-  job keeps to its grant.
+- Cooperative: cpuq hands out CPUs to what runs under it. Work not run under cpuq is seen only as
+  outside load. On macOS a task that starts more threads than its one CPU takes CPUs from other
+  tasks; `cpuq status` flags it, and the hook refuses the common cases.
 - Per user: the state directory is `/tmp/cpuq-UID`, so two users on one machine each have their
-  own queue, and neither sees the other's jobs except as load.
+  own pool, and neither sees the other's runs except as outside load.
 - One machine: the state directory must be on a local file system with working `flock(2)`.
-- One queue per `/tmp`: a container has its own `/tmp`, and with it its own queue. Containers
-  share the host's queue only through a common `CPUQ_DIR` on a bind mount.
-- A descendant that outlives a SIGKILLed cpuq keeps the cores until it exits.
+- One pool per `/tmp`: a container has its own `/tmp`, and with it its own pool. Containers
+  share the host's pool only through a common `CPUQ_DIR` on a bind mount.
+- On macOS, a task that outlives a SIGKILLed cpuq runs until the next run takes its CPU and kills
+  it.
 
 ## More
 
@@ -1015,5 +1001,5 @@ In this mode a few things keep reserved cores from sitting idle:
 - [CHANGELOG.md](CHANGELOG.md): what changed in each version, and why.
 - [docs/RELEASING.md](docs/RELEASING.md): cutting a release.
 - [scripts/scenario.sh](scripts/scenario.sh): synthetic work for a machine's cpuq, shaped like
-  builds, test suites, greedy runners and memory hogs (stress-ng), for watching the queue and
+  builds, test suites, greedy runners and memory hogs (stress-ng), for watching the pool and
   Cpuq.app under load.

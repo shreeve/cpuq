@@ -53,9 +53,8 @@ never write them.
 ```json
 {
   "label": "rig:matrix",
-  "setup": "(cd deps/nexus && zig build -Doptimize=safe -p \"$NEXUS_OUT\") && zig build -j$CPUQ_CORES -Dnexus=$NEXUS_OUT/bin/nexus",
-  "run": "python3 test/matrix.py -j $CPUQ_CORES --delta \"$@\"",
-  "cores": "8-32",
+  "setup": "(cd deps/nexus && zig build -Doptimize=safe -j1 -p \"$NEXUS_OUT\") && zig build -j1 -Dnexus=$NEXUS_OUT/bin/nexus",
+  "run": "python3 test/matrix.py --delta \"$@\"",
   "time": "90m",
   "mem": "96G",
   "tools": { "zig": "0.17.0" },
@@ -71,11 +70,10 @@ never write them.
 | field | meaning | default |
 |---|---|---|
 | `label` | `project:task` | required |
-| `run` | `sh -c RUN cpuq ARGS...` at the copy's top, with `$CPUQ_CORES`; `-- ARGS` become `"$@"` (`cpuq submit`) | `run` or `tasks` |
+| `run` | `sh -c RUN cpuq ARGS...` at the copy's top, as one task; `-- ARGS` become `"$@"` (`cpuq submit`) | `run` or `tasks` |
 | `tasks` | `sh -c TASKS cpuq ARGS...` after `setup`, writing one task file per task into `$CPUQ_TODO` (its work up to the first blank line, run with `sh`); `cpuq jobs run` then runs them on the host, each with `$CPUQ_CODE`, the copy's path (`cpuq test`) | `run` or `tasks` |
 | `setup` | run first, in the same job | none |
-| `cores` | `N` or `MIN-MAX` | that host's history, else 2 |
-| `time` | wall time from admission, enforced by `cpuq cap --time` around setup and run; required on a host with `remote_start` | 2h there, none here |
+| `time` | wall time from the job's start on its CPU, enforced by `cpuq cap --time` around setup and run; required on a host with `remote_start` | 2h there, none here |
 | `mem` | memory of the whole job, by `cpuq cap --mem` (the kernel's memory.max inside a Linux job) | none |
 | `tools` | `{"zig": "0.17.0"}`: `zig version` etc. checked on the host before the run; a mismatch is NOT RUN | none |
 | `env` | variables for setup and run, written to the job's own files on the host, never on a command line | none |
@@ -90,7 +88,11 @@ never write them.
 
 - **Defaults:** the directory is the git top of the spec's repo, and its realpath must be under
   `submit_roots` (default `~/Data/Code`).
-- **Spec errors:** one line naming the field, exit 2.
+- **Spec errors:** one line naming the field, exit 2. A spec with `cores` is refused: its job runs
+  as one task.
+- **One CPU:** `setup` and `run` share the job's one CPU, so they run at one job (`zig build -j1`).
+  A `cpuq run -n M` inside them is nested and runs on that same CPU. A suite that needs many CPUs
+  is a spec with `tasks`, run by `cpuq test`.
 - **Refused directories:** one holding `.env*`, `*.pem`, `id_*`, `.netrc` or `.npmrc` that isn't
   excluded.
 
@@ -112,8 +114,8 @@ never write them.
   - `cpuq job last` names the other jobs of the worktree that are running, if any.
 - **The last line is always a verdict.**
 
-      PASS         rig:matrix  9c1e5f2a  38m40s  burst  32 cores  11409: 6840 ok, 4569 rejected
-      FAIL         rig:matrix  9c1e5f2a  exit 1  38m40s  burst  3 of 11409 failed
+      PASS         rig:matrix  9c1e5f2a  38m40s  burst  11409 tests: 11409 ok, 0 failed
+      FAIL         rig:matrix  9c1e5f2a  exit 1  38m40s  burst  11409 tests: 11406 ok, 3 failed
       TIMEOUT      rig:matrix  9c1e5f2a  stopped at 90m: a limit, may be a hang in your change
       OOM          rig:matrix  9c1e5f2a  stopped at 96G: a limit, may be a leak in your change
       NOT RUN      rig:matrix  9c1e5f2a  no host could take it (burst: zig 0.16.0, wanted 0.17.0): not your code
@@ -174,14 +176,15 @@ never write them.
      `return`, the `deps` targets and `.cpuq-generation`), then each dep's tracked files, then
      writes the generation. `_job` checks it.
 4. **Run.**
-   - `cpuq run --label L --cores C -- cpuq cap --time T --mem M -- sh -c 'SETUP && RUN' cpuq ARGS`,
-     in the copy.
+   - `cpuq run --label L [--note N] -- cpuq cap --time T --mem M -- sh -c 'SETUP && RUN' cpuq ARGS`,
+     in the copy: one task, on one CPU of the host's pool.
    - The environment: `env`, `caches` and a `TMPDIR` of the job's own.
    - Output goes to the job's `output.log`, and the report is truncated first.
    - `tools` are checked before anything runs.
-   - The job is cpuq run's like any other: it queues there, takes cores, gets a cgroup that is
-     killed when the command ends, and lands in history. cap enforces `time` from admission, and
-     `mem` as the kernel's limit inside the job.
+   - The job is a `cpuq run` like any other: it waits in the host's line for its CPU and lands in
+     history. cap enforces `time` from the job's start, and `mem` by reading the job's process
+     tree once a second. The task's time limit is the host's `timeout` (1 hour by default), so a
+     host that runs longer jobs sets `timeout` above its longest `time`.
 5. **Finish on the host.**
    - The verdict comes from the exit code and cap's last line, with the report read for counts and
      failures.
@@ -251,6 +254,6 @@ You're notified at the end. The last line is the verdict, and the exit status ma
   NOT RUN / LOST / CANCELLED / CPUQ ERROR: not your code; follow the hint on the line.
 Never cat logs. After compaction: cpuq jobs, then cpuq job ID --wait in the background.
 Same code resubmitted attaches. After edits, --replace; a repro beside a full run, --again.
-Never add -j, --cores, hosts, ssh or rm -rf; never cancel another worktree's job.
+Never add -j, hosts, ssh or rm -rf; never cancel another worktree's job.
 Never loop on a non-code verdict.
 ```

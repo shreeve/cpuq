@@ -8,8 +8,8 @@ binary, [AGENTS.md](AGENTS.md) is enough.
 1. [README.md](README.md): what cpuq does and every command, as a user sees it.
 2. [AGENTS.md](AGENTS.md): how coding agents on these machines are told to use cpuq. Keep it
    true whenever a command or flag changes.
-3. [docs/DESIGN.md](docs/DESIGN.md): how it works inside: the state directory, admission, the
-   gates, leases, jobs of task files and the agent.
+3. [docs/DESIGN.md](docs/DESIGN.md): how it works inside: the pool's files, an operation's loop,
+   the line, giving CPUs back, the gates, nesting, leases, jobs of task files and the agent.
 4. [docs/SUBMIT.md](docs/SUBMIT.md): specs, `cpuq submit` and `cpuq test`.
 5. [docs/RELEASING.md](docs/RELEASING.md): cutting a CLI release and a Cpuq.app release.
 6. [CHANGELOG.md](CHANGELOG.md) and [app/CHANGELOG.md](app/CHANGELOG.md): why things are the
@@ -21,6 +21,15 @@ binary, [AGENTS.md](AGENTS.md) is enough.
 
 - **Released:** cpuq 0.29.0 (`v0.29.0`) and Cpuq.app 0.22.0 (`app-v0.22.0`), both on
   2026-11-03, with the Homebrew formula and cask bumped. `main` matches `origin/main`.
+- **The CPU pool** (one CPU per task, the fair line, `cpuq drain`, `cpuq kill`) is on branch
+  `slots`, draft PR #7: not released, not installed anywhere. Every machine runs 0.29.0 (burst
+  0.28.0), which takes the old form: `cpuq run --label L --cores 2-4 -- sh -c 'zig build
+  -j"$CPUQ_CORES"'`. `test/run.sh` is being rewritten for the pool, so CI fails on the branch
+  until it lands. CHANGELOG's "Unreleased" lists what each project must change before a machine is
+  cut over; cut over one machine at a time (burst, then pup, then pop), each with a rollback.
+- **The Lean model** of the pool is in `formal/` on the `lean-model` worktree (its README says what
+  is proved and what is only searched). Changes to the line (src/pool.zig) or the loop's stop and
+  give-back (src/op.zig) go past it.
 - **pop** (Steve's Mac): `~/.local/bin/cpuq` and brew's are 0.29.0. The agent and the recorder
   run under launchd (`com.github.shreeve.cpuq.agent`, `com.github.shreeve.cpuq.record`).
 - **pup:** 0.29.0, with the agent as the systemd user service `cpuq-agent` (linger on).
@@ -46,30 +55,36 @@ beside it are Steve's backups: leave them alone.
 
 Run everything heavy under cpuq, even here:
 
-    cpuq run --label cpuq:build --cores 2-4 -- sh -c 'zig build -j"$CPUQ_CORES"'   # bin/cpuq
-    cpuq run --label cpuq:build --cores 2-4 -- sh -c 'zig build -j"$CPUQ_CORES" test fmt'
-    cpuq run --label cpuq:test --cores 1 -- test/run.sh                  # all 99, about 9 min on pop
-    cpuq run --label cpuq:test --cores 1 -- test/run.sh t_job_affinity   # one test by name
+    cpuq run --label cpuq:build -- zig build -j1                 # bin/cpuq
+    cpuq run --label cpuq:build -- zig build -j1 test fmt
+    cpuq run --label cpuq:test -- test/run.sh                    # every test
+    cpuq run --label cpuq:test -- test/run.sh t_hook             # one test by name
+
+(With the installed 0.29.0, use its form, above, until the pool is installed.)
 
 - `zig build test` replays cached results when nothing changed. To prove the tests really ran,
   give it a fresh `--cache-dir`.
 - `test/run.sh` tests `bin/cpuq`, or `$CPUQ`. Each test gets its own state directory and config,
   so it doesn't depend on the machine's load. Run it on pup too when a change touches Linux
-  (affinity, cgroups, `cap`, `/proc`).
+  (affinity, cgroups, `cap`, `/proc`, `PR_SET_PDEATHSIG`).
+- `test/stress/pool.py` runs three projects' tasks against the pool under random SIGKILLs and
+  checks from each task's log: never more CPUs held than the pool, none shared, no leftovers.
 - The app: `cd app && swift build`, under `cpuq run --label cpuq:app-build`.
   `scripts/release.sh` already wraps itself in cpuq.
 - CI: `.github/workflows/ci.yml` (CLI), `app.yml` (app) and `release.yml` (tags).
 
-## Source map (src/, about 17.4k lines)
+## Source map (src/, about 16.6k lines)
 
 | Area | Files |
 |---|---|
-| Entry and options | `main.zig`, `runopts.zig`, `texts.zig`, `table.zig`, `layout.zig` |
-| The queue | `admission.zig` (waiting, granting), `state.zig` (flock holds), `policy.zig` (config, budget, pure decisions), `runner.zig` (`cpuq run`), `leasing.zig`, `timing.zig` (`--exclusive`), `control.zig` (first/start/cancel/…) |
-| Machine signals | `sys.zig` (load, memory, spawning, affinity), `records.zig` (record, samples, history), `history.zig`, `joblog.zig`, `runtimes.zig` |
+| Entry and options | `main.zig` (dispatch, usage, removed commands), `runopts.zig` (`cpuq run`'s options), `texts.zig`, `table.zig`, `layout.zig` |
+| The pool | `pool.zig` (the `v2/` files: tokens, records, promises, wake FIFOs; the line: `ahead`, `handOut`, `firstWaiter`, `giver`, `behindAfter`; the outside-load sample), `op.zig` (an operation's loop, Ctrl-Z, consolidation, nesting, `cpuq drain`, `cpuq kill`), `cpus.zig` (the pool's CPUs and their order), `runner.zig` (`cpuq run`: removed options, `--driver`, `--tethered`; `cpuq wait`; `cpuq hook`'s entry) |
+| Config and gates | `policy.zig` (config keys, removed keys with their pointers, the gates, weights, CPU lists) |
+| Named leases | `leasing.zig`, `state.zig` (a lease's queue) |
+| Machine signals | `sys.zig` (CPU ticks, memory, spawning, affinity, `PR_SET_PDEATHSIG`), `records.zig` (record, samples, history, clean), `history.zig`, `joblog.zig`, `runtimes.zig` |
 | Jobs of task files | `jobs.zig` (the driver, `cpuq jobs`), `agent.zig` (`cpuq agent`, `attach`), `lines.zig` (line sockets), `cap.zig` |
-| Other machines | `remotes.zig` (`--on`), `submit.zig` (`submit`, `test`, `job`), `gitship.zig`, `place.zig`, `packs.zig`, `repos.zig` |
-| Showing and guarding | `status.zig`, `statusjson.zig`, `doctor.zig`, `hook.zig`, `clean.zig` |
+| Other machines | `remotes.zig` (`--on`), `submit.zig` (`submit`, `test`, `job`; a spec's removed `cores`), `gitship.zig`, `place.zig`, `packs.zig`, `repos.zig` |
+| Showing and guarding | `status.zig`, `statusjson.zig` (schema 2), `hook.zig` (rules, `removed_options`), `clean.zig` |
 
 Each file's `//!` header says what it owns.
 
@@ -81,8 +96,12 @@ Each file's `//!` header says what it owns.
 - **Timeless text.** Code comments, help, errors, README, AGENTS and DESIGN state how things are,
   as if they had always been so: never "now", "no longer" or "instead of the old …". Only the
   changelogs and commit messages tell the story of a change.
-- **No compatibility.** No aliases, shims, grace periods or error branches for removed flags,
-  keys or paths. Cut over at once, then tell the projects it breaks.
+- **No compatibility.** No aliases, shims or grace periods for removed flags, keys or paths. Cut
+  over at once, then tell the projects it breaks.
+- **One exception: removed-flag pointers** (Steve's decision 6 for the pool). A removed option,
+  config key, spec field or command fails with one line naming its replacement, exit 2
+  (`hook.removed_options`, `policy.removed_keys`, `main.removed_commands`, submit's `cores`),
+  because that line is what reaches agents' memory files. It never does the old thing.
 - **Shared machines.** Never `pkill -f` or `pgrep -f`: other sessions run identical command
   lines. Kill only by a pid you started. Never act on another session's jobs (`first`, `start`,
   `cancel`, `pause`, `resume`, `stop`).
@@ -96,6 +115,9 @@ Each file's `//!` header says what it owns.
 
 ## Open
 
+- **The pool, before release:** PR B removes `cpuq jobs`, the agent and `cpuq test`'s driver, with
+  the projects' edits (Rip's swarm wraps each case in `cpuq run --`); the app follows in PR C.
+  Known gaps on `slots` are listed in the PR.
 - **Tune the agent once it runs real work:** the ×2-per-step cap, the 10% deadband, "cut fast"
   (two ticks over: × target/runq), and memory-short × 0.75. A new job's cost starts at 1.0. It
   could come from its label's history instead, but that isn't built.
