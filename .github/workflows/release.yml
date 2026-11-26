@@ -2,8 +2,9 @@ name: Release
 
 # A `vX.Y.Z` tag publishes a release. The tag must match build.zig.zon's
 # version and CHANGELOG.md must have its section, whose text becomes the
-# release notes. Each runner tests natively, then cross-builds its two
-# targets in safe mode (static musl on Linux, libSystem only on macOS) and
+# release notes. Each runner tests natively (unless CI already passed on
+# the tagged commit: the same tests, on the same runners), then cross-builds
+# its two targets in safe mode (static musl on Linux, libSystem only on macOS) and
 # packs them with scripts/package-release.sh. The publish job hashes
 # exactly the archives it publishes, signs the checksums with cosign
 # keyless through GitHub OIDC, and creates the release. Assets:
@@ -18,6 +19,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   ZIG_VERSION: "0.17.0"
@@ -53,13 +55,29 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
+      - name: Did CI pass on this commit?
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&status=success" --jq '.total_count' || echo 0)
+          if [ "${n:-0}" -gt 0 ]; then
+            echo "CI passed on $GITHUB_SHA: the tests are not run again"
+            echo "passed=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "No passed CI run on $GITHUB_SHA: testing here"
+          fi
+
       - name: Check formatting
+        if: steps.ci.outputs.passed != 'true'
         run: zig build fmt
 
       - name: Unit tests
+        if: steps.ci.outputs.passed != 'true'
         run: zig build test --summary all
 
       - name: End-to-end tests
+        if: steps.ci.outputs.passed != 'true'
         run: |
           zig build -Doptimize=safe
           test/run.sh
