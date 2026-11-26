@@ -480,42 +480,24 @@ runs outside cpuq, a run looks stuck, a machine is overloaded while another has 
 machine sits idle and billing; the urgent ones are also texted. It reads `cpuq status`, `history`
 and `samples`. Install it with `brew install --cask shreeve/tap/cpuq-app`.
 
-## Jobs: a folder of task files
+## A test's tasks
 
-A job too big for one command, such as a test suite of thousands of programs, is a folder that a
-driver of its own runs:
+A test suite of thousands of programs is a spec with `tasks` ([docs/SUBMIT.md](docs/SUBMIT.md)),
+run by `cpuq test`. Its `tasks` command writes one file per task into `$CPUQ_TODO`, and the tasks
+then run one per CPU of the pool, as `cpuq run -n COUNT -- cpuq _task FOLDER`, sharing the machine
+with every other run:
 
-    ~/.local/state/cpuq/jobs/NAME/STAMP/     e.g. jobs/rig/20261017-180000/
-      todo/  live/  done/  fail/  jobs.sock
+    ~/.local/state/cpuq/jobs/JOB/STAMP/
+      todo/  done/  fail/  manifest
 
-NAME is `[a-z0-9._-]`, not starting with a dot; the part before its first dot is its project.
-A task file is its work: its text up to the first blank line runs with `sh`. Each run appends its
-output, then one line, `== TIME HOST pass|fail|died: REASON SECS`. Exit 0 moves it to `done/`,
-exit 1 to `fail/`; anything else (a signal, a limit, a driver gone) is a death, back to `todo/`,
-and the third death goes to `fail/`. Retrying is running again: `mv fail/* todo/`.
+The manifest lists the files in `todo/`, sorted; task N runs the file on line N. A task file is
+its work: its text up to the first blank line runs with `sh` in the folder, with `$CPUQ_CODE` the
+copy's path. Its output is appended to the file, then one line, `== TIME HOST pass|fail|died:
+REASON SECS`; exit 0 moves it to `done/`, anything else to `fail/`. A task cut off (its run killed)
+stays in `todo/` and counts against the verdict. The verdict follows the run's own lines in the
+job's log, and each failure comes back to the worktree's `.cpuq/fail/`.
 
-| in the folder | |
-|---|---|
-| `cpuq jobs run [--workers N] [--weight W] [--gap MS]` | runs `todo/`, N tasks at once (half the CPUs; the agent's count when one runs), W a whole number (1), each new worker 50 ms after the last and MS after its last task; live on a terminal. Exit 0 when all are done, 1 otherwise, after the failures' output |
-| `cpuq jobs status` / `watch` | the job once, or live until it ends with its result and exit status |
-| `cpuq jobs set workers N` / `weight W` / `gap MS` | changes the running job; a count you set holds |
-| `cpuq jobs pause` / `resume` / `stop` | `stop` puts the running tasks back in `todo/`, with no death |
-| `cpuq jobs reset` | every file back in `todo/` holding only its work; refused while it runs |
-
-`cpuq jobs` lists every job folder on this host, then this worktree's submitted jobs (`--all`:
-every worktree's). Each task runs under `cpuq cap --link` in a process group of its own, with its
-file (locked) as its stdout and stderr: every task ends with its driver, and a driver started
-again files what a dead one left in `live/` as `died: lost`. A job's driver takes no CPU of the
-pool.
-
-**The agent** (`cpuq agent`, kept running by `cpuq agent --install`) keeps the machine at its
-target load and shares it among the running jobs by weight: each second it measures what each
-job's workers cost in CPU and sets every job's workers and gap so the jobs together use what the
-work outside them leaves. A count you set with `cpuq jobs set workers N` holds; the others share
-the rest. Without an agent each job runs at the workers it was given. `cpuq attach` joins a
-terminal (or `ssh HOST cpuq attach`) to the agent: `jobs` lists the jobs, and
-`to FOLDER set workers 4` (or `pause`, `resume`, `stop`) steers one. How it decides is in
-[docs/DESIGN.md](docs/DESIGN.md), "The agent".
+`cpuq jobs` lists this worktree's submitted jobs (`--all`: every worktree's).
 
 ## Other machines: --on HOST
 
@@ -604,15 +586,15 @@ that submits it picks the host. cpuq does the rest:
   little memory for the job, or when a cache the spec `needs` is empty there. `--on HOST` names
   the host (one of the remotes, or this machine); a full host queues it;
 - **runs a test suite as a job of task files** with `cpuq test SPEC` and a spec whose `tasks`
-  command (after `setup`) writes a file per test into `$CPUQ_TODO`: the host runs them with
-  `cpuq jobs run` (see [Jobs](#jobs-a-folder-of-task-files)), its agent sharing the machine, each
-  task with `$CPUQ_CODE`, the copy's path. A worktree has one test at a time: the same code
+  command (after `setup`) writes a file per test into `$CPUQ_TODO`: the host runs them one per
+  CPU of its pool (see [A test's tasks](#a-tests-tasks)), each task with `$CPUQ_CODE`, the copy's
+  path. A worktree has one test at a time: the same code
   attaches to it, changed code replaces it. The failures are listed by name with their last line,
   and their files come back to `.cpuq/fail/`, which git ignores;
 - **syncs a snapshot** of the work there with rsync, moving only what changed, then reads the copy
   back by checksum (as `cpuq run --on` does);
-- **runs it, owned by that host,** as one task (`cpuq run -- cpuq cap ...`), so the agent's
-  session, or this machine sleeping, doesn't stop it;
+- **runs it, owned by that host,** as one task (`cpuq run -- cpuq cap ...`), or a runner with
+  `driver`, so the submitting session ending, or this machine sleeping, doesn't stop it;
 - **reports:** progress while it runs, then a verdict that names the code it tested.
 
 ```json
@@ -971,6 +953,8 @@ instead. The removed variables are simply not set; `cpuq hook` rewrites a `cpuq 
 | `cpuq note` | `cpuq run --note TEXT` |
 | `cpuq doctor` | `cpuq status` flags runs over or under their CPUs, and work outside cpuq |
 | `cpuq qos` | tasks run as they are |
+| `cpuq jobs run`, `status`, `watch`, `set`, `pause`, `resume`, `stop`, `reset` (a folder of task files) | a spec's `tasks` with `cpuq test`, one per CPU; tasks of your own with `cpuq run -n M` |
+| `cpuq agent`, `cpuq attach` | the pool shares the machine by itself; `cpuq status --json` shows every run |
 | config `admit`, `target`, `settle`, `right_size`, `poll`, `aging`, `note`, `backfill`, `window_backfill`, `patience`, `lend`, `lend_after` | the pool hands out one CPU per task through the line (`weights` for shares) |
 | config `exclusive`, `window_gap`, `window_lend` | `cpuq drain` |
 | config `cpu_weights`, `affinity` | each task is pinned to its own CPU on Linux |

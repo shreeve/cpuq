@@ -14,13 +14,10 @@ const runner = @import("runner.zig");
 const leasing = @import("leasing.zig");
 const records = @import("records.zig");
 const status = @import("status.zig");
-const jobs = @import("jobs.zig");
-const agent = @import("agent.zig");
+const tasks = @import("tasks.zig");
 
 test {
-    _ = jobs;
-    _ = agent;
-    _ = @import("lines.zig");
+    _ = tasks;
     _ = cap;
     _ = submit;
     _ = @import("hook.zig");
@@ -68,10 +65,8 @@ const usage =
     \\       cpuq submit SPEC [--note TEXT] [--env K=V]... [--replace | --again] [-- ARGS]
     \\       cpuq test SPEC [--on HOST] [--note TEXT] [--env K=V]... [--again] [-- ARGS]
     \\       cpuq packs [--host HOST] | cpuq packs install NAME@VERSION... [--host HOST]
-    \\       cpuq jobs [--all] | run [--workers N] [--weight W] [--gap MS] | status | watch | reset
-    \\       cpuq jobs set workers N | weight W | gap MS | cpuq jobs pause | resume | stop
+    \\       cpuq jobs [--all]
     \\       cpuq job [ID|last] [--wait [--max-wait S]] [--tail N] [--json] [--cancel]
-    \\       cpuq agent [--install | --uninstall] | cpuq attach
     \\       cpuq hook                (an agent harness's pre-command hook)
     \\       cpuq budget | --version | --help
     \\
@@ -184,19 +179,20 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
     }
     if (std.mem.eql(u8, cmd, "hook")) return runner.cmdHook(ctx);
     if (std.mem.eql(u8, cmd, "_job")) return runner.cmdJob(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "_task")) return tasks.cmdTask(ctx.io, ctx.arena, ctx.env, args[1..]);
     if (std.mem.eql(u8, cmd, "cap")) return cap.main(ctx.arena, args[1..], ctx.env.get("CPUQ_CGROUP"), ctx.env.get("PATH"));
     if (std.mem.eql(u8, cmd, "run")) return runner.cmdRun(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "drain")) return op.cmdDrain(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "lease")) return leasing.cmdLease(ctx, args[1..]);
     loadConfig(ctx);
     if (std.mem.eql(u8, cmd, "status")) return status.cmdStatus(ctx, args[1..]);
-    if (std.mem.eql(u8, cmd, "agent")) return agent.cmdAgent(ctx, args[1..]);
-    if (std.mem.eql(u8, cmd, "attach")) return agent.cmdAttach(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "jobs")) {
+        // The submitted jobs: this worktree's, or --all.
         const rest = args[1..];
-        if (rest.len != 0 and !std.mem.eql(u8, rest[0], "--all")) return jobs.cmdJobs(ctx, rest);
-        // Every job here: the job folders, then the submitted jobs (this worktree's, or --all).
-        _ = jobs.cmdJobs(ctx, &.{});
+        if (rest.len != 0 and !std.mem.eql(u8, rest[0], "--all")) {
+            std.debug.print("cpuq: jobs {s} is gone: a test's tasks run one per CPU of the pool (cpuq test), and tasks of your own with cpuq run -n M; cpuq jobs lists submitted jobs\n", .{rest[0]});
+            return exit_usage;
+        }
         return submit.cmdJobs(submitCx(ctx), rest);
     }
     if (std.mem.eql(u8, cmd, "wait")) return runner.cmdWait(ctx, args[1..]);
@@ -244,6 +240,8 @@ const removed_commands = [_][2][]const u8{
     .{ "note", "note is gone: `cpuq run --note TEXT` keeps a note beside the label" },
     .{ "doctor", "doctor is gone: cpuq status flags runs over or under their CPUs, and work outside cpuq" },
     .{ "qos", "qos is gone: tasks run as they are" },
+    .{ "agent", "agent is gone: the pool shares the machine by itself; stop an installed agent with launchctl bootout gui/$UID/com.github.shreeve.cpuq.agent (macOS) or systemctl --user disable --now cpuq-agent (Linux)" },
+    .{ "attach", "attach is gone: cpuq status --json shows every run" },
 };
 
 fn submitCx(ctx: *Ctx) submit.Cx {

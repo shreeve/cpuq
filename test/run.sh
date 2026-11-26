@@ -445,6 +445,12 @@ t_removed() {
     out=$("$CPUQ" $f x 2>&1); rc=$?
     { [ $rc = 2 ] && [[ "$out" == "cpuq: $f is gone: "* ]]; } || wrong="$wrong [$f: $rc $out]"
   done
+  out=$("$CPUQ" jobs run 2>&1); rc=$?
+  { [ $rc = 2 ] && [[ "$out" == "cpuq: jobs run is gone: "* ]]; } || wrong="$wrong [jobs run: $rc $out]"
+  for f in agent attach; do
+    out=$("$CPUQ" $f 2>&1); rc=$?
+    { [ $rc = 2 ] && [[ "$out" == "cpuq: $f is gone: "* ]]; } || wrong="$wrong [$f: $rc $out]"
+  done
   for f in admit target settle poll aging backfill patience exclusive lend affinity load_check active_cap qos max_memory cpu_weights; do
     echo "$f = x" >"$T/c.$f"
     out=$(CPUQ_CONFIG=$T/c.$f "$CPUQ" run -- touch "$T/ran" 2>&1); rc=$?
@@ -1519,8 +1525,8 @@ print("shipped" if ok else "shipped-wrong %s" % s)'
 }
 
 t_test() {
-  # cpuq test, on "here": setup, then the spec's tasks command fills $CPUQ_TODO and cpuq jobs runs
-  # them with $CPUQ_CODE; a failure is named with its last line and comes back to .cpuq/fail/;
+  # cpuq test, on "here": setup, then the spec's tasks command fills $CPUQ_TODO and they run one
+  # per CPU of the pool with $CPUQ_CODE; a failure is named with its last line and comes back to .cpuq/fail/;
   # changed code replaces the worktree's running test.
   setup test
   export XDG_STATE_HOME=$T/xdg
@@ -1555,6 +1561,31 @@ EOF
     "[[ '$got' == 'bad=1 back ok=0 submit=2 replace='*' replaced=76 ' ]]"
   check "test: the failed task is named with its last line, and the tasks saw \$CPUQ_CODE" \
     "grep -q 'fail  t5  boom' '$T/bad' && grep -q 'hello' \"\$(ls -d '$HOME'/.local/state/cpuq/jobs/t.repo/*/done '$T'/xdg/cpuq/jobs/t.repo/*/done 2>/dev/null | head -1)\"/t1"
+}
+
+count() { ls "$1" 2>/dev/null | wc -l | tr -d ' '; }
+
+t_test_pool() {
+  # A test's tasks share the pool, one per CPU: 4 tasks of 1 s on a pool of 2 take about 2 s.
+  setup test-pool
+  export XDG_STATE_HOME=$T/xdg
+  mkdir -p "$T/roots/repo/cpuq"
+  echo "submit_roots = $T/roots" >> "$CPUQ_CONFIG"
+  (
+    cd "$T/roots/repo" || exit 1
+    git init -q && git config user.email t@t && git config user.name t
+    printf '%s\n' 'for i in 1 2 3 4; do echo "echo cpu \$CPUQ_CPU; sleep 1" > "$CPUQ_TODO/t$i"; done' > mk.sh
+    printf '%s\n' '{ "label": "t:pool", "tasks": "sh mk.sh" }' > cpuq/pool.json
+    git add -A && git commit -qm init
+    local t0; t0=$(now)
+    "$CPUQ" test cpuq/pool.json >"$T/pool" 2>&1; echo "rc=$? took=$(since "$t0")"
+  ) >"$T/out" 2>&1
+  local got; got=$(cat "$T/out")
+  local done_dir; done_dir=$(ls -d "$T"/xdg/cpuq/jobs/*/*/done "$HOME"/.local/state/cpuq/jobs/*/*/done 2>/dev/null | head -1)
+  local cpus; cpus=$(cat "$done_dir"/* 2>/dev/null | grep -o '^cpu [0-9]*' | sort -u | wc -l | tr -d ' ')
+  local secs; secs=$(grep -o 'PASS .* \([0-9]*\)s ' "$T/pool" | grep -o ' [0-9]*s ' | tail -1 | tr -d ' s')
+  check "test: 4 tasks of 1 s on a pool of 2 run on both CPUs and the job takes about 2 s ($got; $(count "$done_dir") done on $cpus CPUs; the job ${secs}s)" \
+    "[[ '$got' == rc=0* ]] && [ \"\$(count '$done_dir')\" = 4 ] && [ '$cpus' = 2 ] && [ '${secs:-99}' -le 4 ]"
 }
 
 t_submit_moved() {
@@ -1845,133 +1876,13 @@ f = open(sys.argv[1]); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$sp/p/held
 
 # --- cpuq jobs and the agent (until they go) -------------------------------------------------
 
-# mkjob NAME: an empty job folder J under $CPUQ_STATE; task FILE WORK writes a task file.
-mkjob() { J=$CPUQ_STATE/jobs/$1/20261017-120000; mkdir -p "$J/todo"; }
-task() { printf '%s\n' "$2" > "$J/todo/$1"; }
-count() { ls "$1" 2>/dev/null | wc -l | tr -d ' '; }
-jrun() { (cd "$J" && "$CPUQ" jobs "$@"); }
-
-t_jobs() {
-  # Exit 0 goes to done/, 1 to fail/; anything else dies back to todo/ and the third death fails.
-  # Each run appends its output and its line; the verdict lists fail/ and its status is 1.
-  setup jobs; export CPUQ_STATE=$T/state
-  mkjob outcomes
-  local i; for i in 1 2 3 4 5; do task t$i "echo hello $i"; done
-  task f1 'echo bad; exit 1'; task d1 'kill -9 $$'; task d2 "$(printf 'exit 3\n\nold output')"
-  local out; out=$(jrun run --workers 3 2>&1); local rc=$?
-  check "the job ends FAIL, 1 (rc $rc): 5 done, 3 failed, none left ($(count "$J/done") $(count "$J/fail") $(count "$J/todo") $(count "$J/live"))" \
-    "[ $rc = 1 ] && [ $(count "$J/done") = 5 ] && [ $(count "$J/fail") = 3 ] && [ $(count "$J/todo") = 0 ] && [ $(count "$J/live") = 0 ]"
-  check "a task file is its work, a blank line, its output, its line" \
-    "[[ \"\$(cat '$J/done/t1')\" == 'echo hello 1'\$'\\n\\n''hello 1'\$'\\n''== '*' pass '*s ]]"
-  check "a death is retried: the third goes to fail/ ($(grep -c 'died: signal 9' "$J/fail/d1") $(grep -c 'died: exit 3' "$J/fail/d2"))" \
-    "[ $(grep -c 'died: signal 9' "$J/fail/d1") = 3 ] && [ $(grep -c 'died: exit 3' "$J/fail/d2") = 3 ]"
-  check "the verdict is last, after each failure's output" "[[ '$out' == *'fail/f1:'*'    bad'* && \"\$(echo '$out' | tail -1)\" == 'FAIL: 3 failed, 5 done in '* ]]"
-  mkjob passing; task a 'true'; task b 'true'
-  out=$(jrun run 2>&1); rc=$?
-  check "all done: PASS, 0 (rc $rc, '$out')" "[ $rc = 0 ] && [[ '$out' == 'PASS: 2 done in '* ]]"
-  mkjob empty; out=$(jrun run 2>&1); rc=$?
-  check "no tasks: FAIL, 1 (rc $rc, '$out')" "[ $rc = 1 ] && [ '$out' = 'FAIL: no tasks' ]"
-  unset CPUQ_STATE
-}
-
-t_jobs_group() {
-  # A task runs in a process group of its own.
-  setup jobs-group; export CPUQ_STATE=$T/state
-  mkjob q; task t "ps -o pgid= -p \$\$; ps -o pgid= -p $$"
-  jrun run >/dev/null 2>&1
-  local g1 g2; g1=$(sed -n 3p "$J/done/t" | tr -d ' '); g2=$(sed -n 4p "$J/done/t" | tr -d ' ')
-  check "a task's group is its own ($g1, the caller's $g2)" "[ -n '$g1' ] && [ '$g1' != '$g2' ]"
-  unset CPUQ_STATE
-}
-
-t_jobs_kill() {
-  # kill -9 of the driver ends its tasks (the link), and a second driver can't run beside the
-  # first. Restarted, it files each one `died: lost` and runs it again; nothing finished runs twice.
-  setup jobs-kill; export CPUQ_STATE=$T/state
-  mkjob k; local i; for i in $(seq 1 8); do task t$i "echo begin >> $T/runs; sleep 30; echo end >> $T/runs"; done
-  (cd "$J" && exec "$CPUQ" jobs run --workers 4 >/dev/null 2>&1) & local d=$!
-  for i in $(seq 1 50); do [ "$(grep -c begin "$T/runs" 2>/dev/null)" = 4 ] && break; sleep 0.1; done
-  local second; second=$(jrun run 2>&1); local src=$?
-  check "a second driver is refused (rc $src, '$second')" "[ $src = 125 ] && [[ '$second' == *'a driver already runs'* ]]"
-  kill -9 $d; wait $d 2>/dev/null
-  for i in $(seq 1 30); do [ -z "$(lsof -t "$J"/live/* 2>/dev/null)" ] && break; sleep 0.1; done
-  check "the tasks end with their driver (live files held: '$(lsof -t "$J"/live/* 2>/dev/null)')" "[ -z \"\$(lsof -t '$J'/live/* 2>/dev/null)\" ]"
-  for i in $(seq 1 8); do sed -i.bak 's/sleep 30/sleep 0.1/' "$J"/todo/t$i "$J"/live/t$i 2>/dev/null; done; rm -f "$J"/todo/*.bak "$J"/live/*.bak
-  (cd "$J" && "$CPUQ" jobs run >/dev/null 2>&1); local rc=$?
-  check "restarted, all 8 are done (rc $rc, $(count "$J/done")), the 4 cut short marked lost ($(grep -l 'died: lost' "$J"/done/* | wc -l | tr -d ' ')), each ending once ($(grep -c end "$T/runs"))" \
-    "[ $rc = 0 ] && [ $(count "$J/done") = 8 ] && [ $(grep -l 'died: lost' "$J"/done/* | wc -l) = 4 ] && [ $(grep -c end "$T/runs") = 8 ]"
-  unset CPUQ_STATE
-}
-
-t_jobs_control() {
-  # status, set and stop on a running job; stop puts its live tasks back with no death; reset
-  # leaves every file holding only its work, and is refused while the job runs.
-  setup jobs-control; export CPUQ_STATE=$T/state
-  mkjob c; local i; for i in $(seq 1 6); do task t$i 'sleep 20'; done
-  (cd "$J" && exec "$CPUQ" jobs run --workers 2 > "$T/out" 2>&1) & local d=$!
-  for i in $(seq 1 50); do [ "$(count "$J/live")" = 2 ] && break; sleep 0.1; done
-  local s; s=$(jrun status)
-  check "status shows the knobs and counts" "[[ '$s' == *'workers 2  weight 1  gap 0ms'* && '$s' == *'todo 4  live 2  done 0'* ]]"
-  jrun set workers 3; local r1=$?; jrun set gap 50 && jrun set weight 2; local r2=$?
-  local e; e=$(jrun set nope 1 2>&1); local r3=$?
-  for i in $(seq 1 50); do [ "$(count "$J/live")" = 3 ] && break; sleep 0.1; done
-  s=$(jrun status)
-  check "set changes it (rc $r1 $r2), a bad knob is refused (rc $r3, '$e')" \
-    "[ $r1 = 0 ] && [ $r2 = 0 ] && [ $r3 = 2 ] && [[ '$s' == *'workers 3 (set)  weight 2  gap 50ms (set)'* && '$s' == *'live 3'* ]]"
-  local l; l=$("$CPUQ" jobs)
-  check "cpuq jobs lists it running" "[[ '$l' == *' c '*'20261017-120000'*'running'* ]]"
-  local rs; rs=$(jrun reset 2>&1); local rr=$?
-  check "reset is refused while it runs (rc $rr, '$rs')" "[ $rr = 125 ] && [[ '$rs' == *refused* ]]"
-  jrun stop; wait $d; local rc=$?
-  check "stop: STOPPED, 1 (rc $rc, '$(cat "$T/out")'), all 6 in todo/, 3 marked stopped, no deaths" \
-    "[ $rc = 1 ] && [[ \"\$(cat '$T/out')\" == 'STOPPED: 6 in todo/'* ]] && [ $(count "$J/todo") = 6 ] && [ \$(grep -l stopped '$J'/todo/* | wc -l) = 3 ] && ! grep -q died '$J'/todo/*"
-  s=$(jrun status)
-  check "status, not running, counts the folders ('$s')" "[[ '$s' == *'not running  todo 6  live 0'* ]]"
-  rs=$(jrun reset); rr=$?
-  check "reset: every file only its work (rc $rr, '$rs')" "[ $rr = 0 ] && [ '$rs' = '6 in todo/' ] && [ \"\$(cat '$J'/todo/* | sort -u)\" = 'sleep 20' ]"
-  unset CPUQ_STATE
-}
-
-t_agent() {
-  # The agent shares the machine among the jobs by weight, pushing their workers; a count set
-  # through `cpuq attach` holds, and the rest goes to the other job. One agent at a time.
-  setup agent; export CPUQ_STATE=$T/state
-  "$CPUQ" agent 2>"$T/agent.err" & local a=$!
-  local i; for i in $(seq 1 50); do [ -S "$CPUQ_STATE/host.sock" ] && break; sleep 0.1; done
-  local second; second=$("$CPUQ" agent 2>&1); local src=$?
-  check "a second agent is refused (rc $src, '$second')" "[ $src = 125 ] && [[ '$second' == *'an agent already runs'* ]]"
-  local n pids=""
-  for n in lo:1 hi:3; do
-    mkjob "ag.${n%%:*}"; for i in $(seq 1 300); do task t$i 'i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done'; done
-    (cd "$J" && exec "$CPUQ" jobs run --workers 1 --weight "${n##*:}" >/dev/null 2>&1) & pids="$pids $!"
-  done
-  local lo=$CPUQ_STATE/jobs/ag.lo/20261017-120000 hi=$CPUQ_STATE/jobs/ag.hi/20261017-120000
-  local listed; for i in $(seq 1 60); do listed=$(echo jobs | "$CPUQ" attach | grep -c '^job '); [ "$listed" = 2 ] && break; sleep 0.1; done
-  sleep 4
-  local wl wh; wl=$(cd "$lo" && "$CPUQ" jobs status | sed -n 2p); wh=$(cd "$hi" && "$CPUQ" jobs status | sed -n 2p)
-  # Each job's share (the last field of its `job` line, to two places): three times as much for
-  # weight 3.
-  local ratio; ratio=$(echo jobs | "$CPUQ" attach | awk '$1 == "job" { s[$4] = $NF } END { if (s[1] > 0) printf "%.2f", s[3] / s[1]; else print "none" }')
-  check "attach lists both jobs ($listed)" "[ '$listed' = 2 ]"
-  check "the agent shares by weight, 3 to 1 (got $ratio), and gives weight 3 at least the workers of weight 1 ('$wl' / '$wh')" \
-    "awk -v r='$ratio' 'BEGIN { exit !(r >= 2.95 && r <= 3.05) }' && [ \$(echo '$wh' | awk '{print \$2}') -ge \$(echo '$wl' | awk '{print \$2}') ]"
-  local r; r=$(printf 'to %s set workers 1\nto /nowhere pause\n' "$hi" | "$CPUQ" attach | tr '\n' ' ')
-  sleep 2.5
-  wh=$(cd "$hi" && "$CPUQ" jobs status | sed -n 2p)
-  check "a count set through attach holds ('$r', '$wh')" "[ '$r' = 'ok error no job runs in /nowhere ' ] && [[ '$wh' == 'workers 1 (set)'* ]]"
-  for J in "$lo" "$hi"; do (cd "$J" && "$CPUQ" jobs stop >/dev/null); done
-  wait $pids 2>/dev/null; kill $a; wait $a 2>/dev/null
-  unset CPUQ_STATE
-}
-
 TESTS=${*:-budget tasks pack cpus_limit timeout retry wait_max share fair order drain kill ctrl_z nested driver removed \
   kill_holder leftovers leaked_descendant kill_waiter term_waiting lost_seq long_command waiters_cpu \
   exit_status direct_sigint terminal_sigint tasks_sigint ignored_signals stack_limit pin repin narrow \
   status progress usage zombie outside status_host history note wait record min_available min_disk hook \
   lease lease_host lease_host_hold hold_gone last_words on include_git on_check on_gitignore tethered \
-  cap cap_quiet_crash cap_link cgroups submit test submit_moved submit_abandon submit_slots submit_on \
-  submit_needs submit_mem submit_tmp submit_cancel_running submit_progress packs clean \
-  jobs jobs_group jobs_kill jobs_control agent}
+  cap cap_quiet_crash cap_link cgroups submit test test_pool submit_moved submit_abandon submit_slots submit_on \
+  submit_needs submit_mem submit_tmp submit_cancel_running submit_progress packs clean}
 for t in $TESTS; do
   if declare -F "t_$t" >/dev/null; then "t_$t"; else echo "no such test: $t"; FAIL=$((FAIL+1)); FAILED+=" $t?"; fi
 done
