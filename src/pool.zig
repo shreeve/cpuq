@@ -384,7 +384,8 @@ pub const Op = struct {
     project: []const u8 = "",
     label: []const u8 = "",
     weight: u32 = 1,
-    /// CPUs it could use now beyond those it holds and is promised.
+    /// CPUs it could use now beyond those it holds (promises to it count against this when
+    /// CPUs are handed out).
     want: u32 = 0,
     /// The CPUs it holds, by number.
     held: []const u32 = &.{},
@@ -582,6 +583,10 @@ fn behindAfter(a: std.mem.Allocator, ops: []const Op, given: []const Promise, wt
     }
     const w = wi orelse return false;
     const g = gi orelse return false;
+    // Giving a CPU up renews the giver's ticket (`renew`): it takes its turn behind everyone.
+    var newest: u64 = 0;
+    for (after) |o| newest = @max(newest, o.ticket);
+    after[g].ticket = newest + 1;
     var projects = countProjects(a, after, given);
     const sw = standing(&after[w], given);
     var sg = standing(&after[g], given);
@@ -747,4 +752,18 @@ test "the giver: never one that would take the CPU straight back" {
     // With B gone, C alone could give, and would take it back: nobody gives.
     const just_c = [_]Op{ ops[0], ops[2] };
     try std.testing.expectEqual(null, giver(a, &just_c, &.{}));
+}
+
+test "the giver: a newcomer gets a CPU from equals, since a giver takes a new ticket" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Lean finding 4: 2 CPUs, C and B hold one each (projects X, Y), A (Z) arrives with none.
+    const ops = [_]Op{
+        .{ .ticket = 1, .project = "X", .held = &.{0}, .want = 1 },
+        .{ .ticket = 2, .project = "Y", .held = &.{1}, .want = 1 },
+        .{ .ticket = 3, .project = "Z", .want = 1 },
+    };
+    try std.testing.expectEqual(3, firstWaiter(a, &ops, &.{}).?.op.ticket);
+    try std.testing.expect(giver(a, &ops, &.{}) != null);
 }
