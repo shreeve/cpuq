@@ -3,7 +3,7 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
-## 0.23.0
+## 0.23.0 — 2026-11-26
 
 - Needs cpuq 0.30.0 or later, which gives each task one CPU from a pool shared by a fair line.
 - **Jobs:** a line of each project's CPUs against its fair share by weight; each job's tasks done
