@@ -471,12 +471,16 @@ const Standing = struct {
 };
 
 /// Whether `x` goes ahead of `y` for the next CPU: urgent first (only for an operation's first
-/// CPU, and only while its project holds no urgent CPU), then the project holding the fewest
-/// CPUs for its weight, then the operation holding the fewest, then the older ticket.
+/// CPU, and only while its project holds no urgent CPU), then an operation holding nothing,
+/// then the project holding the fewest CPUs for its weight, then the operation holding the
+/// fewest, then the older ticket.
 fn ahead(projects: *const std.StringHashMapUnmanaged(Count), x: Standing, y: Standing) bool {
     const ux = urgentNow(projects, x);
     const uy = urgentNow(projects, y);
     if (ux != uy) return ux;
+    // An operation holding nothing goes before every holder, so it can't starve behind a head
+    // nobody may give to.
+    if ((x.has == 0) != (y.has == 0)) return x.has == 0;
     const px = projects.get(x.op.project) orelse Count{};
     const py = projects.get(y.op.project) orelse Count{};
     // px.cpus / x.weight < py.cpus / y.weight, without division.
@@ -563,6 +567,36 @@ pub fn firstWaiter(a: std.mem.Allocator, ops: []const Op, given: []const Promise
     return best;
 }
 
+/// Whether waiter `wt` goes ahead of `gt` in the line once `gt` has given one CPU up (and
+/// wants one again).
+fn behindAfter(a: std.mem.Allocator, ops: []const Op, given: []const Promise, wt: u64, gt: u64) bool {
+    const after = a.dupe(Op, ops) catch return false;
+    var wi: ?usize = null;
+    var gi: ?usize = null;
+    for (after, 0..) |*o, i| {
+        if (o.ticket == wt) wi = i;
+        if (o.ticket == gt) {
+            gi = i;
+            o.draining += 1;
+        }
+    }
+    const w = wi orelse return false;
+    const g = gi orelse return false;
+    var projects = countProjects(a, after, given);
+    const sw = standing(&after[w], given);
+    var sg = standing(&after[g], given);
+    sg.left = @max(sg.left, 1);
+    return ahead(&projects, sw, sg);
+}
+
+fn standing(o: *const Op, given: []const Promise) Standing {
+    var promised: u32 = 0;
+    for (given) |p| if (p.ticket == o.ticket) {
+        promised += 1;
+    };
+    return .{ .op = o, .has = o.keeps() + promised, .left = o.want -| promised };
+}
+
 /// Which operation should empty one of its CPUs for the first waiter, if any: drains are owed
 /// to the first waiter alone, at most as many as it still wants, counted over every operation
 /// (so twelve don't all drain for one). A giver qualifies when the waiter holds nothing, or when
@@ -585,6 +619,9 @@ pub fn giver(a: std.mem.Allocator, ops: []const Op, given: []const Promise) ?u64
         const fits = w.op.drain or w.has == 0 or
             (@as(u64, wp + 1) * g.weight <= @as(u64, gp -| 1) * w.op.weight and gp >= 1);
         if (!fits) continue;
+        // Only if the waiter still goes ahead of the giver once the giver holds one fewer:
+        // else the freed CPU would come straight back to the giver.
+        if (!w.op.drain and !behindAfter(a, ops, given, w.op.ticket, g.ticket)) continue;
         if (best) |b| {
             const bp = (projects.get(b.project) orelse Count{}).cpus;
             const lg = @as(u64, gp) * b.weight;
@@ -678,4 +715,36 @@ test "an op record round trip" {
     try std.testing.expectEqual(3, p.overload);
     try std.testing.expectEqual(1, p.keeps());
     try std.testing.expectEqualStrings("a b c", p.cmd);
+}
+
+test "the line: a waiter holding nothing isn't starved behind a head nobody may give to" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Lean counterexample 1: A (P) holds 2, B (Q) holds 1 and wants more, C (P) holds none.
+    const ops = [_]Op{
+        .{ .ticket = 1, .project = "P", .held = &.{ 1, 2 }, .want = 1 },
+        .{ .ticket = 2, .project = "Q", .held = &.{0}, .want = 1 },
+        .{ .ticket = 3, .project = "P", .want = 1 },
+    };
+    try std.testing.expectEqual(3, firstWaiter(a, &ops, &.{}).?.op.ticket);
+    try std.testing.expectEqual(1, giver(a, &ops, &.{}).?);
+}
+
+test "the giver: never one that would take the CPU straight back" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Lean counterexample 2: weights P=2, Q=1; C (Q, urgent) holds a CPU, A (P) holds none.
+    // Were C to give it, C (urgent, holding nothing) would rank first and take it back.
+    const ops = [_]Op{
+        .{ .ticket = 1, .project = "P", .weight = 2, .want = 3 },
+        .{ .ticket = 2, .project = "Q", .held = &.{ 0, 1 } },
+        .{ .ticket = 3, .project = "Q", .urgent = true, .held = &.{2}, .want = 1 },
+    };
+    // B (ticket 2) may give: A holding nothing stays ahead of B holding one.
+    try std.testing.expectEqual(2, giver(a, &ops, &.{}).?);
+    // With B gone, C alone could give, and would take it back: nobody gives.
+    const just_c = [_]Op{ ops[0], ops[2] };
+    try std.testing.expectEqual(null, giver(a, &just_c, &.{}));
 }
