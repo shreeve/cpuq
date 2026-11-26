@@ -7,7 +7,8 @@
 #   SECONDS how long the long jobs run (default 600).
 #
 # Run it outside any cpuq job: it starts its jobs through cpuq itself. `CPUQ=path` picks the
-# binary. It writes mix-MODE.tsv (one line a second: t, held, busy, waiters) beside itself
+# binary. Busy is, on Linux, this mix's own processes' CPU (its session's), so other work on
+# the machine doesn't count; elsewhere the machine's. It writes mix-MODE.tsv (one line a second: t, held, busy, waiters) beside itself
 # and prints the summary: granted minus busy, and CPU-seconds left idle while a job waited.
 #
 # The jobs, as emdb saw them (asked, then kept busy):
@@ -67,6 +68,13 @@ else:
     jobs.append((secs / 10, tasks("emdb:walk", n(60), burn(long / 2))))
     stream = lambda: tasks("rig:test", 1, burn(2))
 
+# A session of its own: on Linux, busy is this session's CPU alone.
+try:
+    os.setsid()
+except OSError:
+    pass
+sid = os.getsid(0)
+
 stop = threading.Event()
 procs = []
 
@@ -93,13 +101,37 @@ threads = [threading.Thread(target=start, args=j) for j in jobs] + [threading.Th
 for t in threads:
     t.start()
 
+def own_cpu():
+    # Linux: the CPU seconds of every process in this session (its own and the children each
+    # has reaped), so busy counts this mix's work alone, whatever else the machine runs.
+    hz = os.sysconf("SC_CLK_TCK")
+    total = 0
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            st = open("/proc/%s/stat" % d).read()
+        except OSError:
+            continue
+        f = st[st.rfind(")") + 2:].split()
+        if int(f[3]) == sid:  # field 6, the session
+            total += sum(int(x) for x in f[11:15])  # utime stime cutime cstime
+    return total / hz
+
+linux = os.path.isdir("/proc/self")
 rows, prev, t0 = [], None, time.time()
 while time.time() - t0 < secs + 30 and (time.time() - t0 < secs / 10 + 5 or any(p.poll() is None for p in procs)):
     s = status()
-    ticks = [sum(x) for x in zip(*s.get("cpu_ticks") or [[0, 0]])]
+    if linux:
+        ticks = (own_cpu(), time.time())
+    else:
+        ticks = [sum(x) for x in zip(*s.get("cpu_ticks") or [[0, 0]])]
     if prev:
-        total = ticks[1] - prev[1]
-        busy = (ticks[0] - prev[0]) / total * len(s["cpu_ticks"]) if total else 0
+        if linux:
+            busy = (ticks[0] - prev[0]) / (ticks[1] - prev[1])
+        else:
+            total = ticks[1] - prev[1]
+            busy = (ticks[0] - prev[0]) / total * len(s["cpu_ticks"]) if total else 0
         rows.append((round(time.time() - t0, 1), s["held"], round(busy, 1), len(s["waiters"]), s.get("budget") or 0))
     prev = ticks
     if time.time() - t0 >= secs:

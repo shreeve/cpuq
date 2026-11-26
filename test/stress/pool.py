@@ -25,7 +25,7 @@ work = tempfile.mkdtemp(prefix="cpuq-pool-")
 os.makedirs(work + "/home", exist_ok=True)
 log = work + "/log"
 with open(work + "/config", "w") as f:
-    f.write("min_disk = off\npressure_check = off\n" + ("budget = %s\n" % os.environ["CPUQ_BUDGET"] if "CPUQ_BUDGET" in os.environ else ""))
+    f.write("min_disk = off\npressure_check = off\noutside_check = off\n" + ("budget = %s\n" % os.environ["CPUQ_BUDGET"] if "CPUQ_BUDGET" in os.environ else ""))
 env = dict(os.environ, CPUQ_DIR=work + "/state", CPUQ_CONFIG=work + "/config", HOME=work + "/home")
 for k in ("CPUQ_CPU", "CPUQ_OP"):
     env.pop(k, None)

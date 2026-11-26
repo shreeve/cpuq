@@ -11,6 +11,8 @@
 #      emdb saw it) and once on this one (one CPU per task): CPUs granted against busy
 #   2. three projects under SIGKILLs (pool.py): never over the pool, none shared, hand-off
 #   3. a newcomer's time to its fair share and an urgent run's wait (fair.py)
+# The pool ignores outside load (outside_check = off) and mix.py counts its own processes'
+# CPU, so the numbers hold beside other work, as long as the machine has room for the pool.
 # Everything goes to LOG, the mix's samples to .zig-cache/mix-MODE.tsv; scratch is removed.
 set -u
 LOG=${1:?usage: burst.sh LOG [POOL] [SECONDS]}
@@ -35,7 +37,7 @@ for mode in blocks slots; do
     printf 'admit = cores\nbudget = %s\nmin_disk = off\nexclusive = off\n' "$POOL" >"$W/$mode/config"
     bin=$OLD
   else
-    printf 'budget = %s\nmin_disk = off\n' "$POOL" >"$W/$mode/config"
+    printf 'budget = %s\nmin_disk = off\noutside_check = off\n' "$POOL" >"$W/$mode/config"
     bin=$NEW
   fi
   echo "== 1. mix, $mode ($bin)"
