@@ -32,6 +32,9 @@ pub const JsonHolder = struct {
     done: u32 = 0,
     failed: u32 = 0,
     running: u32 = 0,
+    /// Its tasks running now: the task's number, its try, its CPU (by the machine's number;
+    /// null while stopped with its operation), its pid and when it started (Unix seconds).
+    running_tasks: []const JsonTask = &.{},
     /// Its cpuq is stopped (Ctrl-Z).
     paused: bool = false,
     /// `cpuq drain`: it takes the whole machine.
@@ -51,6 +54,8 @@ pub const JsonHolder = struct {
     command: []const u8 = "",
     since: i64 = 0,
 };
+
+pub const JsonTask = struct { task: u32 = 0, attempt: u32 = 1, cpu: ?u32 = null, pid: i32 = 0, since: i64 = 0 };
 
 pub const JsonProgress = struct { done: u64 = 0, total: u64 = 0, failing: u64 = 0 };
 

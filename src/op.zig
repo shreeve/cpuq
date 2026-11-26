@@ -58,6 +58,8 @@ const Task = struct {
     slot: usize = 0,
     /// When TERM was sent for its time limit (0: not yet).
     term_ms: i64 = 0,
+    /// When it started, in Unix seconds (for status).
+    since_s: i64 = 0,
     timed_out: bool = false,
     out: []const u8 = "",
 };
@@ -205,6 +207,15 @@ const Run = struct {
         r.rec.draining = draining;
         r.rec.want = r.wantMore();
         r.rec.running = @intCast(r.running.items.len);
+        var now: std.ArrayList(pool_mod.TaskNow) = .empty;
+        for (r.running.items) |t| now.append(r.a, .{
+            .task = t.index,
+            .attempt = t.attempt,
+            .cpu = if (t.slot == no_slot) std.math.maxInt(u32) else r.slots.items[t.slot].cpu,
+            .pid = t.pid,
+            .since = t.since_s,
+        }) catch break;
+        r.rec.tasks_now = now.items;
         r.pool.write(r.file, r.rec) catch {};
     }
 };
@@ -522,11 +533,14 @@ fn start(r: *Run, t_in: Task, slot: usize) void {
     if (r.single) sys.setChild(pid);
     t.pid = pid;
     t.start_ms = sys.monoMs();
+    t.since_s = main.nowSeconds(ctx.io);
     t.slot = slot;
     s.used += 1;
     s.newest_ms = t.start_ms;
     if (r.first_cpu_ms == 0) r.first_cpu_ms = t.start_ms;
     r.running.append(r.a, t) catch {};
+    // Status shows it at the next look, now.
+    r.event = true;
     noteGroups(r, slot);
 }
 

@@ -366,6 +366,10 @@ extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 pub const Promise = struct { cpu: u32, ticket: u64 };
 
+/// A task running now: its number, its try, the CPU it runs on, its pid, and when it started
+/// (Unix seconds).
+pub const TaskNow = struct { task: u32, attempt: u32, cpu: u32, pid: i32, since: i64 };
+
 fn ticketOf(name: []const u8) ?u64 {
     const dash = std.mem.findScalar(u8, name, '-') orelse return null;
     return std.fmt.parseInt(u64, name[dash + 1 ..], 10) catch null;
@@ -403,6 +407,8 @@ pub const Op = struct {
     since: i64 = 0,
     /// Why it waits, for status ("gate: memory pressure"); empty when it isn't held back.
     why: []const u8 = "",
+    /// Its tasks running now, for status: at most 256, the oldest first.
+    tasks_now: []const TaskNow = &.{},
     cmd: []const u8 = "",
 
     pub fn format(r: Op, w: *Io.Writer) Io.Writer.Error!void {
@@ -410,9 +416,11 @@ pub const Op = struct {
             r.pid, @intFromBool(r.urgent), @intFromBool(r.drain), r.project, r.label, r.weight, r.want,
         });
         for (r.held, 0..) |cpu, i| try w.print("{s}{d}", .{ if (i == 0) "" else ",", cpu });
-        try w.print("\ndraining={d}\noverload={d}\nlimit={d}\ntasks={d}\ndone={d}\nfailed={d}\nrunning={d}\nsince={d}\nwhy={s}\ncmd=", .{
+        try w.print("\ndraining={d}\noverload={d}\nlimit={d}\ntasks={d}\ndone={d}\nfailed={d}\nrunning={d}\nsince={d}\nwhy={s}\nnow=", .{
             r.draining, r.overload, r.limit, r.tasks, r.done, r.failed, r.running, r.since, r.why,
         });
+        for (r.tasks_now[0..@min(r.tasks_now.len, 256)], 0..) |t, i| try w.print("{s}{d}:{d}:{d}:{d}:{d}", .{ if (i == 0) "" else ",", t.task, t.attempt, t.cpu, t.pid, t.since });
+        try w.writeAll("\ncmd=");
         // The command is for people reading status: its first 1,000 bytes are plenty.
         for (r.cmd[0..@min(r.cmd.len, 1000)]) |ch| try w.writeByte(if (ch == '\n' or ch == '\t') ' ' else ch);
         try w.writeByte('\n');
@@ -441,6 +449,7 @@ pub const Op = struct {
             if (eq(k, "running")) r.running = n;
             if (eq(k, "since")) r.since = std.fmt.parseInt(i64, v, 10) catch 0;
             if (eq(k, "why")) r.why = v;
+            if (eq(k, "now")) r.tasks_now = parseTasks(a, v);
             if (eq(k, "cmd")) r.cmd = v;
         }
         return r;
@@ -454,6 +463,22 @@ pub const Op = struct {
 
 fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+fn parseTasks(a: std.mem.Allocator, v: []const u8) []const TaskNow {
+    var out: std.ArrayList(TaskNow) = .empty;
+    var it = std.mem.tokenizeScalar(u8, v, ',');
+    while (it.next()) |item| {
+        var f = std.mem.tokenizeScalar(u8, item, ':');
+        out.append(a, .{
+            .task = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue,
+            .attempt = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue,
+            .cpu = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue,
+            .pid = std.fmt.parseInt(i32, f.next() orelse continue, 10) catch continue,
+            .since = std.fmt.parseInt(i64, f.next() orelse continue, 10) catch continue,
+        }) catch break;
+    }
+    return out.items;
 }
 
 fn parseList(a: std.mem.Allocator, v: []const u8) []const u32 {
@@ -715,7 +740,8 @@ test "an op record round trip" {
     defer arena.deinit();
     var buf: [1024]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
-    const r: Op = .{ .pid = 7, .project = "rig", .label = "rig:test", .weight = 2, .want = 3, .held = &.{ 4, 9 }, .draining = 1, .overload = 3, .limit = 8, .tasks = 100, .done = 5, .cmd = "a\tb\nc" };
+    const now = [_]TaskNow{.{ .task = 17, .attempt = 2, .cpu = 9, .pid = 4242, .since = 1700000000 }};
+    const r: Op = .{ .tasks_now = &now, .pid = 7, .project = "rig", .label = "rig:test", .weight = 2, .want = 3, .held = &.{ 4, 9 }, .draining = 1, .overload = 3, .limit = 8, .tasks = 100, .done = 5, .cmd = "a\tb\nc" };
     try r.format(&w);
     const p = Op.parse(arena.allocator(), w.buffered());
     try std.testing.expectEqualStrings("rig", p.project);
@@ -723,6 +749,9 @@ test "an op record round trip" {
     try std.testing.expectEqual(3, p.overload);
     try std.testing.expectEqual(1, p.keeps());
     try std.testing.expectEqualStrings("a b c", p.cmd);
+    try std.testing.expectEqual(1, p.tasks_now.len);
+    try std.testing.expectEqual(17, p.tasks_now[0].task);
+    try std.testing.expectEqual(4242, p.tasks_now[0].pid);
 }
 
 test "the line: a waiter holding nothing isn't starved behind a head nobody may give to" {

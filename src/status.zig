@@ -465,6 +465,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
             .done = o.done,
             .failed = o.failed,
             .running = o.running,
+            .running_tasks = tasksJson(a, o.tasks_now),
             .paused = stopped,
             .exclusive = o.drain,
             .urgent = o.urgent,
@@ -976,4 +977,10 @@ test "the next CPU frees from an operation giving CPUs back" {
     };
     try std.testing.expectApproxEqAbs(5.0, nextFree(&ops, 20).?, 1e-9);
     try std.testing.expectEqual(null, nextFree(ops[0..1], 20));
+}
+
+fn tasksJson(a: std.mem.Allocator, now: []const pool_mod.TaskNow) []const statusjson.JsonTask {
+    const out = a.alloc(statusjson.JsonTask, now.len) catch return &.{};
+    for (now, out) |t, *j| j.* = .{ .task = t.task, .attempt = t.attempt, .cpu = if (t.cpu == std.math.maxInt(u32)) null else t.cpu, .pid = t.pid, .since = t.since };
+    return out;
 }
