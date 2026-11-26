@@ -7,7 +7,7 @@ A release is a `vX.Y.Z` tag. GitHub Actions does the rest
 | --- | --- | --- |
 | Version | `build.zig.zon` | The one place the version lives. `cpuq --version` reports it; a release build stamps it with `-Dversion`. |
 | Notes | `CHANGELOG.md` | The `## X.Y.Z — date` section is the release's notes. |
-| Release | `release.yml` | Checks the tag against `build.zig.zon` and the changelog, runs the unit and end-to-end tests on Linux and macOS, builds four targets in safe mode, packs them (`scripts/package-release.sh`), writes and cosign-signs the checksums, and publishes the release. |
+| Release | `release.yml` | Checks the tag against `build.zig.zon` and the changelog, runs the unit and end-to-end tests on Linux and macOS unless CI already passed on the tagged commit, builds four targets in safe mode, packs them (`scripts/package-release.sh`), writes and cosign-signs the checksums, and publishes the release. |
 | Install | `install.sh` | Fetched from `main`; installs the latest release, or a pinned tag, after checking its sha256. |
 | Homebrew | `shreeve/homebrew-tap`, `Formula/cpuq.rb` | One archive per platform; `scripts/bump-homebrew-formula.py` points it at a release. |
 
