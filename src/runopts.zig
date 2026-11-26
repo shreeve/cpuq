@@ -57,6 +57,25 @@ pub const RunOptions = struct {
     /// `--repo NAME` (internal, what --on passes on): the repository the job's copy came
     /// from, for its history.
     repo: ?[]const u8 = null,
+    /// `-n M`: an operation of M tasks (0: one task, with the terminal).
+    tasks: u32 = 0,
+    /// `-c C` or `-c P%`: the most CPUs the operation may hold.
+    cpus: u32 = 100,
+    cpus_percent: bool = true,
+    /// `-x K`: processes per CPU.
+    overload: u32 = 1,
+    /// `-t T`: each task's time limit, in seconds.
+    timeout_s: ?u32 = null,
+    /// `-r N`: tries again for a task that failed.
+    retries: u32 = 0,
+    /// `--urgent`: its first CPU goes ahead of the line ("rebuild first").
+    urgent: bool = false,
+    /// `--driver`: a runner that only starts other `cpuq run`s: it holds no CPU itself.
+    driver: bool = false,
+    /// `--wait-max S`: give up (exit 75) when no CPU comes within S seconds; 0: start now or not.
+    wait_max: ?u32 = null,
+    /// A removed option given: its name, so the run can say what replaces it.
+    removed: ?[]const u8 = null,
 };
 
 const max_returns = 8;
@@ -99,6 +118,56 @@ pub fn parseRun(args: []const [:0]const u8) ?RunOptions {
         }
         for ([_][]const u8{ "--cores", "--no-load-check", "--qos", "--opaque", "--return", "--tethered", "--on", "--include", "--repo" }) |r| {
             if (std.mem.eql(u8, name, r)) o.run_only = r;
+        }
+        if (std.mem.eql(u8, name, "-n")) {
+            o.tasks = policy.parseCount(value) orelse {
+                _ = usageError("-n needs a whole number of tasks, at least 1, not '{s}'", .{value});
+                return null;
+            };
+            continue;
+        } else if (std.mem.eql(u8, name, "-c")) {
+            const pct = std.mem.endsWith(u8, value, "%");
+            const n = policy.parseCount(if (pct) value[0 .. value.len - 1] else value) orelse {
+                _ = usageError("-c needs a whole number of CPUs or a percentage (50%), not '{s}'", .{value});
+                return null;
+            };
+            if (pct and n > 100) {
+                _ = usageError("-c takes at most 100%, not '{s}'", .{value});
+                return null;
+            }
+            o.cpus = n;
+            o.cpus_percent = pct;
+            continue;
+        } else if (std.mem.eql(u8, name, "-x")) {
+            o.overload = policy.parseCount(value) orelse {
+                _ = usageError("-x needs a whole number of processes per CPU, at least 1, not '{s}'", .{value});
+                return null;
+            };
+            continue;
+        } else if (std.mem.eql(u8, name, "-t")) {
+            o.timeout_s = policy.parseAge(value) orelse {
+                _ = usageError("-t needs a time limit such as 30s, 10m or 2h (off: none), not '{s}'", .{value});
+                return null;
+            };
+            continue;
+        } else if (std.mem.eql(u8, name, "-r")) {
+            o.retries = std.fmt.parseInt(u32, value, 10) catch {
+                _ = usageError("-r needs a whole number of retries, not '{s}'", .{value});
+                return null;
+            };
+            continue;
+        } else if (std.mem.eql(u8, name, "--urgent")) {
+            o.urgent = true;
+            continue;
+        } else if (std.mem.eql(u8, name, "--driver")) {
+            o.driver = true;
+            continue;
+        } else if (std.mem.eql(u8, name, "--wait-max")) {
+            o.wait_max = std.fmt.parseInt(u32, value, 10) catch {
+                _ = usageError("--wait-max needs whole seconds, not '{s}'", .{value});
+                return null;
+            };
+            continue;
         }
         if (std.mem.eql(u8, name, "--cores")) {
             o.cores_given = true;

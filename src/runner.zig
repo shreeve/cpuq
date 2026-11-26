@@ -14,6 +14,7 @@ const leasing = @import("leasing.zig");
 const timing = @import("timing.zig");
 const remotes = @import("remotes.zig");
 const statusjson = @import("statusjson.zig");
+const op = @import("op.zig");
 
 const exit_usage = main.exit_usage;
 const exit_noexec = main.exit_noexec;
@@ -103,32 +104,11 @@ pub fn nestedGrant(ctx: *Ctx) bool {
 }
 
 pub fn cmdRun(ctx: *Ctx, args: []const [:0]const u8) u8 {
+    if (removedOption(args)) |msg| return usageError("{s}", .{msg});
     var o = parseRun(args) orelse return exit_usage;
     if (o.cmd.len == 0) return usageError("run needs a command", .{});
     if (o.host != null or o.hold or o.slots != 1) return usageError("--host, --hold and --slots are options of `cpuq lease`", .{});
-
-    if (nestedGrant(ctx)) {
-        // Inside a running job: run at once within its grant, everything
-        // passed through untouched.
-        const err = std.process.replace(ctx.io, .{ .argv = @ptrCast(o.cmd) });
-        std.debug.print("cpuq: {s}: {t}\n", .{ o.cmd[0], err });
-        return if (err == error.FileNotFound) exit_notfound else exit_noexec;
-    }
-    if (exclusiveWindow(ctx)) |token| {
-        // Inside a lease held `--exclusive` on this machine (its CPUQ_LEASES
-        // entry passed through ssh): the window is this run's own, so it
-        // starts at once with the cores it asked for, at most.
-        var num: [16]u8 = undefined;
-        ctx.env.put("CPUQ_CORES", std.mem.print(&num, "{d}", .{o.request.max}) catch "1") catch fail("out of memory", .{});
-        ctx.env.put("CPUQ_TOKEN", token) catch fail("out of memory", .{});
-        const err = std.process.replace(ctx.io, .{ .argv = @ptrCast(o.cmd), .environ_map = ctx.env });
-        std.debug.print("cpuq: {s}: {t}\n", .{ o.cmd[0], err });
-        return if (err == error.FileNotFound) exit_notfound else exit_noexec;
-    }
-    _ = ctx.env.swapRemove("CPUQ_TOKEN");
-
     loadConfig(ctx);
-    if (o.exclusive and !ctx.cfg.exclusive) o.exclusive = exclusiveOff(o.label);
     if ((o.return_count != 0 or o.include_count != 0) and o.on == null) return usageError("--return and --include go with --on", .{});
     // `--on` this machine itself runs here; any other host must be one of this machine's remotes.
     if (o.on) |h| {
@@ -141,11 +121,67 @@ pub fn cmdRun(ctx: *Ctx, args: []const [:0]const u8) u8 {
         }
     }
     if (o.tethered) tether();
-    if (o.on) |h| {
-        if (o.exclusive) return usageError("--on sends ordinary jobs, not --exclusive ones (time on the machine you mean)", .{});
-        return runOn(ctx, o, h);
+    if (o.on) |h| return runOn(ctx, o, h);
+    if (o.driver) return runDriver(ctx, o);
+    return op.run(ctx, .{
+        .tasks = o.tasks,
+        .cpus = o.cpus,
+        .cpus_percent = o.cpus_percent,
+        .overload = o.overload,
+        .timeout_s = o.timeout_s,
+        .retries = o.retries,
+        .urgent = o.urgent,
+        .label = o.label,
+        .wait_max_s = o.wait_max,
+        .cmd = o.cmd,
+    });
+}
+
+/// The options `cpuq run` no longer takes, each with what replaces it (said once, then the
+/// run refuses).
+fn removedOption(args: []const [:0]const u8) ?[]const u8 {
+    const gone = [_][2][]const u8{
+        .{ "--cores", "--cores is gone: every task gets one CPU. Run M tasks with -n M (at most -c C CPUs at once); a build runs on one CPU" },
+        .{ "--priority", "--priority is gone: --urgent puts a run's first CPU ahead of the line; there is no low" },
+        .{ "--max-wait", "--max-wait is now --wait-max" },
+        .{ "--exclusive", "--exclusive is gone: `cpuq drain -- CMD` empties the machine and runs CMD alone" },
+        .{ "--no-load-check", "--no-load-check is gone: the pool limits CPU work, and outside load is measured" },
+        .{ "--qos", "--qos is gone: tasks run as they are" },
+        .{ "--opaque", "--opaque is gone: every task holds its one CPU, inside a container or not" },
+    };
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--")) return null;
+        const name = std.mem.sliceTo(arg, '=');
+        for (gone) |g| if (std.mem.eql(u8, name, g[0])) return g[1];
+        if (arg.len == 0 or arg[0] != '-') return null;
     }
-    return runHere(ctx, o);
+    return null;
+}
+
+/// `--driver`: a runner that only starts other `cpuq run`s (a test runner, swarm). It holds no
+/// CPU and takes no turn: each run it starts takes its own. It runs with the terminal, and its
+/// exit status (or signal) is the run's.
+fn runDriver(ctx: *Ctx, o: RunOptions) u8 {
+    const exe = findExecutable(ctx, o.cmd[0]) orelse {
+        std.debug.print("cpuq: {s}: command not found\n", .{o.cmd[0]});
+        return exit_notfound;
+    };
+    _ = ctx.env.swapRemove("CPUQ_CPU");
+    _ = ctx.env.swapRemove("CPUQ_OP");
+    const envp = ctx.env.createPosixBlock(ctx.arena, .{}) catch fail("out of memory", .{});
+    const argv = ctx.arena.allocSentinel(?[*:0]const u8, o.cmd.len, null) catch fail("out of memory", .{});
+    for (o.cmd, 0..) |a, i| argv[i] = a.ptr;
+    sys.installForwarding();
+    const pid = sys.spawn(exe, argv.ptr, @ptrCast(envp.slice.ptr), .unchanged, .{ .pdeath = true }) catch |err| {
+        std.debug.print("cpuq: {s}: {t}\n", .{ o.cmd[0], err });
+        return if (err == error.FileNotFound) exit_notfound else exit_noexec;
+    };
+    sys.setChild(pid);
+    const w = sys.waitChild(pid);
+    switch (w.exit) {
+        .code => |c| return c,
+        .signal => |sig| sys.dieBySignal(sig),
+    }
 }
 
 /// Waits its turn on this machine and runs the command.

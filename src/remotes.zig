@@ -196,16 +196,19 @@ fn sendTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     if (ctx.cfg.remoteEnv(host)) |env| remote.print(a, "export {s} && ", .{env}) catch {};
     // The repo's name for its history there (the copy's folder is named by the worktree).
     if (repo_named) |r| remote.print(a, "export CPUQ_REPO={s} && ", .{shellQuote(a, r)}) catch {};
-    remote.print(a, "exec cpuq run --tethered --priority {t}", .{o.priority}) catch fail("out of memory", .{});
+    remote.print(a, "exec cpuq run --tethered", .{}) catch fail("out of memory", .{});
+    if (o.tasks != 0) remote.print(a, " -n {d}", .{o.tasks}) catch {};
+    if (o.cpus_percent) remote.print(a, " -c {d}%", .{o.cpus}) catch {} else remote.print(a, " -c {d}", .{o.cpus}) catch {};
+    if (o.overload != 1) remote.print(a, " -x {d}", .{o.overload}) catch {};
+    if (o.timeout_s) |t| remote.print(a, " -t {d}", .{t}) catch {};
+    if (o.retries != 0) remote.print(a, " -r {d}", .{o.retries}) catch {};
+    if (o.urgent) remote.print(a, " --urgent", .{}) catch {};
+    if (o.driver) remote.print(a, " --driver", .{}) catch {};
+    if (o.wait_max) |mw| remote.print(a, " --wait-max {d}", .{mw}) catch {};
     if (o.label.len != 0) remote.print(a, " --label {s}", .{shellQuote(a, o.label)}) catch {};
     // Without --note, the worktree it came from: every job on another machine says what it's for.
     const job_note = if (o.note.len != 0) o.note else std.fs.path.basename(root);
     if (job_note.len != 0) remote.print(a, " --note {s}", .{shellQuote(a, job_note)}) catch {};
-    if (o.cores_given) remote.print(a, " --cores {d}-{d}", .{ o.request.min, o.request.max }) catch {};
-    if (o.max_wait) |mw| remote.print(a, " --max-wait {d}", .{mw}) catch {};
-    if (!o.load_check) remote.appendSlice(a, " --no-load-check") catch {};
-    if (!o.qos) remote.appendSlice(a, " --qos none") catch {};
-    if (o.hidden) remote.appendSlice(a, " --opaque") catch {};
     remote.appendSlice(a, " --") catch {};
     for (o.cmd) |arg| remote.print(a, " {s}", .{shellQuote(a, arg)}) catch {};
     // Kept here too, as pool "remote": how long the trip took (copy, queue and run), which

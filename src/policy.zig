@@ -144,6 +144,15 @@ pub const Config = struct {
     /// program a test runner starts a cgroup beside it, with limits the
     /// kernel enforces (`cgroups`).
     cgroups: bool = true,
+    /// The pool's CPUs, in the order they are handed out, as a Linux CPU list (`cpus`, e.g.
+    /// "12-19"); empty: worked out from the machine (cpus.zig).
+    cpus: []const u8 = "",
+    /// Each task's time limit, in seconds, when a run gives none with -t (`timeout`, e.g. 1h;
+    /// off: none).
+    timeout_s: u32 = 3600,
+    /// Project weights for sharing the pool (`weights`, e.g. "rig:2 trig:1"); a project not
+    /// named weighs 1.
+    weights: []const u8 = "",
     /// Directories `cpuq submit` may ship, and take `deps` from, separated by commas or spaces
     /// (`submit_roots`; empty: ~/Data/Code).
     submit_roots: []const u8 = "",
@@ -265,6 +274,9 @@ const keys = [_]Key{
     .{ .name = "cpu_weights", .field = "cpu_weights", .kind = .on_off },
     .{ .name = "affinity", .field = "affinity", .kind = .on_off },
     .{ .name = "cgroups", .field = "cgroups", .kind = .on_off },
+    .{ .name = "cpus", .field = "cpus", .kind = .text },
+    .{ .name = "timeout", .field = "timeout_s", .kind = .age },
+    .{ .name = "weights", .field = "weights", .kind = .text },
     .{ .name = "submit_roots", .field = "submit_roots", .kind = .text },
     .{ .name = "clean_after", .field = "clean_after_s", .kind = .age },
     .{ .name = "remotes", .field = "remotes", .kind = .text },
@@ -1326,4 +1338,22 @@ test "admit leaves the reserve without overflowing" {
     const r: Request = .{ .min = 2, .max = 8 };
     try testing.expectEqual(@as(?u32, 6), admit(r, false, 10, 0, false, 4));
     try testing.expectEqual(@as(?u32, 8), admit(r, false, 10, 0, false, std.math.maxInt(u32)));
+}
+
+/// A project's weight in the pool (`weights`), 1 unless the config names it.
+pub fn weightFor(cfg: Config, project: []const u8) u32 {
+    var it = std.mem.tokenizeAny(u8, cfg.weights, ", \t");
+    while (it.next()) |item| {
+        const name, const w = std.mem.cutScalar(u8, item, ':') orelse continue;
+        if (std.mem.eql(u8, name, project)) return @max(1, parseWhole(u32, w) orelse 1);
+    }
+    return 1;
+}
+
+test "weightFor" {
+    const cfg: Config = .{ .weights = "rig:2, trig:3 x:0" };
+    try std.testing.expectEqual(2, weightFor(cfg, "rig"));
+    try std.testing.expectEqual(3, weightFor(cfg, "trig"));
+    try std.testing.expectEqual(1, weightFor(cfg, "x"));
+    try std.testing.expectEqual(1, weightFor(cfg, "emdb"));
 }

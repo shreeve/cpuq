@@ -39,7 +39,7 @@ pub fn maxAsk(cpus: u32) u32 {
 }
 
 /// The `cpuq run` and `cpuq lease` options that take a value (`--cores 2-6`, or `--cores=2-6`).
-pub const run_value_options = [_][]const u8{ "--cores", "--priority", "--label", "--note", "--max-wait", "--qos", "--host", "--slots", "--return", "--on", "--include", "--repo" };
+pub const run_value_options = [_][]const u8{ "--cores", "--priority", "--label", "--note", "--max-wait", "--qos", "--host", "--slots", "--return", "--on", "--include", "--repo", "-n", "-c", "-x", "-t", "-r", "--wait-max" };
 
 /// What one check knows: the machine, the project for suggested labels, and the advisor for the
 /// `cpuq run`s on this machine.

@@ -430,6 +430,8 @@ pub const SpawnOpts = struct {
     dir: ?[*:0]const u8 = null,
     /// In a process group of its own, out of reach of the terminal's ^C.
     group: bool = false,
+    /// Linux: killed (SIGKILL) when the process that started it dies, however it dies.
+    pdeath: bool = false,
 };
 
 /// Starts `path` with an empty signal mask, in the given scheduling class.
@@ -483,9 +485,15 @@ pub fn spawn(
     for (o.cpus) |cpu| if (cpu < set.len * bits) {
         set[cpu / bits] |= @as(usize, 1) << @intCast(cpu % bits);
     };
+    const parent = c.getpid();
     const pid = c.fork();
     if (pid < 0) return error.SpawnFailed;
     if (pid == 0) {
+        if (o.pdeath) {
+            _ = std.os.linux.prctl(@intCast(@backingInt(std.os.linux.PR.SET_PDEATHSIG)), @backingInt(std.os.linux.SIG.KILL), 0, 0, 0);
+            // The parent may have died before the call: then nobody would send it.
+            if (c.getppid() != parent) c._exit(125);
+        }
         // Before exec, so the command's first thread, and all it starts, see only these.
         if (o.group) _ = c.setpgid(0, 0);
         if (o.cpus.len != 0) _ = std.os.linux.syscall3(.sched_setaffinity, 0, @sizeOf(std.os.linux.cpu_set_t), @intFromPtr(&set));
@@ -1120,6 +1128,75 @@ pub fn processAlive(pid: c.pid_t) bool {
     if (pid <= 0) return false;
     if (c.kill(pid, @fromBackingInt(@intCast(0))) == 0) return true;
     return c.errno(-1) == .PERM;
+}
+
+/// When a process started, as a number that differs between two processes that held the same
+/// pid: macOS its start time in microseconds (proc_bsdinfo's pbi_start_tvsec and _tvusec),
+/// Linux its start in clock ticks since boot (/proc/PID/stat, field 22). Null when it is gone,
+/// a zombie (macOS has no bsdinfo for one), or can't be read.
+pub fn procStart(pid: c.pid_t) ?u64 {
+    if (pid <= 0) return null;
+    if (is_darwin) {
+        // struct proc_bsdinfo (PROC_PIDTBSDINFO, 136 bytes): pbi_start_tvsec at 120, _tvusec at 128.
+        var info: [136]u8 align(8) = undefined;
+        if (proc_pidinfo(pid, 3, 0, &info, info.len) != info.len) return null;
+        const sec = std.mem.readInt(u64, info[120..128], .little);
+        const usec = std.mem.readInt(u64, info[128..136], .little);
+        return sec * 1_000_000 + usec;
+    }
+    var path_buf: [32]u8 = undefined;
+    const path = std.mem.printSentinel(&path_buf, "/proc/{d}/stat", .{pid}, 0) catch return null;
+    const fd = c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    if (fd < 0) return null;
+    defer _ = c.close(fd);
+    var buf: [1024]u8 = undefined;
+    const n = c.read(fd, &buf, buf.len);
+    if (n <= 0) return null;
+    return statStart(buf[0..@intCast(n)]);
+}
+
+/// Field 22 (starttime) of a /proc/PID/stat line; null for a zombie (state Z or X), which has
+/// ended though its parent has not reaped it yet. The name in field 2 is in parentheses and may
+/// hold spaces and parentheses itself, so the count starts after the last ')'.
+fn statStart(line: []const u8) ?u64 {
+    const close = std.mem.findScalarLast(u8, line, ')') orelse return null;
+    var it = std.mem.tokenizeScalar(u8, line[close + 1 ..], ' ');
+    var field: u32 = 3;
+    while (it.next()) |f| : (field += 1) {
+        if (field == 3 and (std.mem.eql(u8, f, "Z") or std.mem.eql(u8, f, "X"))) return null;
+        if (field == 22) return std.fmt.parseInt(u64, f, 10) catch null;
+    }
+    return null;
+}
+
+test "statStart" {
+    try std.testing.expectEqual(@as(?u64, 4242), statStart("17 (a) b) c) S 1 17 17 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 4242 1000 10"));
+    try std.testing.expectEqual(@as(?u64, null), statStart("17 (short) S 1"));
+    try std.testing.expectEqual(@as(?u64, null), statStart("17 (a) Z 1 17 17 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 4242 1000 10"));
+}
+
+/// A process's parent, or null when it is gone or can't be read: macOS proc_bsdinfo's
+/// pbi_ppid, Linux /proc/PID/stat's fourth field.
+pub fn parentOf(pid: c.pid_t) ?c.pid_t {
+    if (pid <= 0) return null;
+    if (is_darwin) {
+        var info: [136]u8 align(8) = undefined;
+        if (proc_pidinfo(pid, 3, 0, &info, info.len) != info.len) return null;
+        return @intCast(std.mem.readInt(u32, info[16..20], .little));
+    }
+    var path_buf: [32]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/stat", .{pid}, 0) catch return null;
+    const fd = c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    if (fd < 0) return null;
+    defer _ = c.close(fd);
+    var buf: [1024]u8 = undefined;
+    const n = c.read(fd, &buf, buf.len);
+    if (n <= 0) return null;
+    const line = buf[0..@intCast(n)];
+    const close = std.mem.findScalarLast(u8, line, ')') orelse return null;
+    var it = std.mem.tokenizeScalar(u8, line[close + 1 ..], ' ');
+    _ = it.next() orelse return null; // state
+    return std.fmt.parseInt(c.pid_t, it.next() orelse return null, 10) catch null;
 }
 
 pub fn getpid() c.pid_t {

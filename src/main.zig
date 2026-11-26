@@ -67,6 +67,9 @@ test {
     _ = clean;
     _ = place;
     _ = sys;
+    _ = @import("pool.zig");
+    _ = @import("op.zig");
+    _ = @import("cpus.zig");
     _ = layout;
     _ = runopts;
     _ = repos;
