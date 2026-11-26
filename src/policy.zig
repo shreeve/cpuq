@@ -14,6 +14,9 @@ pub const Config = struct {
     budget: ?u32 = null,
     /// Hand out no CPU while the OS reports memory pressure.
     pressure_check: bool = true,
+    /// Hand out only the CPUs the machine has idle, judged by its busy CPUs against the CPUs
+    /// held (`outside_check`). Off, the pool alone limits CPU work.
+    outside_check: bool = true,
     /// Linux: the `some avg10` percentage of /proc/pressure/memory that
     /// counts as pressure.
     pressure_psi: f64 = 10,
@@ -132,6 +135,7 @@ const Key = struct {
 const keys = [_]Key{
     .{ .name = "budget", .field = "budget", .kind = .whole, .min = 1, .max = 4096, .unit = "CPUs" },
     .{ .name = "pressure_check", .field = "pressure_check", .kind = .on_off },
+    .{ .name = "outside_check", .field = "outside_check", .kind = .on_off },
     .{ .name = "pressure_psi", .field = "pressure_psi", .kind = .number, .min = 0, .max = 100 },
     .{ .name = "min_available", .field = "min_available", .kind = .bytes },
     .{ .name = "min_disk", .field = "min_disk", .kind = .bytes },

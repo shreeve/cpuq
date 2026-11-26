@@ -657,6 +657,12 @@ pub fn installForwarding() void {
 
 /// Records the command's pid for the handlers and delivers any signal that
 /// arrived while it was being started.
+/// A forwarded signal that came while no command ran yet (0: none), taken: a run waiting for
+/// its CPU ends on it rather than starting the command.
+pub fn takePending() u32 {
+    return pending_signal.swap(0, .acq_rel);
+}
+
 pub fn setChild(pid: c.pid_t) void {
     child_pid.store(pid, .release);
     const sig = pending_signal.swap(0, .acq_rel);

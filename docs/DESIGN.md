@@ -85,17 +85,21 @@ Each turn:
 3. **Ctrl-Z**, if one came (below).
 4. **Consolidate:** move tasks from a draining CPU into free places on its other CPUs (below).
 5. **Continue stopped tasks** that have a place again.
-6. **Place** waiting tasks (retries first) into free places of held, non-draining CPUs, the
+6. **Place** waiting tasks (retries behind the tasks not yet started) into free places of held, non-draining CPUs, the
    fullest first, so CPUs fill to K before another is used and empty ones can go back.
 7. **Give back** each held CPU that is empty and has nothing coming (no task waits, or it is
    draining). Giving any back renews the operation's ticket and hands the CPUs to the line, under
    the lock.
-8. **Settle**, under the lock: write the record; scan the operations and promises; hand every free
+8. **Settle**, under the lock, when something happened here (a task ended, a signal or a promise
+   came, a CPU went back) or on its timer: every second for the head of the line, which catches
+   CPUs freed without a word (a SIGKILLed holder) and gates that reopen, every 10 s for the
+   rest. Write the record; scan the operations and promises; hand every free
    CPU to the line (`handOut`), writing promises and waking their operations; take each CPU
    promised to this operation that it still wants, and drop the rest; if it took none and it is
    the line's giver (`giver`), mark one of its CPUs draining; if a drain waits, mark all of them.
 9. **Sleep** in `poll()` on its self-pipe (SIGCHLD and the stop and terminal signals write a byte)
-   and its wake FIFO, for at most a second, or until the next time limit is due.
+   and its wake FIFO, for at most a second, or until the next time limit is due. A long line
+   costs little: a waiter wakes for its promise, not to look.
 
 The record's `want` is what the line reads: the tasks waiting (stopped ones included) less the
 free places on CPUs it keeps, divided by K and rounded up, at most `limit` less the CPUs held.

@@ -160,6 +160,11 @@ const Run = struct {
     last_wait: ?sys.Waited = null,
     /// Stopped by Ctrl-Z: it wants nothing, so the line hands it nothing, until continued.
     stopped: bool = false,
+    /// A task ended, a signal or a promise came: look at the pool now.
+    event: bool = true,
+    seen_ms: i64 = 0,
+    /// First in line at its last look: it alone looks every second.
+    head: bool = false,
     /// Its history: the record, when it entered the line, and the most CPUs it held at once.
     job: joblog.JobLog = undefined,
     queued_t: f64 = 0,
@@ -324,12 +329,32 @@ fn loop(r: *Run) void {
         timeouts(r);
         if (r.running.items.len == 0 and (r.pending() == 0 or r.stopping_since != 0)) break;
         if (got_tstp.swap(false, .acq_rel)) suspend_(r);
+        // A single run's signal while it waits ends it: nothing runs.
+        if (r.single and r.running.items.len == 0) {
+            const sig = sys.takePending();
+            if (sig != 0) {
+                r.stop_signal = sig;
+                break;
+            }
+        }
+        // A drain begun since the last look: stop refilling before placing anything.
+        if (!r.rec.drain and r.pool.draining()) for (r.slots.items) |*sl| {
+            sl.draining = true;
+        };
         consolidate(r);
         resumeStopped(r);
         place(r);
         const released = giveBackEmpty(r);
-        const took = settle(r, released);
-        if (took) continue;
+        // Look at the pool when something happened here: a task ended, a signal or a promise
+        // came (whoever frees a CPU promises it and wakes the waiter). On a timer, only the
+        // head of the line looks every second, for CPUs freed without a word (a SIGKILLed
+        // holder) and gates that reopen; everyone else every 10 s. So a long line costs little.
+        const now = sys.monoMs();
+        if (r.event or released or now - r.seen_ms >= @as(i64, if (r.head) 1000 else 10_000)) {
+            r.event = false;
+            r.seen_ms = now;
+            if (settle(r, released)) continue;
+        }
         if (wait_deadline) |d| if (r.running.items.len == 0 and (r.slots.items.len == 0 or r.rec.drain) and sys.monoMs() >= d) {
             r.gave_up = true;
             break;
@@ -353,6 +378,7 @@ fn sleep(r: *Run) void {
     _ = c.poll(&fds, fds.len, @intCast(timeout));
     var buf: [64]u8 = undefined;
     for (fds) |f| if (f.revents != 0) {
+        r.event = true;
         while (c.read(f.fd, &buf, buf.len) > 0) {}
     };
 }
@@ -417,7 +443,7 @@ fn reap(r: *Run) void {
 fn noteGroups(r: *Run, slot: usize) void {
     var groups: std.ArrayList(pool_mod.Group) = .empty;
     for (r.running.items) |t| if (t.slot == slot) {
-        groups.append(r.a, .{ .pgid = t.pid, .start = sys.procStart(t.pid) orelse 0 }) catch {};
+        groups.append(r.a, .{ .pgid = t.pid, .start = sys.procStart(t.pid) orelse 0, .alone = r.single }) catch {};
     };
     Pool.noteGroups(r.slots.items[slot].file, groups.items);
 }
@@ -434,10 +460,11 @@ fn place(r: *Run) void {
             if (best == null or s.used > r.slots.items[best.?].used) best = i;
         }
         const i = best orelse return;
-        const t: Task = if (r.retry.items.len != 0) r.retry.orderedRemove(0) else blk: {
+        // A retry goes behind the tasks not yet started.
+        const t: Task = if (r.next_index <= r.total) blk: {
             defer r.next_index += 1;
             break :blk .{ .index = r.next_index, .attempt = 1 };
-        };
+        } else r.retry.orderedRemove(0);
         start(r, t, i);
     }
 }
@@ -647,7 +674,9 @@ fn freeCpus(r: *Run, ops: []const Op, given: []const pool_mod.Promise) []const u
     // machine has idle.
     var held: u32 = 0;
     for (ops) |o| held += @intCast(o.held.len);
-    const ncpu = sys.activeCpus(r.ctx.io);
+    // The machine's CPUs, not this process's: a cpuq started under taskset sees the same room.
+    const ncpu: u32 = if (is_linux) @max(1, @as(u32, @intCast(sys.onlineCpus(r.ctx.io, r.a).len))) else sys.activeCpus(r.ctx.io);
+    if (!r.ctx.cfg.outside_check) return out.items;
     if (r.pool.machineBusy(ncpu)) |busy| {
         const used = @max(busy, @as(f64, @floatFromInt(held)));
         const room: usize = @intFromFloat(@max(0, @floor(@as(f64, @floatFromInt(ncpu)) - used + 0.25)));
@@ -718,6 +747,7 @@ fn settle(r: *Run, released: bool) bool {
     // Owed to the line: empty one CPU, if this operation is the giver.
     ops = r.pool.scan(a);
     given = r.pool.promises(a, ops, r.pool_cpus);
+    r.head = if (pool_mod.firstWaiter(a, ops, given)) |w| w.op.ticket == r.rec.ticket else false;
     if (pool_mod.giver(a, ops, given)) |t| if (t == r.rec.ticket) drainOne(r);
     if (!r.rec.drain and r.pool.draining()) for (r.slots.items) |*s| {
         s.draining = true;
@@ -748,7 +778,11 @@ fn finish(r: *Run) u8 {
         return 75;
     }
     if (r.single) {
-        if (r.outcomes.items.len == 0) return 125;
+        if (r.outcomes.items.len == 0) {
+            // Stopped by a signal before it ran: end the same way.
+            if (r.stop_signal != 0) sys.dieBySignal(@fromBackingInt(@intCast(r.stop_signal)));
+            return 125;
+        }
         const out = r.outcomes.items[r.outcomes.items.len - 1];
         if (out.timed_out) {
             std.debug.print("cpuq: stopped at its time limit\n", .{});

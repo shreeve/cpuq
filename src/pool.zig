@@ -64,7 +64,7 @@ pub const Pool = struct {
     pub fn createShared(io: Io, dir: Io.Dir, name: []const u8) !Io.File {
         var tries: u32 = 0;
         while (true) : (tries += 1) {
-            return dir.createFile(io, name, .{ .truncate = false }) catch |err| switch (err) {
+            return dir.createFile(io, name, .{ .read = true, .truncate = false }) catch |err| switch (err) {
                 error.FileNotFound => if (tries < 100) {
                     io.sleep(.fromMilliseconds(1), .awake) catch {};
                     continue;
@@ -282,7 +282,7 @@ pub const Pool = struct {
     pub fn noteGroups(f: Io.File, groups: []const Group) void {
         var buf: [4096]u8 = undefined;
         var w: Io.Writer = .fixed(&buf);
-        for (groups) |g| w.print("{d} {d}\n", .{ g.pgid, g.start }) catch break;
+        for (groups) |g| w.print("{d} {d}{s}\n", .{ g.pgid, g.start, if (g.alone) " p" else "" }) catch break;
         const text = w.buffered();
         _ = std.c.pwrite(f.handle, text.ptr, text.len, 0);
         _ = std.c.ftruncate(f.handle, @intCast(text.len));
@@ -336,7 +336,6 @@ pub const Pool = struct {
         defer f.close(p.io);
         if (f.tryLock(p.io, .shared) catch false) {
             f.unlock(p.io);
-            p.dir.deleteFile(p.io, "drain") catch {};
             return false;
         }
         return true;
@@ -344,7 +343,9 @@ pub const Pool = struct {
 };
 
 /// A task group running on a CPU: its process group and its leader's start time.
-pub const Group = struct { pgid: i32, start: u64 };
+/// A task running on a CPU: its process group (or, `alone`, its process: a single task shares
+/// cpuq's group) and the leader's start time.
+pub const Group = struct { pgid: i32, start: u64, alone: bool = false };
 
 /// Ends the task groups a dead holder noted on a CPU's token: each whose leader still runs with
 /// the same start time (a pgid alone may name another group by now) gets SIGKILL.
@@ -356,7 +357,8 @@ fn killLeftovers(text: []const u8) void {
         const start = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue;
         if (pgid <= 1) continue;
         if (sys.procStart(pgid) != start) continue;
-        _ = std.c.kill(-pgid, .KILL);
+        const alone = if (f.next()) |m| std.mem.eql(u8, m, "p") else false;
+        _ = std.c.kill(if (alone) pgid else -pgid, .KILL);
     }
 }
 
@@ -411,7 +413,8 @@ pub const Op = struct {
         try w.print("\ndraining={d}\noverload={d}\nlimit={d}\ntasks={d}\ndone={d}\nfailed={d}\nrunning={d}\nsince={d}\nwhy={s}\ncmd=", .{
             r.draining, r.overload, r.limit, r.tasks, r.done, r.failed, r.running, r.since, r.why,
         });
-        for (r.cmd) |ch| try w.writeByte(if (ch == '\n' or ch == '\t') ' ' else ch);
+        // The command is for people reading status: its first 1,000 bytes are plenty.
+        for (r.cmd[0..@min(r.cmd.len, 1000)]) |ch| try w.writeByte(if (ch == '\n' or ch == '\t') ' ' else ch);
         try w.writeByte('\n');
     }
 

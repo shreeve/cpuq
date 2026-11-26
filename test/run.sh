@@ -2,9 +2,8 @@
 # test/run.sh [TEST...]: the end-to-end tests. Each test gets its own state directory, config and
 # HOME, and runs in a folder of its own (not a repo, so a run's project is its label's). The pool
 # is small (budget 2 unless a test says otherwise) and the memory and disk gates are off, so the
-# tests depend neither on the machine's size nor on its memory. The outside-load gate reads the
-# real machine: it hands out only the CPUs the machine has idle, so on a machine with fewer idle
-# CPUs than a test's pool, a test that needs every CPU of its pool at once can be slow or fail.
+# tests depend neither on the machine's size nor on its memory. The outside-load gate, which
+# reads the real machine, is off too, except where a test says otherwise (t_narrow).
 # CPUQ=/path/to/cpuq tests another binary.
 set -u
 cd "$(dirname "$0")/.."
@@ -21,8 +20,7 @@ descendants() { local p; for p in $(pgrep -P "$1"); do echo "$p"; descendants "$
 alive() { [ -s "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
 trap 'killtree $$; rm -rf "$ROOT"' EXIT
 # Linux: the suite runs with every CPU the machine's init may use, even when started inside a
-# narrower CPU set (an outer `cpuq run` pins its job): cpuq's outside-load gate takes the caller's
-# CPU set for the machine's size (t_narrow, a known bug), which would starve every test's pool.
+# narrower CPU set (an outer `cpuq run` pins its job), so each task can be pinned to its pool CPU.
 if [ "$(uname)" = Linux ]; then
   SUITE_PID=$$ python3 -c 'import os, re
 m = re.search(r"Cpus_allowed_list:\s*(\S+)", open("/proc/1/status").read())
@@ -55,7 +53,7 @@ setup() {
   local line keys=" "
   for line in "$@"; do keys="$keys${line%% *} "; done
   {
-    for line in "budget = 2" "min_disk = off" "pressure_check = off"; do
+    for line in "budget = 2" "min_disk = off" "pressure_check = off" "outside_check = off"; do
       case $keys in *" ${line%% *} "*) ;; *) echo "$line" ;; esac
     done
     for line in "$@"; do echo "$line"; done
@@ -229,7 +227,7 @@ case $CPUQ_TASK in 1) exit 0 ;; 2) [ "$CPUQ_ATTEMPT" = 3 ] ;; 3) exit 1 ;; esac'
   local order; order=$(tr '\n' ' ' <"$T/order")
   # op.zig's place() starts a waiting retry before the run's next new task (FINAL-PLAN: "A retry
   # goes to the back of the operation's own tasks, so one flaky task never holds up the rest").
-  known retry-first "a retry goes behind the run's other tasks (order: $order; rc $rc)" "[ $rc = 0 ] && [ '$order' = '1.1 2.1 3.1 1.2 ' ]"
+  check "a retry goes behind the run's other tasks (order: $order; rc $rc)" "[ $rc = 0 ] && [ '$order' = '1.1 2.1 3.1 1.2 ' ]"
   local t0 dt; t0=$(now)
   "$CPUQ" run -n 1 -t 1s -r 1 --label r:slow -- sh -c '[ "$CPUQ_ATTEMPT" = 2 ] || sleep 30' 2>/dev/null; rc=$?
   dt=$(since "$t0")
@@ -331,7 +329,7 @@ EOF
   check "the drain's command starts once the running tasks end, holds the pool alone, and what waited runs after it" "[ '${verdict% *}' = ok ]"
   # An operation asleep in poll() hears of the drain only at its next settle(), and on waking it
   # place()s its next task on the freed CPU first (seen on pup: a3 started after a1 ended).
-  known drain-refill "a run stops starting tasks once a drain waits (${verdict#* })" "[ '${verdict#* }' = held-back ]"
+  check "a run stops starting tasks once a drain waits (${verdict#* })" "[ '${verdict#* }' = held-back ]"
   "$CPUQ" run --label d:long -- sleep 3 & local h=$!
   wait_held 1
   local t0 rc dt; t0=$(now)
@@ -496,7 +494,7 @@ t_leftovers() {
   else
     # Pool.take opens a CPU's token write-only (createShared), so it never reads the groups noted
     # there; and a single task shares cpuq's group, so its pid names no group to kill.
-    known take-reads-no-notes "the next holder of a SIGKILLed operation's CPU ends its leftover tasks (got $got)" "[ '$got' = 'single:gone tasks:gone ' ]"
+    check "the next holder of a SIGKILLed operation's CPU ends its leftover tasks (got $got)" "[ '$got' = 'single:gone tasks:gone ' ]"
   fi
 }
 
@@ -554,7 +552,7 @@ t_term_waiting() {
   check "a waiting run of tasks killed by SIGTERM ends at once by it (rc $rm after ${dm}s), running nothing ($many)" "[ $rm = 143 ] && fl '$dm < 1' && [ $many = no ]"
   # sys.installForwarding keeps the signal for a child not yet started: the run waits on for its
   # CPU, then starts the command and signals it, which may already have run (cpuq kill too).
-  known term-while-waiting "a waiting single run killed by SIGTERM ends at once by it (rc $rs after ${ds}s), running nothing ($single)" "[ $rs = 143 ] && fl '$ds < 1' && [ $single = no ]"
+  check "a waiting single run killed by SIGTERM ends at once by it (rc $rs after ${ds}s), running nothing ($single)" "[ $rs = 143 ] && fl '$ds < 1' && [ $single = no ]"
 }
 
 t_lost_seq() {
@@ -571,18 +569,17 @@ t_lost_seq() {
 }
 
 t_long_command() {
-  # A command line of 5000 bytes (an inline script) runs, and status shows a long one.
+  # A command line of 5000 bytes (an inline script) runs, and status shows its first 1000 bytes.
   setup long-command
   local pad; pad=$(printf 'x%.0s' $(seq 2000))
   "$CPUQ" run --label l:mid -- sh -c "sleep 1 # $pad" & local p=$!
   wait_held 1
   local shown; shown=$(sj '[len(h["command"]) for h in s["holders"]][0]')
   wait $p; local rc=$?
-  check "a 2000-byte command runs and shows in status (rc $rc, $shown bytes)" "[ $rc = 0 ] && [ '$shown' -gt 2000 ]"
+  check "a 2000-byte command runs and status shows its first 1000 bytes (rc $rc, $shown bytes)" "[ $rc = 0 ] && [ '$shown' = 1000 ]"
   pad=$(printf 'x%.0s' $(seq 5000))
   local out; out=$("$CPUQ" run -- sh -c "echo ran # $pad" 2>"$T/err"); rc=$?
-  # pool.write formats an operation's record into 4096 bytes: enter fails (RecordTooLong, 125).
-  known record-4k "a 5000-byte command runs (rc $rc, '$out' $(cut -c1-60 "$T/err"))" "[ $rc = 0 ] && [ '$out' = ran ]"
+  check "a 5000-byte command runs (rc $rc, '$out' $(cut -c1-60 "$T/err"))" "[ $rc = 0 ] && [ '$out' = ran ]"
 }
 
 t_waiters_cpu() {
@@ -628,7 +625,7 @@ EOF
   check "100 waiters were in the line while measured ($queued)" "[ $queued = yes ]"
   # Each waiting run wakes every second (op.zig sleep: a 1000 ms poll) and rescans the whole pool
   # under its lock, so the line's cost grows with the square of its length (0.29: under 0.1 CPU).
-  known waiters-rescan "100 waiters use almost no CPU (${used}s in 4s)" "fl '$used < 0.5'"
+  check "100 waiters use almost no CPU (${used}s in 4s)" "fl '$used < 0.5'"
   check "all 100 ran (rc $rc)" "[ $rc = 0 ]"
 }
 
@@ -794,16 +791,15 @@ t_repin() {
 t_narrow() {
   # Linux: a run started inside a narrower CPU set (taskset, an outer cpuq's pin) still uses its
   # whole pool: 4 tasks of 0.5 s at -c 2 on a pool of 2 take about 1 s, and a drain gets the pool.
-  setup narrow
+  setup narrow "outside_check = on"
   if [ "$(uname)" != Linux ] || ! command -v taskset >/dev/null; then echo "  skipped: Linux with taskset only"; return; fi
   local first; first=$(poolcpus); first=${first%% *}
   local t0 rc dt; t0=$(now)
   taskset -c "$first" "$CPUQ" run -n 4 --label n:x -- sleep 0.5 2>/dev/null; rc=$?
   dt=$(since "$t0")
   taskset -c "$first" "$CPUQ" drain --max 3s -- true 2>/dev/null; local rd=$?
-  # sys.activeCpus counts the caller's CPU set (getCpuCount), and freeCpus's outside-load room is
-  # that count less the CPUs held: one CPU under taskset -c N, whatever the pool.
-  known narrow-affinity "under taskset -c $first, a run of 4 uses the pool of 2 (rc $rc, ${dt}s) and a drain gets it (rc $rd)" "[ $rc = 0 ] && fl '$dt < 1.8' && [ $rd = 0 ]"
+  # The outside-load room counts the machine's CPUs, not the caller's CPU set.
+  check "under taskset -c $first, a run of 4 uses the pool of 2 (rc $rc, ${dt}s) and a drain gets it (rc $rd)" "[ $rc = 0 ] && fl '$dt < 1.8' && [ $rd = 0 ]"
 }
 
 # --- status, history, wait -------------------------------------------------------------------

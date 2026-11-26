@@ -281,7 +281,7 @@ most the CPUs online less the larger of the CPUs busy (from the kernel's CPU tic
 second or so) and the CPUs held. So work cpuq doesn't run (Spotlight, a build typed outside cpuq)
 holds back CPUs while it runs, and so does a task that uses more than its one CPU (which macOS
 can't stop). It never reads the load average, which counts threads waiting on I/O and lags a
-minute.
+minute. `outside_check = off` leaves the pool alone to limit CPU work.
 
 **The gates** hold every free CPU while they are closed; runs keep the CPUs they hold, and keep
 filling them:
@@ -902,6 +902,7 @@ says so.
 | `timeout` | 1h | each task's time limit when a run gives no `-t`; off: none |
 | `weights` | none | project weights for sharing the pool, `rig:2 trig:1`; a project not named weighs 1 |
 | `pressure_check` | on | hand out no CPU under memory pressure |
+| `outside_check` | on | hand out only the CPUs the machine has idle (outside load) |
 | `pressure_psi` | 10 | Linux: the `some avg10` percentage that counts as pressure |
 | `min_available` | off | hand out no CPU while available memory is under this (e.g. `6G`) |
 | `min_disk` | 5G | hand out no CPU while `$HOME`'s, the temp directory's or `~/cpuq`'s filesystem has less free than this; off turns it off |
