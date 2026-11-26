@@ -11,7 +11,8 @@ binary, [AGENTS.md](AGENTS.md) is enough.
 3. [docs/DESIGN.md](docs/DESIGN.md): how it works inside: the pool's files, an operation's loop,
    the line, giving CPUs back, the gates, nesting, leases, jobs of task files and the agent.
 4. [docs/SUBMIT.md](docs/SUBMIT.md): specs, `cpuq submit` and `cpuq test`.
-5. [docs/RELEASING.md](docs/RELEASING.md): cutting a CLI release and a Cpuq.app release.
+5. [docs/RELEASING.md](docs/RELEASING.md): cutting a CLI release and a Cpuq.app release;
+   [docs/CUTOVER.md](docs/CUTOVER.md): moving a machine onto the pool, once.
 6. [CHANGELOG.md](CHANGELOG.md) and [app/CHANGELOG.md](app/CHANGELOG.md): why things are the
    way they are.
 7. Steve's Zig 0.17 guide: `gh gist view 57a74df35e17dacb30dcaa5d5164a27f -f ZIG-0.17.md --raw`.
