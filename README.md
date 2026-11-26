@@ -1000,6 +1000,6 @@ instead. The removed variables are simply not set; `cpuq hook` rewrites a `cpuq 
 - [docs/PRIOR-ART.md](docs/PRIOR-ART.md): who else has tackled this, and what cpuq borrows or does differently.
 - [CHANGELOG.md](CHANGELOG.md): what changed in each version, and why.
 - [docs/RELEASING.md](docs/RELEASING.md): cutting a release.
-- [scripts/scenario.sh](scripts/scenario.sh): synthetic work for a machine's cpuq, shaped like
-  builds, test suites, greedy runners and memory hogs (stress-ng), for watching the pool and
-  Cpuq.app under load.
+- [test/stress/mix.py](test/stress/mix.py) and [test/stress/pool.py](test/stress/pool.py): a mixed
+  load replayed with CPUs granted against busy each second, and three projects sharing the pool
+  under SIGKILLs, checked from each task's log.

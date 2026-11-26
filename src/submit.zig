@@ -99,6 +99,9 @@ const Spec = struct {
     setup: ?[]const u8 = null,
     /// Read only to refuse it, with what replaces it.
     cores: ?std.json.Value = null,
+    /// The job is a runner (`cpuq run --driver`): it holds no CPU, and the `cpuq run`s it
+    /// starts take their own. Without it, the job is one task on one CPU.
+    driver: bool = false,
     time: ?[]const u8 = null,
     mem: ?[]const u8 = null,
     tools: ?Map = null,
@@ -133,6 +136,7 @@ const Payload = struct {
     tasks: ?[]const u8 = null,
     /// A `tasks` job's name under the host's jobs folder: one per worktree.
     job: []const u8 = "",
+    driver: bool = false,
     time: ?[]const u8 = null,
     mem: ?[]const u8 = null,
     tools: ?Map = null,
@@ -557,7 +561,7 @@ fn submit(cx: Cx, args: []const [:0]const u8, as_test: bool) u8 {
     const spec_abs = realpath(cx, sp) orelse return fail2("{s}: not found", .{sp});
     const text = readFile(cx, spec_abs) orelse return fail2("{s}: can't be read", .{sp});
     const spec = std.json.parseFromSliceLeaky(Spec, cx.a, text, .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| {
-        return fail2("spec {s}: {t} (fields: label, run or tasks, setup, time, mem, tools, env, exclude, deps, caches, needs, report, return, git, packs)", .{ sp, err });
+        return fail2("spec {s}: {t} (fields: label, run or tasks, setup, driver, time, mem, tools, env, exclude, deps, caches, needs, report, return, git, packs)", .{ sp, err });
     };
     if (as_test and (spec.tasks == null or spec.run != null)) return fail2("spec {s}: cpuq test runs a spec with \"tasks\" and no \"run\" (cpuq submit runs one with \"run\")", .{sp});
     if (!as_test and (spec.run == null or spec.tasks != null)) return fail2("spec {s}: cpuq submit runs a spec with \"run\" and no \"tasks\" (cpuq test runs one with \"tasks\")", .{sp});
@@ -565,7 +569,7 @@ fn submit(cx: Cx, args: []const [:0]const u8, as_test: bool) u8 {
     const dir = if (top_run.ok) std.mem.trim(u8, top_run.out, " \n") else (std.fs.path.dirname(spec_abs) orelse ".");
     if (std.mem.findScalar(u8, spec.label, ':') == null or !policy.validLabel(spec.label))
         return fail2("spec {s}: \"label\" is project:task, of lowercase letters, digits, '.', '_' and '-', not '{s}'", .{ sp, spec.label });
-    if (spec.cores != null) return fail2("spec {s}: \"cores\" is gone: a spec's job runs as one task; its command runs parallel work as tasks with cpuq run -n", .{sp});
+    if (spec.cores != null) return fail2("spec {s}: \"cores\" is gone: a spec's job runs as one task on one CPU; a runner whose own cpuq runs (-n M) take their own CPUs sets \"driver\": true", .{sp});
     if (spec.time) |t| if (@import("cap.zig").parseDuration(t) == null) return fail2("spec {s}: \"time\" must be a duration like 90m, not '{s}'", .{ sp, t });
     if (spec.mem) |m| if (policy.parseBytes(m) == null) return fail2("spec {s}: \"mem\" must be a size like 64G, not '{s}'", .{ sp, m });
     for (spec.exclude) |p| if (!inside(p)) return fail2("spec {s}: \"exclude\" paths are relative, without .., not '{s}'", .{ sp, p });
@@ -666,6 +670,7 @@ fn submit(cx: Cx, args: []const [:0]const u8, as_test: bool) u8 {
         .tasks = spec.tasks,
         .job = if (as_test) jobName(cx, project, dir) else "",
         .time = spec.time,
+        .driver = spec.driver,
         .mem = spec.mem,
         .tools = spec.tools,
         .env = env_map,
@@ -1609,7 +1614,9 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
 
     // cpuq run gives the job its CPU; cap enforces its time from its start, and its memory.
     var argv: std.ArrayList([]const u8) = .empty;
-    argv.appendSlice(cx.a, &.{ cx.self, "run", "--label", p.label }) catch return 125;
+    // The spec's `time` (cap's --time) limits the job, not the host's per-task default.
+    argv.appendSlice(cx.a, &.{ cx.self, "run", "--label", p.label, "-t", "off" }) catch return 125;
+    if (p.driver) argv.append(cx.a, "--driver") catch {};
     if (p.note.len != 0) argv.appendSlice(cx.a, &.{ "--note", p.note }) catch {};
     argv.appendSlice(cx.a, &.{ "--", cx.self, "cap" }) catch {};
     if (p.time) |t| argv.appendSlice(cx.a, &.{ "--time", t }) catch {};

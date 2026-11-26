@@ -127,7 +127,7 @@ const usage =
     \\
     \\for agents and scripts:
     \\  a build runs on one CPU: cpuq run --label app:build -- zig build -j1
-    \\  many independent pieces run as tasks: cpuq run -n 40 -- ./test/one "$CPUQ_TASK"
+    \\  many independent pieces run as tasks: cpuq run -n 40 -- sh -c 'test/one "$CPUQ_TASK"'
     \\  exit 75: nothing ran; run it again later, not in a loop.
     \\  see AGENTS.md: https://github.com/shreeve/cpuq/blob/main/AGENTS.md
     \\
