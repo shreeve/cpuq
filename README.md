@@ -1009,6 +1009,7 @@ In this mode a few things keep reserved cores from sitting idle:
 ## More
 
 - [AGENTS.md](AGENTS.md): how a coding agent should use cpuq.
+- [HANDOFF.md](HANDOFF.md): working on cpuq itself: where things stand, building, testing, house rules.
 - [docs/DESIGN.md](docs/DESIGN.md): how it works inside.
 - [docs/PRIOR-ART.md](docs/PRIOR-ART.md): who else has tackled this, and what cpuq borrows or does differently.
 - [CHANGELOG.md](CHANGELOG.md): what changed in each version, and why.
