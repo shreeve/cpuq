@@ -680,7 +680,9 @@ fn freeCpus(r: *Run, ops: []const Op, given: []const pool_mod.Promise) []const u
         for (ops) |o| if (std.mem.findScalar(u32, o.held, cpu) != null) continue :outer;
         for (given) |g| if (g.cpu == cpu) continue :outer;
         for (r.slots.items) |s| if (s.cpu == cpu) continue :outer;
-        if (!r.pool.isFree(cpu)) continue;
+        // No lock probe: a CPU's token is held exactly while a live operation's record lists it
+        // (both change under the pool's lock, and both go when an operation dies). take() locks
+        // it, and a CPU that turns out held loses its promise.
         out.append(r.a, cpu) catch break;
     }
     // Outside load: the machine's busy CPUs beyond the CPUs held are work cpuq doesn't run
