@@ -2,7 +2,7 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
-## 0.30.1
+## 0.30.1 — 2026-11-26
 
 - **Two `cpuq drain`s at once no longer stop every cpuq on the machine.** A second drain waited
   for the first one's mark while holding the pool's lock. The first then couldn't take the lock
