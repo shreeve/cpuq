@@ -1124,8 +1124,8 @@ pub fn processAlive(pid: c.pid_t) bool {
 
 /// When a process started, as a number that differs between two processes that held the same
 /// pid: macOS its start time in microseconds (proc_bsdinfo's pbi_start_tvsec and _tvusec),
-/// Linux its start in clock ticks since boot (/proc/PID/stat, field 22). Null when it is gone
-/// or can't be read.
+/// Linux its start in clock ticks since boot (/proc/PID/stat, field 22). Null when it is gone,
+/// a zombie (macOS has no bsdinfo for one), or can't be read.
 pub fn procStart(pid: c.pid_t) ?u64 {
     if (pid <= 0) return null;
     if (is_darwin) {
@@ -1147,13 +1147,15 @@ pub fn procStart(pid: c.pid_t) ?u64 {
     return statStart(buf[0..@intCast(n)]);
 }
 
-/// Field 22 (starttime) of a /proc/PID/stat line. The name in field 2 is in parentheses and may
+/// Field 22 (starttime) of a /proc/PID/stat line; null for a zombie (state Z or X), which has
+/// ended though its parent has not reaped it yet. The name in field 2 is in parentheses and may
 /// hold spaces and parentheses itself, so the count starts after the last ')'.
 fn statStart(line: []const u8) ?u64 {
     const close = std.mem.findScalarLast(u8, line, ')') orelse return null;
     var it = std.mem.tokenizeScalar(u8, line[close + 1 ..], ' ');
     var field: u32 = 3;
     while (it.next()) |f| : (field += 1) {
+        if (field == 3 and (std.mem.eql(u8, f, "Z") or std.mem.eql(u8, f, "X"))) return null;
         if (field == 22) return std.fmt.parseInt(u64, f, 10) catch null;
     }
     return null;
@@ -1162,6 +1164,7 @@ fn statStart(line: []const u8) ?u64 {
 test "statStart" {
     try std.testing.expectEqual(@as(?u64, 4242), statStart("17 (a) b) c) S 1 17 17 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 4242 1000 10"));
     try std.testing.expectEqual(@as(?u64, null), statStart("17 (short) S 1"));
+    try std.testing.expectEqual(@as(?u64, null), statStart("17 (a) Z 1 17 17 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 4242 1000 10"));
 }
 
 /// Whether the process group `pgid` has a process left.

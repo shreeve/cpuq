@@ -1206,3 +1206,18 @@ test "reap: a killed cpuq's tokens stay while its command's group runs" {
     try std.testing.expectEqual(2, p.reap());
     try std.testing.expectEqual(0, p.count(p.held));
 }
+
+test "a killed process its parent has not reaped yet is not alive" {
+    const pid = c.fork();
+    if (pid == 0) {
+        while (true) _ = sleep(1000);
+    }
+    const h: Holder = .{ .pid = pid, .start = sys.procStart(pid).? };
+    try std.testing.expect(h.alive());
+    _ = c.kill(pid, .KILL);
+    // A zombie until waited for: dead to the pool already.
+    var tries: u32 = 0;
+    while (h.alive() and tries < 200) : (tries += 1) std.testing.io.sleep(.fromMilliseconds(5), .awake) catch {};
+    try std.testing.expect(!h.alive());
+    _ = sys.waitChild(pid);
+}
