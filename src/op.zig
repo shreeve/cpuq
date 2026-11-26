@@ -40,6 +40,8 @@ pub const Opts = struct {
     label: []const u8 = "",
     /// --wait-max: give up (exit 75) when no CPU came in this many seconds.
     wait_max_s: ?u32 = null,
+    /// `cpuq drain`: wait for every CPU of the pool, then run the command alone.
+    drain: bool = false,
     cmd: []const [:0]const u8 = &.{},
 };
 
@@ -64,7 +66,7 @@ const Slot = struct {
     newest_ms: i64 = 0,
 };
 
-const Outcome = struct { index: u32, attempt: u32, code: u8, timed_out: bool, out: []const u8 };
+const Outcome = struct { index: u32, attempt: u32, code: u8, timed_out: bool, out: []const u8, stopped: bool = false };
 
 // Signals: the handler only records them and writes a byte to the self-pipe, which the loop
 // sleeps on with the wake FIFO.
@@ -133,6 +135,7 @@ const Run = struct {
     }
 
     fn wantMore(r: *const Run) u32 {
+        if (r.rec.drain) return if (r.running.items.len == 0 and r.pending() > 0) @as(u32, @intCast(r.pool_cpus.len)) -| @as(u32, @intCast(r.slots.items.len)) else 0;
         // Places free on CPUs held and kept, against tasks waiting.
         var free_places: u32 = 0;
         for (r.slots.items) |s| if (!s.draining) {
@@ -176,7 +179,7 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
     const single = o.tasks == 0;
     const total: u32 = if (single) 1 else o.tasks;
     const asked: u32 = if (o.cpus_percent) @max(1, @as(u32, @intCast((@as(u64, pool_cpus.len) * o.cpus) / 100))) else o.cpus;
-    const limit = @max(1, @min(@min(asked, @as(u32, @intCast(pool_cpus.len))), std.math.divCeil(u32, total, o.overload) catch 1));
+    const limit = if (o.drain) @as(u32, @intCast(pool_cpus.len)) else @max(1, @min(@min(asked, @as(u32, @intCast(pool_cpus.len))), std.math.divCeil(u32, total, o.overload) catch 1));
     const timeout_s = o.timeout_s orelse ctx.cfg.timeout_s;
     const timeout_ms: i64 = if (timeout_s == 0) std.math.maxInt(i64) / 2 else @as(i64, timeout_s) * 1000;
 
@@ -194,6 +197,7 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
         .started_ms = sys.monoMs(),
         .rec = .{
             .urgent = o.urgent,
+            .drain = o.drain,
             .pid = sys.getpid(),
             .project = projectOf(ctx, o),
             .label = if (o.label.len != 0) o.label else std.fs.path.basename(o.cmd[0]),
@@ -215,6 +219,9 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
     r.rec.want = r.wantMore();
     r.file = r.pool.enter(&r.rec) catch |err| main.fail("pool {s}: {t}", .{ r.pool.path, err });
     r.wake_fd = r.pool.openWake(r.rec.ticket) catch |err| main.fail("pool {s}: {t}", .{ r.pool.path, err });
+    // A drain says so for its whole life: every other operation empties its CPUs for it.
+    const drain_file: ?Io.File = if (o.drain) r.pool.markDrain() catch |err| main.fail("pool {s}: {t}", .{ r.pool.path, err }) else null;
+    defer if (drain_file) |f| f.close(ctx.io);
     r.pool.unlock();
 
     if (!single) std.debug.print("cpuq: {d} tasks, up to {d} CPU{s}, overload {d}, timeout {d}s{s}\n", .{
@@ -245,11 +252,12 @@ fn loop(r: *Run) void {
         signals(r);
         timeouts(r);
         if (r.running.items.len == 0 and (r.pending() == 0 or r.stopping_since != 0)) break;
+        consolidate(r);
         place(r);
         const released = giveBackEmpty(r);
         const took = settle(r, released);
         if (took) continue;
-        if (wait_deadline) |d| if (r.slots.items.len == 0 and r.running.items.len == 0 and sys.monoMs() >= d) {
+        if (wait_deadline) |d| if (r.running.items.len == 0 and (r.slots.items.len == 0 or r.rec.drain) and sys.monoMs() >= d) {
             r.gave_up = true;
             break;
         };
@@ -325,8 +333,9 @@ fn reap(r: *Run) void {
         if (failed and !cut_off and t.attempt <= r.o.retries) {
             r.retry.append(r.a, .{ .index = t.index, .attempt = t.attempt + 1 }) catch {};
         } else {
-            r.outcomes.append(r.a, .{ .index = t.index, .attempt = t.attempt, .code = if (t.timed_out) 124 else code, .timed_out = t.timed_out, .out = t.out }) catch {};
-            if (failed) r.rec.failed += 1 else r.rec.done += 1;
+            const stopped = failed and cut_off;
+            r.outcomes.append(r.a, .{ .index = t.index, .attempt = t.attempt, .code = if (t.timed_out) 124 else code, .timed_out = t.timed_out, .out = t.out, .stopped = stopped }) catch {};
+            if (stopped) {} else if (failed) r.rec.failed += 1 else r.rec.done += 1;
             if (r.single) r.last_wait = w;
         }
         noteGroups(r, t.slot);
@@ -344,6 +353,8 @@ fn noteGroups(r: *Run, slot: usize) void {
 /// Puts waiting tasks on held CPUs with room, the fullest first, so CPUs fill to K before
 /// another is used and empty ones can go back.
 fn place(r: *Run) void {
+    // `cpuq drain` starts its command only once it holds every CPU of the pool.
+    if (r.rec.drain and r.slots.items.len < r.pool_cpus.len) return;
     while (r.pending() > 0) {
         var best: ?usize = null;
         for (r.slots.items, 0..) |s, i| {
@@ -392,7 +403,8 @@ fn start(r: *Run, t_in: Task, slot: usize) void {
             dups.append(r.a, .{ out_fd, 2 }) catch {};
         }
     }
-    const pin: []const u32 = if (is_linux) &.{s.cpu} else &.{};
+    // A drain's command has the machine: it isn't pinned.
+    const pin: []const u32 = if (is_linux and !r.rec.drain) &.{s.cpu} else &.{};
     const spawned = sys.spawn(r.exe, argv.ptr, @ptrCast(envp.slice.ptr), .unchanged, .{
         .cpus = pin,
         .dups = dups.items,
@@ -419,6 +431,40 @@ fn start(r: *Run, t_in: Task, slot: usize) void {
     noteGroups(r, slot);
 }
 
+/// While a held CPU is being emptied for the line, a place freeing on another held CPU takes
+/// one of its tasks (Linux moves the task's processes there), so the emptied CPU frees sooner.
+fn consolidate(r: *Run) void {
+    for (r.slots.items, 0..) |from, fi| {
+        if (!from.draining or from.used == 0) continue;
+        for (r.slots.items, 0..) |*to, ti| {
+            if (to.draining or to.used >= r.o.overload) continue;
+            // The task on the draining CPU that started last (the one most likely to run on).
+            var pick: ?usize = null;
+            for (r.running.items, 0..) |t, k| if (t.slot == fi) {
+                if (pick == null or t.start_ms > r.running.items[pick.?].start_ms) pick = k;
+            };
+            const k = pick orelse break;
+            const t = &r.running.items[k];
+            if (is_linux) repin(r, t.pid, to.cpu);
+            t.slot = ti;
+            r.slots.items[fi].used -= 1;
+            to.used += 1;
+            noteGroups(r, fi);
+            noteGroups(r, ti);
+            if (r.slots.items[fi].used == 0) break;
+        }
+    }
+}
+
+/// Linux: moves every thread of a task's processes to `cpu`.
+fn repin(r: *Run, root: c.pid_t, cpu: u32) void {
+    const procs = sys.processes(r.ctx.io, r.a);
+    const in_tree = r.a.alloc(bool, procs.len) catch return;
+    @memset(in_tree, false);
+    sys.markTree(procs, root, in_tree);
+    for (procs, in_tree) |p, yes| if (yes) sys.pinThreads(r.ctx.io, r.a, p.pid, cpu);
+}
+
 /// Gives back each held CPU that is empty and has nothing coming: no task waits, or it is
 /// being emptied for the line. Returns whether any went.
 fn giveBackEmpty(r: *Run) bool {
@@ -426,7 +472,9 @@ fn giveBackEmpty(r: *Run) bool {
     var i: usize = 0;
     while (i < r.slots.items.len) {
         const s = r.slots.items[i];
-        if (s.used == 0 and (s.draining or r.pending() == 0)) {
+        // A drain keeps the whole pool while its command runs.
+        const keep = r.rec.drain and r.running.items.len != 0;
+        if (s.used == 0 and !keep and (s.draining or r.pending() == 0)) {
             if (!any) r.pool.lock();
             any = true;
             r.pool.release(s.file);
@@ -475,6 +523,20 @@ fn freeCpus(r: *Run, ops: []const Op, given: []const pool_mod.Promise) []const u
         for (r.slots.items) |s| if (s.cpu == cpu) continue :outer;
         if (!r.pool.isFree(cpu)) continue;
         out.append(r.a, cpu) catch break;
+    }
+    // Outside load: the machine's busy CPUs beyond the CPUs held are work cpuq doesn't run
+    // (or tasks using more than their CPU, which macOS can't stop). Hand out only what the
+    // machine has idle.
+    var held: u32 = 0;
+    for (ops) |o| held += @intCast(o.held.len);
+    const ncpu = sys.activeCpus(r.ctx.io);
+    if (r.pool.machineBusy(ncpu)) |busy| {
+        const used = @max(busy, @as(f64, @floatFromInt(held)));
+        const room: usize = @intFromFloat(@max(0, @floor(@as(f64, @floatFromInt(ncpu)) - used + 0.25)));
+        if (room < out.items.len) {
+            if (room == 0) r.rec.why = "outside load";
+            return out.items[0..room];
+        }
     }
     return out.items;
 }
@@ -540,7 +602,7 @@ fn settle(r: *Run, released: bool) bool {
     ops = r.pool.scan(a);
     given = r.pool.promises(a, ops, r.pool_cpus);
     if (pool_mod.giver(a, ops, given)) |t| if (t == r.rec.ticket) drainOne(r);
-    if (r.pool.draining()) for (r.slots.items) |*s| {
+    if (!r.rec.drain and r.pool.draining()) for (r.slots.items) |*s| {
         s.draining = true;
     };
     r.syncRecord();
@@ -588,17 +650,23 @@ fn summary(r: *Run) u8 {
     var failed: std.ArrayList(Outcome) = .empty;
     var timed: u32 = 0;
     var retried: u32 = 0;
+    var stopped: u32 = 0;
     for (r.outcomes.items) |o| {
+        if (o.stopped) {
+            stopped += 1;
+            continue;
+        }
         if (o.code != 0) failed.append(r.a, o) catch {};
         if (o.timed_out) timed += 1;
         if (o.attempt > 1) retried += 1;
     }
     const secs = @as(f64, @floatFromInt(sys.monoMs() - r.started_ms)) / 1000;
     const not_run = r.total -| @as(u32, @intCast(r.outcomes.items.len));
-    std.debug.print("cpuq: {d} of {d} tasks passed", .{ r.outcomes.items.len - failed.items.len, r.total });
+    std.debug.print("cpuq: {d} of {d} tasks passed", .{ r.outcomes.items.len - failed.items.len - stopped, r.total });
     if (failed.items.len != 0) std.debug.print(", {d} failed", .{failed.items.len});
     if (timed != 0) std.debug.print(" ({d} at the time limit)", .{timed});
     if (retried != 0) std.debug.print(", {d} passed or ended on a retry", .{retried});
+    if (stopped != 0) std.debug.print(", {d} stopped", .{stopped});
     if (not_run != 0) std.debug.print(", {d} not run", .{not_run});
     std.debug.print(", in {d:.1}s; output in {s}\n", .{ secs, r.out_dir });
     for (failed.items, 0..) |o, i| {
@@ -610,12 +678,16 @@ fn summary(r: *Run) u8 {
         printTail(r, o.out, 5);
     }
     if (r.stop_signal != 0) sys.dieBySignal(@fromBackingInt(@intCast(r.stop_signal)));
-    return if (failed.items.len != 0 or not_run != 0) 1 else 0;
+    return if (failed.items.len != 0 or not_run != 0 or stopped != 0) 1 else 0;
 }
 
 fn printTail(r: *Run, path: []const u8, lines: usize) void {
     const text = Io.Dir.cwd().readFileAlloc(r.ctx.io, path, r.a, .limited(1 << 20)) catch return;
     const body = std.mem.trimEnd(u8, text, "\n");
+    if (body.len == 0) {
+        std.debug.print("    (no output)\n", .{});
+        return;
+    }
     var from: usize = body.len;
     var n: usize = 0;
     while (from > 0 and n < lines) {
@@ -724,4 +796,71 @@ fn runNested(ctx: *Ctx, o: Opts, exe: [:0]const u8, cpu: u32) u8 {
         if (!(c.W.IFEXITED(st) and c.W.EXITSTATUS(st) == 0)) failed += 1;
     }
     return if (failed != 0) 1 else 0;
+}
+
+// --- cpuq drain, cpuq kill ------------------------------------------------------------------
+
+/// `cpuq drain [--max SECONDS] [--label L] -- CMD`: empties the machine for timing. Every
+/// operation stops refilling and gives its CPUs back as its tasks end; once the drain holds the
+/// whole pool, CMD runs alone, unpinned, and the CPUs go back when it ends. With --max, a drain
+/// that hasn't the machine by then gives up (exit 75) and nothing runs.
+pub fn cmdDrain(ctx: *Ctx, args: []const [:0]const u8) u8 {
+    var o: Opts = .{ .drain = true, .urgent = true };
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--")) {
+            o.cmd = args[i + 1 ..];
+            break;
+        }
+        if (arg.len == 0 or arg[0] != '-') {
+            o.cmd = args[i..];
+            break;
+        }
+        if (i + 1 >= args.len) return main.usageError("{s} needs a value", .{arg});
+        if (std.mem.eql(u8, arg, "--max")) {
+            o.wait_max_s = policy.parseAge(args[i + 1]) orelse return main.usageError("--max needs a time such as 90s or 10m, not '{s}'", .{args[i + 1]});
+        } else if (std.mem.eql(u8, arg, "--label")) {
+            o.label = args[i + 1];
+        } else return main.usageError("unknown option '{s}'", .{arg});
+        i += 1;
+    }
+    if (o.cmd.len == 0) return main.usageError("drain needs a command", .{});
+    main.loadConfig(ctx);
+    o.timeout_s = 0;
+    return run(ctx, o);
+}
+
+/// `cpuq kill OP`: ends an operation of this user's on this machine, named by its ticket, its
+/// cpuq's pid or its label: its cpuq gets SIGTERM and passes it to every task, then kills what
+/// is left 5 seconds later.
+pub fn cmdKill(ctx: *Ctx, args: []const [:0]const u8) u8 {
+    if (args.len != 1) return main.usageError("kill needs one operation: its ticket, pid or label", .{});
+    const want = args[0];
+    const a = ctx.arena;
+    var pool = Pool.open(ctx.io, a, main.stateDir(ctx)) catch |err| main.fail("pool: {t}", .{err});
+    pool.lock();
+    const ops = pool.scan(a);
+    pool.unlock();
+    const n = std.fmt.parseInt(i64, want, 10) catch -1;
+    var hits: std.ArrayList(Op) = .empty;
+    for (ops) |o| {
+        if ((n >= 0 and (o.ticket == @as(u64, @intCast(n)) or o.pid == n)) or std.mem.eql(u8, o.label, want)) hits.append(a, o) catch {};
+    }
+    if (hits.items.len == 0) {
+        std.debug.print("cpuq: no operation here is {s}\n", .{want});
+        return 1;
+    }
+    if (hits.items.len > 1) {
+        std.debug.print("cpuq: {d} operations are {s}; name one by its ticket:\n", .{ hits.items.len, want });
+        for (hits.items) |o| std.debug.print("  {d}  pid {d}  {s}  {s}\n", .{ o.ticket, o.pid, o.label, o.cmd });
+        return 1;
+    }
+    const o = hits.items[0];
+    if (c.kill(o.pid, .TERM) != 0) {
+        std.debug.print("cpuq: can't signal pid {d}\n", .{o.pid});
+        return 1;
+    }
+    ctx.out.print("stopping {d} ({s}, pid {d})\n", .{ o.ticket, o.label, o.pid }) catch {};
+    return 0;
 }

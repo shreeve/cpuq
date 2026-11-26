@@ -238,6 +238,7 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
     if (std.mem.eql(u8, cmd, "_job")) return cmdJob(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "cap")) return cap.main(ctx.arena, args[1..], ctx.env.get("CPUQ_CGROUP"), ctx.env.get("PATH"));
     if (std.mem.eql(u8, cmd, "run")) return cmdRun(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "drain")) return @import("op.zig").cmdDrain(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "lease")) return cmdLease(ctx, args[1..]);
     loadConfig(ctx);
     if (std.mem.eql(u8, cmd, "status")) return cmdStatus(ctx, args[1..]);
@@ -251,6 +252,7 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
         return submit.cmdJobs(submitCx(ctx), rest);
     }
     if (std.mem.eql(u8, cmd, "wait")) return cmdWait(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "kill")) return @import("op.zig").cmdKill(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "history")) return cmdHistory(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "doctor")) return cmdDoctor(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "record")) return cmdRecord(ctx, args[1..]);

@@ -1175,6 +1175,24 @@ test "statStart" {
     try std.testing.expectEqual(@as(?u64, null), statStart("17 (a) Z 1 17 17 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 4242 1000 10"));
 }
 
+/// Linux: pins every thread of process `pid` to `cpu` (sched_setaffinity works per thread,
+/// so each in /proc/PID/task). Elsewhere it does nothing.
+pub fn pinThreads(io: Io, a: std.mem.Allocator, pid: c.pid_t, cpu: u32) void {
+    if (is_darwin) return;
+    var set: std.os.linux.cpu_set_t = @splat(0);
+    const bits = @bitSizeOf(usize);
+    if (cpu >= set.len * bits) return;
+    set[cpu / bits] |= @as(usize, 1) << @intCast(cpu % bits);
+    const path = std.fmt.allocPrint(a, "/proc/{d}/task", .{pid}) catch return;
+    var dir = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| {
+        const tid = std.fmt.parseInt(i32, e.name, 10) catch continue;
+        _ = std.os.linux.syscall3(.sched_setaffinity, @as(usize, @bitCast(@as(isize, tid))), @sizeOf(std.os.linux.cpu_set_t), @intFromPtr(&set));
+    }
+}
+
 /// A process's parent, or null when it is gone or can't be read: macOS proc_bsdinfo's
 /// pbi_ppid, Linux /proc/PID/stat's fourth field.
 pub fn parentOf(pid: c.pid_t) ?c.pid_t {

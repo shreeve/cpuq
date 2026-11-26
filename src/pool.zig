@@ -295,6 +295,41 @@ pub const Pool = struct {
         f.close(p.io);
     }
 
+    /// The machine's busy CPUs over the last second or so, from the kernel's CPU ticks: the
+    /// sample in `ticks` is renewed once at least a second old, so every operation shares one
+    /// measure. Null until two samples exist. Under the lock.
+    pub fn machineBusy(p: *Pool, cpus: u32) ?f64 {
+        const now = sys.monoMs();
+        const t = sys.cpuTicks(p.io) orelse return null;
+        var buf: [128]u8 = undefined;
+        var last_busy: ?f64 = null;
+        var prev: ?struct { busy: u64, total: u64, ms: i64 } = null;
+        if (p.dir.readFile(p.io, "ticks", &buf)) |text| {
+            var f = std.mem.tokenizeScalar(u8, std.mem.trim(u8, text, " \n"), ' ');
+            const b = std.fmt.parseInt(u64, f.next() orelse "", 10) catch 0;
+            const tot = std.fmt.parseInt(u64, f.next() orelse "", 10) catch 0;
+            const ms = std.fmt.parseInt(i64, f.next() orelse "", 10) catch 0;
+            if (f.next()) |lb| last_busy = std.fmt.parseFloat(f64, lb) catch null;
+            if (tot != 0) prev = .{ .busy = b, .total = tot, .ms = ms };
+        } else |_| {}
+        if (prev) |q| if (now - q.ms < 1000 and now >= q.ms) return last_busy;
+        var busy = last_busy;
+        if (prev) |q| if (t.total > q.total and t.busy >= q.busy) {
+            busy = @as(f64, @floatFromInt(t.busy - q.busy)) / @as(f64, @floatFromInt(t.total - q.total)) * @as(f64, @floatFromInt(cpus));
+        };
+        var out: [128]u8 = undefined;
+        const text = std.fmt.bufPrint(&out, "{d} {d} {d} {d:.2}\n", .{ t.busy, t.total, now, busy orelse 0 }) catch return busy;
+        p.dir.writeFile(p.io, .{ .sub_path = "ticks.new", .data = text }) catch return busy;
+        p.dir.rename("ticks.new", p.dir, "ticks", p.io) catch {};
+        return if (prev != null) busy else null;
+    }
+
+    /// Marks that `cpuq drain` waits for the machine: a locked `drain` file, held by the drain
+    /// for its life. Under the lock.
+    pub fn markDrain(p: *Pool) !Io.File {
+        return p.dir.createFile(p.io, "drain", .{ .lock = .exclusive, .truncate = false });
+    }
+
     /// Whether `cpuq drain` is waiting for or holding the machine.
     pub fn draining(p: *Pool) bool {
         const f = p.dir.openFile(p.io, "drain", .{}) catch return false;
