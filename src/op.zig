@@ -514,6 +514,9 @@ fn suspend_(r: *Run) void {
     for (r.running.items) |*t| t.slot = no_slot;
     r.stopped = true;
     r.syncRecord();
+    // CPUs promised to it before it stopped go on to the line too.
+    const ops = r.pool.scan(r.a);
+    for (r.pool.promises(r.a, ops, r.pool_cpus)) |p| if (p.ticket == r.rec.ticket) r.pool.dropPromise(p.cpu);
     settleOthers(r);
     r.pool.unlock();
     const stopped_at = sys.monoMs();
