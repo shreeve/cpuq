@@ -324,17 +324,19 @@ pub const Pool = struct {
         return if (prev != null) busy else null;
     }
 
-    /// Marks that `cpuq drain` waits for the machine: a locked `drain` file, held by the drain
-    /// for its life. Under the lock.
+    /// Marks that `cpuq drain` waits for the machine: a `drain` file each drain holds a shared
+    /// lock on for its life, so any number of drains hold it at once and none waits for
+    /// another here, under the pool's lock. Under the lock.
     pub fn markDrain(p: *Pool) !Io.File {
-        return p.dir.createFile(p.io, "drain", .{ .lock = .exclusive, .truncate = false });
+        return p.dir.createFile(p.io, "drain", .{ .lock = .shared, .truncate = false });
     }
 
-    /// Whether `cpuq drain` is waiting for or holding the machine.
+    /// Whether `cpuq drain` is waiting for or holding the machine: some drain holds the `drain`
+    /// file's lock.
     pub fn draining(p: *Pool) bool {
         const f = p.dir.openFile(p.io, "drain", .{}) catch return false;
         defer f.close(p.io);
-        if (f.tryLock(p.io, .shared) catch false) {
+        if (f.tryLock(p.io, .exclusive) catch false) {
             f.unlock(p.io);
             return false;
         }

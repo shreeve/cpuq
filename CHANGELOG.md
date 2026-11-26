@@ -2,6 +2,13 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.30.1
+
+- **Two `cpuq drain`s at once no longer stop every cpuq on the machine.** A second drain waited
+  for the first one's mark while holding the pool's lock. The first then couldn't take the lock
+  to end, and neither could anyone else, `cpuq status` included. Now each drain holds a shared
+  lock on the mark, so they wait for each other in the line, and each runs alone in turn.
+
 ## 0.30.0 — 2026-11-26
 
 **One CPU per task, from a pool shared through a fair line.** cpuq no longer reserves cores by

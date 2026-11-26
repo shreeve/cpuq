@@ -338,6 +338,20 @@ EOF
   wait $h
   local ran=no; [ -e "$T/ran" ] && ran=yes
   check "drain --max 1s gives up with 75 while a task runs on (rc $rc after ${dt}s, ran: $ran)" "[ $rc = 75 ] && [ $ran = no ] && fl '$dt < 2.5'"
+  # Two drains at once: the second waits in the line, never on the first's hold of the drain
+  # mark under the pool's lock (that deadlocked every cpuq on the machine). Each runs alone, in
+  # turn, and a run behind them follows.
+  local g=$T/two
+  "$CPUQ" drain --max 20s --label d:one -- sh -c "echo one-start >>$g; sleep 1; echo one-end >>$g" & local d1=$!
+  wait_line "$g" one-start
+  "$CPUQ" drain --max 20s --label d:two -- sh -c "echo two-start >>$g; sleep 1; echo two-end >>$g" & local d2=$!
+  "$CPUQ" run --wait-max 20 --label d:after -- sh -c "echo after >>$g" & local d3=$!
+  local r1 r2 r3; wait $d1; r1=$?; wait $d2; r2=$?; wait $d3; r3=$?
+  local order; order=$(tr '\n' ' ' <"$g" 2>/dev/null)
+  local alone=no
+  case "$order" in "one-start one-end two-start two-end "*|"two-start two-end one-start one-end "*) alone=yes ;; esac
+  check "two drains at once each run alone, in turn, and a run follows (rc $r1 $r2 $r3: $order)" \
+    "[ $r1 = 0 ] && [ $r2 = 0 ] && [ $r3 = 0 ] && [ $alone = yes ]"
 }
 
 t_kill() {
