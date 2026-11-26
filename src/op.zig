@@ -689,7 +689,7 @@ fn freeCpus(r: *Run, ops: []const Op, given: []const pool_mod.Promise) []const u
     var held: u32 = 0;
     for (ops) |o| held += @intCast(o.held.len);
     // The machine's CPUs, not this process's: a cpuq started under taskset sees the same room.
-    const ncpu: u32 = if (is_linux) @max(1, @as(u32, @intCast(sys.onlineCpus(r.ctx.io, r.a).len))) else sys.activeCpus(r.ctx.io);
+    const ncpu: u32 = if (is_linux) onlineCount(r.ctx.io) orelse sys.activeCpus(r.ctx.io) else sys.activeCpus(r.ctx.io);
     if (!r.ctx.cfg.outside_check) return out.items;
     if (r.pool.machineBusy(ncpu)) |busy| {
         const used = @max(busy, @as(f64, @floatFromInt(held)));
@@ -700,6 +700,14 @@ fn freeCpus(r: *Run, ops: []const Op, given: []const pool_mod.Promise) []const u
         }
     }
     return out.items;
+}
+
+/// Linux: how many CPUs are online (/sys/devices/system/cpu/online), whatever this process's
+/// CPU set.
+fn onlineCount(io: Io) ?u32 {
+    var buf: [1024]u8 = undefined;
+    const text = Io.Dir.cwd().readFile(io, "/sys/devices/system/cpu/online", &buf) catch return null;
+    return policy.cpuListCount(std.mem.trim(u8, text, " \n"));
 }
 
 /// Why no CPU may be handed out now, or "" when one may: the machine's memory and disk gates.
