@@ -33,7 +33,8 @@ for k in ("CPUQ_CPU", "CPUQ_OP"):
 # Each task: log S, keep one CPU busy for MS, log E. One write each (O_APPEND lands whole).
 task = ("perl -MTime::HiRes=time -e '"
         "open(my $f, \">>\", $ENV{L}); my $t0 = time; syswrite $f, sprintf(\"S %%.6f %%s %%s %%s %%s\\n\", $t0, $ENV{CPUQ_CPU}, $ENV{P}, $ENV{CPUQ_TASK}, $$);"
-        "1 while time < $t0 + %f; syswrite $f, sprintf(\"E %%.6f %%s %%s %%s %%s\\n\", time, $ENV{CPUQ_CPU}, $ENV{P}, $ENV{CPUQ_TASK}, $$);'") % (ms / 1000)
+        "1 while time < $t0 + %f; my $on = \"-\"; if (open(my $s, \"<\", \"/proc/self/status\")) { while (<$s>) { $on = $1 if /^Cpus_allowed_list:\\s*(\\S+)/ } }"
+        "syswrite $f, sprintf(\"E %%.6f %%s %%s %%s %%s %%s\\n\", time, $ENV{CPUQ_CPU}, $ENV{P}, $ENV{CPUQ_TASK}, $$, $on);'") % (ms / 1000)
 procs = {}
 for p in ("aaa", "bbb", "ccc"):
     procs[p] = subprocess.Popen([cpuq, "run", "--label", p + ":t", "-n", str(tasks), "-t", "60", "--", "sh", "-c", task],
@@ -73,6 +74,9 @@ time.sleep(1.5)
 lines = [l.split() for l in open(log).read().splitlines()]
 starts = {(l[3], l[4], l[5]): (float(l[1]), l[2]) for l in lines if l[0] == "S"}
 ends = {(l[3], l[4], l[5]): float(l[1]) for l in lines if l[0] == "E"}
+# Linux: the CPU a task was pinned to when it ended; another than its start means consolidation
+# moved it (re-pinned) while its CPU was emptied for the line.
+moved_to = {(l[3], l[4], l[5]): l[6] for l in lines if l[0] == "E" and len(l) > 6 and l[6] not in ("-", l[2])}
 kill_at = {str(pid): t for kind, pid, t in killed if kind == "task"}
 parent_kill = next((t for kind, _, t in killed if kind == "parent"), None)
 intervals = []
@@ -89,16 +93,18 @@ for key, (t0, cpu) in starts.items():
 # Each pair of tasks that overlapped on one CPU, with how each ended.
 how = {}
 for (proj, task, pid), (t0, cpu) in starts.items():
-    how[(t0, cpu, proj)] = "ended" if (proj, task, pid) in ends else ("killed" if pid in kill_at else ("parent killed" if proj == victim_parent else "no end"))
+    how[(t0, cpu, proj)] = ("moved to CPU %s" % moved_to[(proj, task, pid)]) if (proj, task, pid) in moved_to else "ended" if (proj, task, pid) in ends else ("killed" if pid in kill_at else ("parent killed" if proj == victim_parent else "no end"))
 overlaps = []
 by = {}
 for iv in intervals:
     by.setdefault(iv[2], []).append(iv)
+moved_starts = {(t0, cpu, proj) for (proj, task, pid), (t0, cpu) in starts.items() if (proj, task, pid) in moved_to}
 for cpu, ivs in by.items():
     ivs.sort()
     for x, y in zip(ivs, ivs[1:]):
         if y[0] < x[1]:
             overlaps.append((cpu, x, y))
+real = [o for o in overlaps if (o[1][0], o[1][2], o[1][3]) not in moved_starts and (o[2][0], o[2][2], o[2][3]) not in moved_starts]
 events = sorted([(t0, 1, cpu, p) for t0, t1, cpu, p in intervals] + [(t1, -1, cpu, p) for t0, t1, cpu, p in intervals])
 running, per_cpu, peak, shared = 0, {}, 0, 0
 for t, d, cpu, p in events:
@@ -141,7 +147,7 @@ def alive_pid(pid):
         return True
 alive = [pid for (_, _, pid) in starts if alive_pid(pid)]
 print("pool: %d tasks of %d ms in 3 projects, %d kills (%s)" % (len(intervals), ms, len(killed), ", ".join(k for k, _, _ in killed)))
-print("most running at once: %d; times two tasks shared a CPU: %d" % (peak, shared))
+print("most running at once: %d; times two tasks shared a CPU: %d (%d with a task that consolidation moved off it)" % (peak, len(real), len(overlaps) - len(real)))
 for cpu, x, y in overlaps[:5]:
     print("  CPU %s: %s from %.3f to %.3f (%s), %s from %.3f (%s): %.1f ms together" % (
         cpu, x[3], x[0] - t_first, x[1] - t_first, how[(x[0], x[2], x[3])], y[3], y[0] - t_first, how[(y[0], y[2], y[3])], 1000 * (x[1] - y[0])))
