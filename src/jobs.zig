@@ -28,9 +28,9 @@ const fail = main.fail;
 const usageError = main.usageError;
 
 pub const folders = [_][:0]const u8{ "todo", "live", "done", "fail" };
-/// A task's scheduling class: a normal job's (on macOS the caller's, so a task may use the
-/// performance cores; nice 5 on Linux).
-const task_qos = policy.qosFor(.normal, false, true);
+/// A task's scheduling class: on macOS the caller's, so a task may use the performance cores;
+/// nice 5 on Linux.
+const task_qos: policy.Qos = if (@import("builtin").os.tag.isDarwin()) .unchanged else .utility;
 /// The death that sends a task to fail/.
 pub const deaths_max = 3;
 /// Each new worker starts this long after the last, give or take half.

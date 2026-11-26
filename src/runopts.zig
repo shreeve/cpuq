@@ -1,8 +1,7 @@
-//! A run's options: `cpuq run`'s and `cpuq lease`'s command line, and the command it runs.
+//! `cpuq run`'s command line, and finding and joining the command it runs.
 const std = @import("std");
 const Io = std.Io;
 const policy = @import("policy.zig");
-const hook = @import("hook.zig");
 
 const main = @import("main.zig");
 
@@ -11,38 +10,11 @@ const fail = main.fail;
 const usageError = main.usageError;
 
 pub const RunOptions = struct {
-    request: policy.Request = .{ .min = 2, .max = 2 },
-    /// Whether --cores was given; under measured admission, without it the
-    /// label's history picks the count.
-    cores_given: bool = false,
-    priority: policy.Priority = .normal,
-    exclusive: bool = false,
     label: []const u8 = "",
-    /// What the job is for (`--note "#224 markers"`), shown beside the label; never sized by.
+    /// What the run is for (`--note "#224 markers"`), kept beside its label in history; never
+    /// matched by.
     note: []const u8 = "",
-    max_wait: ?i64 = null,
-    load_check: bool = true,
-    qos: bool = true,
     cmd: []const [:0]const u8 = &.{},
-    /// A named lease's name; null for cores.
-    lease: ?[]const u8 = null,
-    /// `cpuq lease --host HOST`: hold the lease on HOST's cpuq over ssh.
-    host: ?[]const u8 = null,
-    /// `cpuq lease --hold`: once admitted, say so and hold until stdin
-    /// closes (the other end of `--host`).
-    hold: bool = false,
-    /// `cpuq lease --slots N`: how many may hold the lease at once.
-    slots: u32 = 1,
-    /// Options only `cpuq run` takes, to reject them for a lease.
-    run_only: ?[]const u8 = null,
-    /// Queue at the front, as `cpuq first` would put it: the cores of a
-    /// lease taken `--exclusive`, a timing window that goes next once
-    /// running work drains, not behind a stream of later arrivals.
-    first: bool = false,
-    /// `--opaque`: the command's real work runs where cpuq cannot see or
-    /// stop it (inside a container or a VM): counted at its whole grant,
-    /// never lent a timing window it could not be frozen out of.
-    hidden: bool = false,
     /// `--on HOST`: run on HOST, one of this machine's remotes.
     on: ?[]const u8 = null,
     /// `--return PATH` (with --on): copied back from HOST after.
@@ -52,9 +24,9 @@ pub const RunOptions = struct {
     includes: [max_returns][]const u8 = undefined,
     include_count: u8 = 0,
     /// `--tethered` (internal, what --on runs on HOST): stdin carries the caller's heartbeats;
-    /// when they stop, the job stops.
+    /// when they stop, the run stops.
     tethered: bool = false,
-    /// `--repo NAME` (internal, what --on passes on): the repository the job's copy came
+    /// `--repo NAME` (internal, what --on passes on): the repository the run's copy came
     /// from, for its history.
     repo: ?[]const u8 = null,
     /// `-n M`: an operation of M tasks (0: one task, with the terminal).
@@ -74,12 +46,14 @@ pub const RunOptions = struct {
     driver: bool = false,
     /// `--wait-max S`: give up (exit 75) when no CPU comes within S seconds; 0: start now or not.
     wait_max: ?u32 = null,
-    /// A removed option given: its name, so the run can say what replaces it.
-    removed: ?[]const u8 = null,
 };
 
 const max_returns = 8;
 
+/// The options `cpuq run` takes a value for.
+const value_options = [_][]const u8{ "--label", "--note", "--return", "--on", "--include", "--repo", "-n", "-c", "-x", "-t", "-r", "--wait-max" };
+
+/// Parses `cpuq run`'s command line; null after saying what is wrong.
 pub fn parseRun(args: []const [:0]const u8) ?RunOptions {
     var o: RunOptions = .{};
     var i: usize = 0;
@@ -93,13 +67,8 @@ pub fn parseRun(args: []const [:0]const u8) ?RunOptions {
             o.cmd = args[i..];
             return o;
         }
-        var name: []const u8 = a;
-        var inline_value: ?[]const u8 = null;
-        if (std.mem.cutScalar(u8, a, '=')) |kv| {
-            name = kv[0];
-            inline_value = kv[1];
-        }
-        const takes_value = for (hook.run_value_options) |v| {
+        const name, const inline_value = std.mem.cutScalar(u8, a, '=') orelse .{ a, null };
+        const takes_value = for (value_options) |v| {
             if (std.mem.eql(u8, name, v)) break true;
         } else false;
         var value: []const u8 = "";
@@ -116,15 +85,11 @@ pub fn parseRun(args: []const [:0]const u8) ?RunOptions {
             _ = usageError("{s} takes no value", .{name});
             return null;
         }
-        for ([_][]const u8{ "--cores", "--no-load-check", "--qos", "--opaque", "--return", "--tethered", "--on", "--include", "--repo" }) |r| {
-            if (std.mem.eql(u8, name, r)) o.run_only = r;
-        }
         if (std.mem.eql(u8, name, "-n")) {
             o.tasks = policy.parseCount(value) orelse {
                 _ = usageError("-n needs a whole number of tasks, at least 1, not '{s}'", .{value});
                 return null;
             };
-            continue;
         } else if (std.mem.eql(u8, name, "-c")) {
             const pct = std.mem.endsWith(u8, value, "%");
             const n = policy.parseCount(if (pct) value[0 .. value.len - 1] else value) orelse {
@@ -137,47 +102,28 @@ pub fn parseRun(args: []const [:0]const u8) ?RunOptions {
             }
             o.cpus = n;
             o.cpus_percent = pct;
-            continue;
         } else if (std.mem.eql(u8, name, "-x")) {
             o.overload = policy.parseCount(value) orelse {
                 _ = usageError("-x needs a whole number of processes per CPU, at least 1, not '{s}'", .{value});
                 return null;
             };
-            continue;
         } else if (std.mem.eql(u8, name, "-t")) {
             o.timeout_s = policy.parseAge(value) orelse {
                 _ = usageError("-t needs a time limit such as 30s, 10m or 2h (off: none), not '{s}'", .{value});
                 return null;
             };
-            continue;
         } else if (std.mem.eql(u8, name, "-r")) {
-            o.retries = std.fmt.parseInt(u32, value, 10) catch {
+            o.retries = policy.parseWhole(u32, value) orelse {
                 _ = usageError("-r needs a whole number of retries, not '{s}'", .{value});
                 return null;
             };
-            continue;
         } else if (std.mem.eql(u8, name, "--urgent")) {
             o.urgent = true;
-            continue;
         } else if (std.mem.eql(u8, name, "--driver")) {
             o.driver = true;
-            continue;
         } else if (std.mem.eql(u8, name, "--wait-max")) {
-            o.wait_max = std.fmt.parseInt(u32, value, 10) catch {
+            o.wait_max = policy.parseWhole(u32, value) orelse {
                 _ = usageError("--wait-max needs whole seconds, not '{s}'", .{value});
-                return null;
-            };
-            continue;
-        }
-        if (std.mem.eql(u8, name, "--cores")) {
-            o.cores_given = true;
-            o.request = policy.Request.parse(value) orelse {
-                _ = usageError("--cores needs K or MIN-MAX, whole numbers of at least 1, not '{s}'", .{value});
-                return null;
-            };
-        } else if (std.mem.eql(u8, name, "--priority")) {
-            o.priority = policy.Priority.parse(value) orelse {
-                _ = usageError("--priority is high, normal or low, not '{s}'", .{value});
                 return null;
             };
         } else if (std.mem.eql(u8, name, "--label")) {
@@ -188,31 +134,6 @@ pub fn parseRun(args: []const [:0]const u8) ?RunOptions {
             o.label = value;
         } else if (std.mem.eql(u8, name, "--note")) {
             o.note = value;
-        } else if (std.mem.eql(u8, name, "--max-wait")) {
-            o.max_wait = std.fmt.parseInt(i64, value, 10) catch {
-                _ = usageError("--max-wait needs whole seconds, not '{s}'", .{value});
-                return null;
-            };
-        } else if (std.mem.eql(u8, name, "--qos")) {
-            if (std.mem.eql(u8, value, "none")) o.qos = false else if (std.mem.eql(u8, value, "auto")) o.qos = true else {
-                _ = usageError("--qos is none or auto, not '{s}'", .{value});
-                return null;
-            }
-        } else if (std.mem.eql(u8, name, "--exclusive")) {
-            o.exclusive = true;
-        } else if (std.mem.eql(u8, name, "--no-load-check")) {
-            o.load_check = false;
-        } else if (std.mem.eql(u8, name, "--opaque")) {
-            o.hidden = true;
-        } else if (std.mem.eql(u8, name, "--host")) {
-            o.host = value;
-        } else if (std.mem.eql(u8, name, "--slots")) {
-            o.slots = policy.parseCount(value) orelse {
-                _ = usageError("--slots needs a whole number, at least 1, not '{s}'", .{value});
-                return null;
-            };
-        } else if (std.mem.eql(u8, name, "--hold")) {
-            o.hold = true;
         } else if (std.mem.eql(u8, name, "--on")) {
             if (value.len == 0) {
                 _ = usageError("--on needs a host", .{});
@@ -235,7 +156,7 @@ pub fn parseRun(args: []const [:0]const u8) ?RunOptions {
             o.includes[o.include_count] = value;
             o.include_count += 1;
         } else if (std.mem.eql(u8, name, "--return")) {
-            if (value.len == 0 or value[0] == '/' or std.mem.find(u8, value, "..") != null) {
+            if (!repoPath(value)) {
                 _ = usageError("--return needs a path inside the repo, not '{s}'", .{value});
                 return null;
             }

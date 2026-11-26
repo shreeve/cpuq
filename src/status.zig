@@ -4,11 +4,9 @@
 const std = @import("std");
 const Io = std.Io;
 const policy = @import("policy.zig");
-const state = @import("state.zig");
 const sys = @import("sys.zig");
 const table = @import("table.zig");
 const pool_mod = @import("pool.zig");
-const cpus_mod = @import("cpus.zig");
 
 const main = @import("main.zig");
 const texts = @import("texts.zig");
@@ -160,15 +158,6 @@ fn statusRemote(ctx: *Ctx, host: []const u8, json: bool, measure: bool) u8 {
 }
 
 // --- Collecting: the pool, the line, the machine --------------------------------------------
-
-/// The pool's CPUs, worked out as every operation works them out.
-fn poolCpus(ctx: *Ctx) []const u32 {
-    const env_budget: ?u32 = if (ctx.env.get("CPUQ_BUDGET")) |s|
-        policy.parseCount(s) orelse main.fail("CPUQ_BUDGET must be a whole number of CPUs, at least 1, not '{s}'", .{s})
-    else
-        null;
-    return cpus_mod.list(ctx.io, ctx.arena, if (ctx.cfg.cpus.len != 0) ctx.cfg.cpus else null, env_budget orelse ctx.cfg.budget);
-}
 
 /// The pool's CPUs nobody holds or is promised. Under the pool's lock.
 fn freeCpus(p: *Pool, a: std.mem.Allocator, pool_cpus: []const u32, ops: []const Op, given: []const Promise) []const u32 {
@@ -365,14 +354,13 @@ fn nextFree(ops: []const Op, now: i64) ?f64 {
 /// usable.
 fn gateNow(ctx: *Ctx, a: std.mem.Allocator, drain: bool, drain_holds: bool, busy: ?f64, tasks: ?f64, held: u32, free: u32, ncpu: u32) struct { JsonGate, u32 } {
     const m = main.machine(ctx);
-    const g = policy.gate(ctx.cfg, m, 0, null, 0);
+    const g = policy.gate(ctx.cfg, m);
     var buf: [256]u8 = undefined;
     switch (g) {
         .open => {},
         .pressure => return .{ .{ .state = "pressure", .text = "closed: memory pressure" }, 0 },
-        .low_memory => |av| return .{ .{ .state = "low_memory", .available = av, .text = a.dupe(u8, texts.gateText(&buf, g, 0)) catch "closed: memory low" }, 0 },
-        .low_disk => |d| return .{ .{ .state = "low_disk", .disk_free = d.free, .disk_path = d.path, .text = a.dupe(u8, texts.gateText(&buf, g, 0)) catch "closed: disk low" }, 0 },
-        .load, .spacing => {},
+        .low_memory => |av| return .{ .{ .state = "low_memory", .available = av, .text = a.dupe(u8, texts.gateText(&buf, g)) catch "closed: memory low" }, 0 },
+        .low_disk => |d| return .{ .{ .state = "low_disk", .disk_free = d.free, .disk_path = d.path, .text = a.dupe(u8, texts.gateText(&buf, g)) catch "closed: disk low" }, 0 },
     }
     if (drain) return .{ .{ .state = "drain", .text = if (drain_holds) "closed: cpuq drain holds the machine" else "closed: cpuq drain waits for the machine" }, 0 };
     const b = busy orelse return .{ .{ .state = "open", .text = "open" }, free };
@@ -419,7 +407,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
     const a = ctx.arena;
     const now = nowSeconds(io);
     const dir = main.stateDir(ctx);
-    const pool_cpus = poolCpus(ctx);
+    const pool_cpus = main.poolCpus(ctx);
     const pool_n: u32 = @intCast(pool_cpus.len);
     const ncpu = sys.activeCpus(io);
     var pool = Pool.open(io, a, dir) catch |err| main.fail("pool {s}/v2: {t}", .{ dir, err });
@@ -941,52 +929,6 @@ fn leaveWatch(_: std.c.SIG) callconv(.c) void {
     const off = "\x1b[?25h\x1b[?1049l";
     _ = std.c.write(1, off, off.len);
     std.c._exit(0);
-}
-
-// --- Leases, for `cpuq doctor` ---------------------------------------------------------------
-
-const Sample = struct {
-    /// Cores each lease's command keeps busy; null for one with no command.
-    busy: []?f64,
-    /// The busiest processes outside every lease, busiest first.
-    outside: []JsonOutside = &.{},
-};
-
-/// Watches every process for `sample_ms`: what each lease's command tree keeps busy, and the
-/// busiest processes no lease accounts for. Nothing is sampled when `measure` is off.
-pub fn sample(io: Io, a: std.mem.Allocator, leases: []const state.Entry, drivers: []const i32, measure: bool) Sample {
-    _ = drivers;
-    const busy = a.alloc(?f64, leases.len) catch main.fail("out of memory", .{});
-    @memset(busy, null);
-    if (!measure) return .{ .busy = busy };
-    const t0 = Io.Clock.awake.now(io);
-    const before = sys.processes(io, a);
-    io.sleep(.fromMilliseconds(sample_ms), .awake) catch {};
-    const after = sys.processes(io, a);
-    const wall_ns: f64 = @floatFromInt(t0.durationTo(Io.Clock.awake.now(io)).toNanoseconds());
-    if (wall_ns <= 0) return .{ .busy = busy };
-    for (leases, busy) |l, *u| {
-        if (l.record.child <= 0) continue;
-        const used = sys.treeCpu(after, l.record.child) -| sys.treeCpu(before, l.record.child);
-        u.* = @as(f64, @floatFromInt(used)) / wall_ns;
-    }
-    const in_job = a.alloc(bool, after.len) catch return .{ .busy = busy };
-    @memset(in_job, false);
-    for (leases) |l| {
-        sys.markTree(after, l.record.pid, in_job);
-        if (l.record.child > 0) sys.markTree(after, l.record.child, in_job);
-    }
-    var cpu_before: std.AutoHashMapUnmanaged(i32, u64) = .empty;
-    for (before) |p| cpu_before.put(a, p.pid, p.own_ns) catch {};
-    const self = sys.getpid();
-    var outside: std.ArrayList(JsonOutside) = .empty;
-    for (after, 0..) |p, i| {
-        if (in_job[i] or p.pid == self) continue;
-        const was = cpu_before.get(p.pid) orelse continue;
-        const rate = @as(f64, @floatFromInt(p.own_ns -| was)) / wall_ns;
-        if (rate >= 0.3) outside.append(a, .{ .pid = p.pid, .name = p.name, .using = rate }) catch {};
-    }
-    return .{ .busy = busy, .outside = outside.items };
 }
 
 // --- Tests -------------------------------------------------------------------------------------

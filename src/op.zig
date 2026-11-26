@@ -17,6 +17,7 @@ const pool_mod = @import("pool.zig");
 const cpus_mod = @import("cpus.zig");
 const main = @import("main.zig");
 const repos = @import("repos.zig");
+const joblog = @import("joblog.zig");
 
 const Pool = pool_mod.Pool;
 const Op = pool_mod.Op;
@@ -38,6 +39,9 @@ pub const Opts = struct {
     retries: u32 = 0,
     urgent: bool = false,
     label: []const u8 = "",
+    /// --note, and the repository it runs in: for its history.
+    note: []const u8 = "",
+    repo: ?[]const u8 = null,
     /// --wait-max: give up (exit 75) when no CPU came in this many seconds.
     wait_max_s: ?u32 = null,
     /// `cpuq drain`: wait for every CPU of the pool, then run the command alone.
@@ -154,6 +158,10 @@ const Run = struct {
     started_ms: i64,
     first_cpu_ms: i64 = 0,
     last_wait: ?sys.Waited = null,
+    /// Its history: the record, when it entered the line, and the most CPUs it held at once.
+    job: joblog.JobLog = undefined,
+    queued_t: f64 = 0,
+    peak_held: u32 = 0,
 
     fn pending(r: *const Run) u32 {
         if (r.stopping_since != 0) return 0;
@@ -185,6 +193,7 @@ const Run = struct {
             if (s.draining) draining += 1;
         }
         r.rec.held = held.items;
+        r.peak_held = @max(r.peak_held, @as(u32, @intCast(held.items.len)));
         r.rec.draining = draining;
         r.rec.want = r.wantMore();
         r.rec.running = @intCast(r.running.items.len);
@@ -252,6 +261,10 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
     const drain_file: ?Io.File = if (o.drain) r.pool.markDrain() catch |err| main.fail("pool {s}: {t}", .{ r.pool.path, err }) else null;
     defer if (drain_file) |f| f.close(ctx.io);
     r.pool.unlock();
+    const repo = o.repo orelse repos.repoAt(ctx, std.process.currentPathAlloc(ctx.io, a) catch "");
+    r.job = joblog.newJobLog(ctx, .{ .pool = "cpus", .repo = repo, .project = r.rec.project, .label = r.rec.label, .note = o.note, .cmd = r.rec.cmd, .tasks = if (single) null else total });
+    r.queued_t = joblog.nowFloat(ctx.io);
+    joblog.logEvent(ctx, r.job, "queued", .{ .t = r.queued_t });
 
     if (!single) std.debug.print("cpuq: {d} tasks, up to {d} CPU{s}, overload {d}, timeout {d}s{s}\n", .{
         total, limit, if (limit == 1) "" else "s", o.overload, timeout_s, if (o.retries > 0) retryNote(a, o.retries) else "",
@@ -267,7 +280,33 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
     settleOthers(&r);
     r.pool.unlock();
 
+    logEnd(&r);
     return finish(&r);
+}
+
+/// Its last lines in history: when its first task started, then how it ended (or that it gave
+/// up waiting), with the CPU its tasks used (every child reaped: wait4's figures, summed).
+fn logEnd(r: *Run) void {
+    const ctx = r.ctx;
+    if (r.gave_up) return joblog.logEvent(ctx, r.job, "gave_up", .{});
+    if (r.first_cpu_ms != 0) joblog.logEvent(ctx, r.job, "started", .{ .t = r.queued_t + @as(f64, @floatFromInt(r.first_cpu_ms - r.started_ms)) / 1000 });
+    var extra: joblog.EventExtra = .{ .cores = r.peak_held, .cpu = sys.childrenCpu(), .done = r.rec.done, .failed = r.rec.failed };
+    if (r.single) {
+        const last: ?Outcome = if (r.outcomes.items.len != 0) r.outcomes.items[r.outcomes.items.len - 1] else null;
+        if (last == null) {
+            extra.exit = 125;
+        } else if (last.?.timed_out) {
+            extra.exit = 124;
+        } else if (r.last_wait) |w| switch (w.exit) {
+            .code => |code| extra.exit = code,
+            .signal => |sig| extra.signal = @intCast(@backingInt(sig)),
+        } else extra.exit = last.?.code;
+    } else if (r.stop_signal != 0) {
+        extra.signal = r.stop_signal;
+    } else {
+        extra.exit = if (r.rec.failed != 0 or r.rec.done < r.total) 1 else 0;
+    }
+    joblog.logEvent(ctx, r.job, "ended", extra);
 }
 
 fn retryNote(a: std.mem.Allocator, n: u32) []const u8 {
@@ -615,12 +654,11 @@ fn freeCpus(r: *Run, ops: []const Op, given: []const pool_mod.Promise) []const u
 /// Why no CPU may be handed out now, or "" when one may: the machine's memory and disk gates.
 fn gate(r: *Run) []const u8 {
     const m = main.machine(r.ctx);
-    return switch (policy.gate(r.ctx.cfg, m, 0, null, 0)) {
+    return switch (policy.gate(r.ctx.cfg, m)) {
         .open => "",
         .pressure => "memory pressure",
         .low_memory => "low memory",
         .low_disk => |d| std.fmt.allocPrint(r.a, "low disk on {s}", .{d.path}) catch "low disk",
-        .load, .spacing => "load",
     };
 }
 

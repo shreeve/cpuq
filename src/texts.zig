@@ -9,14 +9,6 @@ pub fn bytesText(buf: []u8, n: u64) []const u8 {
     return std.mem.print(buf, "{d:.0}M", .{f / (1 << 20)}) catch "?";
 }
 
-pub fn className(class: u2) []const u8 {
-    return switch (class) {
-        0 => "high",
-        1 => "normal",
-        else => "low",
-    };
-}
-
 pub fn ordinal(buf: []u8, n: usize) []const u8 {
     const suffix = if (n % 100 >= 11 and n % 100 <= 13) "th" else switch (n % 10) {
         1 => "st",
@@ -40,14 +32,12 @@ pub fn age(buf: []u8, seconds: i64) []const u8 {
     return std.mem.print(buf, "{d}h{d:0>2}m", .{ @divTrunc(s, 3600), @divTrunc(@mod(s, 3600), 60) }) catch "?";
 }
 
-pub fn gateText(buf: []u8, g: policy.Gate, budget: u32) []const u8 {
+pub fn gateText(buf: []u8, g: policy.Gate) []const u8 {
     return switch (g) {
         .open => "open",
         .pressure => "closed: memory pressure",
         .low_memory => |av| std.mem.print(buf, "closed: memory low ({d:.1} GB available)", .{@as(f64, @floatFromInt(av)) / (1 << 30)}) catch "closed: memory low",
         .low_disk => |d| std.mem.print(buf, "closed: disk low ({d:.1} GB free on {s})", .{ @as(f64, @floatFromInt(d.free)) / (1 << 30), d.path }) catch "closed: disk low",
-        .load => |l| std.mem.print(buf, "closed: load {d:.1} (valve tripped; budget {d})", .{ l, budget }) catch "closed: load",
-        .spacing => |l| std.mem.print(buf, "spacing admissions: load {d:.1} over budget {d}", .{ l, budget }) catch "spacing",
     };
 }
 

@@ -34,12 +34,6 @@ pub fn check(a: std.mem.Allocator, command: []const u8, project: []const u8, adv
     return ctx.script(command, null, 0);
 }
 
-/// The largest fixed request (or minimum) that doesn't wait for a nearly empty machine: half the
-/// CPUs, and at least 2, which fits even a small machine.
-pub fn maxAsk(cpus: u32) u32 {
-    return @max(cpus / 2, 2);
-}
-
 /// The `cpuq run` and `cpuq lease` options that take a value (`-n 8`, or `--label=app:test`).
 pub const run_value_options = [_][]const u8{ "--label", "--note", "--host", "--slots", "--return", "--on", "--include", "--repo", "-n", "-c", "-x", "-t", "-r", "--wait-max" };
 

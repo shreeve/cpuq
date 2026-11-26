@@ -1,7 +1,5 @@
 //! `cpuq status --json`: the shapes it prints, which Cpuq.app and other machines' cpuq read back.
 const std = @import("std");
-const Io = std.Io;
-const state = @import("state.zig");
 const sys = @import("sys.zig");
 
 const main = @import("main.zig");
@@ -55,19 +53,6 @@ pub const JsonHolder = struct {
 };
 
 pub const JsonProgress = struct { done: u64 = 0, total: u64 = 0, failing: u64 = 0 };
-
-/// A CPUQ_PROGRESS file's one line, `DONE TOTAL [FAILING]`; null when it says nothing usable.
-pub fn readProgress(io: Io, path: []const u8) ?JsonProgress {
-    if (path.len == 0) return null;
-    var buf: [128]u8 = undefined;
-    const text = Io.Dir.cwd().readFile(io, path, &buf) catch return null;
-    var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
-    const done = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
-    const total = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
-    const failing = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0;
-    if (total == 0) return null;
-    return .{ .done = @min(done, total), .total = total, .failing = failing };
-}
 
 /// An operation in the line for a CPU: one that holds none yet, or one that could use more.
 pub const JsonWaiter = struct {
@@ -124,26 +109,6 @@ pub const JsonGate = struct {
     text: []const u8 = "",
 };
 
-/// Leases as holders, for admission's wait estimates.
-pub fn toHolders(a: std.mem.Allocator, leases: []const state.Entry, busy: []const ?f64) []JsonHolder {
-    var out: std.ArrayList(JsonHolder) = .empty;
-    for (leases, 0..) |l, i| {
-        const r = l.record;
-        out.append(a, .{
-            .ticket = r.ticket,
-            .pid = r.pid,
-            .cores = r.cores,
-            .slots = r.slotList(a),
-            .using = if (i < busy.len) busy[i] else null,
-            .exclusive = r.exclusive,
-            .label = r.label,
-            .command = r.cmd,
-            .since = r.since,
-        }) catch {};
-    }
-    return out.items;
-}
-
 /// `cpuq status --json`. `schema` changes only when a field is removed or changes meaning; new
 /// fields may appear in any version.
 pub const JsonStatus = struct {
@@ -171,9 +136,6 @@ pub const JsonStatus = struct {
     /// Seconds until the next held CPU frees, about; null when there is no estimate.
     next_free: ?f64 = null,
     load: [3]f64 = .{ 0, 0, 0 },
-    /// Whether this machine holds work back for its load average: never, since the pool limits
-    /// CPU work and outside load is measured. A --on sending work here reads it.
-    load_check: bool = false,
     memory_pressure: []const u8 = "",
     /// Memory and swap in bytes: `used` is what Activity Monitor calls Memory Used on macOS,
     /// the total less MemAvailable on Linux.

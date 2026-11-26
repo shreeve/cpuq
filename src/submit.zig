@@ -97,7 +97,8 @@ const Spec = struct {
     /// (`cpuq test`): `cpuq jobs run` then runs them, each with `$CPUQ_CODE`, the copy's path.
     tasks: ?[]const u8 = null,
     setup: ?[]const u8 = null,
-    cores: ?[]const u8 = null,
+    /// Read only to refuse it, with what replaces it.
+    cores: ?std.json.Value = null,
     time: ?[]const u8 = null,
     mem: ?[]const u8 = null,
     tools: ?Map = null,
@@ -132,7 +133,6 @@ const Payload = struct {
     tasks: ?[]const u8 = null,
     /// A `tasks` job's name under the host's jobs folder: one per worktree.
     job: []const u8 = "",
-    cores: ?[]const u8 = null,
     time: ?[]const u8 = null,
     mem: ?[]const u8 = null,
     tools: ?Map = null,
@@ -227,7 +227,6 @@ const Result = struct {
     host: []const u8 = "",
     code: ?i64 = null,
     seconds: f64 = 0,
-    cores: []const u8 = "",
     /// The host's CPUs (0 from a host before 0.28.0): what its time is scaled by for another.
     cpus: u32 = 0,
     total: u64 = 0,
@@ -558,7 +557,7 @@ fn submit(cx: Cx, args: []const [:0]const u8, as_test: bool) u8 {
     const spec_abs = realpath(cx, sp) orelse return fail2("{s}: not found", .{sp});
     const text = readFile(cx, spec_abs) orelse return fail2("{s}: can't be read", .{sp});
     const spec = std.json.parseFromSliceLeaky(Spec, cx.a, text, .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| {
-        return fail2("spec {s}: {t} (fields: label, run or tasks, setup, cores, time, mem, tools, env, exclude, deps, caches, needs, report, return, git, packs)", .{ sp, err });
+        return fail2("spec {s}: {t} (fields: label, run or tasks, setup, time, mem, tools, env, exclude, deps, caches, needs, report, return, git, packs)", .{ sp, err });
     };
     if (as_test and (spec.tasks == null or spec.run != null)) return fail2("spec {s}: cpuq test runs a spec with \"tasks\" and no \"run\" (cpuq submit runs one with \"run\")", .{sp});
     if (!as_test and (spec.run == null or spec.tasks != null)) return fail2("spec {s}: cpuq submit runs a spec with \"run\" and no \"tasks\" (cpuq test runs one with \"tasks\")", .{sp});
@@ -566,7 +565,7 @@ fn submit(cx: Cx, args: []const [:0]const u8, as_test: bool) u8 {
     const dir = if (top_run.ok) std.mem.trim(u8, top_run.out, " \n") else (std.fs.path.dirname(spec_abs) orelse ".");
     if (std.mem.findScalar(u8, spec.label, ':') == null or !policy.validLabel(spec.label))
         return fail2("spec {s}: \"label\" is project:task, of lowercase letters, digits, '.', '_' and '-', not '{s}'", .{ sp, spec.label });
-    if (spec.cores) |cr| if (policy.Request.parse(cr) == null) return fail2("spec {s}: \"cores\" must be N or MIN-MAX, not '{s}'", .{ sp, cr });
+    if (spec.cores != null) return fail2("spec {s}: \"cores\" is gone: a spec's job runs as one task; its command runs parallel work as tasks with cpuq run -n", .{sp});
     if (spec.time) |t| if (@import("cap.zig").parseDuration(t) == null) return fail2("spec {s}: \"time\" must be a duration like 90m, not '{s}'", .{ sp, t });
     if (spec.mem) |m| if (policy.parseBytes(m) == null) return fail2("spec {s}: \"mem\" must be a size like 64G, not '{s}'", .{ sp, m });
     for (spec.exclude) |p| if (!inside(p)) return fail2("spec {s}: \"exclude\" paths are relative, without .., not '{s}'", .{ sp, p });
@@ -666,7 +665,6 @@ fn submit(cx: Cx, args: []const [:0]const u8, as_test: bool) u8 {
         .run = spec.run orelse "",
         .tasks = spec.tasks,
         .job = if (as_test) jobName(cx, project, dir) else "",
-        .cores = spec.cores,
         .time = spec.time,
         .mem = spec.mem,
         .tools = spec.tools,
@@ -990,7 +988,7 @@ fn printVerdict(cx: Cx, id: []const u8) u8 {
     // The words line up: the longest, NOT STARTED, has 11 letters.
     w.print("{s}{s}  {s}  {s}  ", .{ word, "           "[0..11 -| word.len], r.label, r.digest[0..@min(8, r.digest.len)] }) catch {};
     switch (v) {
-        .pass => w.print("{s}  {s}  {s} cores{s}\n", .{ ageText(cx, @intFromFloat(r.seconds)), r.host, r.cores, countsText(cx, r) }) catch {},
+        .pass => w.print("{s}  {s}{s}\n", .{ ageText(cx, @intFromFloat(r.seconds)), r.host, countsText(cx, r) }) catch {},
         .fail => w.print("exit {d}  {s}  {s}{s}\n", .{ r.code orelse -1, ageText(cx, @intFromFloat(r.seconds)), r.host, countsText(cx, r) }) catch {},
         else => w.print("{s}\n", .{r.detail}) catch {},
     }
@@ -1609,11 +1607,10 @@ pub fn cmdHostJob(cx: Cx, args: []const [:0]const u8) u8 {
     if (p.report) |r| if (inside(r)) Io.Dir.cwd().deleteFile(cx.io, cx.a.print("{s}/{s}", .{ copy, r }) catch "") catch {};
     for (p.returns) |r| if (inside(r)) Io.Dir.cwd().deleteTree(cx.io, cx.a.print("{s}/{s}", .{ copy, std.mem.trimEnd(u8, r, "/") }) catch "") catch {};
 
-    // cpuq run takes the cores and the job's cgroup; cap enforces time from admission, and memory.
+    // cpuq run gives the job its CPU; cap enforces its time from its start, and its memory.
     var argv: std.ArrayList([]const u8) = .empty;
     argv.appendSlice(cx.a, &.{ cx.self, "run", "--label", p.label }) catch return 125;
     if (p.note.len != 0) argv.appendSlice(cx.a, &.{ "--note", p.note }) catch {};
-    if (p.cores) |cr| argv.appendSlice(cx.a, &.{ "--cores", cr }) catch {};
     argv.appendSlice(cx.a, &.{ "--", cx.self, "cap" }) catch {};
     if (p.time) |t| argv.appendSlice(cx.a, &.{ "--time", t }) catch {};
     if (p.mem) |m| argv.appendSlice(cx.a, &.{ "--mem", m }) catch {};
@@ -1753,7 +1750,7 @@ pub fn cmdPacks(cx: Cx, args: []const [:0]const u8) u8 {
         cx.out.print("{s} {s}{s}{s}\n", .{ pk.name, pk.version, if (pk.alias.len != 0) "  " else "", pk.alias }) catch {};
     }
     cx.out.flush() catch {};
-    const line = cx.a.print("{s} run --label cpuq:packs --cores 2-8 -- /bin/sh -c {s}", .{ self, quote(cx, script.items) }) catch return 125;
+    const line = cx.a.print("{s} run --label cpuq:packs -- /bin/sh -c {s}", .{ self, quote(cx, script.items) }) catch return 125;
     const ran = if (where) |h| onHost(cx, h, line) else run(cx, &.{ "/bin/sh", "-c", line }, null);
     std.debug.print("{s}{s}", .{ ran.out, ran.err });
     return ran.code;
@@ -1880,7 +1877,6 @@ fn hostDone(cx: Cx, id: []const u8, p: Payload, v: Verdict, code: ?i64, detail: 
         .host = hostname(cx),
         .code = code,
         .seconds = @floatFromInt(now(cx.io) - started),
-        .cores = p.cores orelse "",
         .cpus = sys.totalCpus(cx.io),
         .detail = detail,
     };

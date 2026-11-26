@@ -23,6 +23,7 @@ const Ctx = main.Ctx;
 const fail = main.fail;
 const stateDir = main.stateDir;
 const RunOptions = runopts.RunOptions;
+const joinCommand = runopts.joinCommand;
 const findExecutable = runopts.findExecutable;
 const repoPath = runopts.repoPath;
 const repoOf = repos.repoOf;
@@ -31,14 +32,13 @@ const gitTop = repos.gitTop;
 const JobLog = joblog.JobLog;
 const nowFloat = joblog.nowFloat;
 const historyPath = joblog.historyPath;
-const newJobLog = joblog.newJobLog;
 const logEvent = joblog.logEvent;
 const armLastWords = joblog.armLastWords;
 const logAndArm = joblog.logAndArm;
 const logEnded = joblog.logEnded;
-const runHere = runner.runHere;
 const addLeaseEnv = leasing.addLeaseEnv;
 const untilStdinCloses = leasing.untilStdinCloses;
+const LeaseOptions = leasing.LeaseOptions;
 const JsonStatus = statusjson.JsonStatus;
 
 /// `cpuq run --on HOST`: runs on HOST whatever this machine's state: there at once
@@ -87,7 +87,6 @@ fn probeHost(ctx: *Ctx, host: []const u8) Probe {
     const st = std.json.parseFromSliceLeaky(JsonStatus, a, result.stdout, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return .gone;
     const cpus = st.active_cores;
     if (st.waiters.len != 0) return .{ .full = .{ .why = a.print("has {d} waiting", .{st.waiters.len}) catch "is full", .cpus = cpus } };
-    if (st.load_check and st.load[0] > @as(f64, @floatFromInt(st.active_cores))) return .{ .full = .{ .why = a.print("is at load {d:.1} on {d} CPUs", .{ st.load[0], st.active_cores }) catch "is full", .cpus = cpus } };
     if (!std.mem.eql(u8, st.gate.state, "open")) return .{ .full = .{ .why = "has its gate shut", .cpus = cpus } };
     return .{ .room = cpus };
 }
@@ -175,13 +174,9 @@ fn sendTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     }
     const failed: ?[]const u8 = if (!gitship.copied(copied.term)) std.mem.trim(u8, copied.stderr, " \n") else if (shipChecked(ctx, sync.items, host)) |e| e else if (ship_git) shipGit(ctx, root, host, dir) else null;
     if (failed) |err_text| {
-        // Sent there by name, a job never runs here: it was sized for that host.
-        if (o.on != null) {
-            std.debug.print("cpuq: could not copy {s} to {s}: {s}; --on runs it nowhere else\n", .{ root, host, err_text });
-            return exit_failure;
-        }
-        std.debug.print("cpuq: could not copy {s} to {s}: {s}; running here\n", .{ root, host, err_text });
-        return runHere(ctx, o);
+        // Sent there by name, a job never runs here.
+        std.debug.print("cpuq: could not copy {s} to {s}: {s}; --on runs it nowhere else\n", .{ root, host, err_text });
+        return exit_failure;
     }
 
     // ssh joins its arguments into one line for the remote shell, so
@@ -213,10 +208,7 @@ fn sendTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     for (o.cmd) |arg| remote.print(a, " {s}", .{shellQuote(a, arg)}) catch {};
     // Kept here too, as pool "remote": how long the trip took (copy, queue and run), which
     // placement goes by next time.
-    var job = newJobLog(ctx, o);
-    job.base.pool = "remote";
-    job.base.host = host;
-    job.base.repo = repo_named;
+    const job = joblog.newJobLog(ctx, .{ .pool = "remote", .host = host, .repo = repo_named, .label = o.label, .note = job_note, .cmd = joinCommand(ctx, o.cmd), .tasks = if (o.tasks != 0) o.tasks else null });
     logSent(ctx, job, "queued", trip_t, null);
     logSent(ctx, job, "started", trip_t, null);
     const argv = [_][]const u8{ "ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4", host, remote.items };
@@ -242,8 +234,7 @@ fn sendTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     if ((code == 255 or code > 128) and hostWentAway(ctx, host)) {
         const who = if (o.label.len != 0) o.label else o.cmd[0];
         // Sent there by name: start it again and run there once more, as a Spot VM reclaimed is
-        // usually back a minute later. Never here: a job sized for that host (--cores 8-48 for 96
-        // CPUs) would swamp this machine.
+        // usually back a minute later. Never here: it was sent to that host by name.
         if (!runner.send_retried and ctx.cfg.remoteStart(host) != null) {
             std.debug.print("cpuq: lost {s} while {s} ran there; starting it again\n", .{ host, who });
             runner.send_retried = true;
@@ -388,7 +379,7 @@ fn gitIgnored(ctx: *Ctx, root: []const u8) ?[]const u8 {
 /// once granted it prints `held NAME@HOST ENTRY`, ENTRY being the
 /// CPUQ_LEASES entry (`NAME@HOST=ID:PID`) that makes runs inside see the
 /// lease as theirs, and holds it until its stdin closes or it dies.
-pub fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
+pub fn runRemote(ctx: *Ctx, o: LeaseOptions, host: []const u8) u8 {
     const io = ctx.io;
     const a = ctx.arena;
     const exe: [:0]const u8 = if (o.hold) "" else findExecutable(ctx, o.cmd[0]) orelse {
@@ -398,12 +389,11 @@ pub fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
     // ssh joins its arguments into one command line for the remote shell,
     // so everything after the host is quoted for it.
     var remote: std.ArrayList(u8) = .empty;
-    remote.print(a, "cpuq lease {s} --hold --slots {d} --priority {t}", .{ o.lease.?, o.slots, o.priority }) catch fail("out of memory", .{});
-    if (o.exclusive) remote.appendSlice(a, " --exclusive") catch fail("out of memory", .{});
+    remote.print(a, "cpuq lease {s} --hold --slots {d}", .{ o.name, o.slots }) catch fail("out of memory", .{});
     if (o.label.len != 0) remote.print(a, " --label {s}", .{shellQuote(a, o.label)}) catch fail("out of memory", .{});
-    if (o.max_wait) |mw| remote.print(a, " --max-wait {d}", .{mw}) catch fail("out of memory", .{});
+    if (o.wait_max) |mw| remote.print(a, " --wait-max {d}", .{mw}) catch fail("out of memory", .{});
     const argv = [_][]const u8{ "ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4", host, remote.items };
-    const job = newJobLog(ctx, o);
+    const job = leasing.leaseJob(ctx, o);
     logAndArm(ctx, job, "queued", .{}, "gave_up", null);
     var child = std.process.spawn(io, .{ .argv = &argv, .stdin = .pipe, .stdout = .pipe, .stderr = .inherit }) catch |err|
         fail("ssh {s}: {t}", .{ host, err });
@@ -432,7 +422,7 @@ pub fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
         if (code == exit_timeout) {
             logEvent(ctx, job, "gave_up", .{});
         } else {
-            std.debug.print("cpuq: could not hold lease {s} on {s} (ssh exit {d})\n", .{ o.lease.?, host, code });
+            std.debug.print("cpuq: could not hold lease {s} on {s} (ssh exit {d})\n", .{ o.name, host, code });
             logEvent(ctx, job, "ended", .{ .exit = code });
         }
         return code;
@@ -442,7 +432,7 @@ pub fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
     var pid_buf: [16]u8 = undefined;
     const val = std.mem.concat(a, u8, &.{ id, ":", std.mem.print(&pid_buf, "{d}", .{sys.getpid()}) catch "0" }) catch fail("out of memory", .{});
     if (o.hold) {
-        ctx.out.print("held {s}@{s} {s}@{s}={s}\n", .{ o.lease.?, host, o.lease.?, host, val }) catch {};
+        ctx.out.print("held {s}@{s} {s}@{s}={s}\n", .{ o.name, host, o.name, host, val }) catch {};
         ctx.out.flush() catch {};
         // Killed while it holds, it still ends the job in history; ssh,
         // its stdin gone with it, ends the remote hold. Once stdin closes
@@ -457,7 +447,7 @@ pub fn runRemote(ctx: *Ctx, o: RunOptions, host: []const u8) u8 {
         logEvent(ctx, job, "ended", .{ .cores = 1, .exit = 0 });
         return 0;
     }
-    addLeaseEnv(ctx, std.mem.concat(a, u8, &.{ o.lease.?, "@", host }) catch fail("out of memory", .{}), val);
+    addLeaseEnv(ctx, std.mem.concat(a, u8, &.{ o.name, "@", host }) catch fail("out of memory", .{}), val);
     const envp = ctx.env.createPosixBlock(a, .{}) catch fail("out of memory", .{});
     const cargv = a.allocSentinel(?[*:0]const u8, o.cmd.len, null) catch fail("out of memory", .{});
     for (o.cmd, 0..) |arg, i| cargv[i] = arg.ptr;
@@ -494,8 +484,7 @@ pub fn shellQuote(a: std.mem.Allocator, s: []const u8) []const u8 {
     return out.items;
 }
 
-/// `cpuq first|start|cancel|pause|resume|stop TARGET [--all] [--host HOST]`: a hand at the
-/// queue. TARGET is a label (`PATTERN*` for a prefix) or a cpuq pid. first,
+/// Whether `host` names this machine (its host name up to the first dot, any case).
 pub fn isSelf(a: std.mem.Allocator, host: []const u8) bool {
     return std.ascii.eqlIgnoreCase(host, shortHost(a));
 }

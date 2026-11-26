@@ -2,8 +2,8 @@
 //! label one suite five ways): its repo and its command, counts and core numbers as `#`. Each
 //! machine's history says how long that work took there; a run sent to another machine is kept in
 //! this one's history too (pool "remote", host the machine), so the time it took there, copy and
-//! queue included, is known here without asking. From those, `finish` gives each place's expected
-//! finish (wait + start + copy + run) and `better` says whether going elsewhere is worth it.
+//! queue included, is known here without asking. From those a place's expected finish is its
+//! wait, start, copy and run, and `better` says whether going elsewhere is worth it.
 
 const std = @import("std");
 const history = @import("history.zig");
@@ -58,19 +58,6 @@ fn hash(a: std.mem.Allocator, out: *std.ArrayList(u8)) void {
     out.append(a, '#') catch {};
 }
 
-/// Whether a command takes its width from cpuq: it passes `$CPUQ_CORES` on, or is make (which
-/// takes its job slots from cpuq's jobserver). A command with `-j 2` written in runs at 2
-/// wherever it goes.
-pub fn scales(cmd: []const u8) bool {
-    if (std.mem.find(u8, cmd, "CPUQ_CORES") != null) return true;
-    var words = std.mem.tokenizeAny(u8, cmd, " \t\n;&|()'\"");
-    while (words.next()) |w| {
-        const base = std.fs.path.basename(w);
-        if (std.mem.eql(u8, base, "make") or std.mem.eql(u8, base, "gmake")) return true;
-    }
-    return false;
-}
-
 /// One kind of work's finished runs in one place.
 pub const Stats = struct {
     runs: u32 = 0,
@@ -117,42 +104,8 @@ fn p75(xs: []f64) f64 {
     return xs[(xs.len - 1) * 3 / 4];
 }
 
-/// How long the work would run in a place with `cores` to give it, by that place's own runs
-/// (`there`), else by this machine's (`here`): the same time, unless the command takes its width
-/// from cpuq and used all it was given here, when more cores make it faster (up to 4 times what it
-/// had, and no more than the place gives). Null when it has run in neither.
-pub fn runTime(there: Stats, here: Stats, cores: u32, scaling: bool) ?f64 {
-    if (there.runs != 0) return there.ran;
-    if (here.runs == 0) return null;
-    if (!scaling or here.cores < 1 or here.used < 0.8 * here.cores) return here.ran;
-    const wider = @min(@as(f64, @floatFromInt(cores)), 4 * here.cores);
-    return if (wider > here.cores) here.ran * here.cores / wider else here.ran;
-}
-
-/// A place a job could run: this machine or one of its remotes.
-pub const Place = struct {
-    name: []const u8,
-    /// Expected seconds to its start: the queue there, and starting the machine when it is
-    /// stopped.
-    wait: f64 = 0,
-    /// The copy there (0 here; less when a copy of this repo is there already).
-    copy: f64 = 0,
-    /// Its expected run time (`runTime`); null when unknown.
-    run: ?f64 = null,
-
-    pub fn finish(p: Place) ?f64 {
-        return (p.run orelse return null) + p.wait + p.copy;
-    }
-};
-
 /// Seconds to start a stopped remote: a cloud machine's boot and its cpuq answering.
 pub const start_s: f64 = 120;
-/// Seconds a first copy of a repo takes (Rig, 15k files: 33 s), and a repeat one.
-pub const copy_first_s: f64 = 35;
-pub const copy_again_s: f64 = 3;
-/// A run expected to take less than this here stays here: nothing elsewhere could win enough to
-/// pay for asking.
-pub const short_s: f64 = 120;
 /// A stopped host is started only for work expected to take longer than this here.
 pub const start_worth_s: f64 = 600;
 /// Work expected to take longer than this here is long: the hook asks whether it would finish
@@ -163,19 +116,6 @@ pub const long_s: f64 = 600;
 /// at least 30%, so a near tie stays put (a copy, a cold cache, a guess that may be wrong).
 pub fn better(here: f64, there: f64) bool {
     return there + @max(60, 0.3 * here) <= here;
-}
-
-/// The cores to ask for when a small fixed count was given for a command that takes its width
-/// from cpuq: the count, widened to what the work has used, and to twice the count when it used
-/// all it had (it would have used more); at most half the CPUs. Otherwise the count stands.
-pub fn widen(n: u32, scaling: bool, work: Stats, cpus: u32) struct { min: u32, max: u32 } {
-    const half = @max(cpus / 2, 1);
-    // One core is often asked for on purpose: a serial run of a parallel tool.
-    if (!scaling or work.runs < 2 or n < 2 or n >= half) return .{ .min = n, .max = n };
-    const nf: f64 = @floatFromInt(n);
-    const want: f64 = if (work.used >= 0.9 * nf) 2 * nf else @round(work.used + 0.3);
-    const max: u32 = @intFromFloat(std.math.clamp(want, nf, @as(f64, @floatFromInt(half))));
-    return .{ .min = n, .max = max };
 }
 
 /// Minutes or seconds, for a line a person reads: "~38 min", "~45 s".
@@ -341,49 +281,11 @@ test "work is known by repo and command, not by counts or quoting" {
     try testing.expect(!std.mem.eql(u8, k1, workKey(a, "trig", "./test/run -j 2 --delta")));
 }
 
-test "a command scales when it takes its width from cpuq" {
-    try testing.expect(scales("sh -c 'zig build -j\"$CPUQ_CORES\"'"));
-    try testing.expect(scales("make"));
-    try testing.expect(scales("/usr/bin/make -C src"));
-    try testing.expect(!scales("./test/run -j 2 --delta"));
-    try testing.expect(!scales("makefile-lint"));
-}
-
-test "run time elsewhere: its own runs there, else here's, faster only if it scales" {
-    const here: Stats = .{ .runs = 5, .ran = 2400, .used = 1.9, .cores = 2 };
-    const burst: Stats = .{ .runs = 3, .ran = 400, .used = 6, .cores = 32 };
-    try testing.expectEqual(@as(?f64, 400), runTime(burst, here, 32, true));
-    // Never run there: a fixed -j 2 runs as long anywhere.
-    try testing.expectEqual(@as(?f64, 2400), runTime(.{}, here, 32, false));
-    // It scales and was short of cores here: up to 4x the cores it had.
-    try testing.expectEqual(@as(?f64, 600), runTime(.{}, here, 32, true));
-    try testing.expectEqual(@as(?f64, 1600), runTime(.{}, here, 3, true));
-    // It had more than it used: no faster with more.
-    try testing.expectEqual(@as(?f64, 900), runTime(.{}, .{ .runs = 2, .ran = 900, .used = 1.2, .cores = 4 }, 32, true));
-    try testing.expectEqual(@as(?f64, null), runTime(.{}, .{}, 32, true));
-}
-
 test "leave only for a clear win" {
     try testing.expect(better(2400, 600));
     try testing.expect(!better(300, 250)); // a minute isn't 30% of five
     try testing.expect(!better(100, 50)); // half the time, but not a minute sooner
     try testing.expect(better(1000, 640));
-    const p: Place = .{ .name = "burst", .wait = start_s, .copy = copy_first_s, .run = 400 };
-    try testing.expectEqual(@as(?f64, 555), p.finish());
-    try testing.expectEqual(@as(?f64, null), (Place{ .name = "x" }).finish());
-}
-
-test "a small fixed count widens only for work that takes its width from cpuq" {
-    const busy: Stats = .{ .runs = 4, .ran = 600, .used = 2, .cores = 2 };
-    try testing.expectEqual(@as(u32, 4), widen(2, true, busy, 10).max);
-    try testing.expectEqual(@as(u32, 2), widen(2, false, busy, 10).max);
-    try testing.expectEqual(@as(u32, 5), widen(4, true, .{ .runs = 4, .ran = 1, .used = 4, .cores = 4 }, 10).max);
-    // It used less than it had: the count stands.
-    try testing.expectEqual(@as(u32, 2), widen(2, true, .{ .runs = 4, .ran = 1, .used = 0.9, .cores = 2 }, 10).max);
-    // Too little history.
-    try testing.expectEqual(@as(u32, 2), widen(2, true, .{ .runs = 1, .ran = 1, .used = 2, .cores = 2 }, 10).max);
-    // One core stays one.
-    try testing.expectEqual(@as(u32, 1), widen(1, true, .{ .runs = 4, .ran = 1, .used = 1, .cores = 1 }, 10).max);
 }
 
 test "stats keep the last runs" {

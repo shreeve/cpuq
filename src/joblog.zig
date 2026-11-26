@@ -2,33 +2,12 @@
 //! signal leaves.
 const std = @import("std");
 const Io = std.Io;
-const state = @import("state.zig");
 const sys = @import("sys.zig");
 const history = @import("history.zig");
 
 const main = @import("main.zig");
-const runopts = @import("runopts.zig");
-const repos = @import("repos.zig");
-const runner = @import("runner.zig");
-const timing = @import("timing.zig");
 
 const Ctx = main.Ctx;
-const RunOptions = runopts.RunOptions;
-const joinCommand = runopts.joinCommand;
-const repoOf = repos.repoOf;
-const noiseInto = timing.noiseInto;
-
-pub const Lease = struct {
-    record: state.Record,
-    name: []const u8,
-    file: Io.File,
-    tokens: []Io.File,
-    job: JobLog,
-    /// Cores of the grant lent by holders that leave them idle: the command
-    /// then runs at background priority, so a lender that gets busy again
-    /// has its CPUs back at once.
-    borrowed: u32 = 0,
-};
 
 /// The history's record of the job this cpuq runs: its id and the fields
 /// every one of its events carries.
@@ -53,49 +32,26 @@ pub fn historyPath(ctx: *Ctx) []const u8 {
     return std.mem.concat(ctx.arena, u8, &.{ home, "/.local/state/cpuq/history.jsonl" }) catch "";
 }
 
-pub fn newJobLog(ctx: *Ctx, o: RunOptions) JobLog {
+/// A new job's record: `base` with this cpuq's pid and a fresh id.
+pub fn newJobLog(ctx: *Ctx, base: history.Event) JobLog {
     const pid = sys.getpid();
     const t = nowFloat(ctx.io);
-    return .{
-        .id = ctx.arena.print("{d}-{d}", .{ pid, @as(i64, @intFromFloat(t * 1000)) }) catch "0",
-        .base = .{
-            .pid = pid,
-            .pool = o.lease orelse "cores",
-            .host = o.host,
-            .repo = repoOf(ctx, o),
-            .label = o.label,
-            .note = o.note,
-            .cmd = joinCommand(ctx, o.cmd),
-            .priority = @tagName(o.priority),
-            .exclusive = o.exclusive,
-            .min = o.request.min,
-            .max = o.request.max,
-        },
-    };
+    var b = base;
+    b.pid = pid;
+    return .{ .id = ctx.arena.print("{d}-{d}", .{ pid, @as(i64, @intFromFloat(t * 1000)) }) catch "0", .base = b };
 }
 
+/// What an event carries beyond the job's own fields.
 pub const EventExtra = struct {
+    /// The CPUs or slots it held (started), or the most it held at once (ended).
     cores: ?u32 = null,
-    /// Started ahead of the head of the queue (backfill).
-    ahead: ?bool = null,
-    /// Cores of the grant lent by holders that leave them idle.
-    lent: ?u32 = null,
-    /// Started by hand past the queue (`cpuq start`).
-    forced: ?bool = null,
-    /// Stopped for its memory, using this many bytes (`max_memory`).
-    memory: ?u64 = null,
-    /// The most memory it used at once, in bytes.
-    peak: ?u64 = null,
-    slots: ?[]const u32 = null,
     exit: ?u8 = null,
     signal: ?u32 = null,
     cpu: ?f64 = null,
-    /// A timing window's: CPU used beside it by other work, on average and
-    /// at most (`Noise`).
-    noise: ?f64 = null,
-    noise_peak: ?f64 = null,
-    /// The most cores its tree kept busy over a 2-second look.
-    cpu_peak: ?f64 = null,
+    done: ?u32 = null,
+    failed: ?u32 = null,
+    /// When the event happened, if not now.
+    t: ?f64 = null,
 };
 
 pub fn logEvent(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra) void {
@@ -104,20 +60,13 @@ pub fn logEvent(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra) vo
     var ev = job.base;
     ev.event = event;
     ev.id = job.id;
-    ev.t = nowFloat(ctx.io);
+    ev.t = extra.t orelse nowFloat(ctx.io);
     ev.cores = extra.cores;
     ev.exit = extra.exit;
     ev.signal = extra.signal;
     ev.cpu = extra.cpu;
-    ev.slots = extra.slots;
-    ev.ahead = extra.ahead;
-    ev.lent = extra.lent;
-    ev.forced = extra.forced;
-    ev.memory = extra.memory;
-    ev.peak = extra.peak;
-    ev.noise = extra.noise;
-    ev.noise_peak = extra.noise_peak;
-    ev.cpu_peak = extra.cpu_peak;
+    ev.done = extra.done;
+    ev.failed = extra.failed;
     history.append(ctx.io, path, ev);
 }
 
@@ -137,7 +86,7 @@ pub fn armLastWords(ctx: *Ctx, job: JobLog, event: []const u8, cores: ?u32, done
     tw.print(",\"pid\":{d}", .{job.base.pid}) catch return;
     if (cores) |k| tw.print(",\"cores\":{d}", .{k}) catch return;
     if (done) tw.writeAll(",\"exit\":0") catch return;
-    sys.armLastWords(runner.words_slot, path, head, tw.buffered(), !done);
+    sys.armLastWords(path, head, tw.buffered(), !done);
 }
 
 /// Logs `event` and arms the line a fatal signal leaves next (`armed`, as
@@ -154,16 +103,10 @@ pub fn logAndArm(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra, a
 
 /// Logs how a command ended.
 pub fn logEnded(ctx: *Ctx, job: JobLog, cores: u32, w: sys.Waited) void {
-    var extra: EventExtra = .{ .cores = cores, .cpu = w.cpu_s, .memory = w.memory, .peak = peakOf(w), .cpu_peak = if (runner.cpu_peak > 0) @round(runner.cpu_peak * 100) / 100 else null };
+    var extra: EventExtra = .{ .cores = cores, .cpu = w.cpu_s };
     switch (w.exit) {
         .code => |code| extra.exit = code,
         .signal => |sig| extra.signal = @intCast(@backingInt(sig)),
     }
-    if (job.base.exclusive) noiseInto(&extra);
     logEvent(ctx, job, "ended", extra);
-}
-
-/// A peak of 0 is unknown (no reading), left out of history.
-fn peakOf(w: sys.Waited) ?u64 {
-    return if (w.peak != 0) w.peak else null;
 }

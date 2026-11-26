@@ -29,7 +29,6 @@ const sys = @import("sys.zig");
 const lines = @import("lines.zig");
 const jobs = @import("jobs.zig");
 const main = @import("main.zig");
-const admission = @import("admission.zig");
 const Allocator = std.mem.Allocator;
 
 const Ctx = main.Ctx;
@@ -316,7 +315,7 @@ fn serve(gpa: Allocator, all: []const *Conn, k: *Conn, line: []const u8) void {
 fn tick(ctx: *Ctx, a: Allocator, conns: []const *Conn, budget: *Budget, was: ?sys.Ticks, now: ?sys.Ticks, dt_s: f64) void {
     const io = ctx.io;
     const cpus: f64 = @floatFromInt(sys.activeCpus(io));
-    const target = admission.targetCpus(ctx);
+    const target = cpus;
     var busy: f64 = 0;
     if (was != null and now != null and now.?.total > was.?.total)
         busy = cpus * @as(f64, @floatFromInt(now.?.busy -| was.?.busy)) / @as(f64, @floatFromInt(now.?.total - was.?.total));

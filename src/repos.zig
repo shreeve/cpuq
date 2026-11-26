@@ -1,20 +1,12 @@
 //! The repository a job runs in: its name for history, and the git work tree around it.
 const std = @import("std");
 const Io = std.Io;
-const place = @import("place.zig");
 
 const main = @import("main.zig");
 const runopts = @import("runopts.zig");
 
 const Ctx = main.Ctx;
 const RunOptions = runopts.RunOptions;
-const joinCommand = runopts.joinCommand;
-
-/// This job's work, for history (place.workKey): its repo, else its label's project, and its
-/// command.
-pub fn jobWorkKey(ctx: *Ctx, o: RunOptions) []const u8 {
-    return place.workKey(ctx.arena, repoOf(ctx, o) orelse std.mem.sliceTo(o.label, ':'), joinCommand(ctx, o.cmd));
-}
 
 /// The repository a job runs in, by name (its history's `repo`): `--repo`, else CPUQ_REPO, else
 /// the folder holding the main `.git` above the working directory, so each worktree of a repo

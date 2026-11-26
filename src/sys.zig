@@ -15,7 +15,6 @@ extern "c" fn getpriority(which: c_int, who: c_uint) c_int;
 extern "c" fn setpriority(which: c_int, who: c_uint, prio: c_int) c_int;
 extern "c" fn posix_spawnattr_setsigmask(attr: *c.posix_spawnattr_t, mask: *const c.sigset_t) c_int;
 extern "c" fn posix_spawnattr_set_qos_class_np(attr: *c.posix_spawnattr_t, qos: c_uint) c_int;
-extern "c" fn qos_class_self() c_uint;
 
 /// macOS struct statfs (64-bit inodes), and Linux struct statvfs, alike in
 /// glibc and musl on 64-bit targets.
@@ -62,10 +61,9 @@ const PRIO_PROCESS = 0;
 const QOS_CLASS_UTILITY = 0x11;
 const QOS_CLASS_BACKGROUND = 0x09;
 
-/// Cores the OS has active now: macOS hw.activecpu (it drops under thermal
+/// CPUs the OS has active now: macOS hw.activecpu (it drops under thermal
 /// limits); Linux the CPUs in this process's affinity mask, or every CPU online
-/// in a job cpuq confined to its own (CPUQ_CPUS): a cpuq run there is a job of
-/// its own, on the machine's CPUs.
+/// inside a task (CPUQ_OP), which cpuq pinned to its one CPU.
 pub fn activeCpus(io: Io) u32 {
     if (is_darwin) {
         var n: c_int = 0;
@@ -73,7 +71,7 @@ pub fn activeCpus(io: Io) u32 {
         if (c.sysctlbyname("hw.activecpu", &n, &len, null, 0) == 0 and n > 0) return @intCast(n);
         return 1;
     }
-    if (c.getenv("CPUQ_CPUS") != null) {
+    if (c.getenv("CPUQ_OP") != null) {
         var buf: [1024]u8 = undefined;
         const text = Io.Dir.cwd().readFile(io, "/sys/devices/system/cpu/online", &buf) catch "";
         if (policy.cpuListCount(text)) |n| return n;
@@ -82,16 +80,8 @@ pub fn activeCpus(io: Io) u32 {
     return @intCast(@max(n, 1));
 }
 
-/// Linux: the CPUs online now; empty when they cannot be read.
-pub fn onlineCpus(io: Io, a: std.mem.Allocator) []const u32 {
-    var buf: [1024]u8 = undefined;
-    const text = Io.Dir.cwd().readFile(io, "/sys/devices/system/cpu/online", &buf) catch return &.{};
-    return policy.cpuList(a, text) catch &.{};
-}
-
-/// The machine's cores: one token file each. On Linux this is every CPU the
-/// machine has, not the caller's affinity, so that runs confined to fewer
-/// CPUs (taskset, a cpuset) agree with everyone else on the token set.
+/// The machine's CPUs. On Linux this is every CPU the machine has, not the
+/// caller's affinity (taskset, a cpuset, a task's pin).
 pub fn totalCpus(io: Io) u32 {
     if (is_darwin) {
         var n: c_int = 0;
@@ -367,38 +357,6 @@ pub fn memoryPressure(io: Io, psi_threshold: f64) policy.Pressure {
     return policy.psiPressure(text, psi_threshold);
 }
 
-/// The scheduling class of the calling process, for `cpuq qos`.
-pub fn currentQos(buf: []u8) []const u8 {
-    if (is_darwin) {
-        const class = switch (qos_class_self()) {
-            0x21 => "user-interactive",
-            0x19 => "user-initiated",
-            0x15 => "default",
-            QOS_CLASS_UTILITY => "utility",
-            QOS_CLASS_BACKGROUND => "background",
-            0x00 => "unspecified",
-            else => |q| std.mem.print(buf, "qos 0x{x}", .{q}) catch "qos ?",
-        };
-        // A nice value, when one is set: "default, nice 10".
-        const nice = getpriority(PRIO_PROCESS, 0);
-        if (nice == 0) return class;
-        var tmp: [32]u8 = undefined;
-        @memcpy(tmp[0..class.len], class);
-        return std.mem.print(buf, "{s}, nice {d}", .{ tmp[0..class.len], nice }) catch class;
-    }
-    return std.mem.print(buf, "nice {d}", .{getpriority(PRIO_PROCESS, 0)}) catch "nice ?";
-}
-
-/// A pipe whose descriptors the command inherits, holding `tokens` bytes:
-/// a GNU make jobserver.
-pub fn jobserverPipe(tokens: u32) ![2]c.fd_t {
-    var fds: [2]c.fd_t = undefined;
-    if (c.pipe(&fds) != 0) return error.PipeFailed;
-    var buf: [256]u8 = @splat('+');
-    writeAll(fds[1], buf[0..@min(tokens, buf.len)]);
-    return fds;
-}
-
 pub fn writeAll(fd: c.fd_t, bytes: []const u8) void {
     var i: usize = 0;
     while (i < bytes.len) {
@@ -557,8 +515,7 @@ var pending_signal = std.atomic.Value(u32).init(0);
 /// Last words: the history line cpuq appends if a signal kills it while it
 /// waits, or holds a lease with no command, so the job reads as ended and
 /// not as lost. The line is `head`, the time, `tail` and (when asked) the
-/// signal, rendered ahead of time so the handler only writes. There are two
-/// slots: a lease taken `--exclusive` is two jobs, the lease and the cores.
+/// signal, rendered ahead of time so the handler only writes.
 const Words = struct {
     head: [256]u8 = undefined,
     head_len: usize = 0,
@@ -568,18 +525,17 @@ const Words = struct {
     armed: std.atomic.Value(bool) = .init(false),
 };
 var last_path: [1024]u8 = undefined;
-var last_words: [2]Words = .{ .{}, .{} };
+var last_words: Words = .{};
 
-/// Arms slot `slot`'s last words, catching hangup, ^C, ^\ and kill; arming
-/// it again replaces them. A signal cpuq was started with ignored stays
-/// ignored.
-pub fn armLastWords(slot: u1, path: []const u8, head: []const u8, tail: []const u8, with_signal: bool) void {
+/// Arms the last words, catching hangup, ^C, ^\ and kill; arming them again
+/// replaces them. A signal cpuq was started with ignored stays ignored.
+pub fn armLastWords(path: []const u8, head: []const u8, tail: []const u8, with_signal: bool) void {
     // A fatal signal arriving while the line is rewritten waits until it is
     // in place: the kit closes a hold's stdin and kills it at once, which
     // lands exactly as cpuq re-arms.
     const before = holdFatal();
     defer restoreSignals(before);
-    const w = &last_words[slot];
+    const w = &last_words;
     w.armed.store(false, .release);
     if (path.len >= last_path.len or head.len > w.head.len or tail.len > w.tail.len) return;
     @memcpy(last_path[0..path.len], path);
@@ -600,8 +556,8 @@ pub fn armLastWords(slot: u1, path: []const u8, head: []const u8, tail: []const 
 }
 
 fn onFatal(sig: c.SIG) callconv(.c) void {
-    for (&last_words) |*w| {
-        if (!w.armed.swap(false, .acq_rel)) continue;
+    const w = &last_words;
+    if (w.armed.swap(false, .acq_rel)) {
         var buf: [256 + 64 + 64]u8 = undefined;
         var n: usize = 0;
         @memcpy(buf[n..][0..w.head_len], w.head[0..w.head_len]);
@@ -765,6 +721,16 @@ fn waited(status: c_int, ru: c.rusage) Waited {
     if (c.W.IFEXITED(s)) return .{ .exit = .{ .code = c.W.EXITSTATUS(s) }, .cpu_s = cpu_s, .peak = peak };
     if (c.W.IFSIGNALED(s)) return .{ .exit = .{ .signal = c.W.TERMSIG(s) }, .cpu_s = cpu_s, .peak = peak };
     return .{ .exit = .{ .code = 125 }, .cpu_s = cpu_s, .peak = peak };
+}
+
+extern "c" fn getrusage(who: c_int, usage: *c.rusage) c_int;
+
+/// CPU seconds used by every child this process has reaped, and their descendants that were
+/// reaped in turn (RUSAGE_CHILDREN): what wait4 reported for each, summed.
+pub fn childrenCpu() f64 {
+    var ru: c.rusage = undefined;
+    if (getrusage(-1, &ru) != 0) return 0;
+    return seconds(ru.utime) + seconds(ru.stime);
 }
 
 fn seconds(tv: c.timeval) f64 {
@@ -1063,46 +1029,6 @@ fn rusage(pid: c_int, tb: MachTimebase) ?Rusage {
         .own_ns = @intCast(@as(u128, own) * tb.numer / tb.denom),
         .mem = std.mem.readInt(u64, ru[72..80], .little),
     };
-}
-
-/// Threads ready to run in a process and its descendants.
-pub fn treeRunning(procs: []const Proc, root: i32) u32 {
-    var total: u32 = 0;
-    var frontier: [512]i32 = undefined;
-    var len: usize = 1;
-    frontier[0] = root;
-    var seen: usize = 0;
-    while (seen < len) : (seen += 1) {
-        const pid = frontier[seen];
-        for (procs) |p| {
-            if (p.pid == pid) total += p.running;
-            if (p.ppid == pid and p.pid != pid and len < frontier.len) {
-                frontier[len] = p.pid;
-                len += 1;
-            }
-        }
-    }
-    return total;
-}
-
-/// The memory a process and its descendants use, in bytes.
-pub fn treeMem(procs: []const Proc, root: i32) u64 {
-    var total: u64 = 0;
-    var frontier: [512]i32 = undefined;
-    var len: usize = 1;
-    frontier[0] = root;
-    var seen: usize = 0;
-    while (seen < len) : (seen += 1) {
-        const pid = frontier[seen];
-        for (procs) |p| {
-            if (p.pid == pid) total += p.mem;
-            if (p.ppid == pid and p.pid != pid and len < frontier.len) {
-                frontier[len] = p.pid;
-                len += 1;
-            }
-        }
-    }
-    return total;
 }
 
 pub fn treeCpu(procs: []const Proc, root: i32) u64 {
