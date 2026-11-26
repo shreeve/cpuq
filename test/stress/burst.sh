@@ -18,6 +18,7 @@ set -u
 LOG=${1:?usage: burst.sh LOG [POOL] [SECONDS]}
 POOL=${2:-31}
 SECS=${3:-300}
+mkdir -p "$(dirname "$LOG")" .zig-cache
 : >"$LOG"
 exec >>"$LOG" 2>&1
 # Inside the outer cpuq job: its grant is not these tests' pool.
