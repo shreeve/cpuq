@@ -3,7 +3,7 @@ The exhaustive searches `lake build` runs, each with the result it gave, so a ch
 or the rules that changes what is found shows here. Names of the checks: `Explore.lean`.
 
 Scenarios: up to 4 CPUs, 3 operations, K ≤ 2, with crashes (SIGKILL of a parent), timeouts and
-retries, Ctrl-Z, `cpuq kill`, an urgent operation, project weights and `cpuq drain`. `forever`
+retries, Ctrl-Z, `cpuq kill`, an urgent operation, project weights, `cpuq drain` and backfill. `forever`
 operations never run out of work, so a waiter that is not served is starved, not merely late.
 Rule sets: `Rules.report1` (FINAL-REPORT-1, as review2-formal read it), `Rules.plan`
 (FINAL-PLAN), `Rules.planLoose` (FINAL-PLAN with the unsafe reading of "its place frees at
@@ -107,6 +107,53 @@ def urgentHolds (r : Rules) : Cfg :=
   { cpus := 2, rules := r
     ops := [{ proj := 0, tasks := 1, urgent := true, forever := true },
             { proj := 1, tasks := 1, forever := true }, { proj := 0, tasks := 1, forever := true }] }
+
+/-! Backfill: a `cpuq drain` gathers while operations with time limits (`tlimit`, in ticks) run
+and wait; a drain's registration opens a window of `window` ticks. -/
+
+/-- 2 CPUs: A (limit 2) holds and runs, B (limit 1) waits, and a drain arrives. -/
+def backfill (r : Rules) : Cfg :=
+  { cpus := 2, rules := r, window := 2
+    ops := [{ proj := 0, tasks := 2, forever := true, tlimit := 2 },
+            { proj := 1, tasks := 1, forever := true, tlimit := 1 }, drainOn 2 2] }
+
+/-- As `backfill`, but A has no time limit: no shadow, no backfill. -/
+def backfillOpen (r : Rules) : Cfg :=
+  { cpus := 2, rules := r, window := 2
+    ops := [{ proj := 0, tasks := 2, forever := true },
+            { proj := 1, tasks := 1, forever := true, tlimit := 1 }, drainOn 2 2] }
+
+/-- 3 CPUs, a K = 2 operation, one parent may be killed by SIGKILL. -/
+def backfillCrash (r : Rules) : Cfg :=
+  { cpus := 3, rules := r, window := 2, crashes := 1
+    ops := [{ proj := 0, tasks := 2, K := 2, forever := true, tlimit := 2 },
+            { proj := 1, tasks := 1, forever := true, tlimit := 1 }, drainOn 3 2] }
+
+/-- `backfill` with one Ctrl-Z. -/
+def backfillZ (r : Rules) : Cfg := { backfill r with stops := true }
+
+/-- 2 CPUs, an operation with a limit and two drains, one Ctrl-Z. -/
+def backfillTwoZ (r : Rules) : Cfg :=
+  { cpus := 2, rules := r, window := 2, stops := true
+    ops := [{ proj := 0, tasks := 2, forever := true, tlimit := 1 }, drainOn 2 1, drainOn 2 2] }
+
+/-- Timeouts and retries, a K = 2 operation. -/
+def backfillTimeout (r : Rules) : Cfg :=
+  { cpus := 2, rules := r, window := 2, timeouts := true
+    ops := [{ proj := 0, tasks := 2, K := 2, retries := 1, tlimit := 2 },
+            { proj := 1, tasks := 1, retries := 1, tlimit := 1 }, drainOn 2 2] }
+
+/-- 3 CPUs, a window of 3 ticks. -/
+def backfill3 (r : Rules) : Cfg :=
+  { cpus := 3, rules := r, window := 3
+    ops := [{ proj := 0, tasks := 3, forever := true, tlimit := 3 },
+            { proj := 1, tasks := 2, forever := true, tlimit := 1 }, drainOn 3 2] }
+
+/-- An urgent operation that fits, and `cpuq kill`. -/
+def backfillUrgent (r : Rules) : Cfg :=
+  { cpus := 2, rules := r, window := 2, kills := true
+    ops := [{ proj := 0, tasks := 2, forever := true, tlimit := 2 },
+            { proj := 0, tasks := 1, urgent := true, tlimit := 1 }, drainOn 2 1] }
 
 def row (name : String) (cfg : Cfg) : IO Unit :=
   IO.println s!"{name}: {(explore cfg).summary}"
@@ -269,19 +316,21 @@ SIGCONT that comes after the parent took the Ctrl-Z and before it raised SIGSTOP
 lost (`Z stuck`); and a stopped drain idles the pool until it continues (`L2 idle`).
 `Rules.code0303` fixes all three, and has a fourth: a drain stopped and continued while a newer
 drain holds part of the pool waits for that drain's CPUs while it waits for its own (Finding 10).
-`Rules.released` (0.30.5) fixes it; each row below with "without" takes one fix out. -/
+`Rules.code0305` (0.30.5) fixes it; each row below with "without" takes one fix out of it.
+Re-pinned for 0.32.0: the search now also checks that a gathering drain is served (`D never`,
+`D fair`); the rows whose drains never get the pool show `D never` too. -/
 
 /--
-info: two drains, before 0.30.1: FAILED (791 states): CS stuck, L2 idle, L3 never
+info: two drains, before 0.30.1: FAILED (791 states): CS stuck, L2 idle, L3 never, D never
 Ctrl-Z, before 0.30.2: FAILED (3417 states): Z stuck
 Ctrl-Z, 0.30.2: FAILED (2655 states): Z stuck
 drain, Ctrl-Z, 0.30.2: FAILED (1017 states): Z stuck, L2 idle, L3 never
 urgent holds, 0.30.2: FAILED (187 states): L3 never, L3 fair
-two drains, Ctrl-Z, 0.30.3: FAILED (26071 states): L3 never
+two drains, Ctrl-Z, 0.30.3: FAILED (26071 states): L3 never, D never
 Ctrl-Z, without the stop check: FAILED (3801 states): Z stuck
 drain, Ctrl-Z, without letting go: FAILED (1130 states): L2 idle
 urgent holds, without urgent once: FAILED (187 states): L3 never, L3 fair
-two drains, Ctrl-Z, without drain most: FAILED (26071 states): L3 never
+two drains, Ctrl-Z, without drain most: FAILED (26071 states): L3 never, D never
 -/
 #guard_msgs in
 #eval do
@@ -291,12 +340,12 @@ two drains, Ctrl-Z, without drain most: FAILED (26071 states): L3 never
   row "drain, Ctrl-Z, 0.30.2" (drainZ .code0302)
   row "urgent holds, 0.30.2" (urgentHolds .code0302)
   row "two drains, Ctrl-Z, 0.30.3" (twoDrainsZ .code0303)
-  row "Ctrl-Z, without the stop check" (ctrlZ { Rules.released with haltChecks := false })
-  row "drain, Ctrl-Z, without letting go" (drainZ { Rules.released with drainLets := false })
-  row "urgent holds, without urgent once" (urgentHolds { Rules.released with urgentOnce := false })
-  row "two drains, Ctrl-Z, without drain most" (twoDrainsZ { Rules.released with drainMost := false })
+  row "Ctrl-Z, without the stop check" (ctrlZ { Rules.code0305 with haltChecks := false })
+  row "drain, Ctrl-Z, without letting go" (drainZ { Rules.code0305 with drainLets := false })
+  row "urgent holds, without urgent once" (urgentHolds { Rules.code0305 with urgentOnce := false })
+  row "two drains, Ctrl-Z, without drain most" (twoDrainsZ { Rules.code0305 with drainMost := false })
 
--- The code as released (0.30.5), on every scenario.
+-- The code at 0.30.5, on every scenario.
 /--
 info: two drains: ok: 2091 states, 4931 steps
 drain, crash: ok: 40538 states, 121758 steps
@@ -314,19 +363,56 @@ urgent: ok: 716391 states, 4334356 steps
 -/
 #guard_msgs in
 #eval do
+  row "two drains" (twoDrains .code0305)
+  row "drain, crash" (drainCrash .code0305)
+  row "Ctrl-Z" (ctrlZ .code0305)
+  row "drain, Ctrl-Z" (drainZ .code0305)
+  row "two drains, Ctrl-Z" (twoDrainsZ .code0305)
+  row "urgent holds" (urgentHolds .code0305)
+  row "two CPUs" (twoCpus .code0305)
+  row "odd split" (oddSplit .code0305)
+  row "crash" (crash .code0305)
+  row "strand" (strand .code0305)
+  row "timeout" (timeout .code0305)
+  row "herd" (herd .code0305)
+  row "urgent" (urgent .code0305)
+
+/-! ## Backfill (0.32.0)
+
+`Rules.released`: 0.30.5 with backfill. Every scenario with a drain, then backfill's own. The
+scenarios without a drain are 0.30.5's: backfill acts only while a drain gathers. A drain now
+gives its CPUs back without renewing its ticket, so the drain scenarios reach fewer states. -/
+
+/--
+info: two drains: ok: 1523 states, 3561 steps
+drain, crash: ok: 20174 states, 59943 steps
+drain, Ctrl-Z: ok: 1435 states, 4475 steps
+two drains, Ctrl-Z: ok: 20955 states, 70174 steps
+backfill: ok: 3969 states, 11825 steps
+backfill, no limit: ok: 2816 states, 8527 steps
+backfill, crash: ok: 298711 states, 1216651 steps
+backfill, Ctrl-Z: ok: 55185 states, 225546 steps
+backfill, two drains, Ctrl-Z: ok: 69253 states, 280266 steps
+backfill, timeouts: ok: 392587 states, 1408246 steps
+backfill, 3 CPUs: ok: 114994 states, 488685 steps
+backfill, urgent, kill: ok: 28077 states, 117536 steps
+backfill off: ok: 1512 states, 3708 steps
+-/
+#guard_msgs in
+#eval do
   row "two drains" (twoDrains .released)
   row "drain, crash" (drainCrash .released)
-  row "Ctrl-Z" (ctrlZ .released)
   row "drain, Ctrl-Z" (drainZ .released)
   row "two drains, Ctrl-Z" (twoDrainsZ .released)
-  row "urgent holds" (urgentHolds .released)
-  row "two CPUs" (twoCpus .released)
-  row "odd split" (oddSplit .released)
-  row "crash" (crash .released)
-  row "strand" (strand .released)
-  row "timeout" (timeout .released)
-  row "herd" (herd .released)
-  row "urgent" (urgent .released)
+  row "backfill" (backfill .released)
+  row "backfill, no limit" (backfillOpen .released)
+  row "backfill, crash" (backfillCrash .released)
+  row "backfill, Ctrl-Z" (backfillZ .released)
+  row "backfill, two drains, Ctrl-Z" (backfillTwoZ .released)
+  row "backfill, timeouts" (backfillTimeout .released)
+  row "backfill, 3 CPUs" (backfill3 .released)
+  row "backfill, urgent, kill" (backfillUrgent .released)
+  row "backfill off" (backfill .code0305)
 
 -- Larger: 4 CPUs, and weights over three projects.
 /--

@@ -211,7 +211,7 @@ theorem step_grows {s t : St} {a : Act} (e : step cfg s a = some t) : Grows s t 
     simp only [Cpuq.step] at e; split at e
     · cases e; exact Grows.handout (Grows.same rfl rfl)
     · cases e
-  | enter o | mark o | tstp o | halt o => simp [Cpuq.step] at e
+  | enter o | mark o | tstp o | halt o | tick => simp [Cpuq.step] at e
 
 theorem ServedOk.move {s t : St} {a : Act} (h : ServedOk s) (e : move cfg s a = some t) :
     ServedOk t := by

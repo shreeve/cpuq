@@ -87,6 +87,10 @@ structure St where
   zs : Nat := 0
   /-- Has held a CPU (the record's `served`), as bits by operation. -/
   served : Nat := 0
+  /-- With backfill, the ticks left before the gathering drain could start (src/pool.zig's
+  `shadow` less the time now). A drain's registration opens it (`Cfg.window`); time passing
+  (`Act.tick`) only shrinks it, so a task that fits never ends after it. -/
+  window : Nat := 0
   deriving DecidableEq, Repr, Hashable, Inhabited
 
 /-- Sets of operations as bits. -/
@@ -110,6 +114,9 @@ structure OpCfg where
   drain mark) every other operation empties its CPUs, and every free CPU goes to the first
   drain in ticket order. -/
   drain : Bool := false
+  /-- `-t`: how long a task of it may run, in the model's ticks (`Act.tick`), the time a kill
+  takes included; 0: no limit. Read only by backfill (`fits`). -/
+  tlimit : Nat := 0
   deriving Repr
 
 /-- The rule set. Each switch is one fix; `Rules.report1` has them all off. -/
@@ -177,6 +184,13 @@ structure Rules where
   most, then the older ticket, so at most one drain ever holds a CPU. Off: to the first in
   ticket order. -/
   drainMost : Bool := false
+  /-- Backfill (0.32.0). While one `cpuq drain` gathers the pool and every other operation holding
+  CPUs and running tasks has a time limit (`shadowed`), a task that ends before the latest of
+  those could (`fits`) may still start: a free CPU goes first to the line's best waiter that
+  fits, an operation that fits keeps refilling its CPUs, and the drain lends its idle CPUs to
+  the waiters that fit (`lends`), giving them back without renewing its ticket. Off: while a
+  drain gathers, every free CPU goes to it and every other operation empties its CPUs. -/
+  backfill : Bool := false
   deriving Repr
 
 namespace Rules
@@ -225,9 +239,12 @@ until served, the stop check before SIGSTOP, and a stopped drain letting the poo
 def code0303 : Rules :=
   { code0302 with urgentOnce := true, haltChecks := true, drainLets := true }
 
-/-- The code as released (0.30.5): `code0303` with the fix of README's Finding 10, free CPUs to
+/-- The code at 0.30.5 (and 0.31): `code0303` with the fix of README's Finding 10, free CPUs to
 the drain holding the most. -/
-def released : Rules := { code0303 with drainMost := true }
+def code0305 : Rules := { code0303 with drainMost := true }
+
+/-- The code as released (0.32.0): `code0305` with backfill. -/
+def released : Rules := { code0305 with backfill := true }
 
 end Rules
 
@@ -244,6 +261,9 @@ structure Cfg where
   ctrlZ : Nat := 1
   kills : Bool := false
   timeouts : Bool := false
+  /-- With backfill, the time a drain's gathering may take at most, in ticks: the window
+  (`St.window`) a drain's registration opens. -/
+  window : Nat := 0
 
 /-! ## Reading the state -/
 
@@ -407,11 +427,48 @@ def drainer (cfg : Cfg) (s : St) : Option Nat :=
     else s.order.find? (fun o => drainOp cfg o && decide (demand cfg s o > 0))
   else firstDrain cfg s
 
-/-- Who a free token goes to: while there is a drainer, it alone (and no one while it wants
-nothing); else the head of the line. -/
+/-- A `cpuq drain` that wants CPUs: it gathers the pool. -/
+def gathers (cfg : Cfg) (s : St) (o : Nat) : Bool := drainOp cfg o && decide (demand cfg s o > 0)
+
+/-- In the pool's scan: alive or stopped (a dead operation's record is dropped). -/
+def scanned (s : St) (o : Nat) : Bool := (s.op o).phase == .alive || (s.op o).phase == .stopped
+
+/-- An operation the gathering drain waits for: not a drain, holding CPUs, running tasks. -/
+def shades (cfg : Cfg) (s : St) (o : Nat) : Bool :=
+  !drainOp cfg o && scanned s o && decide (s.owned o > 0) && s.busy o
+
+/-- src/pool.zig's `shadow` is not null: with `backfill`, exactly one drain gathers, no other drain
+holds a CPU, some operation it waits for runs tasks, and every such has a time limit. How long
+until the latest of their tasks may end is `St.window`. -/
+def shadowed (cfg : Cfg) (s : St) : Bool :=
+  cfg.rules.backfill && (opIds cfg).countP (gathers cfg s) == 1 &&
+  (opIds cfg).all (fun o => !(drainOp cfg o && scanned s o) || gathers cfg s o || s.owned o == 0) &&
+  (opIds cfg).any (shades cfg s) &&
+  (opIds cfg).all (fun o => !shades cfg s o || (cfg.op o).tlimit != 0)
+
+/-- src/pool.zig's `fits`: a task of `o` started now ends before the gathering drain could start. -/
+def fits (cfg : Cfg) (s : St) (o : Nat) : Bool :=
+  shadowed cfg s && !drainOp cfg o && (cfg.op o).tlimit != 0 && decide ((cfg.op o).tlimit ≤ s.window)
+
+/-- The best waiter in line that fits, if any. -/
+def fitHead (cfg : Cfg) (s : St) : Option Nat :=
+  s.order.foldl (fun best o =>
+    if waiter cfg s o && fits cfg s o then
+      match best with
+      | none => some o
+      | some b => if before cfg s o b then some o else best
+    else best) none
+
+/-- Who a free token goes to: while there is a drainer, the best waiter that fits (backfill), else
+the drainer alone (and no one while it wants nothing); with no drainer, the head of the line. -/
 def target (cfg : Cfg) (s : St) : Option Nat :=
   match drainer cfg s with
-  | some d => if decide (demand cfg s d > 0) then some d else none
+  | some d =>
+    if decide (demand cfg s d > 0) then
+      match fitHead cfg s with
+      | some f => some f
+      | none => some d
+    else none
   | none => head cfg s
 
 /-! ## Changing the state -/
@@ -515,10 +572,20 @@ def giverOf (cfg : Cfg) (s : St) (h : Nat) : Option Nat :=
     | none => some g
     | some b => if better g b then some g else best) none
 
-/-- Drain on demand (rule 6): may `o` mark its slot `c` draining now? -/
+/-- What the waiters that fit still want (src/pool.zig's `lends`). -/
+def fitWant (cfg : Cfg) (s : St) : Nat :=
+  (opIds cfg).foldl (fun acc o => if fits cfg s o then acc + demand cfg s o else acc) 0
+
+/-- Backfill: the gathering drain `o` lends one more idle CPU, while what the waiters that fit
+still want is more than it already empties for them. -/
+def lends (cfg : Cfg) (s : St) (o : Nat) : Bool :=
+  gathers cfg s o && shadowed cfg s && decide (s.drainOf o < fitWant cfg s)
+
+/-- Drain on demand (rule 6): may `o` mark its slot `c` draining now? While a `cpuq drain` holds
+its mark every other operation does, unless it fits (backfill); the gathering drain lends. -/
 def canDrain (cfg : Cfg) (s : St) (o c : Nat) : Bool :=
   s.isAlive o && (s.cpu c).slot == some { owner := o } &&
-  (s.marks != 0 && !drainOp cfg o ||
+  (s.marks != 0 && !drainOp cfg o && !fits cfg s o || lends cfg s o ||
   if cfg.rules.ledger then
     match head cfg s with
     | none => false
@@ -604,6 +671,8 @@ inductive Act where
   | tstp (o : Nat)
   /-- A parent that has given its CPUs back for a Ctrl-Z raises SIGSTOP on itself. -/
   | halt (o : Nat)
+  /-- Time passes: with backfill, the window shrinks by a tick. -/
+  | tick
   deriving DecidableEq, Repr, Hashable, Inhabited
 
 def step (cfg : Cfg) (s : St) : Act → Option St
@@ -653,7 +722,8 @@ def step (cfg : Cfg) (s : St) : Act → Option St
          (sl.draining || s.pendingN o == 0) && !(drainOp cfg o && s.busy o) then
         some (handout cfg { s.setCpu c {} with
           drains := s.drains - (if sl.draining then 1 else 0)
-          order := if cfg.rules.renewAtRelease then renewed s o else s.order })
+          order := if cfg.rules.renewAtRelease && !(cfg.rules.backfill && drainOp cfg o) then
+            renewed s o else s.order })
       else none
     | none => none
   | .handout =>
@@ -701,7 +771,7 @@ def step (cfg : Cfg) (s : St) : Act → Option St
          (t.st == .done || t.st == .failed || t.st == .gone) && t.dying == none) then
       some (handout cfg (s.setPhase o .over))
     else none
-  | .enter _ | .mark _ | .tstp _ | .halt _ => none
+  | .enter _ | .mark _ | .tstp _ | .halt _ | .tick => none
 
 /-- Steps that touch the pool, under its lock. -/
 def needsLock : Act → Bool
@@ -735,7 +805,8 @@ def move (cfg : Cfg) (s : St) (a : Act) : Option St :=
     if drainOp cfg o && (s.op o).phase == .waiting then some { s with poolLock := some o } else none
   | .mark o =>
     if s.poolLock == some o && (cfg.rules.markShared || s.marks == 0) then
-      (step cfg s (.arrive o)).map fun s' => { s' with poolLock := none, marks := setBit s'.marks o }
+      (step cfg s (.arrive o)).map fun s' =>
+        { s' with poolLock := none, marks := setBit s'.marks o, window := cfg.window }
     else none
   | .crash o =>
     (step cfg s a).map fun s' =>
@@ -767,6 +838,7 @@ def move (cfg : Cfg) (s : St) (a : Act) : Option St :=
         some { s with held := clrBit s.held o,
                       tstp := if cfg.rules.contCancels then clrBit s.tstp o else s.tstp }
     else none
+  | .tick => if cfg.rules.backfill && decide (s.window > 0) then some { s with window := s.window - 1 } else none
   | a => step cfg s a
 
 def init (cfg : Cfg) : St :=
@@ -782,7 +854,7 @@ def actions (cfg : Cfg) : List Act :=
   let os := opIds cfg
   let cs := List.range cfg.cpus
   os.flatMap (fun o => [.arrive o, .kill o, .crash o, .stop o, .cont o, .finish o, .enter o,
-    .mark o, .tstp o, .halt o]) ++
+    .mark o, .tstp o, .halt o]) ++ [.tick] ++
   os.flatMap (fun o => (List.range (cfg.op o).tasks).flatMap (fun i =>
     [.exit o i true, .timeout o i, .gone o i] ++
     (if (cfg.op o).retries > 0 then [.exit o i false] else []) ++

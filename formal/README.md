@@ -32,6 +32,7 @@ fails the build.
 | `CpuqModel/Locks.lean` | The pool lock is always let go: no critical section waits forever |
 | `CpuqModel/Drains.lean` | Runs and weak fairness; `cpuq drain` is served |
 | `CpuqModel/Line.lean` | Every holder has been served; a head holding nothing is never blocked |
+| `CpuqModel/Backfill.lean` | Backfill: the rules' arithmetic in real time (the shadow never grows), the window closes, a gathering drain is served, no CPU runs two operations |
 
 ## The model
 
@@ -49,6 +50,11 @@ consolidate (rule 7), `cpuq kill`, SIGKILL of a parent (the kernel drops its flo
 run on), a Ctrl-Z arriving (`tstp`), the parent acting on it (`stop`), the parent raising
 SIGSTOP on itself (`halt`), SIGCONT (`cont`), finish, and a drain's registration: it takes the
 pool lock (`enter`), then its mark (`mark`).
+
+Backfill (0.32.0) adds time, as little of it as the rules need: each operation's `-t` in ticks
+(`OpCfg.tlimit`, 0 for none), and a window (`St.window`): the ticks left before the gathering
+drain could start, src/pool.zig's `shadow` less the time now. A drain's registration opens it
+(`Cfg.window`, the longest the search tries); time passing (`tick`, weakly fair) only shrinks it.
 
 `step` is the effect of one critical section: each runs under the pool lock (or is a parent's
 own step) and publishes by one rename or under the lock, so an atomic step is faithful to it
@@ -71,7 +77,18 @@ While it holds the drain mark every other operation empties its CPUs. A stopped 
 mark go and takes it again when continued (`drainLets`). Every free CPU goes to the drain that
 wants one and holds or is promised the most, then the older ticket (`drainMost`); in 0.30.3, to
 the first drain in ticket order that wants one; before that, to the first living drain, and to no
-one while it wants none. A drain never gives a CPU.
+one while it wants none. Before backfill a drain never gives a CPU.
+
+Backfill (`backfill`, 0.32.0). The shadow stands (`shadowed`) while exactly one drain gathers
+(wants CPUs), no other drain holds a CPU, some other operation holds CPUs and runs tasks, and
+every such operation has a time limit. Then an operation's task fits (`fits`) when it is no
+drain and its limit is within the window. While a drain gathers, a free CPU goes first to the
+best waiter in line that fits (`fitHead`), else to the drain as before; an operation that fits
+keeps refilling instead of emptying its CPUs for the mark; and the gathering drain lends its
+idle CPUs (`lends`): it marks one draining while what the waiters that fit still want is more
+than it already empties, and gives it back without renewing its ticket. The line's own drains
+go on as before: while the drain is first in line, the giver `giverOf` picks empties a CPU for
+it, and the CPU goes to whoever fits.
 
 An urgent operation goes ahead of the line only until it first holds a CPU (`urgentOnce`); before
 0.30.3 it went ahead whenever it held none.
@@ -82,8 +99,8 @@ FINAL-PLAN's (`plan`), the plan read loosely (`planLoose`), the plan with this m
 (`poolFixed`, the code at 8f997ec), the code at 0d315ed (`pool0d315ed`), the code at 0.30.2
 (`code0302`: the mark shared, a SIGCONT cancels a Ctrl-Z not yet acted on), the code at 0.30.3
 (`code0303`: `code0302` with the fixes of Findings 7, 8 and 9, `urgentOnce`, `haltChecks` and
-`drainLets`), and the code as released in 0.30.5 (`released`: `code0303` with the fix of
-Finding 10, `drainMost`).
+`drainLets`), the code at 0.30.5 and 0.31 (`code0305`: `code0303` with the fix of Finding 10,
+`drainMost`), and the code as released in 0.32.0 (`released`: `code0305` with `backfill`).
 
 `pool` differs from `fixed` where the code does what the plan doesn't say: the giver's ticket is
 renewed when it gives its CPU back, not when it starts to drain (`renewAtRelease`); one giver
@@ -94,9 +111,10 @@ rules say nothing of how a Ctrl-Z is received, so they have `haltChecks` on.
 
 ## What is proved
 
-No `sorry`. `#print axioms` of `Reach.inv`, `lock_released`, `drain_served`, `Reach.servedOk` and
-`zero_head_unblocked` lists only `propext`, `Classical.choice`, `Quot.sound` (`Reach.servedOk`
-not even `Classical.choice`).
+No `sorry`. `#print axioms` of `Reach.inv`, `lock_released`, `drain_served`, `Reach.servedOk`,
+`zero_head_unblocked`, `window_closes`, `drain_served_backfill`, `one_op_per_cpu` and
+`Timed.ends_by` lists only `propext`, `Classical.choice`, `Quot.sound` (`Reach.servedOk` and
+`Timed.ends_by` not even `Classical.choice`).
 
 **Safety** (`Safety.lean`). `Inv` holds initially and every move keeps it, crashes, kills, stops,
 drains and the pool lock included, for any rules with the three safety switches on (`Safe`:
@@ -140,12 +158,17 @@ under the pool lock while the first waits for the pool lock: the search finds th
 | L3 for `cpuq drain`: in a weakly fair run, the first drain is given every CPU of the pool | `drain_served` |
 | Under `urgentOnce`, every operation holding a CPU's flock has been served, in every reachable state | `Reach.servedOk` |
 | Under the code's rules, with no drain living, a head holding nothing is never blocked: a CPU is unlocked, or one is being emptied, or some holder may start emptying one for it | `zero_head_unblocked` |
+| Backfill, in real time: every task that starts fits the shadow, so the shadow never grows and every task the drain waits for ends by the first shadow `S`: the drain starts by `S` | `Timed.ends_by` |
+| Backfill: with no new drain, in a weakly fair run the window closes and stays closed | `window_closes` |
+| Backfill: once the window has closed, a gathering drain is served (`drain_served` for `released`) | `drain_served_backfill` |
+| Backfill never puts two operations' tasks on one CPU (with `k_bound`, at most K of one) | `one_op_per_cpu` |
 
-`drain_served` holds for the code's rules (`CodeRules`: `released`, `code0303`, `code0302`). A run
+`drain_served` holds for the code's rules (`CodeRules`: `released`, `code0305`, `code0303`,
+`code0302`), from a time at which backfill is shut (`Shut`: off, or its window closed). A run
 (`Run`) is a sequence of moves and stutters from a reachable state; it is weakly fair
 (`Run.Fair`) when every step class the search calls fair (`fairKey`: a task's exit whether it
 passes or fails, refill, release, the pass, accept, drain, undrain, consolidate, stop, halt,
-continue, finish, mark) that is enabled from some time on is taken from then on. The theorem
+continue, finish, mark, a tick) that is enabled from some time on is taken from then on. The theorem
 starts from a time `T` after which no operation arrives or crashes (`Run.Calm`), at which the
 drain `d` is first among drains, alive and waiting to run, holds its mark, the pool lock is free,
 and no later drain holds or is granted a CPU (`DCtx`). The pool has no Ctrl-Z and no `cpuq kill`
@@ -160,12 +183,26 @@ neither deadlock on their locks nor starve each other in the line. The first is 
 command ends (A-term) it gives every CPU back and finishes (both fair), and the next drain is
 first. That hand-on is argued, not proved.
 
+With backfill on, the proof starts once the window has closed: then nothing fits, a free CPU
+goes to the drain as before, and the drain lends nothing, so `drain_frame` holds unchanged.
+`window_closes` gives that time in every weakly fair run (a tick is a fair step, and only a
+drain's registration opens the window). What is not proved is the stretch between: while the
+window is open a CPU may move away from the drain (to a waiter that fits, or lent by the
+drain), so the ranks can rise, and `DCtx` asks that the drain has every CPU it lent back. That
+the lent CPUs come back (each is an empty slot being emptied, given back by a fair release) and
+that the context holds through the open window is argued, and searched (`D never`, `D fair`,
+below), not proved. The real-time bound is the rules' own arithmetic (`Timed.ends_by`): a task
+starts only if it ends by the shadow, so the shadow never grows and the drain starts by the
+first `S` it had. In the step function time is the window only, and a task may outlast it; that
+over-approximation only widens what the search covers.
+
 **Liveness, searched, not proved.** "Every waiter is eventually served" (L3) for ordinary
 waiters is checked by the search, in two forms, for every scenario: `L3 never` (no state from
 which no run serves a waiter that holds nothing) and `L3 fair` (no weakly fair run, with no more
 crashes, kills or Ctrl-Z, that never serves one). The search finds counterexamples to FINAL-PLAN
 (Findings 1 and 2) and to the code (Findings 4, 5, 7 and 10). On `released` every scenario
-passes.
+passes. For each `cpuq drain`, the search checks the same two forms over the states where it
+gathers, whatever it holds: `D never` and `D fair`.
 
 **L3 for ordinary waiters: what is proved, and what is left.** Up to 0.30.2, L3 was false for
 the code (Finding 7). The proof of `zero_head_unblocked` shows what `urgentOnce` changes: a
@@ -226,8 +263,14 @@ The timed bound (L4) is not done.
   the head looks every second, everyone else every 10 s); whoever sends a Ctrl-Z sends a SIGCONT
   (A-cont); no more crashes, kills or Ctrl-Z after some time. The fair-run check makes every
   enabled step class weakly fair, as `Run.Fair` does.
+- **For backfill's real-time bound:** a task ends within its limit (`tlimit`: `-t` and the 10 s
+  a kill and a restart may take), its whole tree included; every operation has seen the drain
+  before it starts a task (an operation that looked just before the drain registered may still
+  start one that doesn't fit, which the drain then waits for, as before backfill: in the model
+  noticing the mark is atomic).
 - **Small scope** for the search: up to 3 CPUs, 3 operations, K ≤ 2, 3 tasks per operation, one
-  crash, one or two Ctrl-Z; on the released rules also 4 CPUs, and weights over three projects.
+  crash, one or two Ctrl-Z; on the released rules also 4 CPUs, weights over three projects, and
+  backfill with windows of 2 and 3 ticks.
 
 ## Not modelled
 
@@ -248,7 +291,9 @@ The timed bound (L4) is not done.
 - Which slot drains ("youngest process oldest"): any slot may. Retry order ("behind the tasks
   not yet started"): the lowest pending task runs first. Both choices only widen what the search
   covers for safety.
-- Time. Liveness is untimed; the timed bound is not done.
+- Time, but for backfill's window and limits. Liveness is untimed; the timed bound (L4) is not
+  done. A task's end is not tied to its limit in the step function (`Timed` does that apart).
+- Which idle CPUs a drain lends, and when a waiter wakes it to (any idle slot, at any step).
 
 ## What the search checks, and finds
 
@@ -257,8 +302,8 @@ Checks on every state: `S1 holder`, `S1 grant`, `S3 cap`, `S4 K`, `S5 twice`, `S
 pass or accept can run until some task ends), `CS stuck` (the pool lock's holder waits for a
 lock only the pool lock lets go), `Z stuck` (a parent the kernel stopped that no SIGCONT will
 continue). On every drain: `F1 drain not owed`, `F6 drain not for the head`, `F6 giver ahead`
-(not for the emptying a live `cpuq drain` asks of everyone). On the graph: `L3 never`,
-`L3 fair`.
+(not for the emptying a live `cpuq drain` asks of everyone, nor a drain's lending). On the
+graph: `L3 never`, `L3 fair`, and for each drain `D never`, `D fair`.
 
 review2-formal's counterexamples, on FINAL-REPORT-1's rules (`Checks.lean`):
 
@@ -282,8 +327,23 @@ and fails three scenarios (Findings 4, 5). The code at 8f997ec (`poolFixed`) pas
 fails on two drains (`CS stuck`, the deadlock of 2026-11-26) and on a lost SIGCONT (`Z stuck`,
 Finding 8). The code at 0.30.2 (`code0302`) passes two drains, and fails Findings 7, 8 and 9.
 The code at 0.30.3 (`code0303`) passes every scenario but two drains, one stopped and continued
-(Finding 10). The code as released (`released`, 0.30.5) passes every scenario. Each of the four
-fixes is needed: take one out and its scenario fails again.
+(Finding 10). The code at 0.30.5 (`code0305`) passes every scenario. Each of the four fixes is
+needed: take one out and its scenario fails again.
+
+The code as released (`released`, 0.32.0, backfill) passes every scenario with a drain, and
+eight of backfill's own: an operation with a limit running and one waiting that fits sooner, on
+2 and 3 CPUs (windows of 2 and 3 ticks), with a crash, a Ctrl-Z, two drains and a Ctrl-Z,
+timeouts and retries, an urgent operation and `cpuq kill`, and with no limit in the way (no
+backfill). No safety check fails, and no drain goes unserved (`D never`, `D fair`) nor waiter
+holding nothing (`L3`). Backfill reaches states the rules before it don't (3969 against 1512 on
+the first scenario): CPUs go to waiters that fit, and the drain lends. A drain gives CPUs back
+without renewing its ticket, so the old drain scenarios reach fewer states than on 0.30.5. The
+scenarios without a drain are 0.30.5's: backfill acts only while a drain gathers.
+
+Even with time taken out (a mutation in which a task fits whatever the window), the search
+finds the drain served (on `backfill` and on two drains with a Ctrl-Z; not pinned): while the drain is first in line, the line's own drains (`giverOf`)
+keep emptying CPUs for it, and once no task the drain waits for runs, nothing fits. The window
+is what bounds the wait in real time (`Timed.ends_by`), not what the untimed model needs.
 
 ## Findings
 

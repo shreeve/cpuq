@@ -195,12 +195,13 @@ theorem zero_head_can_drain {cfg : Cfg} {s : St} {h o c : Nat}
 and the head's project q, measured in slots held as the line counts them. -/
 theorem drain_is_transfer {cfg : Cfg} {s : St} {h o c : Nat}
     (hl : cfg.rules.ledger = true) (hsh : cfg.rules.shareRule = true) (hm : s.marks = 0)
-    (hdh : drainOp cfg h = false)
+    (hdh : drainOp cfg h = false) (hdo : drainOp cfg o = false)
     (hd : canDrain cfg s o c = true) (hh : head cfg s = some h) (hz : eff cfg s h ≠ 0) :
     Transfers.shareOk cfg.w (projEff cfg s) (cfg.op o).proj (cfg.op h).proj := by
   have m : mayGive cfg s o h c = true := by
     unfold canDrain at hd
-    simp only [hl, hh, hm, ite_true, Bool.and_eq_true, bne_self_eq_false, Bool.false_and,
+    have hln : lends cfg s o = false := by simp [lends, gathers, hdo]
+    simp only [hl, hh, hm, hln, ite_true, Bool.and_eq_true, bne_self_eq_false, Bool.false_and,
       Bool.false_or] at hd
     exact hd.2.1.2
   unfold mayGive at m
@@ -323,7 +324,8 @@ theorem step_tickets {cfg : Cfg} {s s' : St} {a : Act} (e : step cfg s a = some 
       · cases e; intro o' hs
         rw [(handout_order_ops cfg _).1]; rw [phase_of_ops (handout_order_ops cfg _).2] at hs
         have := hold o' hs
-        show o' ∈ (if cfg.rules.renewAtRelease then renewed s _ else s.order)
+        show o' ∈ (if (cfg.rules.renewAtRelease && !(cfg.rules.backfill && drainOp cfg o)) = true
+          then renewed s _ else s.order)
         split
         · exact mem_renewed (.inl this)
         · exact this
@@ -415,7 +417,7 @@ theorem step_tickets {cfg : Cfg} {s s' : St} {a : Act} (e : step cfg s a = some 
         rw [St.phase_setPhase _ _ _ _ ho] at hs; simp [started] at hs
       · rw [St.op_setPhase_ne _ _ _ _ eo] at hs; exact hold o' hs
     · cases e
-  | enter o | mark o | tstp o | halt o => simp [Cpuq.step] at e
+  | enter o | mark o | tstp o | halt o | tick => simp [Cpuq.step] at e
 
 theorem move_tickets {cfg : Cfg} {s s' : St} {a : Act} (e : move cfg s a = some s')
     (hold : ∀ o, started (s.op o).phase → o ∈ s.order) :
