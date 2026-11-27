@@ -2,6 +2,15 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.31.2 — 2026-11-27
+
+- **`cpuq status` lists only work someone ran outside cpuq.** Apps and system services (detached,
+  running in `/`) still count in the load, but no longer fill the outside-work lines; a job
+  someone left running detached in its own folder still shows. `--json` keeps every entry.
+- Two end-to-end tests no longer fail on a slow shared CI runner: the usage test takes the
+  busiest of three looks, and the abandoned-submit test accepts CANCELLED as well as CPUQ ERROR
+  for the job given up (either way its copy is free).
+
 ## 0.31.1 — 2026-11-27
 
 - **The hook accepts Rig's split build under `--driver`.** With `RIG_UNIT_LAUNCHER='cpuq run --'`

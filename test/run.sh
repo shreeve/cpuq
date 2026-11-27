@@ -1011,10 +1011,15 @@ while time.time() < e: pass' &
   "$CPUQ" run --label u:idle -- sleep 9 &
   wait_held 2
   sleep 1
-  local u; u=$("$CPUQ" status --json | python3 -c 'import json, sys
-s = json.load(sys.stdin)
-print(" ".join("%s=%.2f" % (h["label"], h["using"]) for h in sorted(s["holders"], key=lambda h: h["label"])))')
-  sleep 4.3
+  # Three looks, each run's busiest: a shared CI runner can starve the spinner for one half-second
+  # sample (seen: 0.48 on macOS), never for three.
+  local u; u=$(for k in 1 2 3; do "$CPUQ" status --json; done | python3 -c 'import json, sys
+best = {}
+for line in sys.stdin.read().replace("}\n{", "}\0{").split("\0"):
+    for h in json.loads(line)["holders"]:
+        best[h["label"]] = max(best.get(h["label"], 0), h["using"] or 0)
+print(" ".join("%s=%.2f" % (k, v) for k, v in sorted(best.items())))')
+  sleep 2.8
   local flags; flags=$("$CPUQ" status --json | python3 -c 'import json, sys
 s = json.load(sys.stdin)
 print(" ".join("%s:%s" % (h["label"], ",".join(h["flags"]) or "-") for h in sorted(s["holders"], key=lambda h: h["label"])))')
@@ -1794,7 +1799,9 @@ t_submit_moved() {
 
 t_submit_abandon() {
   # A submitted job given up before its copy was synced (here, an rsync that fails) is cancelled on
-  # its host too, so it holds the worktree's copy no longer: the next job runs at once. And a job
+  # its host too, so it holds the worktree's copy no longer: the next job runs at once. Its own
+  # verdict is CPUQ ERROR (125), or CANCELLED (76) when the host's cancel is recorded first (seen
+  # on a slow macOS runner): either way the copy is free. And a job
   # queued behind another on the copy ends when cancelled, while it waits.
   setup submit-abandon
   export XDG_STATE_HOME=$T/xdg
@@ -1822,7 +1829,7 @@ t_submit_abandon() {
   ) >"$T/out" 2>&1
   local got; got=$(tr '\n' ' ' < "$T/out")
   check "submit: a job given up before its sync frees its copy (the next runs at once), and a queued job ends when cancelled ($got)" \
-    "[[ '$got' == 'broken=125 next=0 next_s='[0-9]' queued=76 ' || '$got' == 'broken=125 next=0 next_s=1'[0-9]' queued=76 ' ]]"
+    "[[ '$got' =~ ^broken=(125|76)\ next=0\ next_s=1?[0-9]\ queued=76\ $ ]]"
 }
 
 t_submit_slots() {

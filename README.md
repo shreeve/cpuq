@@ -345,7 +345,8 @@ drain -- ./bench'`). Work outside cpuq (system services) still runs; `cpuq statu
   (an agent's harness, an ssh session, a terminal, a service manager), shown with its command
   (an agent's own, out of its harness's wrapper), where it runs, the starter and its pid, its
   busy processes and the CPUs they keep busy. So `ssh burst 'make -j'`, or a build an agent ran
-  without cpuq, shows as one line naming the command and its folder.
+  without cpuq, shows as one line naming the command and its folder. Apps and system services
+  (detached, running in `/`) count in the load but aren't listed; `--json` keeps them.
 - **Held:** each running run's ticket (`OP`), pid, project, label, tasks done of total and failed,
   tasks running, its CPUs (`×K` with `-x`, and how many it is emptying), CPU busy per CPU held, how
   long, an estimate of the time left, and its command. A note under it flags a run whose CPUs are

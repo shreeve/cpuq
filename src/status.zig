@@ -708,6 +708,14 @@ fn agentCommand(cmd: []const u8) []const u8 {
     return rest;
 }
 
+/// Work someone ran: started by an agent, ssh, a terminal or cron, or detached in a folder of its
+/// own (`nohup make &` keeps the folder it was started in). An app or a system service runs
+/// detached in `/`; it counts in the load but isn't listed as work to move under cpuq.
+fn ranBySomeone(wk: JsonWork) bool {
+    const detached = std.mem.eql(u8, wk.via, "launchd") or std.mem.eql(u8, wk.via, "systemd") or std.mem.eql(u8, wk.via, "init");
+    return !detached or !(wk.cwd.len == 0 or std.mem.eql(u8, wk.cwd, "/"));
+}
+
 /// A work tree's command for one line: its first 100 bytes, on one line.
 fn workCommand(wk: JsonWork) []const u8 {
     const line = std.mem.sliceTo(wk.command, '\n');
@@ -906,6 +914,7 @@ fn boxed(ctx: *Ctx, st: JsonStatus, remote: ?[]const u8) void {
     if (showOutside(st)) {
         var rows: std.ArrayList([]const C) = .empty;
         for (st.outside_work) |wk| {
+            if (!ranBySomeone(wk)) continue;
             rows.append(a, a.dupe(C, &.{
                 .{ .text = workCommand(wk), .tint = .accent },
                 .{ .text = wk.cwd, .tint = .dim },
@@ -959,8 +968,10 @@ fn plain(ctx: *Ctx, st: JsonStatus) void {
     w.print("load    {d:.2} {d:.2} {d:.2}; memory pressure {s}; gate {s}\n", .{ st.load[0], st.load[1], st.load[2], st.memory_pressure, st.gate.text }) catch {};
     if (st.memory) |mem| w.print("memory  {s}\n", .{memoryText(a, mem)}) catch {};
     if (showOutside(st)) {
-        w.print("outside {d:.1} CPUs busy outside cpuq, by what started it:\n", .{st.outside_total}) catch {};
-        for (st.outside_work) |wk| w.print("  {d:>5.1}  {s}  (pid {d} via {s}, {d} process{s}, in {s})\n", .{
+        var listed: usize = 0;
+        for (st.outside_work) |wk| listed += @intFromBool(ranBySomeone(wk));
+        w.print("outside {d:.1} CPUs busy outside cpuq{s}\n", .{ st.outside_total, if (listed == 0) ", by apps and services" else ", by what started it:" }) catch {};
+        for (st.outside_work) |wk| if (ranBySomeone(wk)) w.print("  {d:>5.1}  {s}  (pid {d} via {s}, {d} process{s}, in {s})\n", .{
             wk.using, workCommand(wk), wk.pid, if (wk.via.len == 0) "?" else wk.via, wk.procs, if (wk.procs == 1) "" else "es", if (wk.cwd.len == 0) "?" else wk.cwd,
         }) catch {};
     }
@@ -1068,4 +1079,12 @@ test "agentCommand: the command out of Claude Code's wrapper" {
     const wrapped = "/bin/zsh -c source /x/snapshot.sh 2>/dev/null || true && \\builtin setopt NO_EQUALS 2>/dev/null || true && eval 'cd ~/w && zig build' \\< /dev/null && pwd -P >| /tmp/cwd";
     try std.testing.expectEqualStrings("cd ~/w && zig build", agentCommand(wrapped));
     try std.testing.expectEqualStrings("make -j8", agentCommand("make -j8"));
+}
+
+test "ranBySomeone: apps and services in / are not work someone ran" {
+    try std.testing.expect(ranBySomeone(.{ .via = "claude", .cwd = "/" }));
+    try std.testing.expect(ranBySomeone(.{ .via = "sshd-session", .cwd = "/home/s" }));
+    try std.testing.expect(!ranBySomeone(.{ .via = "launchd", .cwd = "/" }));
+    try std.testing.expect(!ranBySomeone(.{ .via = "systemd", .cwd = "" }));
+    try std.testing.expect(ranBySomeone(.{ .via = "init", .cwd = "/home/s/emdb" }));
 }
