@@ -196,7 +196,11 @@ What a proof of L3 still needs, under `released` with no drain living, no Ctrl-Z
    most once more (alive to over), so from some time the phases hold still.
 
 The drain proof's machinery (`Run`, `Run.Fair`, `Run.Calm`, the pass, accept and release
-lemmas, `drain_frame`) carries over to 1. Item 2 is the open mathematical step.
+lemmas, `drain_frame`) carries over to 1. Item 2 is the open mathematical step. Lemma P does
+not bound it as it stands: a head that holds nothing may take a CPU from any holder of two,
+whatever the shares, so a drain for it is not always a share-clause transfer, and Φ can rise.
+A measure for item 2 must use what `giverOf` picks (the giver whose project holds the most for
+its weight) and the ticket order among holders of nothing together.
 
 The timed bound (L4) is not done.
 
@@ -223,7 +227,7 @@ The timed bound (L4) is not done.
   (A-cont); no more crashes, kills or Ctrl-Z after some time. The fair-run check makes every
   enabled step class weakly fair, as `Run.Fair` does.
 - **Small scope** for the search: up to 3 CPUs, 3 operations, K ≤ 2, 3 tasks per operation, one
-  crash, one or two Ctrl-Z.
+  crash, one or two Ctrl-Z; on the released rules also 4 CPUs, and weights over three projects.
 
 ## Not modelled
 

@@ -2,7 +2,7 @@
 The exhaustive searches `lake build` runs, each with the result it gave, so a change to the model
 or the rules that changes what is found shows here. Names of the checks: `Explore.lean`.
 
-Scenarios: up to 3 CPUs, 3 operations, K ≤ 2, with crashes (SIGKILL of a parent), timeouts and
+Scenarios: up to 4 CPUs, 3 operations, K ≤ 2, with crashes (SIGKILL of a parent), timeouts and
 retries, Ctrl-Z, `cpuq kill`, an urgent operation, project weights and `cpuq drain`. `forever`
 operations never run out of work, so a waiter that is not served is starved, not merely late.
 Rule sets: `Rules.report1` (FINAL-REPORT-1, as review2-formal read it), `Rules.plan`
@@ -77,6 +77,24 @@ def drainZ (r : Rules) : Cfg :=
 def twoDrainsZ (r : Rules) : Cfg :=
   { cpus := 2, rules := r, stops := true
     ops := [{ proj := 0, tasks := 2, forever := true }, drainOn 2 1, drainOn 2 2] }
+
+/-- 3 CPUs, weights 2, 1 and 1, three projects with endless work. -/
+def weighted3 (r : Rules) : Cfg :=
+  { cpus := 3, rules := r, weights := [2, 1, 1]
+    ops := [{ proj := 0, tasks := 3, forever := true }, { proj := 1, tasks := 2, forever := true },
+            { proj := 2, tasks := 1, forever := true }] }
+
+/-- 4 CPUs, two operations of one project and one of another, all with endless work. -/
+def fourCpus (r : Rules) : Cfg :=
+  { cpus := 4, rules := r
+    ops := [{ proj := 0, tasks := 3, forever := true }, { proj := 1, tasks := 2, forever := true },
+            { proj := 0, tasks := 1, forever := true }] }
+
+/-- 4 CPUs, weights 1 and 2, one operation of the first project and two of the second. -/
+def fourWeighted (r : Rules) : Cfg :=
+  { cpus := 4, rules := r, weights := [1, 2]
+    ops := [{ proj := 0, tasks := 3, forever := true }, { proj := 1, tasks := 2, forever := true },
+            { proj := 1, tasks := 1, forever := true }] }
 
 /-- 2 CPUs, two operations with endless work, two Ctrl-Z. -/
 def ctrlZ (r : Rules) : Cfg :=
@@ -309,5 +327,17 @@ urgent: ok: 716391 states, 4334356 steps
   row "timeout" (timeout .released)
   row "herd" (herd .released)
   row "urgent" (urgent .released)
+
+-- Larger: 4 CPUs, and weights over three projects.
+/--
+info: weights 2 1 1: ok: 16807 states, 56795 steps
+four CPUs: ok: 26048 states, 117012 steps
+four CPUs, weights 1 2: ok: 34414 states, 148680 steps
+-/
+#guard_msgs in
+#eval do
+  row "weights 2 1 1" (weighted3 .released)
+  row "four CPUs" (fourCpus .released)
+  row "four CPUs, weights 1 2" (fourWeighted .released)
 
 end Cpuq.Checks
