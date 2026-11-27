@@ -10,7 +10,15 @@ cd "$(dirname "$0")/.."
 REPO=$PWD
 CPUQ=${CPUQ:-$PWD/bin/cpuq}
 [ -x "$CPUQ" ] || { echo "no $CPUQ; run zig build first"; exit 2; }
+# The tests run git in scratch folders: git found through the caller's environment (a GIT_DIR
+# set by whoever started the suite) would be another repository, and its commits and config would
+# land there.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CEILING_DIRECTORIES GIT_CONFIG GIT_CONFIG_GLOBAL
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cpuq-test.XXXXXX")
+# The scratch folder must be in no repository, or a test's git would write into that one.
+if found=$(git -C "$ROOT" rev-parse --absolute-git-dir 2>/dev/null); then
+  echo "refusing to run: git in $ROOT finds the repository $found"; rm -rf "$ROOT"; exit 2
+fi
 # On exit, end every process the tests started, children's children
 # included, so none outlives the run holding its output open.
 killtree() { local p; for p in $(pgrep -P "$1"); do killtree "$p"; kill "$p" 2>/dev/null; done; }

@@ -15,6 +15,8 @@
 # with lives in the login keychain: the Developer ID, the notarytool profile `notary-tool`, and
 # the Sparkle key under the account `cpuq`, whose public half is Support/sparkle-public-key.txt.
 set -euo pipefail
+# git acts on the repository each step names, never one found through the caller's GIT_DIR.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
 cd "$(dirname "$0")/.."
 root=$(pwd)
 fail() { echo "error: $*" >&2; exit 1; }
