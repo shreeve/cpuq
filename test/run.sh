@@ -2017,6 +2017,17 @@ f = open(sys.argv[1]); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$sp/p/held
   echo "  left: $left"
   check "clean: old copies and an unnamed old pack version go, fresh ones, a named one and a locked copy stay; --dry-run removes nothing ($(tail -1 "$T/dry"))" \
     "[[ '$after_dry' == *old-1* && '$left' != *old-1* && '$left' != *oldcopy* && '$left' != *tool/aaa* && '$left' == *new-2* && '$left' == *newcopy* && '$left' == *heldcopy* && '$left' == *tool/bbb* && '$left' == *tool/ccc* ]] && grep -q 'removed 3' '$T/out'"
+  # Only what cpuq made goes: a folder made by hand in ~/cpuq/tmp, a plain clone straight under
+  # ~/cpuq/worktrees, and a folder in a project's copies with no marker all stay, however old. A
+  # job's scratch whose record is there goes.
+  local tmp=$HOME/cpuq/tmp jobs=${XDG_STATE_HOME:-$HOME/.local/state}/cpuq/jobs
+  mkdir -p "$tmp/setup1123" "$tmp/0123456789ab" "$jobs/0123456789ab" "$sp/trig-main/.git" "$sp/trig-main/src" "$sp/p/handmade"
+  # A folder's age is its ctime too, which touch can't set back: age them by waiting instead.
+  sleep 2
+  "$CPUQ" clean --older 1s >"$T/out2"
+  left=$(cd "$HOME" && find cpuq -mindepth 2 -maxdepth 3 -type d | sort | tr '\n' ' ')
+  check "clean leaves what cpuq didn't make: a hand-made scratch folder, a plain clone, an unmarked copy; a job's old scratch goes ($(tail -1 "$T/out2"))" \
+    "[[ '$left' == *tmp/setup1123* && '$left' == *trig-main/src* && '$left' == *p/handmade* && '$left' != *tmp/0123456789ab* ]]"
 }
 
 # --- cpuq jobs and the agent (until they go) -------------------------------------------------

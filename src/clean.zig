@@ -1,10 +1,13 @@
 //! `cpuq clean`: what jobs left on a host and no longer use, removed once unused for
-//! `clean_after` (3 days by default):
+//! `clean_after` (3 days by default). Only what cpuq made, known by its marker or record; a
+//! folder someone made by hand there is never touched:
 //!
 //! - copies of repos sent from other machines (~/cpuq/worktrees/PROJECT/NAME), by when a job
 //!   last ran in one (`.cpuq-used`, a `cpuq run --on`'s) or last synced it (`.cpuq-generation`, a
-//!   submitted job's), never while a job holds one's lock;
-//! - submitted jobs' scratch (~/cpuq/tmp/ID) that outlived them;
+//!   submitted job's), never while a job holds one's lock; a folder with neither marker, and a
+//!   PROJECT that is itself a repo (a plain clone), stay;
+//! - submitted jobs' scratch (~/cpuq/tmp/ID) that outlived them, only where the job's record
+//!   (~/.local/state/cpuq/jobs/ID) is still there;
 //! - pack versions (~/cpuq/packs/NAME/VERSION), by when a job last used one, never one that
 //!   `latest` or `stable` names;
 //! - submitted jobs' records (~/.local/state/cpuq/jobs/ID), a week after they ended.
@@ -52,11 +55,13 @@ pub fn run(a: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, no
 }
 
 /// ~/cpuq/worktrees/PROJECT/NAME: by the later of its markers, `.cpuq-used` (each `cpuq run --on`
-/// touches it) and `.cpuq-generation` (each submitted job's sync writes it), else by when it
-/// changed; never while its lock (NAME.lock, a submitted job's) is held.
+/// touches it) and `.cpuq-generation` (each submitted job's sync writes it); never one with
+/// neither (cpuq didn't make it), nor while its lock (NAME.lock, a submitted job's) is held. A
+/// PROJECT that is a repo itself (a clone made there by hand) is not a project's copies.
 fn worktrees(cx: *Cx, root: []const u8) void {
     for (children(cx, root, .directory)) |project| {
         const pdir = cx.a.print("{s}/{s}", .{ root, project }) catch continue;
+        if (exists(cx, cx.a.print("{s}/.git", .{pdir}) catch continue)) continue;
         for (children(cx, pdir, .directory)) |name| {
             const dir = cx.a.print("{s}/{s}", .{ pdir, name }) catch continue;
             const lock = cx.a.print("{s}.lock", .{dir}) catch continue;
@@ -65,16 +70,19 @@ fn worktrees(cx: *Cx, root: []const u8) void {
                 continue;
             }
             const used = @max(touched(cx, dir, ".cpuq-used"), touched(cx, dir, ".cpuq-generation"));
-            consider(cx, dir, if (used != 0) used else changed(cx, dir), &.{lock});
+            if (used == 0) continue;
+            consider(cx, dir, used, &.{lock});
         }
         removeIfEmpty(cx, pdir);
     }
 }
 
 /// ~/cpuq/tmp/ID: a submitted job's TMPDIR, which it removes when it ends; one left by a job
-/// that was killed goes by when it changed, never while that job's record says it runs.
+/// that was killed goes by when it changed, never while that job's record says it runs. Only
+/// where the job's record is there: any other folder in ~/cpuq/tmp is someone's own.
 fn scratch(cx: *Cx, root: []const u8, jobs: []const u8) void {
     for (children(cx, root, .directory)) |id| {
+        if (!exists(cx, cx.a.print("{s}/{s}", .{ jobs, id }) catch continue)) continue;
         if (locked(cx, cx.a.print("{s}/{s}/running.lock", .{ jobs, id }) catch continue)) continue;
         const dir = cx.a.print("{s}/{s}", .{ root, id }) catch continue;
         consider(cx, dir, changed(cx, dir), &.{});
@@ -174,6 +182,11 @@ fn locked(cx: *Cx, path: []const u8) bool {
     const free = f.tryLock(cx.io, .exclusive) catch return true;
     if (free) f.unlock(cx.io);
     return !free;
+}
+
+fn exists(cx: *Cx, path: []const u8) bool {
+    Io.Dir.cwd().access(cx.io, path, .{}) catch return false;
+    return true;
 }
 
 fn removeIfEmpty(cx: *Cx, dir: []const u8) void {
