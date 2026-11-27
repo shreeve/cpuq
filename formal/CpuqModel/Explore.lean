@@ -12,14 +12,21 @@ The checks, by name (README lists which guarantee each one is):
   accept can happen until some task ends; a release, a finish and a drain's registration
   run a pass), `CS stuck` (the pool lock's holder waits for a lock
   that only the pool lock lets go: a deadlock) and `Z stuck` (a parent stopped by the kernel
-  that no SIGCONT will continue);
-- step: `F1 drain not owed`,
+  that no SIGCONT will continue), and with a drain's time limit `T lock` (time may not pass and
+  no step can be taken);
+- step: `T pass` (a drain's command starts while an older operation that has yet to start, with
+  `drainTurn`, or that is no drain and holds nothing, with `drainFifo`, still wants CPUs), `F1 drain not owed`,
   `F6 drain not for the head`, `F6 giver ahead` (after the drain the giver ranks before the
   waiter it drained for, so the token may come back to the giver);
 - graph: `L3 never` (from some state, no run at all gets a waiter that holds nothing a CPU) and
   `L3 fair` (a weakly fair run, with no more crashes, where such a waiter never gets one); and
   the same for a `cpuq drain` that gathers, whatever it holds: `D never` (no run gives it the
-  pool) and `D fair` (a weakly fair run that never does).
+  pool) and `D fair` (a weakly fair run that never does); where a scenario asks (`Cfg.hold`),
+  `L3 hold`: `L3 fair` in runs where a drain's command need not end (no A-term for it), and a
+  run may stay in a state in which no step class is forced.
+
+The search runs `moveX` (`move` with the drain's time limit, streams of drains and FIFO's
+accept), which is `move` when none of them is on.
 -/
 import CpuqModel.Model
 import Std.Data.HashMap
@@ -76,6 +83,7 @@ def stateFails (cfg : Cfg) (s : St) (enabled : List (Act × St)) : List String :
       | .mark _ => true
       | _ => false)
   let zStuck := os.any (fun o => bit s.halted o && !bit s.held o)
+  let tLock := cfg.rules.drainCap && due cfg s && enabled.isEmpty
   (if holder then [] else ["S1 holder"]) ++
   (if grant then [] else ["S1 grant"]) ++
   (if cap then [] else ["S3 cap"]) ++
@@ -86,7 +94,8 @@ def stateFails (cfg : Cfg) (s : St) (enabled : List (Act × St)) : List String :
   (if unheld then [] else ["S1' unheld"]) ++
   (if idle then ["L2 idle"] else []) ++
   (if csStuck then ["CS stuck"] else []) ++
-  (if zStuck then ["Z stuck"] else [])
+  (if zStuck then ["Z stuck"] else []) ++
+  (if tLock then ["T lock"] else [])
 
 /-- The yield rule of FINAL-PLAN rule 6, whatever the rules searched. -/
 def yieldShare (cfg : Cfg) (s : St) (o h : Nat) : Bool :=
@@ -94,10 +103,21 @@ def yieldShare (cfg : Cfg) (s : St) (o h : Nat) : Bool :=
 
 def stepFails (cfg : Cfg) (s : St) (a : Act) (s' : St) : List String :=
   match a with
+  | .refill o _ =>
+    -- A drain takes its turn: its command never starts while an older operation that has yet
+    -- to start still wants CPUs.
+    -- With FIFO: while an older waiter that is no drain and holds nothing still wants CPUs.
+    if drainOp cfg o && !s.busy o &&
+       (opIds cfg).any (fun w => decide (s.order.findIdx (· == w) < s.order.findIdx (· == o)) &&
+         ((cfg.rules.drainTurn && starting cfg s w && decide (demand cfg s w > 0)) ||
+          (cfg.rules.drainFifo && !drainOp cfg w && waiter cfg s w && s.owned w + s.grants w == 0)))
+    then ["T pass"] else []
   | .drain o _ =>
     -- While a `cpuq drain` lives, every other operation empties its CPUs, and the drain lends
     -- its own (backfill): not line drains.
-    if s.marks != 0 && !drainOp cfg o || drainOp cfg o then [] else
+    -- So are the giver's drains for a drain that heads the line (a drain of a few CPUs).
+    if markOn cfg s && !drainOp cfg o || drainOp cfg o ||
+       (match head cfg s with | some h => drainOp cfg h | none => false) then [] else
     (if decide (s.drains < need cfg s) then [] else ["F1 drain not owed"]) ++
     (match head cfg s with
      | some h =>
@@ -130,6 +150,13 @@ def fairKey : Act → Option Act
   | .exit o i _ => some (.exit o i true)
   | .timeout _ _ | .arrive _ | .enter _ | .crash _ | .kill _ | .tstp _ => none
   | a => some a
+
+/-- Weak fairness without A-term for a drain's command: its own end is forced by nothing (it may
+run forever), every other class as `fairKey`. With `drainCap`, the clock's TERM and KILL come
+with the tick, which stays weakly fair. -/
+def fairKeyHold (cfg : Cfg) : Act → Option Act
+  | .exit o i ok => if drainOp cfg o then none else fairKey (.exit o i ok)
+  | a => fairKey a
 
 structure Report where
   states : Nat
@@ -251,9 +278,13 @@ def explore (cfg : Cfg) (limit : Nat := 4000000) : Report := Id.run do
   let n := states.size
   -- Liveness, for each operation `w`: a waiter holding nothing is served (L3), and a drain
   -- that gathers is given the pool (D).
-  let goals := (opIds cfg).map (fun w => (w, "L3 never", "L3 fair", fun s => starving cfg s w)) ++
-    ((opIds cfg).filter (drainOp cfg)).map (fun w => (w, "D never", "D fair", fun s => gathering cfg s w))
-  for (w, never, fair, wait) in goals do
+  let goals := (opIds cfg).map (fun w =>
+      (w, "L3 never", "L3 fair", fun s => starving cfg s w, fairKey, false)) ++
+    ((opIds cfg).filter (drainOp cfg)).map (fun w =>
+      (w, "D never", "D fair", fun s => gathering cfg s w, fairKey, false)) ++
+    (if cfg.hold then (opIds cfg).map (fun w =>
+      (w, "", "L3 hold", fun s => starving cfg s w, fairKeyHold cfg, true)) else [])
+  for (w, never, fair, wait, fk, stutter) in goals do
     let starve := states.map wait
     -- L3 never: states from which no run without crashes, kills or stops serves w.
     let mut pred : Array (Array Nat) := Array.replicate n #[]
@@ -271,7 +302,7 @@ def explore (cfg : Cfg) (limit : Nat := 4000000) : Report := Id.run do
         if !can[u]! then
           can := can.set! u true
           work := work.push u
-    match (List.range n).find? (fun u => !can[u]!) with
+    match if never == "" then none else (List.range n).find? (fun u => !can[u]!) with
     | some u =>
       if !fails.any (·.1 == never) then
         fails := fails.push (never, traceOf parent u ++ [.finish (1000 + w)])
@@ -290,10 +321,14 @@ def explore (cfg : Cfg) (limit : Nat := 4000000) : Report := Id.run do
         for (v, a) in succ[u]! do
           if inside v && progressAct a then
             loop := true
-            if let some k := fairKey a then
+            if let some k := fk a then
               if !taken.contains k then taken := taken.push k
+      let enabledAt (u : Nat) : Array Act := (succ[u]!.filterMap (fk ·.2))
+      -- With `stutter`, a run may also stay in one state in which no class is forced.
+      if stutter && !loop && (enabledAt us[0]!).isEmpty then
+        if !fails.any (·.1 == fair) then
+          fails := fails.push (fair, traceOf parent us[0]! ++ [.finish (2000 + w), .finish 999])
       if loop then
-        let enabledAt (u : Nat) : Array Act := (succ[u]!.filterMap (fairKey ·.2))
         let mut always := enabledAt us[0]!
         for u in us do
           let e := enabledAt u
@@ -312,7 +347,7 @@ def explore (cfg : Cfg) (limit : Nat := 4000000) : Report := Id.run do
                 for u in us do
                   if edge.isNone then
                     for (v, a) in succ[u]! do
-                      if edge.isNone && inside v && progressAct a && fairKey a == some k then
+                      if edge.isNone && inside v && progressAct a && fk a == some k then
                         edge := some (u, v, a)
                 if let some (x, v, a) := edge then
                   cyc := cyc ++ pathIn succ inside cur x ++ [a]
@@ -353,7 +388,8 @@ def brief (cfg : Cfg) (s : St) : String :=
     | none => ""
   let mk := if s.marks != 0 then s!", marks {s.marks}" else ""
   let wd := if s.window != 0 then s!", window {s.window}" else ""
-  String.intercalate " " cs ++ s!" | head {hd}, drains {s.drains}{lk}{mk}{wd}"
+  let ck := if s.clock.isEmpty then "" else s!", clock {s.clock}"
+  String.intercalate " " cs ++ s!" | head {hd}, drains {s.drains}{lk}{mk}{wd}{ck}"
 
 def actName : Act → String
   | .arrive o => s!"{opName o} arrives"
@@ -390,7 +426,7 @@ def narrate (cfg : Cfg) (name : String) : String :=
     let mut s := init cfg
     let mut out := s!"{name}:\n"
     for a in tr do
-      match move cfg s a with
+      match moveX cfg s a with
       | some s' =>
         s := s'
         out := out ++ s!"  {actName a}: {brief cfg s}\n"

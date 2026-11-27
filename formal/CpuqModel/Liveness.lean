@@ -201,7 +201,8 @@ theorem drain_is_transfer {cfg : Cfg} {s : St} {h o c : Nat}
   have m : mayGive cfg s o h c = true := by
     unfold canDrain at hd
     have hln : lends cfg s o = false := by simp [lends, gathers, hdo]
-    simp only [hl, hh, hm, hln, ite_true, Bool.and_eq_true, bne_self_eq_false, Bool.false_and,
+    have hmk : markOn cfg s = false := by simp [markOn, hm]
+    simp only [hl, hh, hmk, hln, ite_true, Bool.and_eq_true, Bool.false_and,
       Bool.false_or] at hd
     exact hd.2.1.2
   unfold mayGive at m
