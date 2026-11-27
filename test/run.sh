@@ -374,6 +374,7 @@ EOF
   "$CPUQ" drain --all --max 20s --label d:one -- sh -c "echo one-start >>$g; sleep 1; echo one-end >>$g" & local d1=$!
   wait_line "$g" one-start
   "$CPUQ" drain --all --max 20s --label d:two -- sh -c "echo two-start >>$g; sleep 1; echo two-end >>$g" & local d2=$!
+  wait_waiters 1
   "$CPUQ" run --wait-max 20 --label d:after -- sh -c "echo after >>$g" & local d3=$!
   local r1 r2 r3; wait $d1; r1=$?; wait $d2; r2=$?; wait $d3; r3=$?
   local order; order=$(tr '\n' ' ' <"$g" 2>/dev/null)
@@ -422,7 +423,7 @@ t_drain_turn() {
   wait_waiters 1
   "$CPUQ" drain --all --max 30s --label t:drain -- sh -c "echo drain-start >>$f; sleep 1; echo drain-end >>$f" & local d=$!
   wait_waiters 2
-  local why; why=$("$CPUQ" status --no-usage | grep 't:drain' | grep -o '[0-9]* run[s]* queued before it start[s]* first' | head -1)
+  local why; why=$("$CPUQ" status --no-usage | grep 't:drain' | grep -o '[0-9]* runs* queued before it go[es]* first' | head -1)
   # The newer run's -t (2h) runs past the drain's start, so it can't backfill.
   "$CPUQ" run -t 2h --label t:newer -- sh -c "echo newer >>$f" & local n=$!
   wait $b $o $d $n

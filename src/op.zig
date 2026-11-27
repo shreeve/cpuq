@@ -401,9 +401,7 @@ fn loop(r: *Run) void {
         // this operation's tasks end before the drain could start anyway.
         if (!r.rec.drain and r.pool.draining()) {
             const ops = r.pool.scan(r.a);
-            if (pool_mod.drainWantsAll(ops) and !backfills(r, ops) and !pool_mod.before(r.rec, pool_mod.turnOf(ops))) for (r.slots.items) |*sl| {
-                sl.draining = true;
-            };
+            if (pool_mod.drainWantsAll(ops) and !backfills(r, ops)) emptyForDrain(r);
         }
         consolidate(r);
         resumeStopped(r);
@@ -900,9 +898,7 @@ fn settle(r: *Run, released: bool) bool {
     given = r.pool.promises(a, ops, r.pool_cpus);
     r.head = if (pool_mod.firstWaiter(a, ops, given)) |w| w.op.ticket == r.rec.ticket else false;
     if (pool_mod.giver(a, ops, given)) |t| if (t == r.rec.ticket) drainOne(r);
-    if (!r.rec.drain and pool_mod.drainWantsAll(ops) and !backfills(r, ops) and !pool_mod.before(r.rec, pool_mod.turnOf(ops))) for (r.slots.items) |*s| {
-        s.draining = true;
-    };
+    if (!r.rec.drain and pool_mod.drainWantsAll(ops) and !backfills(r, ops)) emptyForDrain(r);
     // Backfill: a gathering drain empties idle CPUs for the waiters whose tasks end before it
     // could start; a waiter that finds one owed wakes the drain.
     if (pool_mod.lends(ops, given, main.nowSeconds(r.ctx.io))) |l| {
@@ -916,6 +912,15 @@ fn settle(r: *Run, released: bool) bool {
     }
     r.syncRecord();
     return false;
+}
+
+/// A drain of the whole machine gathers: stop filling every CPU, each given back as its tasks
+/// end. A CPU just taken, with no task on it yet, runs one first: it was handed out ahead of the
+/// drain (a run older than it, or backfill), not to be given straight back.
+fn emptyForDrain(r: *Run) void {
+    for (r.slots.items) |*s| if (s.newest_ms != 0) {
+        s.draining = true;
+    };
 }
 
 /// Whether this operation's tasks, started now, end before the gathering drain could start,

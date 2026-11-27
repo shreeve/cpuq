@@ -421,7 +421,7 @@ fn gateNow(ctx: *Ctx, a: std.mem.Allocator, drain: bool, drain_holds: bool, busy
 }
 
 /// Why a waiter waits, for people: its place in line, then what holds it back.
-/// Runs that queued before drain `t` and have yet to start: they go first.
+/// Runs that queued before drain `t` and wait holding nothing: they go first.
 fn olderStarting(ops: []const Op, t: u64) u32 {
     var n: u32 = 0;
     for (ops) |p| if (pool_mod.before(p, t)) {
@@ -444,7 +444,7 @@ fn whyText(a: std.mem.Allocator, place: usize, o: Op, pool: u32, gate: JsonGate,
             out.print(a, "; waits for every CPU ({d} of {d} held)", .{ o.held.len, pool }) catch {}
         else
             out.print(a, "; a drain of {d} CPU{s} ({d} held)", .{ o.limit, if (o.limit == 1) "" else "s", o.held.len }) catch {};
-        if (older != 0) out.print(a, "; {d} run{s} queued before it start{s} first", .{ older, if (older == 1) "" else "s", if (older == 1) "s" else "" }) catch {};
+        if (older != 0) out.print(a, "; {d} run{s} queued before it go{s} first", .{ older, if (older == 1) "" else "s", if (older == 1) "es" else "" }) catch {};
     } else if (o.why.len != 0) {
         out.print(a, "; {s}", .{o.why}) catch {};
     } else if (!std.mem.eql(u8, gate.state, "open") and usable == 0) {

@@ -329,8 +329,9 @@ For timing, nothing else. A drain gathers CPUs ahead of the line, then runs CMD 
 - **`--all`**: the whole machine, for at most 20 minutes. Every run that has started stops filling
   its CPUs and gives each back as its tasks end; CMD runs unpinned on the emptied machine.
 
-A drain takes its turn: runs that queued before it start first (each freed CPU goes to such a run
-until its first task is on it), and runs that queue after it wait for it. So a stream of drains
+A drain takes its turn: a run that queued before it and holds no CPU gets each freed CPU first,
+and runs a task on it before it could be emptied for the drain; runs that queue after it wait for
+it. A run that gives CPUs back takes a new turn, behind the drains that came meanwhile. So a stream of drains
 can't starve one-CPU runs, and a stream of new runs can't starve a drain. `--max T` (`90s`,
 `10m`) gives up if its CPUs aren't free by then (exit 75), and nothing runs.
 

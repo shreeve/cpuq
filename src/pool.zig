@@ -663,24 +663,21 @@ pub fn handOut(a: std.mem.Allocator, ops: []const Op, given: []const Promise, fr
     return out.items;
 }
 
-/// An operation that has yet to start its first task: waiting for a CPU, or holding one it
-/// hasn't put a task on yet.
-pub fn starting(o: Op) bool {
-    return !o.drain and o.running + o.done + o.failed == 0 and (o.want > 0 or o.held.len > 0);
-}
-
 /// A drain takes its turn: it passes no run that queued before it. Of the gathering drains, the
-/// oldest; an operation older than it that hasn't started yet (`starting`) gets CPUs ahead of
-/// it and keeps the one it takes until its first task runs. Null when no drain gathers.
+/// oldest; an operation older than it that holds no CPU and wants one (`before`) gets CPUs ahead
+/// of it, and a CPU it takes runs a task before it is emptied for the drain. An operation that
+/// gives CPUs back takes a new ticket (`renew`), so after its turn it is younger than the drains
+/// that came meanwhile: they go first, then it. Null when no drain gathers.
 pub fn turnOf(ops: []const Op) ?u64 {
     for (ops) |o| if (o.drain and o.want > 0) return o.ticket;
     return null;
 }
 
-/// Whether `o` queued before the gathering drain `turn` and has yet to start: it goes first.
+/// Whether `o` queued before the gathering drain `turn`, holds no CPU and wants one: it goes
+/// first.
 pub fn before(o: Op, turn: ?u64) bool {
     const t = turn orelse return false;
-    return o.ticket < t and starting(o);
+    return !o.drain and o.ticket < t and o.held.len == 0 and o.want > 0;
 }
 
 /// Whether a drain gathers the whole machine (--all): every
@@ -901,14 +898,16 @@ test "a drain takes its turn: it passes no run that queued before it" {
     };
     try std.testing.expectEqual(3, turnOf(&ops).?);
     try std.testing.expect(before(ops[1], turnOf(&ops)));
+    try std.testing.expect(!before(ops[0], turnOf(&ops)));
     try std.testing.expect(!before(ops[3], turnOf(&ops)));
     const got = handOut(a, &ops, &.{}, &.{ 1, 2 }, 0);
     try std.testing.expectEqual(2, got.len);
     try std.testing.expectEqual(2, got[0].ticket);
     try std.testing.expectEqual(3, got[1].ticket);
-    // Holding its CPU with no task on it yet, it still goes first; once its task runs, no more.
-    try std.testing.expect(before(.{ .ticket = 2, .project = "rig", .held = &.{1} }, 3));
-    try std.testing.expect(!before(.{ .ticket = 2, .project = "rig", .held = &.{1}, .running = 1 }, 3));
+    // Once it holds a CPU it asks no more ahead of the drain; a run that has had tasks, holds
+    // nothing and still wants (a long run between turns) goes first again while older.
+    try std.testing.expect(!before(.{ .ticket = 2, .project = "rig", .held = &.{1}, .want = 1 }, 3));
+    try std.testing.expect(before(.{ .ticket = 2, .project = "rig", .done = 5, .want = 1 }, 3));
 }
 
 test "the line: of two drains, the one holding the most takes the free CPUs" {
