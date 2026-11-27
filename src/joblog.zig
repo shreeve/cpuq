@@ -47,6 +47,8 @@ pub const EventExtra = struct {
     cores: ?u32 = null,
     exit: ?u8 = null,
     signal: ?u32 = null,
+    /// Why cpuq stopped it: "time limit" or "idle".
+    stopped: ?[]const u8 = null,
     cpu: ?f64 = null,
     done: ?u32 = null,
     failed: ?u32 = null,
@@ -64,6 +66,7 @@ pub fn logEvent(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra) vo
     ev.cores = extra.cores;
     ev.exit = extra.exit;
     ev.signal = extra.signal;
+    ev.stopped = extra.stopped;
     ev.cpu = extra.cpu;
     ev.done = extra.done;
     ev.failed = extra.failed;

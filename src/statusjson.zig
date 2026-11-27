@@ -43,7 +43,8 @@ pub const JsonHolder = struct {
     /// CPUs its tasks kept busy over the sample, its own cpuq left out; null with --no-usage.
     using: ?f64 = null,
     /// What deserves a look: "low_use" (its CPUs average under 0.5 busy), "over_cpu" (over 1.2
-    /// busy per CPU), "stopped" (its cpuq is stopped).
+    /// busy per CPU), "stopped" (its cpuq is stopped); for a drain, "idle_drain" (its command
+    /// keeps under 0.25 CPUs busy in all) and "long_drain" (held past config `drain_timeout`).
     flags: []const []const u8 = &.{},
     /// Its tasks ended (passed or failed) of all, with those that failed.
     progress: ?JsonProgress = null,

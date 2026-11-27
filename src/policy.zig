@@ -39,6 +39,12 @@ pub const Config = struct {
     /// Each task's time limit, in seconds, when a run gives none with -t (`timeout`, e.g. 1h;
     /// off: none).
     timeout_s: u32 = 3600,
+    /// A drain's time limit, in seconds, when it gives none with -t (`drain_timeout`, e.g. 20m;
+    /// at most `drain_ceiling_s`).
+    drain_timeout_s: u32 = 20 * 60,
+    /// A drain whose command keeps under `drain_idle_busy` CPUs busy this long while another
+    /// run waits is stopped (`drain_idle`, e.g. 5m; off: never).
+    drain_idle_s: u32 = 5 * 60,
     /// Project weights for sharing the pool (`weights`, e.g. "rig:2 trig:1"); a project not
     /// named weighs 1.
     weights: []const u8 = "",
@@ -142,6 +148,8 @@ const keys = [_]Key{
     .{ .name = "cgroups", .field = "cgroups", .kind = .on_off },
     .{ .name = "cpus", .field = "cpus", .kind = .text },
     .{ .name = "timeout", .field = "timeout_s", .kind = .age },
+    .{ .name = "drain_timeout", .field = "drain_timeout_s", .kind = .age },
+    .{ .name = "drain_idle", .field = "drain_idle_s", .kind = .age },
     .{ .name = "weights", .field = "weights", .kind = .text },
     .{ .name = "submit_roots", .field = "submit_roots", .kind = .text },
     .{ .name = "clean_after", .field = "clean_after_s", .kind = .age },

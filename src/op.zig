@@ -185,6 +185,14 @@ const Run = struct {
     job: joblog.JobLog = undefined,
     queued_t: f64 = 0,
     peak_held: u32 = 0,
+    /// A drain's watch on its command's CPU: the last sample (monotonic ms, task-tree CPU ns),
+    /// since when it has kept under `drain_idle_busy` while others wait, and whether it was
+    /// warned or stopped for it.
+    idle_at_ms: i64 = 0,
+    idle_cpu_ns: u64 = 0,
+    idle_since_ms: i64 = 0,
+    idle_warned: bool = false,
+    idle_stopped: bool = false,
 
     fn pending(r: *const Run) u32 {
         if (r.stopping_since != 0) return 0;
@@ -352,6 +360,7 @@ fn logEnd(r: *Run) void {
             extra.exit = 125;
         } else if (last.?.timed_out) {
             extra.exit = 124;
+            extra.stopped = if (r.idle_stopped) "idle" else "time limit";
         } else if (r.last_wait) |w| switch (w.exit) {
             .code => |code| extra.exit = code,
             .signal => |sig| extra.signal = @intCast(@backingInt(sig)),
@@ -374,6 +383,7 @@ fn loop(r: *Run) void {
         reap(r);
         signals(r);
         timeouts(r);
+        if (r.rec.drain) idleDrain(r);
         if (r.running.items.len == 0 and (r.pending() == 0 or r.stopping_since != 0)) break;
         if (got_tstp.swap(false, .acq_rel)) suspend_(r);
         // A single run's signal while it waits ends it: nothing runs.
@@ -454,6 +464,55 @@ fn timeouts(r: *Run) void {
     if (r.stopping_since != 0 and now - r.stopping_since >= 5000) {
         for (r.running.items) |t| signalTask(r, t, .KILL);
     }
+}
+
+/// A drain holds the whole machine, so it must use it: every few seconds it samples its task
+/// tree's CPU time. Kept under `drain_idle_busy` CPUs for `drain_idle` while another run waits,
+/// it is warned halfway, then stopped as at its time limit.
+fn idleDrain(r: *Run) void {
+    const window: i64 = @as(i64, r.ctx.cfg.drain_idle_s) * 1000;
+    if (window == 0 or r.running.items.len == 0 or r.idle_stopped) return;
+    const now = sys.monoMs();
+    const every = @min(@as(i64, 30_000), @max(@divTrunc(window, 4), 500));
+    if (r.idle_at_ms != 0 and now - r.idle_at_ms < every) return;
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const me = sys.getpid();
+    const procs = sys.processes(r.ctx.io, a);
+    var own: u64 = 0;
+    for (procs) |p| if (p.pid == me) {
+        own = p.own_ns;
+    };
+    const cpu = sys.treeCpu(procs, me) -| own;
+    const prev_at = r.idle_at_ms;
+    const prev_cpu = r.idle_cpu_ns;
+    r.idle_at_ms = now;
+    r.idle_cpu_ns = cpu;
+    if (prev_at == 0) return;
+    const busy = @as(f64, @floatFromInt(cpu -| prev_cpu)) / 1e6 / @as(f64, @floatFromInt(@max(now - prev_at, 1)));
+    var others = false;
+    for (r.pool.scan(a)) |o| if (o.ticket != r.rec.ticket and o.want > 0) {
+        others = true;
+    };
+    if (busy >= drain_idle_busy or !others) {
+        r.idle_since_ms = 0;
+        r.idle_warned = false;
+        return;
+    }
+    if (r.idle_since_ms == 0) r.idle_since_ms = prev_at;
+    const idle = now - r.idle_since_ms;
+    if (!r.idle_warned and idle * 2 >= window) {
+        r.idle_warned = true;
+        std.debug.print("cpuq: this drain's command has kept under {d:.2} CPUs busy for {d}s while others wait; it is stopped at {d}s\n", .{ drain_idle_busy, @divTrunc(idle, 1000), @divTrunc(window, 1000) });
+    }
+    if (idle < window) return;
+    r.idle_stopped = true;
+    for (r.running.items) |*t| if (t.term_ms == 0) {
+        t.term_ms = now;
+        t.timed_out = true;
+        signalTask(r, t.*, .TERM);
+    };
 }
 
 fn signalTask(r: *Run, t: Task, sig: c.SIG) void {
@@ -879,7 +938,10 @@ fn finish(r: *Run) u8 {
         }
         const out = r.outcomes.items[r.outcomes.items.len - 1];
         if (out.timed_out) {
-            std.debug.print("cpuq: stopped at its time limit\n", .{});
+            if (r.idle_stopped)
+                std.debug.print("cpuq: drain stopped: its command kept under {d:.2} CPUs busy for {d}s while others waited\n", .{ drain_idle_busy, r.ctx.cfg.drain_idle_s })
+            else
+                std.debug.print("cpuq: stopped at its time limit\n", .{});
             return 124;
         }
         if (r.last_wait) |w| switch (w.exit) {
@@ -1049,6 +1111,12 @@ fn runNested(ctx: *Ctx, o: Opts, exe: [:0]const u8, cpu: u32) u8 {
 /// operation stops refilling and gives its CPUs back as its tasks end; once the drain holds the
 /// whole pool, CMD runs alone, unpinned, and the CPUs go back when it ends. With --max, a drain
 /// that hasn't the machine by then gives up (exit 75) and nothing runs.
+/// The longest a drain may hold the whole machine: `-t` and config `drain_timeout` go no higher.
+pub const drain_ceiling_s: u32 = 2 * 3600;
+/// A drain whose command keeps fewer CPUs than this busy (CPU seconds a second, whatever it
+/// holds) for `drain_idle` while another run waits is stopped: a timing run computes.
+pub const drain_idle_busy: f64 = 0.25;
+
 pub fn cmdDrain(ctx: *Ctx, args: []const [:0]const u8) u8 {
     var o: Opts = .{ .drain = true, .urgent = true };
     var i: usize = 0;
@@ -1067,12 +1135,16 @@ pub fn cmdDrain(ctx: *Ctx, args: []const [:0]const u8) u8 {
             o.wait_max_s = policy.parseAge(args[i + 1]) orelse return main.usageError("--max needs a time such as 90s or 10m, not '{s}'", .{args[i + 1]});
         } else if (std.mem.eql(u8, arg, "--label")) {
             o.label = args[i + 1];
+        } else if (std.mem.eql(u8, arg, "-t")) {
+            const t = policy.parseAge(args[i + 1]) orelse 0;
+            if (t == 0 or t > drain_ceiling_s) return main.usageError("a drain's -t needs a time limit up to 2h, such as 20m or 1h, not '{s}'", .{args[i + 1]});
+            o.timeout_s = t;
         } else return main.usageError("unknown option '{s}'", .{arg});
         i += 1;
     }
     if (o.cmd.len == 0) return main.usageError("drain needs a command", .{});
     main.loadConfig(ctx);
-    o.timeout_s = 0;
+    if (o.timeout_s == null) o.timeout_s = @min(@max(ctx.cfg.drain_timeout_s, 1), drain_ceiling_s);
     return run(ctx, o);
 }
 

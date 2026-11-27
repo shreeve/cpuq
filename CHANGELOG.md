@@ -2,6 +2,21 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.33.0 — 2026-11-27
+
+- **A drain can no longer hold a machine for hours.** On pup, a drain held all 22 CPUs for 2h51m
+  at 0.09 CPUs busy while eight runs waited: `--max` bounds only a drain's wait, and its command
+  had no time limit. Now:
+  - A drain's command has a time limit: 20 minutes unless `-t T` says otherwise (config
+    `drain_timeout`), at most 2 hours, never off. At the limit it is stopped, exit 124.
+  - A drain whose command keeps under 0.25 CPUs busy in all for 5 minutes (config `drain_idle`)
+    while another run waits is warned halfway, then stopped the same way. This counts CPUs busy,
+    not the share of the drain's CPUs, so a benchmark computing on one CPU runs on.
+  - History shows why: `124 time limit` or `124 idle` (`stopped` in `--json`).
+  - `cpuq status` flags a drain held past `drain_timeout` (`long_drain`), or whose command keeps
+    under 0.25 CPUs busy (`idle_drain`), in place of the per-CPU `low_use`, which flagged every
+    single-threaded benchmark.
+
 ## 0.32.0 — 2026-11-27
 
 - **A waiting `cpuq drain` no longer sits on idle CPUs: backfill.** A drain gathers the
