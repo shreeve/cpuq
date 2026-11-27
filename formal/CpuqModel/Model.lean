@@ -85,6 +85,8 @@ structure St where
   halted : Nat := 0
   /-- How many more Ctrl-Z the search may send. -/
   zs : Nat := 0
+  /-- Has held a CPU (the record's `served`), as bits by operation. -/
+  served : Nat := 0
   deriving DecidableEq, Repr, Hashable, Inhabited
 
 /-- Sets of operations as bits. -/
@@ -164,6 +166,17 @@ structure Rules where
   since it took the Ctrl-Z, and if one did, goes on instead. The plan's rules have it: they say
   nothing of how a Ctrl-Z is received, and the code's race is not theirs. -/
   haltChecks : Bool := true
+  /-- An operation is urgent only until it first holds a CPU (the record's `served`): holding
+  none again, it is not urgent again. Off: urgent whenever it holds none. -/
+  urgentOnce : Bool := false
+  /-- A stopped drain lets its mark go (and takes it again when continued), and free CPUs go
+  to the first drain that wants some. Off: a stopped drain keeps its mark, and free CPUs go to
+  the first living drain, or to no one while it wants none. -/
+  drainLets : Bool := false
+  /-- With `drainLets`, free CPUs go to the drain wanting some that holds or was granted the
+  most, then the older ticket, so at most one drain ever holds a CPU. Off: to the first in
+  ticket order. -/
+  drainMost : Bool := false
   deriving Repr
 
 namespace Rules
@@ -203,12 +216,15 @@ def poolFixed : Rules := { pool with behindFresh := true, stoppedWaits := false 
 stopped stays valid. (8f997ec drops those grants: the code there is `poolFixed`.) -/
 def pool0d315ed : Rules := { poolFixed with stoppedGrants := true }
 
-/-- The code as released (0.30.2): `poolFixed`, with a drain's mark held shared and a SIGCONT
-cancelling a Ctrl-Z not yet acted on. -/
-def released : Rules := { poolFixed with markShared := true, contCancels := true }
+/-- The code at 0.30.2: `poolFixed`, with a drain's mark held shared and a SIGCONT cancelling
+a Ctrl-Z not yet acted on. -/
+def code0302 : Rules := { poolFixed with markShared := true, contCancels := true }
 
-/-- `released` with the stop check this model proposes (README, "Findings" 8). -/
-def releasedFixed : Rules := { released with haltChecks := true }
+/-- The code as released (0.30.3): `code0302` with the fixes of README's Findings 7, 8 and 9:
+urgent only until served, the stop check before SIGSTOP, and a stopped drain letting the pool
+go. -/
+def released : Rules :=
+  { code0302 with urgentOnce := true, haltChecks := true, drainLets := true }
 
 end Rules
 
@@ -317,7 +333,7 @@ def projEff (cfg : Cfg) (s : St) (p : Nat) : Nat :=
 
 /-- Urgent class: an urgent operation while no urgent operation of its project holds a slot. -/
 def urgentFirst (cfg : Cfg) (s : St) (o : Nat) : Bool :=
-  (cfg.op o).urgent && (opIds cfg).all (fun o' =>
+  (cfg.op o).urgent && !(cfg.rules.urgentOnce && bit s.served o) && (opIds cfg).all (fun o' =>
     !((cfg.op o').urgent && (cfg.op o').proj == (cfg.op o).proj) || eff cfg s o' == 0)
 
 /-- In the line: alive and wanting a slot (and, without `standing`, holding none). -/
@@ -370,8 +386,23 @@ def yieldTo (cfg : Cfg) (s : St) (o h : Nat) : Bool :=
 
 /-- The first `cpuq drain` in ticket order that has started and not ended (alive or stopped:
 its record stays while it is stopped). -/
-def drainer (cfg : Cfg) (s : St) : Option Nat :=
+def firstDrain (cfg : Cfg) (s : St) : Option Nat :=
   s.order.find? (fun o => drainOp cfg o && ((s.op o).phase == .alive || (s.op o).phase == .stopped))
+
+/-- The drain free tokens go to: with `drainLets`, the first in ticket order that wants some
+(with `drainMost`, the one of those holding the most); else the first that has started and not
+ended. -/
+def drainer (cfg : Cfg) (s : St) : Option Nat :=
+  if cfg.rules.drainLets then
+    if cfg.rules.drainMost then
+      s.order.foldl (fun best o =>
+        if drainOp cfg o && decide (demand cfg s o > 0) then
+          match best with
+          | none => some o
+          | some b => if s.owned o + s.grants o > s.owned b + s.grants b then some o else best
+        else best) none
+    else s.order.find? (fun o => drainOp cfg o && decide (demand cfg s o > 0))
+  else firstDrain cfg s
 
 /-- Who a free token goes to: while there is a drainer, it alone (and no one while it wants
 nothing); else the head of the line. -/
@@ -409,13 +440,17 @@ def killOn (c : Nat) (t : Task) : Task :=
 def reclaimOps (c : Nat) (ops : List Op) : List Op :=
   ops.map (fun op => if op.phase == .dead then { op with tasks := op.tasks.map (killOn c) } else op)
 
+/-- With `urgentOnce`, taking a CPU marks the operation served. -/
+def serve (cfg : Cfg) (n o : Nat) : Nat := if cfg.rules.urgentOnce then setBit n o else n
+
 /-- `o` takes token `c`: first kills a dead operation's leftovers on it (with `reclaim`), then
-holds its flock with a fresh, empty slot. -/
+holds its flock with a fresh, empty slot (and, with `urgentOnce`, is served). -/
 def takeTok (cfg : Cfg) (s : St) (o c : Nat) : St :=
   let s1 := if cfg.rules.reclaim then { s with ops := reclaimOps c s.ops } else s
   { s1 with
     cpus := s1.cpus.set c { lock := some o, grant := none, slot := some { owner := o } }
-    drains := s1.drains - (if drainingC (s.cpu c) then 1 else 0) }
+    drains := s1.drains - (if drainingC (s.cpu c) then 1 else 0)
+    served := serve cfg s1.served o }
 
 def firstFree (cfg : Cfg) (s : St) : Option Nat :=
   (List.range s.cpus.length).find? (fun c => freeC cfg s (s.cpu c))
@@ -677,6 +712,14 @@ def leave (s : St) (o : Nat) : St :=
   { s with marks := clrBit s.marks o, tstp := clrBit s.tstp o, held := clrBit s.held o,
            halted := clrBit s.halted o }
 
+/-- With `drainLets`, a drain stopping lets its mark go. -/
+def letsGo (cfg : Cfg) (o : Nat) : Bool := cfg.rules.drainLets && drainOp cfg o
+
+/-- A drain continued takes its mark again (`suspend_`): under the pool lock, but a shared lock
+waits for no one, so here it is part of the continue. -/
+def retake (cfg : Cfg) (s : St) (o : Nat) : St :=
+  if letsGo cfg o then { s with marks := setBit s.marks o } else s
+
 /-- A step with its locks and signals. `step` is the effect of each critical section on the
 pool; `move` adds the pool lock (a drain takes its mark while holding it), the drain mark, and
 Ctrl-Z as the code receives it: the handler notes it, the loop acts on it, the parent then
@@ -702,16 +745,21 @@ def move (cfg : Cfg) (s : St) (a : Act) : Option St :=
       some { s with tstp := setBit s.tstp o, held := setBit s.held o, zs := s.zs - 1 }
     else none
   | .stop o =>
-    if bit s.tstp o then (step cfg s a).map fun s' => { s' with tstp := clrBit s'.tstp o } else none
+    if bit s.tstp o then
+      (step cfg s a).map fun s' =>
+        { s' with tstp := clrBit s'.tstp o,
+                  marks := if letsGo cfg o then clrBit s'.marks o else s'.marks }
+    else none
   | .halt o =>
     if (s.op o).phase == .stopped && !bit s.halted o then
-      if cfg.rules.haltChecks && !bit s.held o then step cfg s (.cont o)
+      if cfg.rules.haltChecks && !bit s.held o then (step cfg s (.cont o)).map (retake cfg · o)
       else some { s with halted := setBit s.halted o }
     else none
   | .cont o =>
     if bit s.held o then
       if bit s.halted o then
-        (step cfg s a).map fun s' => { s' with held := clrBit s'.held o, halted := clrBit s'.halted o }
+        (step cfg s a).map fun s' =>
+          retake cfg { s' with held := clrBit s'.held o, halted := clrBit s'.halted o } o
       else
         some { s with held := clrBit s.held o,
                       tstp := if cfg.rules.contCancels then clrBit s.tstp o else s.tstp }

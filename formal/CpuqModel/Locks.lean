@@ -201,6 +201,12 @@ theorem step_phase {cfg : Cfg} {s t : St} {a : Act} (e : step cfg s a = some t) 
 def LockOk (cfg : Cfg) (s : St) : Prop :=
   ∀ o, s.poolLock = some o → drainOp cfg o = true ∧ (s.op o).phase = .waiting
 
+theorem LockOk.retake {cfg : Cfg} {u : St} {o : Nat} (h : LockOk cfg u) :
+    LockOk cfg (Cpuq.retake cfg u o) := by
+  unfold Cpuq.retake; split
+  · exact h
+  · exact h
+
 theorem LockOk.move {cfg : Cfg} {s t : St} {a : Act} (h : LockOk cfg s)
     (e : move cfg s a = some t) : LockOk cfg t := by
   -- After a step that needs the lock, the lock is free (it was, and `step` keeps it).
@@ -289,7 +295,8 @@ theorem LockOk.move {cfg : Cfg} {s t : St} {a : Act} (h : LockOk cfg s)
       dsimp only at e
       split at e
       · split at e
-        · exact keep e (by intro p x; cases x)
+        · obtain ⟨u, hu, rfl⟩ := Option.map_eq_some_iff.1 e
+          exact (keep hu (by intro p x; cases x)).retake
         · cases e; exact h
       · cases e
     | cont o =>
@@ -297,7 +304,7 @@ theorem LockOk.move {cfg : Cfg} {s t : St} {a : Act} (h : LockOk cfg s)
       split at e
       · split at e
         · obtain ⟨u, hu, rfl⟩ := Option.map_eq_some_iff.1 e
-          exact fun p hp => keep (b := .cont o) hu (by intro p x; cases x) p hp
+          exact LockOk.retake (fun p hp => keep (b := .cont o) hu (by intro p x; cases x) p hp)
         · cases e; exact h
       · cases e
     | exit o i ok => exact keep e (by intro p x; cases x)

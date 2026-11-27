@@ -434,21 +434,81 @@ theorem Reach.tickets {cfg : Cfg} {s : St} (r : Reach cfg s) :
     cases h : cfg.ops[o]? <;> simp [h, started] at hs
   | step a _ e ih => exact move_tickets e ih
 
-theorem drainer_congr {cfg : Cfg} {s t : St} (ho : s.ops = t.ops) (hr : s.order = t.order) :
-    drainer cfg s = drainer cfg t := by
-  simp only [drainer, hr, phase_of_ops ho]
+theorem firstDrain_congr {cfg : Cfg} {s t : St} (ho : s.ops = t.ops) (hr : s.order = t.order) :
+    firstDrain cfg s = firstDrain cfg t := by
+  simp only [firstDrain, hr, phase_of_ops ho]
+
+/-- An operation that wants a CPU has started and not ended. -/
+theorem wants_living {cfg : Cfg} {s : St} {o : Nat} (h : demand cfg s o > 0) :
+    (s.op o).phase = .alive ∨ (s.op o).phase = .stopped := by
+  unfold demand at h
+  split at h
+  · rename_i hl
+    simp only [liveOp, St.isAlive, Bool.or_eq_true, beq_iff_eq, Bool.and_eq_true] at hl
+    rcases hl with hl | ⟨_, hl⟩
+    · exact .inl hl
+    · exact .inr hl
+  · omega
+
+theorem foldl_skip {p : Nat → Bool} {F : Option Nat → Nat → Option Nat} (l : List Nat)
+    (h : ∀ x ∈ l, p x = false) (b : Option Nat) :
+    l.foldl (fun best o => if p o then F best o else best) b = b := by
+  induction l generalizing b with
+  | nil => rfl
+  | cons x l ih =>
+    simp only [List.foldl, h x (List.mem_cons_self ..), Bool.false_eq_true, ite_false]
+    exact ih (fun y hy => h y (List.mem_cons_of_mem _ hy)) b
+
+/-- No drain living: no drainer. -/
+theorem drainer_none {cfg : Cfg} {s : St} (h : firstDrain cfg s = none) : drainer cfg s = none := by
+  unfold drainer; split
+  · split
+    · unfold firstDrain at h
+      rw [List.find?_eq_none] at h
+      apply foldl_skip
+      intro x hx
+      cases hq : (drainOp cfg x && decide (demand cfg s x > 0))
+      · rfl
+      · simp only [Bool.and_eq_true, decide_eq_true_eq] at hq
+        exfalso; apply h x hx
+        rcases wants_living hq.2 with e | e <;> simp [hq.1, e]
+    · unfold firstDrain at h
+      rw [List.find?_eq_none] at h ⊢
+      intro x hx hq
+      simp only [Bool.and_eq_true, decide_eq_true_eq] at hq
+      apply h x hx
+      rcases wants_living hq.2 with e | e <;> simp [hq.1, e]
+  · exact h
+
+/-- The first living drain, while it wants a CPU, is the drainer. -/
+theorem drainer_of_first {cfg : Cfg} {s : St} {d : Nat} (hm : cfg.rules.drainMost = false)
+    (h : firstDrain cfg s = some d) (hw : demand cfg s d > 0) : drainer cfg s = some d := by
+  unfold drainer; simp only [hm, Bool.false_eq_true, ite_false]; split
+  · unfold firstDrain at h
+    have hd := (List.find?_eq_some_iff_append.1 h).1
+    simp only [Bool.and_eq_true] at hd
+    apply List.find?_eq_some_iff_append.2
+    obtain ⟨_, as, bs, e, hn⟩ := List.find?_eq_some_iff_append.1 h
+    refine ⟨by simp [hd.1, hw], as, bs, e, fun a ha => ?_⟩
+    have := hn a ha
+    cases hda : drainOp cfg a
+    · simp
+    · have hm : ¬ demand cfg s a > 0 := fun hm => by
+        rcases wants_living hm with e | e <;> simp [hda, e] at this
+      simp [hm]
+  · exact h
 
 /-- L2 for every reachable state under a standing line: right after a hand-out pass, if a token
 is free and no `cpuq drain` is in the line, then no living operation wants a slot. -/
 theorem work_conserving {cfg : Cfg} {s : St} (r : Reach cfg s) (hst : cfg.rules.standing = true)
-    (hdr : drainer cfg s = none) (c : Nat) (hc : c < s.cpus.length)
+    (hdr : firstDrain cfg s = none) (c : Nat) (hc : c < s.cpus.length)
     (hf : freeC cfg (handout cfg s) ((handout cfg s).cpu c) = true)
     (o : Nat) (ha : ((handout cfg s).op o).phase = .alive) : demand cfg (handout cfg s) o = 0 := by
   have ht := handout_conserves cfg s c hc hf
   obtain ⟨ho1, ho2⟩ := handout_order_ops cfg s
   have hh : head cfg (handout cfg s) = none := by
-    rw [← drainer_congr ho2 ho1] at hdr
-    simpa [target, hdr] using ht
+    rw [← firstDrain_congr ho2 ho1] at hdr
+    simpa [target, drainer_none hdr] using ht
   apply standing_line hst hh o _ ha
   rw [ho1]; rw [phase_of_ops ho2] at ha
   exact r.tickets o (by simp [started, ha])

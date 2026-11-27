@@ -224,19 +224,19 @@ theorem Inv.runningOn_zero {cfg : Cfg} {s : St} {o c : Nat} (h : Inv cfg s)
 def takenCpu (o : Nat) : Cpu := { lock := some o, grant := none, slot := some { owner := o } }
 
 /-- The state after `o` takes token `c` with reclaim. -/
-def taken (s : St) (o c : Nat) : St :=
+def taken (s : St) (o c sv : Nat) : St :=
   St.mk (s.cpus.set c (takenCpu o)) (reclaimOps c s.ops) s.order
     (s.drains - (if drainingC (s.cpu c) then 1 else 0)) s.crashes s.poolLock s.marks s.tstp s.held
-    s.halted s.zs
+    s.halted s.zs sv
 
 theorem takeTok_eq (cfg : Cfg) (s : St) (o c : Nat) (hr : cfg.rules.reclaim = true) :
-    takeTok cfg s o c = taken s o c := by
+    takeTok cfg s o c = taken s o c (serve cfg s.served o) := by
   simp [takeTok, hr, taken, takenCpu]
 
-theorem taken_op (s : St) (o c o' : Nat) : (taken s o c).op o' = (reclaimed s c).op o' := rfl
-theorem taken_task (s : St) (o c o' i : Nat) : (taken s o c).task o' i = (reclaimed s c).task o' i := rfl
-theorem taken_runningOn (s : St) (o c o' c' : Nat) :
-    (taken s o c).runningOn o' c' = (reclaimed s c).runningOn o' c' := rfl
+theorem taken_op (s : St) (o c o' : Nat) {sv : Nat} : (taken s o c sv).op o' = (reclaimed s c).op o' := rfl
+theorem taken_task (s : St) (o c o' i : Nat) {sv : Nat} : (taken s o c sv).task o' i = (reclaimed s c).task o' i := rfl
+theorem taken_runningOn (s : St) (o c o' c' : Nat) {sv : Nat} :
+    (taken s o c sv).runningOn o' c' = (reclaimed s c).runningOn o' c' := rfl
 
 theorem Inv.takeTok {cfg : Cfg} {s : St} {o c : Nat} (h : Inv cfg s) (hr : cfg.rules.reclaim = true)
     (ha : (s.op o).phase = .alive) (hc : c < s.cpus.length) (hl : (s.cpu c).lock = none)
@@ -244,7 +244,7 @@ theorem Inv.takeTok {cfg : Cfg} {s : St} {o c : Nat} (h : Inv cfg s) (hr : cfg.r
     Inv cfg (takeTok cfg s o c) := by
   rw [takeTok_eq cfg s o c hr]
   -- How the new state reads.
-  have hcpu : ∀ c', (taken s o c).cpu c' = if c = c' then takenCpu o else s.cpu c' := by
+  have hcpu : ∀ c', (taken s o c (serve cfg s.served o)).cpu c' = if c = c' then takenCpu o else s.cpu c' := by
     intro c'; simp only [St.cpu, taken, getD_set, hc, and_true]
   -- The old record is not a living operation's.
   have hold : ∀ sl, (s.cpu c).slot = some sl → (s.op sl.owner).phase ≠ .alive := by
@@ -359,7 +359,7 @@ theorem Inv.takeTok {cfg : Cfg} {s : St} {o c : Nat} (h : Inv cfg s) (hr : cfg.r
 
 /-- `s` with CPU `c`'s record replaced, the drain count and the tickets given. -/
 def withCpu (s : St) (c : Nat) (x : Cpu) (d : Nat) (ord : List Nat) : St :=
-  St.mk (s.cpus.set c x) s.ops ord d s.crashes s.poolLock s.marks s.tstp s.held s.halted s.zs
+  St.mk (s.cpus.set c x) s.ops ord d s.crashes s.poolLock s.marks s.tstp s.held s.halted s.zs s.served
 
 theorem withCpu_cpu (s : St) (c : Nat) (x : Cpu) (d : Nat) (ord : List Nat) (c' : Nat)
     (hc : c < s.cpus.length) : (withCpu s c x d ord).cpu c' = if c = c' then x else s.cpu c' := by
@@ -787,7 +787,7 @@ def dropLock (o : Nat) (x : Cpu) : Cpu := if x.lock == some o then { x with lock
 
 def crashed (s : St) (o : Nat) : St :=
   St.mk (s.cpus.map (dropLock o)) (s.setPhase o .dead).ops s.order s.drains (s.crashes - 1)
-    s.poolLock s.marks s.tstp s.held s.halted s.zs
+    s.poolLock s.marks s.tstp s.held s.halted s.zs s.served
 
 theorem crashed_cpu (s : St) (o c : Nat) : (crashed s o).cpu c = dropLock o (s.cpu c) := by
   simp only [St.cpu, crashed]
@@ -883,7 +883,7 @@ def clearOf (o : Nat) (x : Cpu) : Cpu := if ownsC o x then {} else x
 
 def retired (s : St) (o : Nat) (g : Task → Task) (p : Phase) : St :=
   St.mk (s.cpus.map (clearOf o)) (s.ops.set o { phase := p, tasks := (s.op o).tasks.map g }) s.order
-    (s.drains - s.drainOf o) s.crashes s.poolLock s.marks s.tstp s.held s.halted s.zs
+    (s.drains - s.drainOf o) s.crashes s.poolLock s.marks s.tstp s.held s.halted s.zs s.served
 
 theorem retire_eq (s : St) (o : Nat) (g : Task → Task) (p : Phase) (ho : o < s.ops.length) :
     ((releaseAll s o).mapTasks o g).setPhase o p = retired s o g p := by
@@ -1381,38 +1381,13 @@ theorem move_cases {cfg : Cfg} {s s' : St} {a : Act} (e : move cfg s a = some s'
     obtain ⟨t, ht, rfl⟩ := Option.map_eq_some_iff.1 e
     exact ⟨b, t, ht, hf t⟩
   unfold move at e
-  split at e
-  · cases e
-  · split at e
-    · split at e
-      · cases e
-      · exact .inr ⟨_, _, e, Same.rfl' _⟩
-    · split at e
-      · cases e; exact .inl ⟨rfl, rfl, rfl, rfl⟩
-      · cases e
-    · split at e
-      · exact .inr (viaMap _ _ (fun _ => by exact ⟨rfl, rfl, rfl, rfl⟩) e)
-      · cases e
-    · exact .inr (viaMap _ _ (fun _ => by exact ⟨rfl, rfl, rfl, rfl⟩) e)
-    · exact .inr (viaMap _ _ (fun _ => by exact ⟨rfl, rfl, rfl, rfl⟩) e)
-    · exact .inr (viaMap _ _ (fun _ => by exact ⟨rfl, rfl, rfl, rfl⟩) e)
-    · split at e
-      · cases e; exact .inl ⟨rfl, rfl, rfl, rfl⟩
-      · cases e
-    · split at e
-      · exact .inr (viaMap _ _ (fun _ => by exact ⟨rfl, rfl, rfl, rfl⟩) e)
-      · cases e
-    · split at e
-      · split at e
-        · exact .inr ⟨_, _, e, Same.rfl' _⟩
-        · cases e; exact .inl ⟨rfl, rfl, rfl, rfl⟩
-      · cases e
-    · split at e
-      · split at e
-        · exact .inr (viaMap _ _ (fun _ => by exact ⟨rfl, rfl, rfl, rfl⟩) e)
-        · cases e; exact .inl ⟨rfl, rfl, rfl, rfl⟩
-      · cases e
-    · exact .inr ⟨_, _, e, Same.rfl' _⟩
+  repeat' split at e
+  all_goals first
+    | exact .inr ⟨_, _, e, Same.rfl' _⟩
+    | (cases e; exact .inl ⟨rfl, rfl, rfl, rfl⟩)
+    | exact .inr (viaMap _ _ (fun _ => by
+        first | exact ⟨rfl, rfl, rfl, rfl⟩ | (unfold retake; split <;> exact ⟨rfl, rfl, rfl, rfl⟩)) e)
+    | cases e
 
 theorem Inv.move {cfg : Cfg} {s s' : St} {a : Act} (hs : Safe cfg.rules) (h : Inv cfg s)
     (e : move cfg s a = some s') : Inv cfg s' := by
