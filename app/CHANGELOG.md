@@ -3,6 +3,16 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.24.0 — 2026-11-27
+
+- **Work outside cpuq, by who started it.** With cpuq 0.31 on, the jobs list starts with each
+  piece of work running outside cpuq that keeps a CPU busy: who started it (an agent, ssh, a
+  terminal, or detached), its folder and command, its processes, the CPUs it keeps busy and its
+  pid. The header counts them ("· 2 outside cpuq"), and the tooltip has the whole command and
+  path. Apps and system services (detached, in `/`) are left out. The notification for heavy
+  work outside cpuq names the same.
+- The "+N more" badge on a long jobs list sits in the middle, not over the last row's figures.
+
 ## 0.23.0 — 2026-11-26
 
 - Needs cpuq 0.30.0 or later, which gives each task one CPU from a pool shared by a fair line.

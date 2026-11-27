@@ -28,7 +28,9 @@ bottom, its sections' heights dragged to taste:
   efficiency cores) on one time axis, with rose where jobs waited while pool CPUs sat free and a strip
   of how many waited. Pointing at a moment replays it in the cells. A right click forgets what is
   older than that moment, or than five minutes ago.
-- **Jobs:** each project's CPUs against its fair share by weight, then each running job's
+- **Jobs:** each project's CPUs against its fair share by weight; first, any work running
+  outside cpuq that keeps a CPU busy (who started it, its folder and command, its CPUs: cpuq 0.31
+  on); then each running job's
   progress (its count, else its tasks done of all), what cpuq sees wrong with it, its project's
   weight, the CPU it uses of the CPUs it holds, and how long it has run; each waiting job says why
   it waits. A right click pauses or resumes a job (Ctrl-Z and fg: paused, its CPUs go back to the

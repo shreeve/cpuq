@@ -186,3 +186,25 @@ import Testing
     #expect(s.outside[1].shortCommand == "zig" && s.outside[1].command == nil)
     #expect(try Status.decode(Data(#"{"schema":1}"#.utf8)).outsideTotal == nil)
 }
+
+@Test func decodesOutsideWorkByStarter() throws {
+    let json = """
+    {"schema": 2, "budget": 4, "outside_total": 3.1,
+     "outside_work": [{"pid": 77, "command": "/bin/bash -c for n in 4 9; do python3 r5mut.py $n & done", "cwd": "/home/s/emdb",
+                       "via": "sshd-session", "procs": 9, "using": 3.0}]}
+    """
+    let s = try Status.decode(Data(json.utf8))
+    #expect(s.outsideWork.count == 1)
+    let w = s.outsideWork[0]
+    #expect(w.pid == 77 && w.procs == 9 && w.using == 3.0 && w.cwd == "/home/s/emdb")
+    #expect(w.shortCommand == "bash -c for n in 4 9; do python3 r5mut.py $n & done")
+    #expect(w.starter == "ssh" && w.ranBySomeone)
+    // A service or an app runs detached in /: not work someone ran. A detached job in its own
+    // folder is.
+    var svc = w; svc.via = "launchd"; svc.cwd = "/"
+    #expect(!svc.ranBySomeone)
+    svc.cwd = "/home/s/emdb"
+    #expect(svc.ranBySomeone)
+    // Older cpuq: no outside_work.
+    #expect(try Status.decode(Data(#"{"schema": 2}"#.utf8)).outsideWork.isEmpty)
+}
