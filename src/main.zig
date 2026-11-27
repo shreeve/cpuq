@@ -53,6 +53,7 @@ const usage =
     \\usage: cpuq run [-n M] [-c C] [-x K] [-t T] [-r N] [run options] [--] CMD [ARGS...]
     \\       cpuq drain -c N | --all [--max T] [-t T] [--label L] [--] CMD [ARGS...]
     \\       cpuq kill TICKET|PID|LABEL
+    \\       cpuq limit TICKET|PID|LABEL -c C [--host HOST]
     \\       cpuq lease NAME [--slots N] [--label L] [--wait-max S] [--host HOST] [--] CMD [ARGS...]
     \\       cpuq lease NAME --host HOST --hold [--slots N] [--label L] [--wait-max S]
     \\       cpuq wait --label PATTERN [--max-wait S]
@@ -96,6 +97,8 @@ const usage =
     \\                        machine (at most 20m); --max T gives up (exit 75); -t T ends CMD
     \\                        (exit 124; default 20m, at most 2h)
     \\  kill                  end a run here: SIGTERM to its tasks, SIGKILL 5 s later
+    \\  limit                 change a running run's -c (a count or 50%): raised, it takes
+    \\                        free CPUs at once; lowered, it gives CPUs back as tasks end
     \\  lease                 hold one of NAME's --slots places (default 1) while CMD runs, first
     \\                        come first served; --host holds it on HOST over ssh, --hold prints
     \\                        `held NAME@HOST ENTRY` and holds until stdin closes
@@ -200,6 +203,7 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
     }
     if (std.mem.eql(u8, cmd, "wait")) return runner.cmdWait(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "kill")) return op.cmdKill(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "limit")) return op.cmdLimit(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "history")) return records.cmdHistory(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "record")) return records.cmdRecord(ctx, args[1..]);
     inline for (.{

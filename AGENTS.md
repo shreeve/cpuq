@@ -41,7 +41,8 @@ them for CMD, not for your shell: use `sh -c` with SINGLE quotes.
   K = 1 + time waiting ÷ time computing. Never for computing.
 - `-t T`: each task's time limit, about ten times its usual time (`-t 30s`; default 1h).
 - `-r N`: try a failed task up to N more times (`CPUQ_ATTEMPT` says which try). Flaky work only.
-- `-c C`: hold at most C CPUs, or `-c 25%`. Usually leave it out.
+- `-c C`: hold at most C CPUs, or `-c 25%`. Usually leave it out. `cpuq limit LABEL -c C` changes it while the run runs
+  (raised: it takes free CPUs at once; lowered: it gives CPUs back as tasks end).
 - One run per phase: build with one task, then test with `-n M`.
 
 ## Labels

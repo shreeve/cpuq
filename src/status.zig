@@ -529,6 +529,8 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
             if (per > over_use) flags.append(a, "over_cpu") catch {};
         };
         if (stopped) flags.append(a, "stopped") catch {};
+        // Held back by its own -c: tasks queued while CPUs sit free.
+        if (!o.drain and o.held.len >= o.limit and o.limit < pool_n and o.tasks > o.done + o.failed + o.running and free.len > 0) flags.append(a, "capped") catch {};
         const ended = o.done + o.failed;
         const ran: f64 = @floatFromInt(@max(now - o.since, 0));
         holders.append(a, .{
@@ -711,6 +713,8 @@ fn flagNotes(a: std.mem.Allocator, holders: []const JsonHolder) []const []const 
                 a.print("{s}: its CPU averages {d:.2} busy", .{ whoText(a, h), per }))
         else if (std.mem.eql(u8, f, "over_cpu"))
             a.print("{s}: {d:.2} busy per CPU held: its tasks run beyond their CPUs", .{ whoText(a, h), per })
+        else if (std.mem.eql(u8, f, "capped"))
+            a.print("{s}: {d} tasks queued under its -c {d} while CPUs are free; raise it with cpuq limit {d} -c N", .{ whoText(a, h), h.tasks -| (h.done + h.failed + h.running), h.limit, h.ticket })
         else if (std.mem.eql(u8, f, "idle_drain"))
             a.print("{s}: a drain whose command keeps {d:.2} CPUs busy; under {d:.2} for `drain_idle` while others wait, it is stopped", .{ whoText(a, h), h.using orelse 0, op_mod.drain_idle_busy })
         else if (std.mem.eql(u8, f, "long_drain"))
