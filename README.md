@@ -326,6 +326,14 @@ however it ends. `--max T` (`90s`, `10m`) gives up if the machine isn't empty by
 and nothing runs. Its own builds and helpers run inside it as nested runs. A drain that spans
 several commands wraps them in one: `cpuq drain --label app:bench -- ./bench.sh`.
 
+The CPUs a drain has gathered don't sit idle while it waits for long tasks: **backfill**. The
+drain can start no sooner than the last task it waits for may end (its start plus its `-t`). A
+task whose own `-t` ends before then runs on the drain's CPUs meanwhile, in the line's order, one
+task or a run of many. So a short test still runs while a drain waits an hour for a long build,
+and the drain still starts by the time the tasks it waited for could have run to their `-t`. A task that could run past that waits for the
+drain. While a task with no time limit (`-t 0`) is in the way, or two drains wait, nothing
+backfills.
+
 Draining a busy machine stops everyone, so time where that is fair: a quiet machine, or another
 machine through a named lease (`cpuq lease bench --host buildbox -- ssh buildbox 'cd repo && cpuq
 drain -- ./bench'`). Work outside cpuq (system services) still runs; `cpuq status` shows it.

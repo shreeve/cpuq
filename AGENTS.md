@@ -65,7 +65,9 @@ branch names: history is kept by label.
     cpuq drain --label app:bench --max 10m -- ./bench
 
 Every run gives its CPUs back as its tasks end; then CMD runs alone, unpinned, and the CPUs go back
-when it ends. `--max` gives up with exit 75. It stops everyone: only for real timing.
+when it ends. `--max` gives up with exit 75. While it waits, a task whose `-t` ends before the
+drain could start runs on its idle CPUs (backfill): a short `-t` gets work through. It stops
+everyone else: only for real timing.
 
 ## Another machine
 

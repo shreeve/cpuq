@@ -2,6 +2,18 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.32.0 — 2026-11-27
+
+- **A waiting `cpuq drain` no longer sits on idle CPUs: backfill.** A drain gathers the
+  machine's CPUs as they free up and waits for the last long task to end. On burst, 84 of 94
+  CPUs sat held and idle for over an hour while short test tasks waited behind it and timed out.
+  Now the drain can start no sooner than the last task it waits for may end (its start plus its
+  `-t`), and a task whose own `-t` ends before then runs on the drain's CPUs meanwhile, in the
+  line's order: one task or a run of many. The drain still starts by the time the tasks it waited
+  for could have run to their `-t`.
+  A task that could run past that, or any task while one with no time limit (`-t 0`) is in the
+  way, waits for the drain as before.
+
 ## 0.31.2 — 2026-11-27
 
 - **`cpuq status` lists only work someone ran outside cpuq.** Apps and system services (detached,
