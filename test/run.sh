@@ -312,6 +312,17 @@ t_order() {
   wait
   local got; got=$(tr -d '\n' <"$f")
   check "--urgent goes first, then first come first served (got $got)" "[ '$got' = Uabcd ]"
+  # --urgent counts for an operation's first CPU only: an urgent run with long work that holds
+  # one CPU gives it up for a waiter of its own project, rather than rank first again.
+  setup urgent-once "budget = 2"
+  "$CPUQ" run -n 30 --label q:b -- sleep 0.5 2>/dev/null & local b=$!
+  wait_held 2
+  "$CPUQ" run --urgent -n 30 --label p:u -- sleep 0.5 2>/dev/null & local u=$!
+  poll 5 '[ "$(sj "len([h for h in s[\"holders\"] if h[\"cores\"]])")" = 2 ]'
+  local t0 rc dt; t0=$(now)
+  "$CPUQ" run --wait-max 6 --label p:c -- true; rc=$?; dt=$(since "$t0")
+  kill -TERM $u $b; reap $u; reap $b
+  check "an urgent run holding a CPU gives way to a waiter of its project (rc $rc after ${dt}s)" "[ $rc = 0 ] && fl '$dt < 4'"
 }
 
 t_drain() {
@@ -497,6 +508,36 @@ f = open(sys.argv[1], "r+"); fcntl.flock(f, fcntl.LOCK_EX); open(sys.argv[2], "w
   if poll 8 "! kill -0 $a 2>/dev/null"; then ended=yes; else st2=$(ps -o stat= -p $a | tr -d ' '); kill -CONT $a; fi
   reap $a; wait $h
   check "a stop then a continue while cpuq is busy leave the run running: it finishes (ended: $ended $st2)" "[ $ended = yes ]"
+  # A continue that lands after cpuq has taken the stop, while it gives its CPUs back (here:
+  # blocked on the pool's lock, held from outside), as from an agent's `kill -TSTP; kill -CONT`:
+  # cpuq doesn't stop itself after it, and the run finishes.
+  dfl "$CPUQ" run --label z:lost -- sh -c 'sleep 1; echo finished >"$1"' sh "$T/lost" 2>/dev/null & a=$!
+  wait_held 1
+  python3 -c 'import fcntl, sys, time
+f = open(sys.argv[1], "r+"); fcntl.flock(f, fcntl.LOCK_EX); open(sys.argv[2], "w").write("1"); time.sleep(1.5)' "$CPUQ_DIR/v2/lock" "$T/locked2" & p=$!
+  wait_file "$T/locked2"
+  kill -TSTP $a; sleep 0.4; kill -CONT $a
+  wait $p
+  ended=no; st2=""
+  if poll 8 "! kill -0 $a 2>/dev/null"; then ended=yes; else st2=$(ps -o stat= -p $a | tr -d ' '); kill -CONT $a; fi
+  reap $a
+  check "a continue while cpuq gives its CPUs back for a stop leaves the run running: it finishes (ended: $ended $st2, $(cat "$T/lost" 2>/dev/null))" \
+    "[ $ended = yes ] && [ \"\$(cat '$T/lost' 2>/dev/null)\" = finished ]"
+  # A drain stopped by Ctrl-Z lets the pool go: the CPUs it waited for go back to work, not idle
+  # until it continues. Continued, it takes the pool again and its command runs.
+  setup ctrl-z-drain "budget = 2"
+  "$CPUQ" run -n 8 --label z:work -- sleep 1.5 2>/dev/null & local w=$!
+  wait_held 2
+  dfl "$CPUQ" drain --max 30s --label z:drain -- touch "$T/drained" 2>/dev/null & a=$!
+  wait_waiters 1; sleep 0.2
+  kill -TSTP $a
+  sleep 2  # past the end of the tasks running when the drain came
+  local busy=no; poll 4 '[ "$(held)" = 2 ]' && busy=yes
+  kill -CONT $a
+  local rd; reap $a; rd=$?
+  wait $w; local rw=$?
+  check "a stopped drain lets its CPUs go to work (busy: $busy); continued, it runs (rc $rd, ran: $([ -e "$T/drained" ] && echo yes || echo no)); the work ends (rc $rw)" \
+    "[ $busy = yes ] && [ $rd = 0 ] && [ -e '$T/drained' ] && [ $rw = 0 ]"
 }
 
 t_nested() {

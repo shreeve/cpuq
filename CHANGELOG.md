@@ -2,6 +2,21 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.30.3 — 2026-11-27
+
+Three faults the Lean model (`formal/`) found, each now with a test that fails on 0.30.2.
+
+- **`--urgent` counts for a run's first CPU only.** An urgent run with long work that gave a CPU
+  up and held nothing again was urgent again, so it kept its CPU, and a waiter of its own project
+  waited as long as that work lasted. Once a run has held a CPU it is urgent no more.
+- **A continue right after a stop no longer leaves a run stopped for good.** If the SIGCONT came
+  while cpuq was giving its CPUs back for the stop, cpuq stopped itself afterwards with no
+  continue to follow (a shell could `fg` it again; a script's `kill -TSTP; kill -CONT` couldn't).
+  cpuq now counts continues and doesn't stop itself once one has come.
+- **A drain stopped by Ctrl-Z lets the pool go.** While it was stopped, every other run kept
+  emptying its CPUs for it and the freed CPUs sat idle until it continued. A stopped drain now
+  lets its mark go and the line passes it by; continued, it takes the pool again.
+
 ## 0.30.2 — 2026-11-26
 
 - **`cpuq status` names a stuck pool instead of hanging.** Every step under the pool's lock takes

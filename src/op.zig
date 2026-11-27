@@ -92,15 +92,22 @@ fn onStop(sig: c.SIG) callconv(.c) void {
 }
 
 var got_tstp = std.atomic.Value(bool).init(false);
+/// Continues received, and their count when the last stop came: a continue after the stop it
+/// answers has moved the count.
+var conts = std.atomic.Value(u32).init(0);
+var tstp_conts = std.atomic.Value(u32).init(0);
 
 fn onTstp(_: c.SIG) callconv(.c) void {
+    tstp_conts.store(conts.load(.acquire), .release);
     got_tstp.store(true, .release);
     _ = c.write(self_pipe[1], "z", 1);
 }
 
 /// A continue cancels a stop not yet acted on: the shell (or whoever sent both) now counts the
-/// run as running, so stopping after it would leave the run stopped for good.
+/// run as running, so stopping after it would leave the run stopped for good. A stop already
+/// being acted on sees the count move and doesn't stop cpuq (`suspend_`).
 fn onCont(_: c.SIG) callconv(.c) void {
+    _ = conts.fetchAdd(1, .acq_rel);
     got_tstp.store(false, .release);
     _ = c.write(self_pipe[1], "g", 1);
 }
@@ -165,6 +172,8 @@ const Run = struct {
     last_wait: ?sys.Waited = null,
     /// Stopped by Ctrl-Z: it wants nothing, so the line hands it nothing, until continued.
     stopped: bool = false,
+    /// A drain's mark (`Pool.markDrain`), held while it runs and let go while it is stopped.
+    drain_mark: ?Io.File = null,
     /// A task ended, a signal or a promise came: look at the pool now.
     event: bool = true,
     seen_ms: i64 = 0,
@@ -208,6 +217,7 @@ const Run = struct {
             if (s.draining) draining += 1;
         }
         r.rec.held = held.items;
+        if (held.items.len != 0) r.rec.served = true;
         r.peak_held = @max(r.peak_held, @as(u32, @intCast(held.items.len)));
         r.rec.draining = draining;
         r.rec.want = r.wantMore();
@@ -295,9 +305,9 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
     r.rec.want = r.wantMore();
     r.file = r.pool.enter(&r.rec) catch |err| main.fail("pool {s}: {t}", .{ r.pool.path, err });
     r.wake_fd = r.pool.openWake(r.rec.ticket) catch |err| main.fail("pool {s}: {t}", .{ r.pool.path, err });
-    // A drain says so for its whole life: every other operation empties its CPUs for it.
-    const drain_file: ?Io.File = if (o.drain) r.pool.markDrain() catch |err| main.fail("pool {s}: {t}", .{ r.pool.path, err }) else null;
-    defer if (drain_file) |f| f.close(ctx.io);
+    // A drain says so while it runs: every other operation empties its CPUs for it.
+    if (o.drain) r.drain_mark = r.pool.markDrain() catch |err| main.fail("pool {s}: {t}", .{ r.pool.path, err });
+    defer if (r.drain_mark) |f| f.close(ctx.io);
     r.pool.unlock();
     const repo = o.repo orelse repos.repoAt(ctx, std.process.currentPathAlloc(ctx.io, a) catch "");
     r.job = joblog.newJobLog(ctx, .{ .pool = "cpus", .repo = repo, .project = r.rec.project, .label = r.rec.label, .note = o.note, .cmd = r.rec.cmd, .tasks = if (single) null else total });
@@ -563,9 +573,10 @@ fn start(r: *Run, t_in: Task, slot: usize) void {
     noteGroups(r, slot);
 }
 
-/// Ctrl-Z: stops every task, gives back every CPU, then stops cpuq itself. Continued, it stops
-/// the tasks again (a shell continues a whole job's group, and a single task shares cpuq's), and
-/// the loop asks the line for CPUs: each stopped task continues once it has a place again.
+/// Ctrl-Z: stops every task, gives back every CPU, then stops cpuq itself (unless a continue has
+/// come meanwhile). Continued, it stops the tasks again (a shell continues a whole job's group,
+/// and a single task shares cpuq's), and the loop asks the line for CPUs: each stopped task
+/// continues once it has a place again.
 fn suspend_(r: *Run) void {
     for (r.running.items) |t| _ = c.kill(if (r.single) t.pid else -t.pid, .STOP);
     r.pool.lock();
@@ -573,6 +584,11 @@ fn suspend_(r: *Run) void {
     r.slots.clearRetainingCapacity();
     for (r.running.items) |*t| t.slot = no_slot;
     r.stopped = true;
+    // A stopped drain lets its mark go, so no one empties CPUs for it while it can't use them.
+    if (r.drain_mark) |f| {
+        f.close(r.pool.io);
+        r.drain_mark = null;
+    }
     r.syncRecord();
     // CPUs promised to it before it stopped go on to the line too.
     const ops = r.pool.scan(r.a);
@@ -581,9 +597,17 @@ fn suspend_(r: *Run) void {
     r.pool.unlock();
     const stopped_at = sys.monoMs();
     // SIGSTOP, not TSTP: a TSTP to a process outside job control (an agent's shell) is dropped.
-    _ = c.raise(.STOP);
+    // Not once a continue has come since the stop: nothing would continue cpuq after it. Only a
+    // continue between this check and the raise is still lost.
+    if (conts.load(.acquire) == tstp_conts.load(.acquire)) _ = c.raise(.STOP);
     // Continued.
     r.stopped = false;
+    if (r.rec.drain) {
+        // A shared lock: no other drain makes it wait.
+        r.pool.lock();
+        r.drain_mark = r.pool.markDrain() catch null;
+        r.pool.unlock();
+    }
     for (r.running.items) |*t| {
         _ = c.kill(if (r.single) t.pid else -t.pid, .STOP);
         // The time stopped doesn't count against its time limit.
