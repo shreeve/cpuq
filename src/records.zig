@@ -63,6 +63,7 @@ const JsonJob = struct {
     failed: ?u32,
     exit: ?u8,
     signal: ?u32,
+    stopped: ?[]const u8 = null,
 };
 
 /// `cpuq record`: samples this machine every few seconds into samples.jsonl beside the
@@ -372,6 +373,7 @@ pub fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
             .failed = j.failed,
             .exit = j.exit,
             .signal = j.signal,
+            .stopped = j.stopped,
         }) catch {};
         std.json.Stringify.value(out.items, .{ .whitespace = .indent_2 }, w) catch {};
         w.writeAll("\n") catch {};
@@ -409,7 +411,7 @@ pub fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
         const ran_text = if (j.ran()) |x| duration(&b4, x) else "-";
         const used_text = if (j.used()) |x| std.mem.print(&b5, "{d:.1}", .{x}) catch "?" else "-";
         const exit_text: []const u8 = switch (j.state) {
-            .done => if (j.signal) |sig| std.mem.print(&b6, "signal {d}", .{sig}) catch "signal" else std.mem.print(&b6, "{d}", .{j.exit orelse 0}) catch "?",
+            .done => if (j.signal) |sig| std.mem.print(&b6, "signal {d}", .{sig}) catch "signal" else if (j.stopped) |why| std.mem.print(&b6, "{d} {s}", .{ j.exit orelse 0, why }) catch "?" else std.mem.print(&b6, "{d}", .{j.exit orelse 0}) catch "?",
             .gave_up => "gave up",
             .lost => "lost",
             .active => if (j.started != null) "running" else "waiting",

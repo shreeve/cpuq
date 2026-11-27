@@ -42,6 +42,9 @@ pub const Event = struct {
     /// killed it.
     exit: ?u8 = null,
     signal: ?u32 = null,
+    /// Why cpuq stopped it (ended): "time limit", or "idle" for a drain whose command kept
+    /// next to no CPU busy while others waited.
+    stopped: ?[]const u8 = null,
     /// CPU seconds its commands and the descendants they reaped used (ended).
     cpu: ?f64 = null,
     /// Its tasks that passed and failed (ended).
@@ -145,6 +148,7 @@ pub const Job = struct {
     ended: ?f64 = null,
     exit: ?u8 = null,
     signal: ?u32 = null,
+    stopped: ?[]const u8 = null,
     cpu: ?f64 = null,
     done: ?u32 = null,
     failed: ?u32 = null,
@@ -218,6 +222,7 @@ pub fn load(io: Io, a: std.mem.Allocator, path: []const u8, boot: f64, alive: *c
                 j.ended = ev.t;
                 j.exit = ev.exit;
                 j.signal = ev.signal;
+                j.stopped = ev.stopped;
                 j.cpu = ev.cpu;
                 j.done = ev.done;
                 j.failed = ev.failed;

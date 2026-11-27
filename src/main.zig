@@ -51,7 +51,7 @@ pub const version = @import("build_options").version;
 
 const usage =
     \\usage: cpuq run [-n M] [-c C] [-x K] [-t T] [-r N] [run options] [--] CMD [ARGS...]
-    \\       cpuq drain [--max T] [--label L] [--] CMD [ARGS...]
+    \\       cpuq drain [--max T] [-t T] [--label L] [--] CMD [ARGS...]
     \\       cpuq kill TICKET|PID|LABEL
     \\       cpuq lease NAME [--slots N] [--label L] [--wait-max S] [--host HOST] [--] CMD [ARGS...]
     \\       cpuq lease NAME --host HOST --hold [--slots N] [--label L] [--wait-max S]
@@ -91,7 +91,8 @@ const usage =
     \\
     \\commands:
     \\  drain                 empty the machine (every run gives its CPUs back as its tasks
-    \\                        end), then run CMD alone: for timing; --max T gives up (exit 75)
+    \\                        end), then run CMD alone: for timing; --max T gives up (exit 75);
+    \\                        -t T ends CMD (exit 124; default 30m)
     \\  kill                  end a run here: SIGTERM to its tasks, SIGKILL 5 s later
     \\  lease                 hold one of NAME's --slots places (default 1) while CMD runs, first
     \\                        come first served; --host holds it on HOST over ssh, --hold prints

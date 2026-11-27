@@ -381,6 +381,34 @@ EOF
   case "$order" in "one-start one-end two-start two-end "*|"two-start two-end one-start one-end "*) alone=yes ;; esac
   check "two drains at once each run alone, in turn, and a run follows (rc $r1 $r2 $r3: $order)" \
     "[ $r1 = 0 ] && [ $r2 = 0 ] && [ $r3 = 0 ] && [ $alone = yes ]"
+  # A drain holds the whole machine, so its command has a time limit too (default 30m).
+  local t1 rt dt1; t1=$(now)
+  "$CPUQ" drain --max 20s -t 1s -- sleep 30 2>/dev/null; rt=$?; dt1=$(since "$t1")
+  check "drain -t 1s ends its command with 124 (rc $rt after ${dt1}s)" "[ $rt = 124 ] && fl '$dt1 < 10'"
+  local bad; bad=$("$CPUQ" drain -t off -- true 2>&1 >/dev/null; echo "rc $?")
+  check "a drain has no -t off, and -t goes no higher than 2h (${bad##*rc })" "[ '${bad##*rc }' = 2 ] && \"$CPUQ\" drain -t 3h -- true 2>/dev/null; [ \$? = 2 ]"
+  # A drain that holds the machine while its command idles, with others waiting, is stopped
+  # (drain_idle); one that computes, even on a single CPU, runs on.
+  echo "drain_idle = 3s" >>"$CPUQ_CONFIG"
+  local w=$T/idle
+  "$CPUQ" drain --max 20s --label d:idle -- sh -c "echo idle-start >>$w; sleep 30; echo idle-end >>$w" 2>"$T/idle.err" & local di=$!
+  wait_line "$w" idle-start
+  "$CPUQ" run --wait-max 30 --label d:waiter -- sh -c "echo waiter >>$w" & local dw=$!
+  local ri rw; wait $di; ri=$?; wait $dw; rw=$?
+  local hist; hist=$("$CPUQ" history --label d:idle --json | python3 -c 'import json,sys; print(json.load(sys.stdin)[0].get("stopped"))')
+  check "an idle drain with a run waiting is stopped (rc $ri, history: $hist), and the run follows (rc $rw: $(tr '\n' ' ' <"$w"))" \
+    "[ $ri = 124 ] && [ $rw = 0 ] && [ '$hist' = idle ] && grep -q waiter $w && ! grep -q idle-end $w && grep -q 'kept under' $T/idle.err"
+  local u=$T/busy
+  "$CPUQ" drain --max 20s --label d:busy -- python3 -c "import time
+open('$u','a').write('busy-start\n')
+e = time.time() + 6
+while time.time() < e: pass
+open('$u','a').write('busy-end\n')" & local db=$!
+  wait_line "$u" busy-start
+  "$CPUQ" run --wait-max 30 --label d:waiter2 -- sh -c "echo waiter2 >>$u" & local dw2=$!
+  local rb rw2; wait $db; rb=$?; wait $dw2; rw2=$?
+  check "a drain computing on one CPU runs on with a run waiting (rc $rb $rw2: $(tr '\n' ' ' <"$u"))" \
+    "[ $rb = 0 ] && [ $rw2 = 0 ] && [ \"\$(tr '\n' ' ' <$u)\" = 'busy-start busy-end waiter2 ' ]"
 }
 
 t_backfill() {

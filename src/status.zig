@@ -5,6 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const policy = @import("policy.zig");
+const op_mod = @import("op.zig");
 const sys = @import("sys.zig");
 const table = @import("table.zig");
 const pool_mod = @import("pool.zig");
@@ -499,7 +500,12 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
         var slots: std.ArrayList(u32) = .empty;
         for (o.held) |cpu| if (std.mem.findScalar(u32, pool_cpus, cpu)) |k| slots.append(a, @intCast(k)) catch {};
         var flags: std.ArrayList([]const u8) = .empty;
-        if (using) |u| if (o.held.len != 0 and now - o.since >= 5) {
+        // A drain holds every CPU to time one command, often on one CPU: judge what it keeps
+        // busy in all, and how long it has held the machine.
+        if (o.drain and o.held.len != 0 and now - o.since >= @as(i64, ctx.cfg.drain_timeout_s)) flags.append(a, "long_drain") catch {};
+        if (using) |u| if (o.drain and o.held.len != 0 and now - o.since >= 5) {
+            if (u < op_mod.drain_idle_busy) flags.append(a, "idle_drain") catch {};
+        } else if (o.held.len != 0 and now - o.since >= 5) {
             const per = u / @as(f64, @floatFromInt(o.held.len));
             if (per < low_use) flags.append(a, "low_use") catch {};
             if (per > over_use) flags.append(a, "over_cpu") catch {};
@@ -687,6 +693,10 @@ fn flagNotes(a: std.mem.Allocator, holders: []const JsonHolder) []const []const 
                 a.print("{s}: its CPU averages {d:.2} busy", .{ whoText(a, h), per }))
         else if (std.mem.eql(u8, f, "over_cpu"))
             a.print("{s}: {d:.2} busy per CPU held: its tasks run beyond their CPUs", .{ whoText(a, h), per })
+        else if (std.mem.eql(u8, f, "idle_drain"))
+            a.print("{s}: a drain whose command keeps {d:.2} CPUs busy; under {d:.2} for `drain_idle` while others wait, it is stopped", .{ whoText(a, h), h.using orelse 0, op_mod.drain_idle_busy })
+        else if (std.mem.eql(u8, f, "long_drain"))
+            a.print("{s}: a drain holding the whole machine past config `drain_timeout`; it ends at its -t (at most 2h)", .{whoText(a, h)})
         else if (std.mem.eql(u8, f, "stopped"))
             a.print("{s}: its cpuq (pid {d}) is stopped", .{ whoText(a, h), h.pid })
         else
