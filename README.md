@@ -319,8 +319,11 @@ filling them:
 
     cpuq drain [--max T] [-t T] [--label L] [--] CMD ARGS...
 
-For timing, nothing else. A drain goes first in the line. While it waits, every run stops filling
-its CPUs and gives each back as its tasks end, and every CPU freed goes to the drain. Once it holds
+For timing, nothing else. A drain takes its turn: runs that queued before it start first, and
+runs that queue after it wait for it. While it waits, every run that has started stops filling its
+CPUs and gives each back as its tasks end, and every CPU freed goes to a run older than the drain
+that has yet to start, else to the drain. So a stream of drains can't starve one-CPU runs, and a
+stream of new runs can't starve a drain. Once it holds
 the whole pool, CMD runs alone, unpinned, and the CPUs go back when it ends, however it ends.
 `--max T` (`90s`, `10m`) gives up if the machine isn't empty by then (exit 75), and nothing runs.
 

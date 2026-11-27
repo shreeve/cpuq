@@ -411,6 +411,30 @@ open('$u','a').write('busy-end\n')" & local db=$!
     "[ $rb = 0 ] && [ $rw2 = 0 ] && [ \"\$(tr '\n' ' ' <$u)\" = 'busy-start busy-end waiter2 ' ]"
 }
 
+t_drain_turn() {
+  # A drain takes its turn: a run that queued before it starts first, and one that queues after
+  # it waits for it. So a stream of drains can't starve one-CPU runs.
+  setup drain_turn
+  local f=$T/log
+  "$CPUQ" run -n 2 -t 1h --label t:busy -- sh -c "sleep 2; echo busy\$CPUQ_TASK-end >>$f" 2>/dev/null & local b=$!
+  wait_held 2
+  "$CPUQ" run -t 1h --label t:older -- sh -c "echo older-start >>$f; sleep 1; echo older-end >>$f" & local o=$!
+  wait_waiters 1
+  "$CPUQ" drain --max 30s --label t:drain -- sh -c "echo drain-start >>$f; sleep 1; echo drain-end >>$f" & local d=$!
+  wait_waiters 2
+  local why; why=$("$CPUQ" status --no-usage | grep 't:drain' | grep -o '[0-9]* run[s]* queued before it start[s]* first' | head -1)
+  # The newer run's -t (2h) runs past the drain's start, so it can't backfill.
+  "$CPUQ" run -t 2h --label t:newer -- sh -c "echo newer >>$f" & local n=$!
+  wait $b $o $d $n
+  local got; got=$(tr '\n' ' ' <"$f")
+  python3 - "$f" <<'EOF' >"$T/verdict"
+import sys
+at = {l.strip(): i for i, l in enumerate(open(sys.argv[1]))}
+print("ok" if at["older-start"] < at["drain-start"] and at["older-end"] < at["drain-start"] and at["drain-end"] < at["newer"] else "wrong")
+EOF
+  check "an older run starts before the drain, a newer one after it (${why:-no turn shown}: $got)" "[ \"\$(cat $T/verdict)\" = ok ]"
+}
+
 t_backfill() {
   # While a drain waits for a long task, the CPUs it gathered don't sit idle: a task whose time
   # limit ends before the drain could start anyway runs on them (one task or many). A task that
@@ -2138,7 +2162,7 @@ f = open(sys.argv[1]); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$sp/p/held
 
 # --- cpuq jobs and the agent (until they go) -------------------------------------------------
 
-TESTS=${*:-budget tasks pack cpus_limit timeout retry wait_max share fair order drain backfill lock_stuck storm kill ctrl_z nested driver removed \
+TESTS=${*:-budget tasks pack cpus_limit timeout retry wait_max share fair order drain backfill drain_turn lock_stuck storm kill ctrl_z nested driver removed \
   kill_holder leftovers leaked_descendant kill_waiter term_waiting lost_seq long_command waiters_cpu \
   exit_status direct_sigint terminal_sigint tasks_sigint ignored_signals stack_limit pin repin narrow \
   status progress usage zombie outside status_host history note wait record min_available min_disk hook \

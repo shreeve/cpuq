@@ -421,12 +421,27 @@ fn gateNow(ctx: *Ctx, a: std.mem.Allocator, drain: bool, drain_holds: bool, busy
 }
 
 /// Why a waiter waits, for people: its place in line, then what holds it back.
-fn whyText(a: std.mem.Allocator, place: usize, o: Op, pool: u32, gate: JsonGate, usable: u32, emptying: u32, next_free: ?f64) []const u8 {
+/// Runs that queued before drain `t` and have yet to start: they go first.
+fn olderStarting(ops: []const Op, t: u64) u32 {
+    var n: u32 = 0;
+    for (ops) |p| if (pool_mod.before(p, t)) {
+        n += 1;
+    };
+    return n;
+}
+
+fn drainHolds(ops: []const Op) bool {
+    for (ops) |o| if (o.drain and o.held.len != 0) return true;
+    return false;
+}
+
+fn whyText(a: std.mem.Allocator, place: usize, o: Op, pool: u32, gate: JsonGate, usable: u32, emptying: u32, next_free: ?f64, older: u32) []const u8 {
     var out: std.ArrayList(u8) = .empty;
     var ob: [16]u8 = undefined;
     out.print(a, "{s} in line", .{texts.ordinal(&ob, place)}) catch {};
     if (o.drain) {
         out.print(a, "; waits for every CPU ({d} of {d} held)", .{ o.held.len, pool }) catch {};
+        if (older != 0) out.print(a, "; {d} run{s} queued before it start{s} first", .{ older, if (older == 1) "" else "s", if (older == 1) "s" else "" }) catch {};
     } else if (o.why.len != 0) {
         out.print(a, "; {s}", .{o.why}) catch {};
     } else if (!std.mem.eql(u8, gate.state, "open") and usable == 0) {
@@ -475,7 +490,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
     const ops = pool.scan(a);
     const given = pool.promises(a, ops, pool_cpus);
     const free = freeCpus(&pool, a, pool_cpus, ops, given);
-    const drain = pool.draining();
+    const drain = pool.draining() and (pool_mod.drainWants(ops) or drainHolds(ops));
     const last_busy = pool.machineBusy(ncpu);
     pool.unlock();
 
@@ -503,7 +518,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
         // A drain holds every CPU to time one command, often on one CPU: judge what it keeps
         // busy in all, and how long it has held the machine.
         if (o.drain and o.held.len != 0 and now - o.since >= @as(i64, ctx.cfg.drain_timeout_s)) flags.append(a, "long_drain") catch {};
-        if (using) |u| if (o.drain and o.held.len != 0 and now - o.since >= 5) {
+        if (using) |u| if (o.drain and o.held.len != 0 and o.running != 0 and now - o.since >= 5) {
             if (u < op_mod.drain_idle_busy) flags.append(a, "idle_drain") catch {};
         } else if (o.held.len != 0 and now - o.since >= 5) {
             const per = u / @as(f64, @floatFromInt(o.held.len));
@@ -560,7 +575,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
             .holds = @intCast(o.held.len),
             .exclusive = o.drain,
             .urgent = o.urgent,
-            .why = whyText(a, place, o, pool_n, gate, usable, emptying, next_free),
+            .why = whyText(a, place, o, pool_n, gate, usable, emptying, next_free, if (o.drain) olderStarting(ops, o.ticket) else 0),
             .gate = o.why,
             .eta = if (place == 1 and usable == 0) next_free else null,
             .label = o.label,

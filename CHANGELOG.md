@@ -2,6 +2,16 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.34.0 — 2026-11-27
+
+- **A drain takes its turn.** A drain went first in the line, ahead of runs that had waited
+  longer, so on pup a stream of drains kept one-CPU builds waiting for hours. Now runs that queued
+  before a drain start first: every CPU freed while it gathers goes to such a run, else to the
+  drain, and the run keeps it until its first task is on it. Runs that queue after the drain wait
+  for it, as before, except backfill. `cpuq status` says how many runs queued before a drain start
+  first.
+- `cpuq status` no longer flags a drain as idle while it is still gathering the machine.
+
 ## 0.33.0 — 2026-11-27
 
 - **A drain can no longer hold a machine for hours.** On pup, a drain held all 22 CPUs for 2h51m

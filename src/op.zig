@@ -396,9 +396,12 @@ fn loop(r: *Run) void {
         }
         // A drain begun since the last look: stop refilling before placing anything, unless
         // this operation's tasks end before the drain could start anyway.
-        if (!r.rec.drain and r.pool.draining() and !backfills(r, r.pool.scan(r.a))) for (r.slots.items) |*sl| {
-            sl.draining = true;
-        };
+        if (!r.rec.drain and r.pool.draining()) {
+            const ops = r.pool.scan(r.a);
+            if (pool_mod.drainWants(ops) and !backfills(r, ops) and !pool_mod.before(r.rec, pool_mod.turnOf(ops))) for (r.slots.items) |*sl| {
+                sl.draining = true;
+            };
+        }
         consolidate(r);
         resumeStopped(r);
         place(r);
@@ -884,7 +887,7 @@ fn settle(r: *Run, released: bool) bool {
     given = r.pool.promises(a, ops, r.pool_cpus);
     r.head = if (pool_mod.firstWaiter(a, ops, given)) |w| w.op.ticket == r.rec.ticket else false;
     if (pool_mod.giver(a, ops, given)) |t| if (t == r.rec.ticket) drainOne(r);
-    if (!r.rec.drain and r.pool.draining() and !backfills(r, ops)) for (r.slots.items) |*s| {
+    if (!r.rec.drain and pool_mod.drainWants(ops) and !backfills(r, ops) and !pool_mod.before(r.rec, pool_mod.turnOf(ops))) for (r.slots.items) |*s| {
         s.draining = true;
     };
     // Backfill: a gathering drain empties idle CPUs for the waiters whose tasks end before it

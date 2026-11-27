@@ -157,7 +157,9 @@ operations'. In order:
 `handOut` gives free CPUs, in the pool's order, one at a time, counting each promise as held at
 once and ranking the line again before the next, so free CPUs spread over projects by weight.
 Only operations with `want` left are in the line. While a drain is in the line, every CPU goes to
-it, except for backfill (`cpuq drain`, below). `firstWaiter` is the head of the same order once every promise is counted.
+it, except for two: first an operation that queued before the drain and has yet to start a task
+(`before`: a drain takes its turn), which keeps that CPU until its first task runs; then backfill
+(`cpuq drain`, below). `firstWaiter` is the head of the same order once every promise is counted.
 
 An operation's ticket is renewed (its record and FIFO renamed, under the lock) each time it gives
 a CPU back, so it takes its turn behind every other: runs that hold one CPU each take turns with
@@ -183,7 +185,7 @@ its settle, whether that is itself:
   a giver holding nothing, or urgent, would rank first again and take the freed CPU straight back.
 - **Which giver:** of those that qualify, the operation whose project holds the most for its
   weight, then the one keeping the most, then the newest ticket. A drain (`cpuq drain`) never
-  gives; while it waits, every operation drains every CPU.
+  gives; while it waits, every operation that has started drains every CPU.
 - **Which CPU:** an empty one, else the one with the fewest tasks, then the one whose newest task
   started longest ago (`drainOne`).
 
