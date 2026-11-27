@@ -2,7 +2,7 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
-## 0.30.3 — 2026-11-27
+## 0.30.3 — 2026-11-26
 
 Three faults the Lean model (`formal/`) found, each now with a test that fails on 0.30.2.
 
