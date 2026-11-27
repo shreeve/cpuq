@@ -44,8 +44,10 @@ pub const Opts = struct {
     repo: ?[]const u8 = null,
     /// --wait-max: give up (exit 75) when no CPU came in this many seconds.
     wait_max_s: ?u32 = null,
-    /// `cpuq drain`: wait for every CPU of the pool, then run the command alone.
+    /// `cpuq drain`: gather CPUs ahead of the line, then run the command alone on them: `cpus`
+    /// of them (-c N), pinned on Linux, or the whole pool with `drain_all` (--all).
     drain: bool = false,
+    drain_all: bool = false,
     cmd: []const [:0]const u8 = &.{},
 };
 
@@ -201,7 +203,7 @@ const Run = struct {
 
     fn wantMore(r: *const Run) u32 {
         if (r.stopped) return 0;
-        if (r.rec.drain) return if (r.running.items.len == 0 and r.pending() > 0) @as(u32, @intCast(r.pool_cpus.len)) -| @as(u32, @intCast(r.slots.items.len)) else 0;
+        if (r.rec.drain) return if (r.running.items.len == 0 and r.pending() > 0) r.limit -| @as(u32, @intCast(r.slots.items.len)) else 0;
         // Places free on CPUs held and kept, against tasks waiting.
         var free_places: u32 = 0;
         for (r.slots.items) |s| if (!s.draining) {
@@ -278,7 +280,7 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
     const single = o.tasks == 0;
     const total: u32 = if (single) 1 else o.tasks;
     const asked: u32 = if (o.cpus_percent) @max(1, @as(u32, @intCast((@as(u64, pool_cpus.len) * o.cpus) / 100))) else o.cpus;
-    const limit = if (o.drain) @as(u32, @intCast(pool_cpus.len)) else @max(1, @min(@min(asked, @as(u32, @intCast(pool_cpus.len))), std.math.divCeil(u32, total, o.overload) catch 1));
+    const limit = if (o.drain) (if (o.drain_all) @as(u32, @intCast(pool_cpus.len)) else @max(1, @min(o.cpus, @as(u32, @intCast(pool_cpus.len))))) else @max(1, @min(@min(asked, @as(u32, @intCast(pool_cpus.len))), std.math.divCeil(u32, total, o.overload) catch 1));
     const timeout_s = o.timeout_s orelse ctx.cfg.timeout_s;
     const timeout_ms: i64 = if (timeout_s == 0) std.math.maxInt(i64) / 2 else @as(i64, timeout_s) * 1000;
 
@@ -297,6 +299,7 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
         .rec = .{
             .urgent = o.urgent,
             .drain = o.drain,
+            .all = o.drain_all,
             .pid = sys.getpid(),
             .project = projectOf(ctx, o),
             .label = if (o.label.len != 0) o.label else std.fs.path.basename(o.cmd[0]),
@@ -398,7 +401,7 @@ fn loop(r: *Run) void {
         // this operation's tasks end before the drain could start anyway.
         if (!r.rec.drain and r.pool.draining()) {
             const ops = r.pool.scan(r.a);
-            if (pool_mod.drainWants(ops) and !backfills(r, ops) and !pool_mod.before(r.rec, pool_mod.turnOf(ops))) for (r.slots.items) |*sl| {
+            if (pool_mod.drainWantsAll(ops) and !backfills(r, ops) and !pool_mod.before(r.rec, pool_mod.turnOf(ops))) for (r.slots.items) |*sl| {
                 sl.draining = true;
             };
         }
@@ -560,9 +563,16 @@ fn noteGroups(r: *Run, slot: usize) void {
 
 /// Puts waiting tasks on held CPUs with room, the fullest first, so CPUs fill to K before
 /// another is used and empty ones can go back.
+/// CPUs as a comma-separated list, for `CPUQ_CPUS` (what taskset -c takes).
+fn cpuListText(a: std.mem.Allocator, cpus: []const u32) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (cpus, 0..) |cpu, i| out.print(a, "{s}{d}", .{ if (i == 0) "" else ",", cpu }) catch {};
+    return out.items;
+}
+
 fn place(r: *Run) void {
-    // `cpuq drain` starts its command only once it holds every CPU of the pool.
-    if (r.rec.drain and r.slots.items.len < r.pool_cpus.len) return;
+    // `cpuq drain` starts its command only once it holds all its CPUs (-c N, or the pool).
+    if (r.rec.drain and r.slots.items.len < r.limit) return;
     while (r.pending() > 0) {
         var best: ?usize = null;
         for (r.slots.items, 0..) |s, i| {
@@ -592,6 +602,9 @@ fn start(r: *Run, t_in: Task, slot: usize) void {
     ctx.env.put("CPUQ_ATTEMPTS", std.fmt.bufPrint(&att[1], "{d}", .{r.o.retries + 1}) catch "1") catch {};
     var opn: [24]u8 = undefined;
     ctx.env.put("CPUQ_OP", std.fmt.bufPrint(&opn, "{d}", .{r.rec.ticket}) catch "") catch {};
+    var drain_cpus: std.ArrayList(u32) = .empty;
+    if (r.rec.drain) for (r.slots.items) |sl| drain_cpus.append(r.a, sl.cpu) catch {};
+    if (r.rec.drain) ctx.env.put("CPUQ_CPUS", cpuListText(r.a, drain_cpus.items)) catch {};
     const envp = ctx.env.createPosixBlock(r.a, .{}) catch main.fail("out of memory", .{});
     const argv = r.a.allocSentinel(?[*:0]const u8, r.o.cmd.len, null) catch main.fail("out of memory", .{});
     for (r.o.cmd, 0..) |arg, k| argv[k] = arg.ptr;
@@ -612,8 +625,8 @@ fn start(r: *Run, t_in: Task, slot: usize) void {
             dups.append(r.a, .{ out_fd, 2 }) catch {};
         }
     }
-    // A drain's command has the machine: it isn't pinned.
-    const pin: []const u32 = if (is_linux and !r.rec.drain) &.{s.cpu} else &.{};
+    // A drain's command runs on every CPU it holds: pinned to them, unless it has the machine.
+    const pin: []const u32 = if (!is_linux) &.{} else if (!r.rec.drain) &.{s.cpu} else if (r.limit < r.pool_cpus.len) drain_cpus.items else &.{};
     const spawned = sys.spawn(r.exe, argv.ptr, @ptrCast(envp.slice.ptr), .unchanged, .{
         .cpus = pin,
         .dups = dups.items,
@@ -887,7 +900,7 @@ fn settle(r: *Run, released: bool) bool {
     given = r.pool.promises(a, ops, r.pool_cpus);
     r.head = if (pool_mod.firstWaiter(a, ops, given)) |w| w.op.ticket == r.rec.ticket else false;
     if (pool_mod.giver(a, ops, given)) |t| if (t == r.rec.ticket) drainOne(r);
-    if (!r.rec.drain and pool_mod.drainWants(ops) and !backfills(r, ops) and !pool_mod.before(r.rec, pool_mod.turnOf(ops))) for (r.slots.items) |*s| {
+    if (!r.rec.drain and pool_mod.drainWantsAll(ops) and !backfills(r, ops) and !pool_mod.before(r.rec, pool_mod.turnOf(ops))) for (r.slots.items) |*s| {
         s.draining = true;
     };
     // Backfill: a gathering drain empties idle CPUs for the waiters whose tasks end before it
@@ -1114,14 +1127,17 @@ fn runNested(ctx: *Ctx, o: Opts, exe: [:0]const u8, cpu: u32) u8 {
 /// operation stops refilling and gives its CPUs back as its tasks end; once the drain holds the
 /// whole pool, CMD runs alone, unpinned, and the CPUs go back when it ends. With --max, a drain
 /// that hasn't the machine by then gives up (exit 75) and nothing runs.
-/// The longest a drain may hold the whole machine: `-t` and config `drain_timeout` go no higher.
+/// The longest a drain may run: `-t` and config `drain_timeout` go no higher.
 pub const drain_ceiling_s: u32 = 2 * 3600;
+/// The longest a drain may hold the whole machine (--all).
+pub const drain_all_ceiling_s: u32 = 20 * 60;
 /// A drain whose command keeps fewer CPUs than this busy (CPU seconds a second, whatever it
 /// holds) for `drain_idle` while another run waits is stopped: a timing run computes.
 pub const drain_idle_busy: f64 = 0.25;
 
 pub fn cmdDrain(ctx: *Ctx, args: []const [:0]const u8) u8 {
     var o: Opts = .{ .drain = true, .urgent = true };
+    var cpus_given = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -1133,6 +1149,10 @@ pub fn cmdDrain(ctx: *Ctx, args: []const [:0]const u8) u8 {
             o.cmd = args[i..];
             break;
         }
+        if (std.mem.eql(u8, arg, "--all")) {
+            o.drain_all = true;
+            continue;
+        }
         if (i + 1 >= args.len) return main.usageError("{s} needs a value", .{arg});
         if (std.mem.eql(u8, arg, "--max")) {
             o.wait_max_s = policy.parseAge(args[i + 1]) orelse return main.usageError("--max needs a time such as 90s or 10m, not '{s}'", .{args[i + 1]});
@@ -1142,12 +1162,19 @@ pub fn cmdDrain(ctx: *Ctx, args: []const [:0]const u8) u8 {
             const t = policy.parseAge(args[i + 1]) orelse 0;
             if (t == 0 or t > drain_ceiling_s) return main.usageError("a drain's -t needs a time limit up to 2h, such as 20m or 1h, not '{s}'", .{args[i + 1]});
             o.timeout_s = t;
+        } else if (std.mem.eql(u8, arg, "-c")) {
+            o.cpus = policy.parseWhole(u32, args[i + 1]) orelse 0;
+            if (o.cpus == 0) return main.usageError("a drain's -c needs the number of CPUs it times on, at least 1, not '{s}'", .{args[i + 1]});
+            o.cpus_percent = false;
+            cpus_given = true;
         } else return main.usageError("unknown option '{s}'", .{arg});
         i += 1;
     }
     if (o.cmd.len == 0) return main.usageError("drain needs a command", .{});
+    if (cpus_given == o.drain_all) return main.usageError("a drain takes -c N, the CPUs it times on (the rest of the machine keeps working), or --all, the whole machine for at most 20m", .{});
     main.loadConfig(ctx);
     if (o.timeout_s == null) o.timeout_s = @min(@max(ctx.cfg.drain_timeout_s, 1), drain_ceiling_s);
+    if (o.drain_all and o.timeout_s.? > drain_all_ceiling_s) return main.usageError("a drain with --all holds the whole machine for at most 20m (-t); time on fewer CPUs with -c N for longer", .{});
     return run(ctx, o);
 }
 

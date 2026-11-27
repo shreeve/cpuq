@@ -430,8 +430,8 @@ fn olderStarting(ops: []const Op, t: u64) u32 {
     return n;
 }
 
-fn drainHolds(ops: []const Op) bool {
-    for (ops) |o| if (o.drain and o.held.len != 0) return true;
+fn drainHolds(ops: []const Op, n: u32) bool {
+    for (ops) |o| if (o.drain and o.all and o.held.len >= n) return true;
     return false;
 }
 
@@ -440,7 +440,10 @@ fn whyText(a: std.mem.Allocator, place: usize, o: Op, pool: u32, gate: JsonGate,
     var ob: [16]u8 = undefined;
     out.print(a, "{s} in line", .{texts.ordinal(&ob, place)}) catch {};
     if (o.drain) {
-        out.print(a, "; waits for every CPU ({d} of {d} held)", .{ o.held.len, pool }) catch {};
+        if (o.all)
+            out.print(a, "; waits for every CPU ({d} of {d} held)", .{ o.held.len, pool }) catch {}
+        else
+            out.print(a, "; a drain of {d} CPU{s} ({d} held)", .{ o.limit, if (o.limit == 1) "" else "s", o.held.len }) catch {};
         if (older != 0) out.print(a, "; {d} run{s} queued before it start{s} first", .{ older, if (older == 1) "" else "s", if (older == 1) "s" else "" }) catch {};
     } else if (o.why.len != 0) {
         out.print(a, "; {s}", .{o.why}) catch {};
@@ -490,7 +493,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
     const ops = pool.scan(a);
     const given = pool.promises(a, ops, pool_cpus);
     const free = freeCpus(&pool, a, pool_cpus, ops, given);
-    const drain = pool.draining() and (pool_mod.drainWants(ops) or drainHolds(ops));
+    const drain = pool.draining() and (pool_mod.drainWantsAll(ops) or drainHolds(ops, pool_n));
     const last_busy = pool.machineBusy(ncpu);
     pool.unlock();
 
@@ -503,7 +506,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
     for (ops) |o| {
         held += @intCast(o.held.len);
         emptying += o.draining;
-        if (o.drain and o.held.len >= pool_n) drain_holds = true;
+        if (o.drain and o.all and o.held.len >= pool_n) drain_holds = true;
     }
     const gate, const usable = gateNow(ctx, a, drain, drain_holds, busy, m.tasks, held, @intCast(free.len), ncpu);
     const next_free = if (free.len == 0 or usable == 0) nextFree(ops, now) else null;
@@ -1054,8 +1057,8 @@ test "the line's order: by project share, and a drain first" {
     defer arena.deinit();
     const a = arena.allocator();
     const ops = [_]Op{
-        .{ .ticket = 1, .project = "rig", .held = &.{ 0, 1, 2 }, .want = 10 },
-        .{ .ticket = 2, .project = "trig", .held = &.{3}, .want = 10 },
+        .{ .ticket = 1, .project = "rig", .held = &.{ 0, 1, 2 }, .want = 10, .running = 3 },
+        .{ .ticket = 2, .project = "trig", .held = &.{3}, .want = 10, .running = 1 },
         .{ .ticket = 3, .project = "rip", .want = 2 },
         .{ .ticket = 4, .project = "emdb", .held = &.{4}, .want = 0 },
     };
@@ -1063,7 +1066,7 @@ test "the line's order: by project share, and a drain first" {
     // A promise already made counts: rip, promised its two, waits no more.
     const given = [_]Promise{ .{ .cpu = 5, .ticket = 3 }, .{ .cpu = 6, .ticket = 3 } };
     try std.testing.expectEqualSlices(u64, &.{ 2, 1 }, lineOrder(a, &ops, &given, 0));
-    const drained = [_]Op{ ops[0], ops[1], .{ .ticket = 9, .project = "x", .drain = true, .want = 8 } };
+    const drained = [_]Op{ ops[0], ops[1], .{ .ticket = 9, .project = "x", .drain = true, .all = true, .want = 8 } };
     try std.testing.expectEqualSlices(u64, &.{ 9, 2, 1 }, lineOrder(a, &drained, &.{}, 0));
 }
 

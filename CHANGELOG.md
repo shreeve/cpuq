@@ -4,6 +4,11 @@ User-visible changes to cpuq. Each version's section is its release notes.
 
 ## 0.34.0 — 2026-11-27
 
+- **A drain takes only the CPUs it times on.** `cpuq drain -c N` gathers N CPUs ahead of the
+  line and runs its command alone on them, pinned on Linux (`CPUQ_CPUS` lists them), while the
+  rest of the machine keeps working. A drain held all 22 of pup's CPUs to time work that used 1 to
+  6 of them, while one-CPU runs waited for hours. `--all` still empties the whole machine, for at
+  most 20 minutes. A drain takes one or the other: `cpuq drain -- CMD` names both.
 - **A drain takes its turn.** A drain went first in the line, ahead of runs that had waited
   longer, so on pup a stream of drains kept one-CPU builds waiting for hours. Now runs that queued
   before a drain start first: every CPU freed while it gathers goes to such a run, else to the

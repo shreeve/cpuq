@@ -185,7 +185,9 @@ its settle, whether that is itself:
   a giver holding nothing, or urgent, would rank first again and take the freed CPU straight back.
 - **Which giver:** of those that qualify, the operation whose project holds the most for its
   weight, then the one keeping the most, then the newest ticket. A drain (`cpuq drain`) never
-  gives; while it waits, every operation that has started drains every CPU.
+  gives. While an `--all` drain waits, every operation that has started drains every CPU; a drain
+  of N CPUs (`-c N`) is owed them one at a time like any first waiter, and once it has them the
+  line goes on as usual.
 - **Which CPU:** an empty one, else the one with the fewest tasks, then the one whose newest task
   started longest ago (`drainOne`).
 

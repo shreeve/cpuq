@@ -340,7 +340,7 @@ t_drain() {
   local f=$T/log
   "$CPUQ" run -n 4 --label d:a -- sh -c "echo a\$CPUQ_TASK-start >>$f; sleep 1; echo a\$CPUQ_TASK-end >>$f" 2>/dev/null & local a=$!
   wait_held 2
-  "$CPUQ" drain --max 20s --label d:timing -- sh -c "echo drain-start >>$f; \"$CPUQ\" status --json --no-usage | python3 -c 'import json, sys; s = json.load(sys.stdin); print(\"drain-held\", s[\"held\"], \" \".join(h[\"label\"] for h in s[\"holders\"] if h[\"cores\"]))' >>$f; sleep 1; echo drain-end >>$f" & local d=$!
+  "$CPUQ" drain --all --max 20s --label d:timing -- sh -c "echo drain-start >>$f; \"$CPUQ\" status --json --no-usage | python3 -c 'import json, sys; s = json.load(sys.stdin); print(\"drain-held\", s[\"held\"], \" \".join(h[\"label\"] for h in s[\"holders\"] if h[\"cores\"]))' >>$f; sleep 1; echo drain-end >>$f" & local d=$!
   wait_waiters 1
   "$CPUQ" run --label d:late -- sh -c "echo late >>$f" & local l=$!
   wait $a $d $l
@@ -363,7 +363,7 @@ EOF
   "$CPUQ" run --label d:long -- sleep 3 & local h=$!
   wait_held 1
   local t0 rc dt; t0=$(now)
-  "$CPUQ" drain --max 1s -- touch "$T/ran" 2>/dev/null; rc=$?; dt=$(since "$t0")
+  "$CPUQ" drain --all --max 1s -- touch "$T/ran" 2>/dev/null; rc=$?; dt=$(since "$t0")
   wait $h
   local ran=no; [ -e "$T/ran" ] && ran=yes
   check "drain --max 1s gives up with 75 while a task runs on (rc $rc after ${dt}s, ran: $ran)" "[ $rc = 75 ] && [ $ran = no ] && fl '$dt < 2.5'"
@@ -371,9 +371,9 @@ EOF
   # mark under the pool's lock (that deadlocked every cpuq on the machine). Each runs alone, in
   # turn, and a run behind them follows.
   local g=$T/two
-  "$CPUQ" drain --max 20s --label d:one -- sh -c "echo one-start >>$g; sleep 1; echo one-end >>$g" & local d1=$!
+  "$CPUQ" drain --all --max 20s --label d:one -- sh -c "echo one-start >>$g; sleep 1; echo one-end >>$g" & local d1=$!
   wait_line "$g" one-start
-  "$CPUQ" drain --max 20s --label d:two -- sh -c "echo two-start >>$g; sleep 1; echo two-end >>$g" & local d2=$!
+  "$CPUQ" drain --all --max 20s --label d:two -- sh -c "echo two-start >>$g; sleep 1; echo two-end >>$g" & local d2=$!
   "$CPUQ" run --wait-max 20 --label d:after -- sh -c "echo after >>$g" & local d3=$!
   local r1 r2 r3; wait $d1; r1=$?; wait $d2; r2=$?; wait $d3; r3=$?
   local order; order=$(tr '\n' ' ' <"$g" 2>/dev/null)
@@ -383,15 +383,15 @@ EOF
     "[ $r1 = 0 ] && [ $r2 = 0 ] && [ $r3 = 0 ] && [ $alone = yes ]"
   # A drain holds the whole machine, so its command has a time limit too (default 30m).
   local t1 rt dt1; t1=$(now)
-  "$CPUQ" drain --max 20s -t 1s -- sleep 30 2>/dev/null; rt=$?; dt1=$(since "$t1")
+  "$CPUQ" drain --all --max 20s -t 1s -- sleep 30 2>/dev/null; rt=$?; dt1=$(since "$t1")
   check "drain -t 1s ends its command with 124 (rc $rt after ${dt1}s)" "[ $rt = 124 ] && fl '$dt1 < 10'"
-  local bad; bad=$("$CPUQ" drain -t off -- true 2>&1 >/dev/null; echo "rc $?")
+  local bad; bad=$("$CPUQ" drain --all -t off -- true 2>&1 >/dev/null; echo "rc $?")
   check "a drain has no -t off, and -t goes no higher than 2h (${bad##*rc })" "[ '${bad##*rc }' = 2 ] && \"$CPUQ\" drain -t 3h -- true 2>/dev/null; [ \$? = 2 ]"
   # A drain that holds the machine while its command idles, with others waiting, is stopped
   # (drain_idle); one that computes, even on a single CPU, runs on.
   echo "drain_idle = 3s" >>"$CPUQ_CONFIG"
   local w=$T/idle
-  "$CPUQ" drain --max 20s --label d:idle -- sh -c "echo idle-start >>$w; sleep 30; echo idle-end >>$w" 2>"$T/idle.err" & local di=$!
+  "$CPUQ" drain --all --max 20s --label d:idle -- sh -c "echo idle-start >>$w; sleep 30; echo idle-end >>$w" 2>"$T/idle.err" & local di=$!
   wait_line "$w" idle-start
   "$CPUQ" run --wait-max 30 --label d:waiter -- sh -c "echo waiter >>$w" & local dw=$!
   local ri rw; wait $di; ri=$?; wait $dw; rw=$?
@@ -399,7 +399,7 @@ EOF
   check "an idle drain with a run waiting is stopped (rc $ri, history: $hist), and the run follows (rc $rw: $(tr '\n' ' ' <"$w"))" \
     "[ $ri = 124 ] && [ $rw = 0 ] && [ '$hist' = idle ] && grep -q waiter $w && ! grep -q idle-end $w && grep -q 'kept under' $T/idle.err"
   local u=$T/busy
-  "$CPUQ" drain --max 20s --label d:busy -- python3 -c "import time
+  "$CPUQ" drain --all --max 20s --label d:busy -- python3 -c "import time
 open('$u','a').write('busy-start\n')
 e = time.time() + 6
 while time.time() < e: pass
@@ -420,7 +420,7 @@ t_drain_turn() {
   wait_held 2
   "$CPUQ" run -t 1h --label t:older -- sh -c "echo older-start >>$f; sleep 1; echo older-end >>$f" & local o=$!
   wait_waiters 1
-  "$CPUQ" drain --max 30s --label t:drain -- sh -c "echo drain-start >>$f; sleep 1; echo drain-end >>$f" & local d=$!
+  "$CPUQ" drain --all --max 30s --label t:drain -- sh -c "echo drain-start >>$f; sleep 1; echo drain-end >>$f" & local d=$!
   wait_waiters 2
   local why; why=$("$CPUQ" status --no-usage | grep 't:drain' | grep -o '[0-9]* run[s]* queued before it start[s]* first' | head -1)
   # The newer run's -t (2h) runs past the drain's start, so it can't backfill.
@@ -435,6 +435,32 @@ EOF
   check "an older run starts before the drain, a newer one after it (${why:-no turn shown}: $got)" "[ \"\$(cat $T/verdict)\" = ok ]"
 }
 
+t_drain_part() {
+  # cpuq drain -c 1: the drain gathers one CPU ahead of the line and runs on it alone, pinned
+  # (CPUQ_CPUS), while the rest of the machine keeps working: a run behind it uses the other CPU.
+  setup drain_part
+  local f=$T/log
+  "$CPUQ" run -n 2 -t 1h --label p:busy -- sh -c "sleep \$((CPUQ_TASK * 3 - 2)); echo busy\$CPUQ_TASK-end >>$f" 2>/dev/null & local b=$!
+  wait_held 2
+  "$CPUQ" drain -c 1 --max 30s --label p:drain -- sh -c "echo drain-start \$CPUQ_CPUS >>$f; sleep 4; echo drain-end >>$f" & local d=$!
+  wait_waiters 1
+  "$CPUQ" run -t 1h --label p:after -- sh -c "echo after-start >>$f" & local l=$!
+  wait $b $d $l
+  local got; got=$(tr '\n' ' ' <"$f")
+  python3 - "$f" <<'EOF' >"$T/verdict"
+import sys
+rows = [l.split() for l in open(sys.argv[1])]
+at = {r[0]: i for i, r in enumerate(rows)}
+cpus = [r[1:] for r in rows if r[0] == "drain-start"][0]
+print("ok" if at["drain-start"] < at["busy2-end"] and at["after-start"] < at["drain-end"] and len(cpus) == 1 and "," not in cpus[0] else "wrong")
+EOF
+  check "a drain of 1 CPU runs beside other work, and a run behind it takes the other CPU ($got)" "[ \"\$(cat $T/verdict)\" = ok ]"
+  local none; none=$("$CPUQ" drain -- true 2>&1 >/dev/null; echo "rc $?")
+  check "a drain needs -c N or --all (${none##*rc })" "[ '${none##*rc }' = 2 ]"
+  local long; long=$("$CPUQ" drain --all -t 30m -- true 2>&1 >/dev/null; echo "rc $?")
+  check "a drain of the whole machine holds it at most 20m (${long##*rc })" "[ '${long##*rc }' = 2 ]"
+}
+
 t_backfill() {
   # While a drain waits for a long task, the CPUs it gathered don't sit idle: a task whose time
   # limit ends before the drain could start anyway runs on them (one task or many). A task that
@@ -443,7 +469,7 @@ t_backfill() {
   local f=$T/log
   "$CPUQ" run -t 1h --label b:build -- sh -c "echo build-start >>$f; sleep 4; echo build-end >>$f" & local b=$!
   wait_held 1
-  "$CPUQ" drain --max 30s --label b:drain -- sh -c "echo drain-start >>$f" & local d=$!
+  "$CPUQ" drain --all --max 30s --label b:drain -- sh -c "echo drain-start >>$f" & local d=$!
   wait_held 2
   local t0; t0=$(now)
   "$CPUQ" run -t 5s --label b:short -- sh -c "echo short >>$f"; local rs=$?
@@ -502,7 +528,7 @@ t_storm() {
   ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" run --label s:one -- sleep 0.1; done ) & pids="$pids $!"
   ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" run --urgent --label s:urgent -- sleep 0.2; sleep 0.5; done ) & pids="$pids $!"
   for d in 1 2; do
-    ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" drain --max 30s --label s:drain$d -- sleep 0.3; sleep 0.7; done ) & pids="$pids $!"
+    ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" drain --all --max 30s --label s:drain$d -- sleep 0.3; sleep 0.7; done ) & pids="$pids $!"
   done
   ( while [ "$(date +%s)" -lt $end ]; do
       "$CPUQ" run --label s:victim -- sleep 5 >/dev/null 2>&1 & local v=$!
@@ -619,7 +645,7 @@ f = open(sys.argv[1], "r+"); fcntl.flock(f, fcntl.LOCK_EX); open(sys.argv[2], "w
   setup ctrl-z-drain "budget = 2"
   "$CPUQ" run -n 8 --label z:work -- sleep 1.5 2>/dev/null & local w=$!
   wait_held 2
-  dfl "$CPUQ" drain --max 30s --label z:drain -- touch "$T/drained" 2>/dev/null & a=$!
+  dfl "$CPUQ" drain --all --max 30s --label z:drain -- touch "$T/drained" 2>/dev/null & a=$!
   wait_waiters 1; sleep 0.2
   kill -TSTP $a
   sleep 2  # past the end of the tasks running when the drain came
@@ -634,10 +660,10 @@ f = open(sys.argv[1], "r+"); fcntl.flock(f, fcntl.LOCK_EX); open(sys.argv[2], "w
   setup ctrl-z-drains "budget = 2"
   "$CPUQ" run -n 4 --label z:work -- sh -c 'sleep $((CPUQ_TASK % 2 ? 1 : 3))' 2>/dev/null & w=$!
   wait_held 2
-  dfl "$CPUQ" drain --max 15s --label z:b -- true 2>/dev/null & local b=$!
+  dfl "$CPUQ" drain --all --max 15s --label z:b -- true 2>/dev/null & local b=$!
   wait_waiters 1; sleep 0.1
   kill -TSTP $b; sleep 0.2
-  "$CPUQ" drain --max 15s --label z:c -- true 2>/dev/null & local cc=$!
+  "$CPUQ" drain --all --max 15s --label z:c -- true 2>/dev/null & local cc=$!
   sleep 1.3  # the first CPU frees (at 1 s) and goes to c
   kill -CONT $b
   local t0 rb rc2 dt; t0=$(now)
@@ -1021,7 +1047,7 @@ t_pin() {
   "$CPUQ" run -n 4 --label p:x -- sh -c "echo \$CPUQ_CPU=\$($list) >>$T/pins; sleep 0.2" 2>/dev/null
   local single; single=$("$CPUQ" run -- sh -c "echo \$CPUQ_CPU=\$($list)")
   local mine; mine=$(eval "$list")
-  local drain; drain=$("$CPUQ" drain --max 20s -- sh -c "$list")
+  local drain; drain=$("$CPUQ" drain --all --max 20s -- sh -c "$list")
   local pinned; pinned=$(awk -F= '$1 == $2' "$T/pins" | wc -l | tr -d ' ')
   check "tasks pinned to their CPU ($(tr '\n' ' ' <"$T/pins"); $pinned of 4), one task too ($single); a drain's command unpinned ($drain, this shell: $mine)" \
     "[ $pinned = 4 ] && [ \"\${single%%=*}\" = \"\${single#*=}\" ] && [ '$drain' = '$mine' ]"
@@ -1055,7 +1081,7 @@ t_narrow() {
   local t0 rc dt; t0=$(now)
   taskset -c "$first" "$CPUQ" run -n 4 --label n:x -- sleep 0.5 2>/dev/null; rc=$?
   dt=$(since "$t0")
-  taskset -c "$first" "$CPUQ" drain --max 3s -- true 2>/dev/null; local rd=$?
+  taskset -c "$first" "$CPUQ" drain --all --max 3s -- true 2>/dev/null; local rd=$?
   # The outside-load room counts the machine's CPUs, not the caller's CPU set.
   check "under taskset -c $first, a run of 4 uses the pool of 2 (rc $rc, ${dt}s) and a drain gets it (rc $rd)" "[ $rc = 0 ] && fl '$dt < 1.8' && [ $rd = 0 ]"
 }
@@ -2162,7 +2188,7 @@ f = open(sys.argv[1]); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$sp/p/held
 
 # --- cpuq jobs and the agent (until they go) -------------------------------------------------
 
-TESTS=${*:-budget tasks pack cpus_limit timeout retry wait_max share fair order drain backfill drain_turn lock_stuck storm kill ctrl_z nested driver removed \
+TESTS=${*:-budget tasks pack cpus_limit timeout retry wait_max share fair order drain backfill drain_turn drain_part lock_stuck storm kill ctrl_z nested driver removed \
   kill_holder leftovers leaked_descendant kill_waiter term_waiting lost_seq long_command waiters_cpu \
   exit_status direct_sigint terminal_sigint tasks_sigint ignored_signals stack_limit pin repin narrow \
   status progress usage zombie outside status_host history note wait record min_available min_disk hook \
