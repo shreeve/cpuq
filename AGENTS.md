@@ -137,6 +137,8 @@ a watchdog that lists every process (`ps`):
     cpuq run --label proj:case -- cpuq cap --mem 2G --time 120s --output 1M --pids 512 -- PROGRAM ARGS...   # in the runner
 
 - **`--driver` is for a test runner only.** A build under it holds no CPU; the hook refuses it.
+  One exception: `rig build` with `RIG_UNIT_LAUNCHER='cpuq run --'` set on it, so each unit's
+  compile takes a CPU of its own (`cpuq run --driver -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build …`).
 - **cap is a limit, not a queue:** it takes no CPU, and the hook judges what it runs as if typed
   alone.
 - **Put it inside `cpuq run`, never around it:** its `--time` would count the time spent waiting.

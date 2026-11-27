@@ -2,6 +2,14 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.31.1 — 2026-11-27
+
+- **The hook accepts Rig's split build under `--driver`.** With `RIG_UNIT_LAUNCHER='cpuq run --'`
+  set on it, `rig build` starts each unit's compile as a `cpuq run` of its own, on a CPU of its
+  own, so it is a driver like a test runner: `cpuq run --driver -- env
+  RIG_UNIT_LAUNCHER='cpuq run --' rig build --units=8 app.rig`. Without the launcher it is
+  refused, with that command as the fix.
+
 ## 0.31.0 — 2026-11-27
 
 - **`cpuq status` says who runs work outside cpuq.** Work outside cpuq was shown as its five
