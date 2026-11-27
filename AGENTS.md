@@ -62,13 +62,14 @@ branch names: history is kept by label.
 
 ## Timing
 
-    cpuq drain --label app:bench --max 10m -t 20m -- ./bench
+    cpuq drain -c 4 --label app:bench --max 10m -t 20m -- ./bench
 
-Every run gives its CPUs back as its tasks end; then CMD runs alone, unpinned, and the CPUs go back
-when it ends. `-t` ends it (default 20m, at most 2h); one round of timing per drain. A drain whose
-command keeps under 0.25 CPUs busy for 5 min while others wait is stopped: time, don't sleep. `--max` gives up with exit 75. While it waits, a task whose `-t` ends before the
-drain could start runs on its idle CPUs (backfill): a short `-t` gets work through. It stops
-everyone else: only for real timing.
+A drain gathers N CPUs ahead of the line (runs queued before it go first) and runs CMD alone on
+them, pinned on Linux; the rest of the machine keeps working. Use `$CPUQ_CPUS`, never a `taskset`
+of your own. `-c` is as many CPUs as the measurement uses. `--all` empties the whole machine, for
+at most 20 min: rarely. `-t` ends it (default 20m, at most 2h); one round of timing per drain. A
+drain whose command keeps under 0.25 CPUs busy for 5 min while others wait is stopped: time,
+don't sleep. `--max` gives up with exit 75. Only for real timing.
 
 ## Another machine
 

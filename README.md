@@ -86,7 +86,7 @@ borrows, and what is new here.
 | emptying | a held CPU its run fills no more, to give it up once its tasks end |
 | label | a run's name, `project:task`; history is kept by label |
 | gate | a machine check that holds every free CPU: memory pressure, low memory, low disk |
-| drain | `cpuq drain`: the whole machine, emptied, for one command, for timing |
+| drain | `cpuq drain`: N CPUs (or the whole machine), emptied, for one command, for timing |
 | named lease | a queue for something that is not CPUs: a database, a device, another machine |
 
 ## cpuq run
@@ -317,40 +317,50 @@ filling them:
 
 ## cpuq drain: timing
 
-    cpuq drain [--max T] [-t T] [--label L] [--] CMD ARGS...
+    cpuq drain -c N  [--max T] [-t T] [--label L] [--] CMD ARGS...
+    cpuq drain --all [--max T] [-t T] [--label L] [--] CMD ARGS...
 
-For timing, nothing else. A drain goes first in the line. While it waits, every run stops filling
-its CPUs and gives each back as its tasks end, and every CPU freed goes to the drain. Once it holds
-the whole pool, CMD runs alone, unpinned, and the CPUs go back when it ends, however it ends.
-`--max T` (`90s`, `10m`) gives up if the machine isn't empty by then (exit 75), and nothing runs.
+For timing, nothing else. A drain gathers CPUs ahead of the line, then runs CMD alone on them.
 
-A drain holds every CPU, so it ends on time and must use what it holds:
+- **`-c N`**: N CPUs, the ones it times on. On Linux CMD is pinned to them (`CPUQ_CPUS` lists
+  them, as `taskset -c` takes them; use it, not CPUs of your own), and no other cpuq task runs on
+  them. The rest of the machine keeps working. Each CPU it needs is emptied for it as a task ends
+  there, one at a time, the way the line's first waiter is owed one.
+- **`--all`**: the whole machine, for at most 20 minutes. Every run that has started stops filling
+  its CPUs and gives each back as its tasks end; CMD runs unpinned on the emptied machine.
+
+A drain takes its turn: a run that queued before it and holds no CPU gets each freed CPU first,
+and runs a task on it before it could be emptied for the drain; runs that queue after it wait for
+it. A run that gives CPUs back takes a new turn, behind the drains that came meanwhile. So a stream of drains
+can't starve one-CPU runs, and a stream of new runs can't starve a drain. `--max T` (`90s`,
+`10m`) gives up if its CPUs aren't free by then (exit 75), and nothing runs.
+
+A drain must end on time and use what it holds:
 
 - **`-t T`** is its command's time limit: 20 minutes unless it says otherwise (config
-  `drain_timeout`), at most 2 hours, never off. At the limit the command gets SIGTERM, then
-  SIGKILL 5 s later, and cpuq exits 124.
+  `drain_timeout`), at most 2 hours with `-c`, 20 minutes with `--all`, never off. At the limit
+  the command gets SIGTERM, then SIGKILL 5 s later, and cpuq exits 124.
 - **An idle drain is stopped.** A command that keeps under 0.25 CPUs busy in all (CPU seconds a
   second, whatever the drain holds) for 5 minutes (config `drain_idle`; off: never) while
   another run waits is warned halfway, then stopped the same way. A benchmark computing on one
-  CPU is real timing and runs on; a script that sleeps or waits on the network with the machine
-  held is not.
+  CPU is real timing and runs on; a script that sleeps or waits on the network is not.
 - History says which stopped it (`124 time limit`, `124 idle`), and `cpuq status` flags a drain
   past `drain_timeout` or idling.
 
- Its own builds and helpers run inside it as nested runs. A drain that spans
-several commands wraps them in one: `cpuq drain --label app:bench -- ./bench.sh`.
+Its own builds and helpers run inside it as nested runs. A drain that spans several commands
+wraps them in one: `cpuq drain -c 4 --label app:bench -- ./bench.sh`.
 
-The CPUs a drain has gathered don't sit idle while it waits for long tasks: **backfill**. The
-drain can start no sooner than the last task it waits for may end (its start plus its `-t`). A
-task whose own `-t` ends before then runs on the drain's CPUs meanwhile, in the line's order, one
-task or a run of many. So a short test still runs while a drain waits an hour for a long build,
-and the drain still starts by the time the tasks it waited for could have run to their `-t`. A task that could run past that waits for the
-drain. While a task with no time limit (`-t off`) is in the way, or two drains wait, nothing
-backfills.
+While an `--all` drain waits for long tasks, the CPUs it has gathered don't sit idle:
+**backfill**. It can start no sooner than the last task it waits for may end (its start plus its
+`-t`). A task whose own `-t` ends before then runs on the drain's CPUs meanwhile, in the line's
+order, one task or a run of many, and the drain still starts by the time the tasks it waited for
+could have run to their `-t`. A task that could run past that waits for the drain. While a task
+with no time limit (`-t off`) is in the way, or two drains wait, nothing backfills.
 
-Draining a busy machine stops everyone, so time where that is fair: a quiet machine, or another
-machine through a named lease (`cpuq lease bench --host buildbox -- ssh buildbox 'cd repo && cpuq
-drain -- ./bench'`). Work outside cpuq (system services) still runs; `cpuq status` shows it.
+Time on as few CPUs as the measurement needs: `-c` leaves the machine working. For a whole quiet
+machine, use another machine through a named lease (`cpuq lease bench --host buildbox -- ssh
+buildbox 'cd repo && cpuq drain --all -- ./bench'`). Work outside cpuq (system services) still
+runs; `cpuq status` shows it.
 
 ## Watching
 
@@ -838,7 +848,7 @@ ask for a password. A `cpuq lease NAME --host HOST` inside CMD starts at once, a
 HOST that carries CMD's `CPUQ_LEASES` sees the lease as its own. For timing on HOST, hold the lease
 and drain HOST inside it:
 
-    cpuq lease bench --host buildbox -- ssh buildbox 'cd repo && cpuq drain --label app:bench -- ./bench'
+    cpuq lease bench --host buildbox -- ssh buildbox 'cd repo && cpuq drain --all --label app:bench -- ./bench'
 
 **Held by a script.** `--hold` with `--host` and no command takes the lease for a script that
 holds it partway through its run. Once HOST grants the lease, cpuq prints
@@ -982,8 +992,8 @@ instead. The removed variables are simply not set; `cpuq hook` rewrites a `cpuq 
 | `$CPUQ_CORES`, `$CPUQ_CPUS`, `$CPUQ_TOKEN`, the make jobserver in `MAKEFLAGS` | one job per task (`zig build -j1`, `make`); `CPUQ_TASK` picks a task's work |
 | `--priority high\|normal\|low` | `--urgent` for a run's first CPU; no low |
 | `--max-wait` (run, lease) | `--wait-max` |
-| `--exclusive` (run) | `cpuq drain -- CMD` |
-| `--exclusive` (lease) | `cpuq lease NAME -- cpuq drain -- CMD` |
+| `--exclusive` (run) | `cpuq drain -c N -- CMD` (or `--all`) |
+| `--exclusive` (lease) | `cpuq lease NAME -- cpuq drain --all -- CMD` |
 | `--no-load-check` | outside load is measured, never the load average |
 | `--qos` | tasks run as they are |
 | `--opaque` | every task holds its one CPU, in a container or not |

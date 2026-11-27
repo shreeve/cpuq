@@ -43,14 +43,14 @@ pub const removed_options = [_][2][]const u8{
     .{ "--cores", "--cores is gone: every task gets one CPU. Run M tasks with -n M (at most -c C CPUs at once); a build runs on one CPU" },
     .{ "--priority", "--priority is gone: --urgent puts a run's first CPU ahead of the line; there is no low" },
     .{ "--max-wait", "--max-wait is now --wait-max" },
-    .{ "--exclusive", "--exclusive is gone: `cpuq drain -- CMD` empties the machine and runs CMD alone" },
+    .{ "--exclusive", "--exclusive is gone: `cpuq drain -c N -- CMD` times CMD alone on N CPUs; `--all` empties the machine" },
     .{ "--no-load-check", "--no-load-check is gone: the pool limits CPU work, and outside load is measured" },
     .{ "--qos", "--qos is gone: tasks run as they are" },
     .{ "--opaque", "--opaque is gone: every task holds its one CPU, inside a container or not" },
 };
 
 /// `--exclusive`, given to `cpuq lease`.
-pub const lease_exclusive = "--exclusive is gone: `cpuq lease NAME -- cpuq drain -- CMD` holds the lease and runs CMD alone on the emptied machine";
+pub const lease_exclusive = "--exclusive is gone: `cpuq lease NAME -- cpuq drain --all -- CMD` holds the lease and runs CMD alone on the emptied machine";
 
 /// The removed options that took a value: skipped with it.
 const removed_value_options = [_][]const u8{ "--cores", "--priority", "--max-wait", "--qos" };
@@ -506,7 +506,7 @@ fn fixRun(a: std.mem.Allocator, w: []const []const u8, drop_driver: bool) FixedR
     var words: std.ArrayList([]const u8) = .empty;
     if (drain and !lease) {
         // A run held alone: `cpuq drain`, which takes a label and a time to wait.
-        words.appendSlice(a, &.{ "cpuq", "drain" }) catch {};
+        words.appendSlice(a, &.{ "cpuq", "drain", "--all" }) catch {};
         if (label) |l| words.appendSlice(a, &.{ "--label", l }) catch {};
         if (wait) |s| words.appendSlice(a, &.{ "--max", a.print("{s}s", .{s}) catch s }) catch {};
     } else {
@@ -515,7 +515,7 @@ fn fixRun(a: std.mem.Allocator, w: []const []const u8, drop_driver: bool) FixedR
     }
     if (fixed.words.len != 0) {
         words.append(a, "--") catch {};
-        if (drain and lease) words.appendSlice(a, &.{ "cpuq", "drain", "--" }) catch {};
+        if (drain and lease) words.appendSlice(a, &.{ "cpuq", "drain", "--all", "--" }) catch {};
         words.appendSlice(a, fixed.words) catch {};
     }
     return .{ .text = joinQuoted(a, words.items), .whole = fixed.whole };
@@ -1219,7 +1219,7 @@ test "removed options are refused as cpuq refuses them, with the run they become
         .{ "cpuq run --cores=4 -- make", "--cores", "cpuq run -- make" },
         .{ "cpuq run --priority high --label a:b -- ./x", "--priority", "cpuq run --label a:b -- ./x" },
         .{ "cpuq run --max-wait 60 --label a:b -- ./x", "--max-wait", "cpuq run --wait-max 60 --label a:b -- ./x" },
-        .{ "cpuq run --exclusive --label rig:bench --max-wait 90 -- ./bench", "--exclusive", "cpuq drain --label rig:bench --max 90s -- ./bench" },
+        .{ "cpuq run --exclusive --label rig:bench --max-wait 90 -- ./bench", "--exclusive", "cpuq drain --all --label rig:bench --max 90s -- ./bench" },
         .{ "cpuq run --no-load-check -- ./x", "--no-load-check", "cpuq run -- ./x" },
         .{ "cpuq run --qos none -- ./x", "--qos", "cpuq run -- ./x" },
         .{ "cpuq run --label e:t --cores 4 --opaque -- incus exec c -- make", "--cores", "cpuq run --label e:t -- incus exec c -- make" },
@@ -1235,7 +1235,7 @@ test "removed options are refused as cpuq refuses them, with the run they become
     // A lease held alone: the lease, then cpuq drain inside it.
     const r = refusal(a, "cpuq lease w --host pup --exclusive -- ./bench");
     try std.testing.expectEqualStrings(lease_exclusive, r.reason);
-    try std.testing.expectEqualStrings("cpuq lease w --host pup -- cpuq drain -- ./bench", r.instead);
+    try std.testing.expectEqualStrings("cpuq lease w --host pup -- cpuq drain --all -- ./bench", r.instead);
     try std.testing.expect(refused("cpuq lease w --priority low -- ./bench"));
     // After `--` an option is the command's.
     try std.testing.expect(!refused("cpuq run --label a:b -- ./x --cores 4"));

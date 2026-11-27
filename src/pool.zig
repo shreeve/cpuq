@@ -433,8 +433,10 @@ pub const Op = struct {
     urgent: bool = false,
     /// It has held a CPU: urgent no more, even holding none again.
     served: bool = false,
-    /// `cpuq drain`: waits for every CPU, and takes the machine.
+    /// `cpuq drain`: gathers its CPUs ahead of the line and runs alone on them.
     drain: bool = false,
+    /// A drain of the whole machine (--all); else of `limit` CPUs (-c N).
+    all: bool = false,
     pid: i32 = 0,
     project: []const u8 = "",
     label: []const u8 = "",
@@ -465,8 +467,8 @@ pub const Op = struct {
     cmd: []const u8 = "",
 
     pub fn format(r: Op, w: *Io.Writer) Io.Writer.Error!void {
-        try w.print("pid={d}\nurgent={d}\nserved={d}\ndrain={d}\nproject={s}\nlabel={s}\nweight={d}\nwant={d}\nheld=", .{
-            r.pid, @intFromBool(r.urgent), @intFromBool(r.served), @intFromBool(r.drain), r.project, r.label, r.weight, r.want,
+        try w.print("pid={d}\nurgent={d}\nserved={d}\ndrain={d}\nall={d}\nproject={s}\nlabel={s}\nweight={d}\nwant={d}\nheld=", .{
+            r.pid, @intFromBool(r.urgent), @intFromBool(r.served), @intFromBool(r.drain), @intFromBool(r.all), r.project, r.label, r.weight, r.want,
         });
         for (r.held, 0..) |cpu, i| try w.print("{s}{d}", .{ if (i == 0) "" else ",", cpu });
         try w.print("\ndraining={d}\noverload={d}\nlimit={d}\ntasks={d}\ndone={d}\nfailed={d}\nrunning={d}\nsince={d}\ntlimit={d}\nends={d}\nwhy={s}\nnow=", .{
@@ -489,6 +491,7 @@ pub const Op = struct {
             if (eq(k, "urgent")) r.urgent = eq(v, "1");
             if (eq(k, "served")) r.served = eq(v, "1");
             if (eq(k, "drain")) r.drain = eq(v, "1");
+            if (eq(k, "all")) r.all = eq(v, "1");
             if (eq(k, "project")) r.project = v;
             if (eq(k, "label")) r.label = v;
             if (eq(k, "weight")) r.weight = @max(1, n);
@@ -603,9 +606,10 @@ fn countProjects(a: std.mem.Allocator, ops: []const Op, given: []const Promise) 
 /// each: the CPUs already promised (`given`) count as held by their operation. Returns the new
 /// promises. While a `cpuq drain` wants CPUs, every CPU goes to a drain alone: the one holding
 /// or promised the most, then the older, so two drains never each hold part of the pool waiting
-/// for the other's. A stopped one (which wants none) is passed over. One exception, backfill:
-/// a CPU goes first to a waiter whose task would end before the drain could start anyway
-/// (`fits`), in the line's order.
+/// for the other's. A stopped one (which wants none) is passed over. Two exceptions, in the
+/// line's order: a run that queued before the drain and has yet to start goes first (`before`:
+/// a drain takes its turn); then backfill, a waiter whose task would end before the drain could
+/// start anyway (`fits`).
 pub fn handOut(a: std.mem.Allocator, ops: []const Op, given: []const Promise, free: []const u32, now: i64) []Promise {
     var out: std.ArrayList(Promise) = .empty;
     if (free.len == 0) return out.items;
@@ -625,7 +629,12 @@ pub fn handOut(a: std.mem.Allocator, ops: []const Op, given: []const Promise, fr
         var projects = countProjects(a, ops, all.items);
         var best: ?usize = null;
         if (drains) {
-            if (shadow(ops)) |sh| for (standings, 0..) |st, i| {
+            const turn = turnOf(ops);
+            for (standings, 0..) |st, i| {
+                if (st.left == 0 or !before(st.op.*, turn)) continue;
+                if (best == null or ahead(&projects, st, standings[best.?])) best = i;
+            }
+            if (best == null) if (shadow(ops)) |sh| for (standings, 0..) |st, i| {
                 if (st.left == 0 or !fits(st.op.*, sh, now)) continue;
                 if (best == null or ahead(&projects, st, standings[best.?])) best = i;
             };
@@ -638,10 +647,12 @@ pub fn handOut(a: std.mem.Allocator, ops: []const Op, given: []const Promise, fr
                 }
                 if (standings[d.?].left > 0) best = d;
             }
-        } else for (standings, 0..) |s, i| {
+        }
+        // No drain wants, or it has all it asked for (-c N): the line as usual.
+        if (best == null) for (standings, 0..) |s, i| {
             if (s.left == 0) continue;
             if (best == null or ahead(&projects, s, standings[best.?])) best = i;
-        }
+        };
         const b = best orelse break;
         const p: Promise = .{ .cpu = cpu, .ticket = standings[b].op.ticket };
         out.append(a, p) catch break;
@@ -650,6 +661,31 @@ pub fn handOut(a: std.mem.Allocator, ops: []const Op, given: []const Promise, fr
         standings[b].left -= 1;
     }
     return out.items;
+}
+
+/// A drain takes its turn: it passes no run that queued before it. Of the gathering drains, the
+/// oldest; an operation older than it that holds no CPU and wants one (`before`) gets CPUs ahead
+/// of it, and a CPU it takes runs a task before it is emptied for the drain. An operation that
+/// gives CPUs back takes a new ticket (`renew`), so after its turn it is younger than the drains
+/// that came meanwhile: they go first, then it. Null when no drain gathers.
+pub fn turnOf(ops: []const Op) ?u64 {
+    for (ops) |o| if (o.drain and o.want > 0) return o.ticket;
+    return null;
+}
+
+/// Whether `o` queued before the gathering drain `turn`, holds no CPU and wants one: it goes
+/// first.
+pub fn before(o: Op, turn: ?u64) bool {
+    const t = turn orelse return false;
+    return !o.drain and o.ticket < t and o.held.len == 0 and o.want > 0;
+}
+
+/// Whether a drain gathers the whole machine (--all): every
+/// operation that has started stops filling its CPUs for it (unless its tasks backfill). A
+/// drain of fewer CPUs (-c N) is owed them one at a time by the line's giver instead.
+pub fn drainWantsAll(ops: []const Op) bool {
+    for (ops) |o| if (o.drain and o.all and o.want > 0) return true;
+    return false;
 }
 
 /// While one `cpuq drain` gathers the machine: the latest the tasks it waits for may end (Unix
@@ -662,6 +698,8 @@ pub fn shadow(ops: []const Op) ?i64 {
     var latest: i64 = 0;
     for (ops) |o| {
         if (o.drain) {
+            // A drain of a few CPUs (-c N) is owed them one by one, not the machine: no backfill.
+            if (o.want > 0 and !o.all) return null;
             if (o.want > 0) gathering += 1 else if (o.held.len > 0) return null;
             continue;
         }
@@ -801,7 +839,7 @@ test "the line: urgent only until served; a stopped drain is passed over" {
     const fresh = [_]Op{ ops[0], .{ .ticket = 5, .project = "p", .urgent = true, .want = 1 } };
     try std.testing.expectEqual(5, handOut(a, &fresh, &.{}, &.{2}, 0)[0].ticket);
     // A stopped drain wants nothing: free CPUs go to the line, not to no one.
-    const stopped = [_]Op{ .{ .ticket = 1, .project = "q", .want = 2 }, .{ .ticket = 2, .project = "x", .drain = true } };
+    const stopped = [_]Op{ .{ .ticket = 1, .project = "q", .want = 2 }, .{ .ticket = 2, .project = "x", .drain = true, .all = true } };
     const got = handOut(a, &stopped, &.{}, &.{ 0, 1 }, 0);
     try std.testing.expectEqual(2, got.len);
     try std.testing.expectEqual(1, got[0].ticket);
@@ -814,7 +852,7 @@ test "backfill: a waiter that ends before the drain could start goes first" {
     // A build holds CPU 0 until 1000 at the latest; the drain holds CPU 1 and wants CPU 0.
     const ops = [_]Op{
         .{ .ticket = 1, .project = "rig", .held = &.{0}, .running = 1, .tlimit = 3600, .ends = 1000 },
-        .{ .ticket = 2, .project = "x", .drain = true, .held = &.{1}, .want = 2 },
+        .{ .ticket = 2, .project = "x", .drain = true, .all = true, .held = &.{1}, .want = 2 },
         .{ .ticket = 3, .project = "trig", .want = 1, .tlimit = 130 },
         .{ .ticket = 4, .project = "rip", .want = 1, .tlimit = 3610 },
     };
@@ -839,11 +877,37 @@ test "backfill: a waiter that ends before the drain could start goes first" {
     var open = ops;
     open[0].tlimit = 0;
     try std.testing.expectEqual(null, shadow(&open));
-    const two = [_]Op{ ops[0], ops[1], .{ .ticket = 5, .project = "y", .drain = true, .held = &.{2} } };
+    const two = [_]Op{ ops[0], ops[1], .{ .ticket = 5, .project = "y", .drain = true, .all = true, .held = &.{2} } };
     try std.testing.expectEqual(null, shadow(&two));
     var idle = ops;
     idle[0].running = 0;
     try std.testing.expectEqual(null, shadow(&idle));
+}
+
+test "a drain takes its turn: it passes no run that queued before it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A run (1) holds CPU 0; an older waiter (2) has never run a task; then a drain (3); then a
+    // newer waiter (4). Two CPUs free: the older waiter's first, then the drain's; not the newer.
+    const ops = [_]Op{
+        .{ .ticket = 1, .project = "a", .served = true, .held = &.{0}, .running = 1, .tlimit = 3600, .ends = 4000 },
+        .{ .ticket = 2, .project = "rig", .want = 1 },
+        .{ .ticket = 3, .project = "trig", .drain = true, .all = true, .urgent = true, .want = 3 },
+        .{ .ticket = 4, .project = "z", .want = 1 },
+    };
+    try std.testing.expectEqual(3, turnOf(&ops).?);
+    try std.testing.expect(before(ops[1], turnOf(&ops)));
+    try std.testing.expect(!before(ops[0], turnOf(&ops)));
+    try std.testing.expect(!before(ops[3], turnOf(&ops)));
+    const got = handOut(a, &ops, &.{}, &.{ 1, 2 }, 0);
+    try std.testing.expectEqual(2, got.len);
+    try std.testing.expectEqual(2, got[0].ticket);
+    try std.testing.expectEqual(3, got[1].ticket);
+    // Once it holds a CPU it asks no more ahead of the drain; a run that has had tasks, holds
+    // nothing and still wants (a long run between turns) goes first again while older.
+    try std.testing.expect(!before(.{ .ticket = 2, .project = "rig", .held = &.{1}, .want = 1 }, 3));
+    try std.testing.expect(before(.{ .ticket = 2, .project = "rig", .done = 5, .want = 1 }, 3));
 }
 
 test "the line: of two drains, the one holding the most takes the free CPUs" {
@@ -852,12 +916,12 @@ test "the line: of two drains, the one holding the most takes the free CPUs" {
     const a = arena.allocator();
     // B (older) holds nothing, C holds one: the free CPU goes to C, not to B.
     const ops = [_]Op{
-        .{ .ticket = 1, .project = "x", .drain = true, .urgent = true, .want = 2 },
-        .{ .ticket = 2, .project = "x", .drain = true, .urgent = true, .held = &.{0}, .want = 1 },
+        .{ .ticket = 1, .project = "x", .drain = true, .all = true, .urgent = true, .want = 2 },
+        .{ .ticket = 2, .project = "x", .drain = true, .all = true, .urgent = true, .held = &.{0}, .want = 1 },
     };
     try std.testing.expectEqual(2, handOut(a, &ops, &.{}, &.{1}, 0)[0].ticket);
     // Holding the same, the older goes first.
-    const even = [_]Op{ .{ .ticket = 1, .project = "x", .drain = true, .want = 2 }, .{ .ticket = 2, .project = "x", .drain = true, .want = 2 } };
+    const even = [_]Op{ .{ .ticket = 1, .project = "x", .drain = true, .all = true, .want = 2 }, .{ .ticket = 2, .project = "x", .drain = true, .all = true, .want = 2 } };
     try std.testing.expectEqual(1, handOut(a, &even, &.{}, &.{0}, 0)[0].ticket);
 }
 
@@ -884,8 +948,8 @@ test "the line: weight, urgent, drain" {
     defer arena.deinit();
     const a = arena.allocator();
     const ops = [_]Op{
-        .{ .ticket = 1, .project = "rig", .weight = 2, .held = &.{ 0, 1 }, .want = 5 },
-        .{ .ticket = 2, .project = "trig", .held = &.{2}, .want = 5 },
+        .{ .ticket = 1, .project = "rig", .weight = 2, .held = &.{ 0, 1 }, .want = 5, .running = 2 },
+        .{ .ticket = 2, .project = "trig", .held = &.{2}, .want = 5, .running = 1 },
         .{ .ticket = 3, .project = "trig", .urgent = true, .want = 5 },
     };
     // The urgent op's first CPU goes first; then rig (2/2 = 1) ties trig (2/1 = 2)? No: rig is lower.
@@ -893,7 +957,7 @@ test "the line: weight, urgent, drain" {
     try std.testing.expectEqual(3, got[0].ticket);
     try std.testing.expectEqual(1, got[1].ticket);
     // A drain takes every CPU.
-    const with_drain = [_]Op{ ops[0], .{ .ticket = 9, .project = "x", .drain = true, .want = 8 } };
+    const with_drain = [_]Op{ ops[0], .{ .ticket = 9, .project = "x", .drain = true, .all = true, .want = 8 } };
     const d = handOut(a, &with_drain, &.{}, &.{ 3, 4 }, 0);
     try std.testing.expectEqual(2, d.len);
     try std.testing.expectEqual(9, d[0].ticket);
