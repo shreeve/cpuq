@@ -9,6 +9,10 @@ User-visible changes to cpuq. Each version's section is its release notes.
   runs it there. Raised, the run takes free CPUs at once, in the line's order; lowered, it stops
   filling the CPUs beyond the new limit and gives each back as its tasks end, killing none. On
   burst an `-n 200 -c 32` run left 57 CPUs free for hours with 159 tasks to go.
+- **The hook refuses a command that gives cpuq a pool of its own** (`CPUQ_DIR=...`) outside
+  cpuq's own repository. Such a pool's runs wait in a line nobody else is in, and their load
+  lands on the machine's real line unseen: a load test of 20 CPU burners on a private pool took
+  the Mac to a load of 61.
 - **`cpuq status` flags a run held back by its own `-c`** (`capped`): tasks queued under its
   limit while CPUs are free, with the `cpuq limit` command that raises it.
 

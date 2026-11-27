@@ -368,10 +368,28 @@ pub fn cmdHook(ctx: *Ctx) u8 {
     const call = std.json.parseFromSliceLeaky(Call, a, input.items, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return 0;
     if (!std.mem.eql(u8, call.tool_name, "Bash") or call.tool_input.command.len == 0) return 0;
     const project = std.fs.path.basename(call.cwd);
+    // A pool of its own hides its load from this machine's line, except cpuq's own suite's.
+    if (hook.privatePool(call.tool_input.command) and std.mem.indexOf(u8, call.tool_input.command, "# cpuq: skip") == null and !cpuqRepo(ctx, call.cwd)) {
+        std.debug.print("cpuq: this command gives cpuq a pool of its own (CPUQ_DIR=...): its runs would wait in a line no one else is in, and the load they make would land on this machine's real line unseen.\nRun instead: the same command without CPUQ_DIR, so its runs share this machine's pool.\n(A command that must run as it is can end with `# cpuq: skip`.)\n", .{});
+        return 2;
+    }
     var advisor: HookAdvisor = .{ .ctx = ctx, .cwd = call.cwd };
     const r = hook.check(a, call.tool_input.command, project, advisor.it()) orelse return 0;
     std.debug.print("cpuq: {s}.\nRun instead: {s}\n(See AGENTS.md in the cpuq repo. A command that must run as it is can end with `# cpuq: skip`.)\n", .{ r.reason, r.instead });
     return 2;
+}
+
+/// Whether `cwd` is in a checkout of cpuq itself, whose suite runs on pools of its own.
+fn cpuqRepo(ctx: *Ctx, cwd: []const u8) bool {
+    var dir: []const u8 = cwd;
+    while (dir.len > 1) : (dir = std.fs.path.dirname(dir) orelse return false) {
+        const p = std.fs.path.join(ctx.arena, &.{ dir, "src", "hook.zig" }) catch return false;
+        const t = std.fs.path.join(ctx.arena, &.{ dir, "test", "run.sh" }) catch return false;
+        Io.Dir.cwd().access(ctx.io, p, .{}) catch continue;
+        Io.Dir.cwd().access(ctx.io, t, .{}) catch continue;
+        return true;
+    }
+    return false;
 }
 
 /// What the hook knows of a `cpuq run`'s work: its runs here and elsewhere, and the repo's specs.
