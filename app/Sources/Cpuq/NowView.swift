@@ -1260,12 +1260,17 @@ struct JobsCard: View {
         let s = model.status
         let holders = order.sorted(s?.holders ?? [])
         let waiters = s?.waiters ?? []
+        // Work outside cpuq, by what started it: shown once it keeps a CPU busy, so a build an
+        // agent ran without cpuq, or `ssh HOST 'make'`, is named beside the jobs it slows.
+        let outside = (s?.outsideWork ?? []).filter { $0.using >= 0.5 && $0.ranBySomeone }
         let free = Moment.now(model).free
         let scale = max(4, holders.map { $0.using ?? 0 }.max() ?? 0).rounded(.up)
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline) {
                 Text("JOBS").eyebrow()
-                Text("· \(holders.count) running · \(waiters.count) waiting").font(.system(size: 13, weight: .medium)).foregroundStyle(Alive.ink)
+                (Text("· \(holders.count) running · \(waiters.count) waiting").foregroundStyle(Alive.ink)
+                    + Text(outside.isEmpty ? "" : " · \(outside.count) outside cpuq").foregroundStyle(.orange))
+                    .font(.system(size: 13, weight: .medium))
                 Picker("Order", selection: $order) {
                     ForEach(JobOrder.allCases) { Text($0.rawValue).tag($0) }
                 }
@@ -1298,9 +1303,11 @@ struct JobsCard: View {
             if !holders.isEmpty { columnHeads }
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 0) {
+                    // First: work outside cpuq is what to act on, and a long list mustn't hide it.
+                    ForEach(outside, id: \.pid) { o in outsideRow(o) }
                     ForEach(holders, id: \.pid) { h in running(h, scale: scale) }
                     ForEach(waiters, id: \.pid) { w in waiting(w, free: free) }
-                    if holders.isEmpty && waiters.isEmpty {
+                    if holders.isEmpty && waiters.isEmpty && outside.isEmpty {
                         Text("Nothing running or waiting.").foregroundStyle(Alive.ink2).frame(maxWidth: .infinity, alignment: .leading).frame(height: 21)
                     }
                 }
@@ -1315,8 +1322,9 @@ struct JobsCard: View {
             })
             // macOS hides an idle scroller, so rows past the card's edge say so: "4 running" with
             // three rows in sight looked like a job had gone missing.
-            .overlay(alignment: .bottomTrailing) {
-                let below = holders.count + waiters.count - Int(((listHeight + scrolled) / rowHeight).rounded(.down))
+            // Centred, so it covers no column's figures.
+            .overlay(alignment: .bottom) {
+                let below = holders.count + waiters.count + outside.count - Int(((listHeight + scrolled) / rowHeight).rounded(.down))
                 if below > 0 {
                     Text("+\(below) more ↓").font(.system(size: 11, weight: .medium)).foregroundStyle(Alive.ink2)
                         .padding(.horizontal, 7).padding(.vertical, 2)
@@ -1402,6 +1410,31 @@ struct JobsCard: View {
             }
         }
         .help(flagWords(h).joined(separator: "\n"))
+    }
+
+    /// Work outside cpuq: what started it and its command, where it runs, and the CPUs it keeps
+    /// busy, in the grey of work outside cpuq.
+    private func outsideRow(_ o: Status.Work) -> some View {
+        HStack(spacing: 10) {
+            Circle().fill(Alive.out).frame(width: 8, height: 8)
+            (Text("outside cpuq").fontWeight(.medium).foregroundStyle(.orange)
+                + Text("  \(o.starter)").foregroundStyle(Alive.ink2))
+                .lineLimit(1).frame(width: 230, alignment: .leading)
+            // Its folder by name first (the whole path is in the tooltip), then the command.
+            (Text(o.cwd.isEmpty ? "" : "\((o.cwd as NSString).lastPathComponent)   ").fontWeight(.medium).foregroundStyle(Alive.ink)
+                + Text(String(o.shortCommand.split(separator: "\n").first ?? "")).foregroundStyle(Alive.ink2))
+                .lineLimit(1).truncationMode(.tail)
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+            Text("\(o.procs) proc\(o.procs == 1 ? "" : "s")").font(.system(size: 11.5)).foregroundStyle(Alive.ink3)
+                .frame(width: 56, alignment: .trailing)
+            Text(String(format: "%.1f busy", o.using)).font(.system(size: 11.5)).foregroundStyle(o.using >= 1 ? .orange : Alive.ink2)
+                .frame(width: 100, alignment: .trailing)
+            Text("pid " + String(o.pid)).font(.system(size: 11.5)).foregroundStyle(Alive.ink3).frame(width: 64, alignment: .trailing)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .font(.system(size: 12)).monospacedDigit()
+        .frame(height: 21)
+        .help("Not under cpuq: started by \(o.via.isEmpty ? "an unknown parent" : o.via) (pid \(o.pid)), in \(o.cwd.isEmpty ? "?" : o.cwd)\n\(o.command)\n\nIt takes CPUs cpuq can't see or share; run it with cpuq run.")
     }
 
     /// Its project's weight (the config's `weights`): its share of the pool against the other

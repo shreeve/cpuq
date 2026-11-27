@@ -488,7 +488,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             let busy = s.outsideTotal ?? s.outside.reduce(0) { $0 + $1.using }
             var e = outsideHeavy[id] ?? Episode()
             track(&e, busy >= max(2, 0.4 * cpus), after: 3 * 60, now) {
-                notify("outside-\(id)", String(format: "%@: %.1f of %d CPUs busy outside cpuq", name, busy, Int(cpus)), Self.outsideBody(s.outside))
+                notify("outside-\(id)", String(format: "%@: %.1f of %d CPUs busy outside cpuq", name, busy, Int(cpus)),
+                       s.outsideWork.contains(where: \.ranBySomeone) ? Self.workBody(s.outsideWork.filter(\.ranBySomeone)) : Self.outsideBody(s.outside))
             }
             outsideHeavy[id] = e
         }
@@ -572,6 +573,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
         let lines = groups.prefix(2).map { g in
             g.cmd + (g.n > 1 ? " ×\(g.n)" : "") + (g.cwd.isEmpty ? "" : " in " + g.cwd)
+        }
+        return "For 3 minutes, not under cpuq: " + lines.joined(separator: "; ") + ". Jobs queued here wait for it."
+    }
+
+    /// Outside work for a notification, by what started it: its two busiest, each with its
+    /// command, who started it, where, and its CPUs.
+    static func workBody(_ work: [Status.Work]) -> String {
+        let lines = work.prefix(2).map { w in
+            String(w.shortCommand.prefix(60)) + " (\(w.starter)" + (w.cwd.isEmpty ? "" : ", in " + shortPath(w.cwd)) + String(format: ", %.1f CPUs)", w.using)
         }
         return "For 3 minutes, not under cpuq: " + lines.joined(separator: "; ") + ". Jobs queued here wait for it."
     }

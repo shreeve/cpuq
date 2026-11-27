@@ -33,6 +33,8 @@ public struct Status: Decodable, Sendable, Equatable {
     public var outside: [Outside] = []
     /// CPUs busy outside every cpuq job, in all.
     public var outsideTotal: Double?
+    /// The same load by what started it, busiest first (cpuq 0.31 on).
+    public var outsideWork: [Work] = []
     /// `cpuq record` is sampling the machine: `cpuq samples` has its past.
     public var recorder = false
 
@@ -119,6 +121,46 @@ public struct Status: Decodable, Sendable, Equatable {
         public var fair = 0.0
     }
 
+    /// Work outside cpuq by what started it: the top of a process tree just below its starter
+    /// (an agent's harness, an ssh session, a terminal, a service manager).
+    public struct Work: Decodable, Sendable, Equatable {
+        public var pid = 0
+        /// The command (an agent's own, out of its harness's wrapper) and where it runs.
+        public var command = ""
+        public var cwd = ""
+        /// The starter's program name: `claude`, `sshd-session`, `launchd`, ...
+        public var via = ""
+        public var procs = 0
+        public var using = 0.0
+
+        /// The command for one line: the program's own name, not its path, then its arguments.
+        public var shortCommand: String {
+            let first = command.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+            guard let head = first.first else { return "pid \(pid)" }
+            let prog = head.split(separator: "/").last.map(String.init) ?? String(head)
+            return first.count > 1 ? prog + " " + first[1] : prog
+        }
+
+        /// Work someone ran: started by an agent, ssh, a terminal or cron, or detached in a folder
+        /// of its own (`nohup make &` keeps the folder it was started in). An app or a system
+        /// service runs detached in `/`, and isn't work anyone should move under cpuq.
+        public var ranBySomeone: Bool {
+            starter != "detached" || !(cwd.isEmpty || cwd == "/")
+        }
+
+        /// Who started it, in words: "an agent", "ssh", "a terminal", or the starter's name.
+        public var starter: String {
+            switch via {
+            case "claude": "an agent"
+            case "sshd", "sshd-session": "ssh"
+            case "Terminal", "iTerm2", "login", "tmux", "tmux: server", "screen": "a terminal"
+            case "launchd", "systemd", "init": "detached"
+            case "": "?"
+            default: via
+            }
+        }
+    }
+
     public struct Outside: Decodable, Sendable, Equatable {
         public var pid = 0
         public var name = ""
@@ -170,7 +212,7 @@ extension Status {
 // Decoding with defaults: a missing key keeps the property's default.
 extension Status {
     private enum Keys: String, CodingKey {
-        case version, budget, held, load, memoryPressure, gate, holders, waiters, projects, outside, outsideTotal, recorder, admit, pool, free, activeCores, cpuTicks, bootTime, memory
+        case version, budget, held, load, memoryPressure, gate, holders, waiters, projects, outside, outsideTotal, outsideWork, recorder, admit, pool, free, activeCores, cpuTicks, bootTime, memory
     }
 
     public init(from decoder: any Decoder) throws {
@@ -193,6 +235,7 @@ extension Status {
         projects = try c.decodeIfPresent([Project].self, forKey: .projects) ?? []
         outside = try c.decodeIfPresent([Outside].self, forKey: .outside) ?? []
         outsideTotal = try c.decodeIfPresent(Double.self, forKey: .outsideTotal)
+        outsideWork = try c.decodeIfPresent([Work].self, forKey: .outsideWork) ?? []
         recorder = try c.decodeIfPresent(Bool.self, forKey: .recorder) ?? false
     }
 }
@@ -272,6 +315,19 @@ extension Status.Project {
         held = try c.decodeIfPresent(Int.self, forKey: .held) ?? 0
         want = try c.decodeIfPresent(Int.self, forKey: .want) ?? 0
         fair = try c.decodeIfPresent(Double.self, forKey: .fair) ?? 0
+    }
+}
+
+extension Status.Work {
+    private enum Keys: String, CodingKey { case pid, command, cwd, via, procs, using }
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        pid = try c.decodeIfPresent(Int.self, forKey: .pid) ?? 0
+        command = try c.decodeIfPresent(String.self, forKey: .command) ?? ""
+        cwd = try c.decodeIfPresent(String.self, forKey: .cwd) ?? ""
+        via = try c.decodeIfPresent(String.self, forKey: .via) ?? ""
+        procs = try c.decodeIfPresent(Int.self, forKey: .procs) ?? 0
+        using = try c.decodeIfPresent(Double.self, forKey: .using) ?? 0
     }
 }
 
