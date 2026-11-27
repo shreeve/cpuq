@@ -51,7 +51,8 @@ tasks to go. A holder that broke this would stop every cpuq on the
 machine, so `cpuq status` waits for the lock at most 5 s, then names the holder from the lock
 file's note and exits 125.
 
-An operation's record is `key=value` lines: `pid`, `urgent`, `drain`, `project`, `label`,
+An operation's record is `key=value` lines: `pid`, `urgent`, `served` (it has held a CPU),
+`drain`, `project`, `label`,
 `weight`, `want` (CPUs it could use now beyond those it holds), `held` (its CPUs, by number),
 `draining` (how many of those it is emptying), `overload` (`-x`), `limit` (`-c`, worked out),
 `tasks`, `done`, `failed`, `running`, `since`, `why` (what holds it back, for status) and `cmd`.
@@ -143,8 +144,10 @@ what a crash freed without a hand-out.
 keeps (held less draining) plus those promised to it; a project's count is the sum of its
 operations'. In order:
 
-1. **Urgent:** an urgent operation that has nothing, while its project holds no urgent CPU, goes
-   first. So urgency is for an operation's first CPU, one per project at a time.
+1. **Urgent:** an urgent operation that has never held a CPU, while its project holds no urgent
+   CPU, goes first. So urgency is for an operation's first CPU, one per project at a time: one
+   that gave its CPUs up and holds nothing again isn't urgent, or with endless work it would
+   rank first again and starve a waiter of its own project.
 2. **Holding nothing:** an operation with nothing goes before every operation with something, so
    it can't starve behind a head nobody may give to.
 3. **The project's share:** the lower project count ÷ weight (compared without division).
@@ -251,20 +254,25 @@ with an orphan. A dead operation's history reads `lost`.
 
 ## Ctrl-Z
 
-cpuq takes SIGTSTP (unless it was started with it ignored). It SIGSTOPs every task, gives back
-every CPU, marks itself stopped (its record wants nothing, so the line passes it by), drops every
-promise made to it, hands the freed CPUs to the line, and then stops itself with SIGSTOP (a TSTP
-to a process outside job control, an agent's shell, would be dropped). Continued, it stops the
-tasks again (a shell continues the whole job's group, and a single task shares cpuq's), adds the
-time stopped to each task's start so it doesn't count against its limit, and the loop asks the
-line for CPUs again: each stopped task gets a place, is re-pinned there on Linux, and gets SIGCONT.
+cpuq takes SIGTSTP (unless it was started with it ignored). It SIGSTOPs every task, gives back every
+CPU, marks itself stopped (its record wants nothing, so the line passes it by), drops every promise
+made to it, hands the freed CPUs to the line, and then stops itself with SIGSTOP (a TSTP to a
+process outside job control, an agent's shell, would be dropped). A continue that comes before cpuq
+acts on the stop cancels it; one that comes while cpuq gives its CPUs back moves a count of
+continues, and cpuq then doesn't stop itself (only a continue between that check and the raise is
+still lost). A stopped drain lets `v2/drain` go, so no one empties CPUs for it, and the line passes
+it by; continued, it takes the mark again. Continued, cpuq stops the tasks again (a shell continues
+the whole job's group, and a single task shares cpuq's), adds the time stopped to each task's start
+so it doesn't count against its limit, and the loop asks the line for CPUs again: each stopped task
+gets a place, is re-pinned there on Linux, and gets SIGCONT.
 
 ## cpuq drain
 
 `cpuq drain` is an operation with `drain` and `urgent` set, `want` the whole pool while its
-command hasn't started, and no time limit. It holds a shared lock on `v2/drain` for its life, so
-two drains never wait for each other there; they wait in the line, and run in turn. While it is
-in the line every CPU handed out goes to it (`handOut`), and every other operation, seeing
+command hasn't started, and no time limit. It holds a shared lock on `v2/drain` while it runs
+(not while stopped), so two drains never wait for each other there; they wait in the line, and
+run in turn. While it wants CPUs every CPU handed out goes to it (`handOut`), and every other
+operation, seeing
 `v2/drain` held, marks all its CPUs draining: it starts nothing new and gives each CPU back as its
 tasks end. Once the drain holds every pool CPU its command runs, unpinned, and the CPUs go back
 when it ends. `--max` gives up (exit 75) while it holds less than the pool.
@@ -364,11 +372,11 @@ gone, or which queued before the machine last booted, is `lost`.
 
 ## What the Lean model checks
 
-A Lean 4 model of the protocol lives in `formal/` on the `lean-model` worktree. It models the
-protocol, not the Zig code: one step function over finite state (each CPU's flock holder, promise
-and record; each operation's phase and tasks; the tickets; the drain count), with the rules of
-src/pool.zig and the loop of src/op.zig as one of its rule sets (`Rules.poolFixed`, the code at
-8f997ec).
+A Lean 4 model of the protocol lives in `formal/` (its README has the whole account). It models
+the protocol, not the Zig code: one step function over finite state (each CPU's flock holder,
+promise and record; each operation's phase and tasks; the tickets; the drain count; the pool's
+lock, the drain mark and Ctrl-Z), with the rules of src/pool.zig and the loop of src/op.zig as
+its rule sets.
 
 - **Proved, safety,** in every reachable state, crashes, kills and stops included: one holder per
   token, and a held token has no promise; never more CPUs held than the pool; never more than C
@@ -377,18 +385,20 @@ src/pool.zig and the loop of src/op.zig as one of its rule sets (`Rules.poolFixe
   on a CPU nobody holds); the drain count equals the draining CPUs; a promise goes only to the
   first in line.
 - **Proved, liveness parts:** right after any hand-out, no CPU is free while anyone is in line;
-  each share-rule transfer lowers Σ nₚ²/wₚ, so transfers can't go back and forth; and a head that
-  holds nothing may take from every holder.
+  each share-rule transfer lowers Σ nₚ²/wₚ, so transfers can't go back and forth; a head that
+  holds nothing may take from every holder; the pool's lock is always let go (two drains can't
+  deadlock); and in a weakly fair run the first `cpuq drain` is given every CPU of the pool.
 - **Searched, not proved:** that every waiter is eventually served, by exhaustive search at small
   sizes (up to 3 CPUs, 3 operations, K ≤ 2, 3 tasks each, one crash), under its assumptions: every
   task ends (`-t`, the 1-hour default), no process stops holding the pool's lock, finitely many
   urgent arrivals, no task waits on a `cpuq run` outside its own tree, the fallback hand-out runs,
   and crashes, kills and stops end. The search found the line's earlier faults (a waiter holding
   nothing starved; a giver taking its CPU back; the giver weighed at its old ticket; a stopped run
-  kept first in line), each fixed in the code with its scenario as a unit test.
+  kept first in line; an urgent run starving its own project; a continue lost while a run stops;
+  a stopped drain idling the pool), each fixed in the code with its scenario as a test.
 - **Not modelled:** flock itself, pinning, macOS, process groups and leftovers beyond a task's own
-  processes, the gates and outside load, `-c` as a percentage, nesting, `cpuq drain`, output
-  files, and time: no timed bound is proved.
+  processes, the gates and outside load, `-c` as a percentage, nesting, output files, and time:
+  no timed bound is proved.
 
 ## The hook
 

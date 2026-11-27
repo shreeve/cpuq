@@ -297,7 +297,9 @@ filling them:
 ### Ctrl-Z, kill and a dead run
 
 - **Ctrl-Z** on a run stops every task, gives back every CPU (and every CPU promised to it), and
-  then stops cpuq. While stopped it wants nothing, so the line passes it by. Continued (`fg`), it
+  then stops cpuq. While stopped it wants nothing, so the line passes it by (a stopped `cpuq drain`
+  lets the pool go back to work). A continue sent at once after the stop leaves it running, as
+  `kill -TSTP; kill -CONT` from a script expects. Continued (`fg`), it
   joins the line again, and each stopped task continues once it has a place on a CPU (on Linux,
   pinned there). Time stopped doesn't count against a task's limit.
 - **`cpuq kill TICKET|PID|LABEL`** ends a run on this machine, waiting or running: its cpuq gets

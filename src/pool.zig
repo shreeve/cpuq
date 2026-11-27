@@ -431,6 +431,8 @@ pub const Op = struct {
     ticket: u64 = 0,
     /// "Rebuild first": its first CPU goes ahead of the line.
     urgent: bool = false,
+    /// It has held a CPU: urgent no more, even holding none again.
+    served: bool = false,
     /// `cpuq drain`: waits for every CPU, and takes the machine.
     drain: bool = false,
     pid: i32 = 0,
@@ -459,8 +461,8 @@ pub const Op = struct {
     cmd: []const u8 = "",
 
     pub fn format(r: Op, w: *Io.Writer) Io.Writer.Error!void {
-        try w.print("pid={d}\nurgent={d}\ndrain={d}\nproject={s}\nlabel={s}\nweight={d}\nwant={d}\nheld=", .{
-            r.pid, @intFromBool(r.urgent), @intFromBool(r.drain), r.project, r.label, r.weight, r.want,
+        try w.print("pid={d}\nurgent={d}\nserved={d}\ndrain={d}\nproject={s}\nlabel={s}\nweight={d}\nwant={d}\nheld=", .{
+            r.pid, @intFromBool(r.urgent), @intFromBool(r.served), @intFromBool(r.drain), r.project, r.label, r.weight, r.want,
         });
         for (r.held, 0..) |cpu, i| try w.print("{s}{d}", .{ if (i == 0) "" else ",", cpu });
         try w.print("\ndraining={d}\noverload={d}\nlimit={d}\ntasks={d}\ndone={d}\nfailed={d}\nrunning={d}\nsince={d}\nwhy={s}\nnow=", .{
@@ -481,6 +483,7 @@ pub const Op = struct {
             const n = std.fmt.parseInt(u32, v, 10) catch 0;
             if (eq(k, "pid")) r.pid = std.fmt.parseInt(i32, v, 10) catch 0;
             if (eq(k, "urgent")) r.urgent = eq(v, "1");
+            if (eq(k, "served")) r.served = eq(v, "1");
             if (eq(k, "drain")) r.drain = eq(v, "1");
             if (eq(k, "project")) r.project = v;
             if (eq(k, "label")) r.label = v;
@@ -547,9 +550,9 @@ const Standing = struct {
 };
 
 /// Whether `x` goes ahead of `y` for the next CPU: urgent first (only for an operation's first
-/// CPU, and only while its project holds no urgent CPU), then an operation holding nothing,
-/// then the project holding the fewest CPUs for its weight, then the operation holding the
-/// fewest, then the older ticket.
+/// CPU, so once it has held one it is urgent no more, and only while its project holds no
+/// urgent CPU), then an operation holding nothing, then the project holding the fewest CPUs for
+/// its weight, then the operation holding the fewest, then the older ticket.
 fn ahead(projects: *const std.StringHashMapUnmanaged(Count), x: Standing, y: Standing) bool {
     const ux = urgentNow(projects, x);
     const uy = urgentNow(projects, y);
@@ -568,7 +571,7 @@ fn ahead(projects: *const std.StringHashMapUnmanaged(Count), x: Standing, y: Sta
 }
 
 fn urgentNow(projects: *const std.StringHashMapUnmanaged(Count), s: Standing) bool {
-    if (!s.op.urgent or s.has != 0) return false;
+    if (!s.op.urgent or s.op.served or s.has != 0) return false;
     const c = projects.get(s.op.project) orelse return true;
     return c.urgent == 0;
 }
@@ -592,7 +595,8 @@ fn countProjects(a: std.mem.Allocator, ops: []const Op, given: []const Promise) 
 
 /// Hands out `free` CPUs (in the pool's order) to the line, one at a time, re-ranking after
 /// each: the CPUs already promised (`given`) count as held by their operation. Returns the new
-/// promises. While a `cpuq drain` is in the line, every CPU goes to it alone.
+/// promises. While a `cpuq drain` wants CPUs, every CPU goes to it alone; a stopped one (which
+/// wants none) is passed over.
 pub fn handOut(a: std.mem.Allocator, ops: []const Op, given: []const Promise, free: []const u32) []Promise {
     var out: std.ArrayList(Promise) = .empty;
     if (free.len == 0) return out.items;
@@ -606,7 +610,7 @@ pub fn handOut(a: std.mem.Allocator, ops: []const Op, given: []const Promise, fr
             promised += 1;
         };
         s.* = .{ .op = o, .has = o.keeps() + promised, .left = o.want -| promised };
-        if (o.drain and drainer == null) drainer = i;
+        if (o.drain and o.want > 0 and drainer == null) drainer = i;
     }
     for (free) |cpu| {
         var projects = countProjects(a, ops, all.items);
@@ -715,6 +719,28 @@ pub fn giver(a: std.mem.Allocator, ops: []const Op, given: []const Promise) ?u64
         best = g;
     }
     return if (best) |b| b.ticket else null;
+}
+
+test "the line: urgent only until served; a stopped drain is passed over" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // U (urgent, served) and B (another project) hold one CPU each; C, of U's project, holds
+    // nothing. U gives: holding nothing again it is not urgent, so C still goes ahead of it.
+    const ops = [_]Op{
+        .{ .ticket = 1, .project = "q", .held = &.{0}, .want = 9 },
+        .{ .ticket = 2, .project = "p", .urgent = true, .served = true, .held = &.{1}, .want = 9 },
+        .{ .ticket = 3, .project = "p", .want = 1 },
+    };
+    try std.testing.expectEqual(2, giver(a, &ops, &.{}).?);
+    // Not yet served, an urgent op holding nothing still goes first.
+    const fresh = [_]Op{ ops[0], .{ .ticket = 5, .project = "p", .urgent = true, .want = 1 } };
+    try std.testing.expectEqual(5, handOut(a, &fresh, &.{}, &.{2})[0].ticket);
+    // A stopped drain wants nothing: free CPUs go to the line, not to no one.
+    const stopped = [_]Op{ .{ .ticket = 1, .project = "q", .want = 2 }, .{ .ticket = 2, .project = "x", .drain = true } };
+    const got = handOut(a, &stopped, &.{}, &.{ 0, 1 });
+    try std.testing.expectEqual(2, got.len);
+    try std.testing.expectEqual(1, got[0].ticket);
 }
 
 test "the line: projects take turns, by weight" {
