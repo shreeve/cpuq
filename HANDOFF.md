@@ -27,9 +27,17 @@ binary, [AGENTS.md](AGENTS.md) is enough.
 - **Cut-over:** docs/CUTOVER.md, done on burst, pup and pop on 2026-11-26; each machine keeps its
   old binary (`~/.local/bin/cpuq.0.29.0`, burst's `.0.28.0`) and config (`config.before-pool`)
   for a rollback. CHANGELOG 0.30.0 lists what each project changed.
-- **The Lean model** of the pool is in `formal/` on the `lean-model` worktree (its README says what
-  is proved and what is only searched). Changes to the line (src/pool.zig) or the loop's stop and
-  give-back (src/op.zig) go past it.
+- **The Lean model** of the pool is in `formal/` (its README says what is proved, what is only
+  searched, and every finding). A change to the line (src/pool.zig) or to the loop's stop, drain
+  and give-back (src/op.zig) goes past it before release:
+  1. Add the change to `Model.lean` as a rule switch, and make `Rules.released` the code as it
+     will ship.
+  2. Run `cd formal && cpuq run --label cpuq:lean -- lake build` (a few minutes). It checks every
+     proof and runs every search; a search whose result changes fails the build.
+  3. A new failure is a finding: `narrate` prints its trace. Reproduce it with a test on a real
+     binary, then fix the code or the rule.
+  Its searches found ten faults in the design and the code, four of them in released code, one
+  brought in by a release's own fix (Finding 10).
 - **pop** (Steve's Mac): `~/.local/bin/cpuq` and brew's; the recorder runs under launchd
   (`com.github.shreeve.cpuq.record`).
 - **pup:** `~/.local/bin/cpuq`, with linger on.
