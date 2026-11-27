@@ -538,6 +538,21 @@ f = open(sys.argv[1], "r+"); fcntl.flock(f, fcntl.LOCK_EX); open(sys.argv[2], "w
   wait $w; local rw=$?
   check "a stopped drain lets its CPUs go to work (busy: $busy); continued, it runs (rc $rd, ran: $([ -e "$T/drained" ] && echo yes || echo no)); the work ends (rc $rw)" \
     "[ $busy = yes ] && [ $rd = 0 ] && [ -e '$T/drained' ] && [ $rw = 0 ]"
+  # Two drains, one stopped and continued while the other took part of the pool: the free CPUs
+  # go to the drain holding the most, so it runs, then the other; they never wait on each other.
+  setup ctrl-z-drains "budget = 2"
+  "$CPUQ" run -n 4 --label z:work -- sh -c 'sleep $((CPUQ_TASK % 2 ? 1 : 3))' 2>/dev/null & w=$!
+  wait_held 2
+  dfl "$CPUQ" drain --max 15s --label z:b -- true 2>/dev/null & local b=$!
+  wait_waiters 1; sleep 0.1
+  kill -TSTP $b; sleep 0.2
+  "$CPUQ" drain --max 15s --label z:c -- true 2>/dev/null & local cc=$!
+  sleep 1.3  # the first CPU frees (at 1 s) and goes to c
+  kill -CONT $b
+  local t0 rb rc2 dt; t0=$(now)
+  reap $b; rb=$?; reap $cc; rc2=$?; dt=$(since "$t0")
+  wait $w
+  check "two drains, one stopped and continued, don't wait on each other: both run (rc $rb $rc2 in ${dt}s)" "[ $rb = 0 ] && [ $rc2 = 0 ] && fl '$dt < 8'"
 }
 
 t_nested() {

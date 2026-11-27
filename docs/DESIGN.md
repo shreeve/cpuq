@@ -268,14 +268,15 @@ gets a place, is re-pinned there on Linux, and gets SIGCONT.
 
 ## cpuq drain
 
-`cpuq drain` is an operation with `drain` and `urgent` set, `want` the whole pool while its
-command hasn't started, and no time limit. It holds a shared lock on `v2/drain` while it runs
-(not while stopped), so two drains never wait for each other there; they wait in the line, and
-run in turn. While it wants CPUs every CPU handed out goes to it (`handOut`), and every other
-operation, seeing
-`v2/drain` held, marks all its CPUs draining: it starts nothing new and gives each CPU back as its
-tasks end. Once the drain holds every pool CPU its command runs, unpinned, and the CPUs go back
-when it ends. `--max` gives up (exit 75) while it holds less than the pool.
+`cpuq drain` is an operation with `drain` and `urgent` set, `want` the whole pool while its command
+hasn't started, and no time limit. It holds a shared lock on `v2/drain` while it runs (not while
+stopped), so two drains never wait for each other there; they wait in the line, and run in turn.
+While it wants CPUs every CPU handed out goes to it (`handOut`; of two drains, to the one holding or
+promised the most, then the older, so they never each hold part of the pool waiting for the other),
+and every other operation, seeing `v2/drain` held, marks all its CPUs draining: it starts nothing
+new and gives each CPU back as its tasks end. Once the drain holds every pool CPU its command runs,
+unpinned, and the CPUs go back when it ends. `--max` gives up (exit 75) while it holds less than the
+pool.
 
 ## cpuq kill
 
