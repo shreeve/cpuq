@@ -1361,12 +1361,13 @@ theorem Inv.step {cfg : Cfg} {s s' : St} {a : Act} (hs : Safe cfg.rules) (h : In
 
 /-- Two states that agree on everything the pool's rules read but the pool lock, the drain mark
 and the signals. -/
-def Same (s t : St) : Prop := t.cpus = s.cpus ∧ t.ops = s.ops ∧ t.order = s.order ∧ t.drains = s.drains
+def Same (s t : St) : Prop :=
+  t.cpus = s.cpus ∧ t.ops = s.ops ∧ t.order = s.order ∧ t.drains = s.drains ∧ t.served = s.served
 
-theorem Same.rfl' (s : St) : Same s s := ⟨rfl, rfl, rfl, rfl⟩
+theorem Same.rfl' (s : St) : Same s s := ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 theorem Inv.congr {cfg : Cfg} {s t : St} (h : Inv cfg s) (e : Same s t) : Inv cfg t := by
-  obtain ⟨hc, ho, -, hd⟩ := e
+  obtain ⟨hc, ho, -, hd, -⟩ := e
   cases s; cases t
   simp only at hc ho hd; subst hc ho hd
   exact ⟨h.len, h.lockOwner, h.ownerLock, h.ownerPhase, h.grantFree, h.kBound, h.capBound,
@@ -1384,9 +1385,9 @@ theorem move_cases {cfg : Cfg} {s s' : St} {a : Act} (e : move cfg s a = some s'
   repeat' split at e
   all_goals first
     | exact .inr ⟨_, _, e, Same.rfl' _⟩
-    | (cases e; exact .inl ⟨rfl, rfl, rfl, rfl⟩)
+    | (cases e; exact .inl ⟨rfl, rfl, rfl, rfl, rfl⟩)
     | exact .inr (viaMap _ _ (fun _ => by
-        first | exact ⟨rfl, rfl, rfl, rfl⟩ | (unfold retake; split <;> exact ⟨rfl, rfl, rfl, rfl⟩)) e)
+        first | exact ⟨rfl, rfl, rfl, rfl, rfl⟩ | (unfold retake; split <;> exact ⟨rfl, rfl, rfl, rfl, rfl⟩)) e)
     | cases e
 
 theorem Inv.move {cfg : Cfg} {s s' : St} {a : Act} (hs : Safe cfg.rules) (h : Inv cfg s)
