@@ -15,7 +15,7 @@ cd formal && cpuq run --label cpuq:lean -- lake build
 ```
 
 `lake build` checks every proof and runs every search in `Checks.lean` (the searches take about
-a minute on pop; a clean build checks the proofs first, several minutes more). Every warning is an error. A search whose result changes
+a minute and a half; a clean build checks the proofs first, several minutes more). Every warning is an error. A search whose result changes
 fails the build.
 
 ## Layout
@@ -31,6 +31,7 @@ fails the build.
 | `CpuqModel/Liveness.lean` | Work conservation, drains for a head that holds nothing, drains as Lemma P transfers |
 | `CpuqModel/Locks.lean` | The pool lock is always let go: no critical section waits forever |
 | `CpuqModel/Drains.lean` | Runs and weak fairness; `cpuq drain` is served |
+| `CpuqModel/Line.lean` | Every holder has been served; a head holding nothing is never blocked |
 
 ## The model
 
@@ -39,7 +40,8 @@ token file's record (`slot`: owner and whether it drains); per operation its pha
 alive, stopped, dead, over) and its tasks (pending, running on CPU c, timed out, done, failed,
 gone; attempt number; a dying earlier attempt); the tickets in order; the shared drain count;
 the pool lock's holder while a drain registers; the drains holding the drain mark; per
-operation a Ctrl-Z not yet acted on, a SIGCONT still owed, and whether the kernel has stopped it.
+operation a Ctrl-Z not yet acted on, a SIGCONT still owed, whether the kernel has stopped it, and
+whether it has held a CPU (the record's `served`).
 
 Actions (`Act`): arrive, a task's exit (pass or fail, with `-r` retries), timeout (TERM) and the
 dying attempt's exit, refill, release, the hand-out pass, accept a grant, drain, undrain,
@@ -60,20 +62,26 @@ needs the pool lock free. A drain's registration takes the pool lock, then the d
 shared lock, or before 0.30.1 an exclusive one), then lets the pool lock go: two moves, so a
 wait inside that critical section shows. Ctrl-Z is received as the code receives it: the handler
 notes it, the loop acts on it (gives every CPU back), the parent raises SIGSTOP on itself, and
-a SIGCONT continues it; a SIGCONT before the loop acts cancels the Ctrl-Z (0.30.2).
+a SIGCONT continues it; a SIGCONT before the loop acts cancels the Ctrl-Z, and one after it
+keeps the parent from raising SIGSTOP (`haltChecks`).
 
 `cpuq drain` (`OpCfg.drain`) is an urgent operation with one command. It wants every CPU of the
 pool while its command waits, starts it only holding them all, and keeps them while it runs.
-While it lives it holds the drain mark, and every other operation empties its CPUs; every free
-CPU goes to the first drain in ticket order, and to no one while that drain wants none. A drain
-never gives a CPU.
+While it holds the drain mark every other operation empties its CPUs. A stopped drain lets its
+mark go and takes it again when continued (`drainLets`); every free CPU goes to the first drain
+in ticket order that wants one (before 0.30.3: to the first living drain, and to no one while it
+wants none). A drain never gives a CPU.
+
+An urgent operation goes ahead of the line only until it first holds a CPU (`urgentOnce`); before
+0.30.3 it went ahead whenever it held none.
 
 `Rules` switches between FINAL-REPORT-1's rules (`report1`, as review2-formal reads them),
 FINAL-PLAN's (`plan`), the plan read loosely (`planLoose`), the plan with this model's two fixes
 (`fixed`), the rules of the code on branch `slots` (`pool`), those with this model's fixes 4 to 6
-(`poolFixed`, the code at 8f997ec), the code at 0d315ed (`pool0d315ed`), the code as released in
-0.30.2 (`released`: the mark shared, a SIGCONT cancels a Ctrl-Z not yet acted on), and that with
-this model's fix 8 (`releasedFixed`).
+(`poolFixed`, the code at 8f997ec), the code at 0d315ed (`pool0d315ed`), the code at 0.30.2
+(`code0302`: the mark shared, a SIGCONT cancels a Ctrl-Z not yet acted on), and the code as
+released in 0.30.3 (`released`: `code0302` with the fixes of Findings 7, 8 and 9, `urgentOnce`,
+`haltChecks` and `drainLets`). `drainMost` is this model's fix for Finding 10.
 
 `pool` differs from `fixed` where the code does what the plan doesn't say: the giver's ticket is
 renewed when it gives its CPU back, not when it starts to drain (`renewAtRelease`); one giver
@@ -84,8 +92,9 @@ rules say nothing of how a Ctrl-Z is received, so they have `haltChecks` on.
 
 ## What is proved
 
-No `sorry`. `#print axioms` of `Reach.inv`, `lock_released` and `drain_served` lists only
-`propext`, `Classical.choice`, `Quot.sound`.
+No `sorry`. `#print axioms` of `Reach.inv`, `lock_released`, `drain_served`, `Reach.servedOk` and
+`zero_head_unblocked` lists only `propext`, `Classical.choice`, `Quot.sound` (`Reach.servedOk`
+not even `Classical.choice`).
 
 **Safety** (`Safety.lean`). `Inv` holds initially and every move keeps it, crashes, kills, stops,
 drains and the pool lock included, for any rules with the three safety switches on (`Safe`:
@@ -127,8 +136,10 @@ under the pool lock while the first waits for the pool lock: the search finds th
 | … and with a standing line and no drain in it, in every reachable state, no token is free while an alive operation wants a slot | `work_conserving` |
 | No tie-rule starvation: under FINAL-PLAN's rules, when the head holds nothing and a drain is owed, every other alive holder may drain | `zero_head_can_drain` |
 | L3 for `cpuq drain`: in a weakly fair run, the first drain is given every CPU of the pool | `drain_served` |
+| Under `urgentOnce`, every operation holding a CPU's flock has been served, in every reachable state | `Reach.servedOk` |
+| Under the code's rules, with no drain living, a head holding nothing is never blocked: a CPU is unlocked, or one is being emptied, or some holder may start emptying one for it | `zero_head_unblocked` |
 
-`drain_served` holds for the code's rules (`CodeRules`: `released`, `releasedFixed`). A run
+`drain_served` holds for the code's rules (`CodeRules`: `released`, `code0302`). A run
 (`Run`) is a sequence of moves and stutters from a reachable state; it is weakly fair
 (`Run.Fair`) when every step class the search calls fair (`fairKey`: a task's exit whether it
 passes or fails, refill, release, the pass, accept, drain, undrain, consolidate, stop, halt,
@@ -151,29 +162,39 @@ first. That hand-on is argued, not proved.
 waiters is checked by the search, in two forms, for every scenario: `L3 never` (no state from
 which no run serves a waiter that holds nothing) and `L3 fair` (no weakly fair run, with no more
 crashes, kills or Ctrl-Z, that never serves one). The search finds counterexamples to FINAL-PLAN
-(Findings 1 and 2) and to the code (Findings 4, 5 and 7).
+(Findings 1 and 2) and to the code (Findings 4, 5, 7 and 10). On `released` every scenario
+passes but Finding 10's.
 
-L3 in general is not proved for ordinary waiters, and as stated it is false for the code
-(Finding 7): an urgent operation with endless work that holds one CPU starves a waiter of its own
-project. A general proof needs A-urgent in a stronger form (every urgent operation's work ends)
-or the fix of Finding 7, and then a ranking over the line that the drain proof does not need,
-because a drain's target is fixed while an ordinary waiter's place moves. What that ranking must
-show, with the drain proof's lemmas reusable for each step (the pass, accept and release
-lemmas, `drain_frame`'s pattern, `Run.Fair`):
+**L3 for ordinary waiters: what is proved, and what is left.** Up to 0.30.2, L3 was false for
+the code (Finding 7). The proof of `zero_head_unblocked` shows what `urgentOnce` changes: a
+holder that gives a CPU has been served (`ServedOk`), so it is not urgent again, and the head,
+holding nothing, ranks ahead of it after the drain whenever the giver is of the head's project or
+the head's project holds nothing. Such a giver always exists once every CPU is a slot not being
+emptied, and `giverOf` then picks one. So the line never stalls with a waiter holding nothing at
+its head and nothing under way for it.
 
-1. The head is served: once a waiter `w` holding nothing is the head, it gets a CPU. Free
-   tokens go to the head at the next pass; with no urgent holder, some alive holder may give to
-   `w` (any holder of two CPUs, or of `w`'s project, or of a project that stays at or above
-   `w`'s share), its drain is owed, and the emptied CPU goes to the head when it is released.
-   Open: the head at the release may be the giver itself, renewed only at release; `behindFresh`
-   checked at the drain must be shown to still hold at the release.
-2. The head is reached: tickets only move back (renewals), so the operations with older tickets
-   than `w` only leave that set; each ranks ahead of `w` at most while it waits for its first
-   CPU and while it holds only CPUs it is giving up. Open: project shares change as others are
-   served, so an operation of a lower-share project can rank ahead of `w` again; a measure over
-   project shares (Lemma P's Φ is the candidate) must bound how often.
-3. Phases settle: with no more arrivals, crashes, kills or Ctrl-Z, each operation changes phase
-   finitely often, so from some time they hold still.
+What a proof of L3 still needs, under `released` with no drain living, no Ctrl-Z and no
+`cpuq kill`, from a time after which no operation arrives or crashes:
+
+1. The head is served. If `h` is the head and holds nothing at every step from some time on,
+   some step gives `h` a CPU. `zero_head_unblocked` gives, in every such state, a CPU unlocked,
+   a CPU being emptied, or an enabled drain for `h`. What is left is the ranking over CPUs that
+   turns this into progress under `Run.Fair`, in `drain_frame`'s pattern. Free CPUs go to the
+   head at the next pass. A grant to another operation is accepted (or dropped when its holder
+   ends), and no new one is made while `h` is head. A CPU being emptied is released to the head.
+   The drain `giverOf` picks stays enabled until a CPU is unlocked or starts emptying.
+2. The head is reached. A waiter `w` holding nothing becomes the head and stays the head until
+   it is served. Tickets only move back (a release renews the giver's), and an urgent operation
+   goes ahead only until its first CPU. But each time an operation of a project with a lower
+   share is served, the shares move, and so does the order among holders of nothing. Shown
+   neither that this ends nor that it can't cycle: a measure over project shares is needed
+   (Lemma P's Φ is the candidate, as `drain_is_transfer` makes each share-clause drain a
+   transfer).
+3. Phases settle. With no arrivals, crashes, kills or Ctrl-Z, each operation changes phase at
+   most once more (alive to over), so from some time the phases hold still.
+
+The drain proof's machinery (`Run`, `Run.Fair`, `Run.Calm`, the pass, accept and release
+lemmas, `drain_frame`) carries over to 1. Item 2 is the open mathematical step.
 
 The timed bound (L4) is not done.
 
@@ -181,10 +202,11 @@ The timed bound (L4) is not done.
 
 - **Critical sections end.** Each critical section is one step except a drain's registration,
   which the model splits at its second lock. That is faithful while nothing else under the pool
-  lock waits for another process. In the code (0.30.2): the pool lock itself (`lock`, blocking,
+  lock waits for another process. In the code (0.30.3): the pool lock itself (`lock`, blocking,
   taken outside any other lock); the drain mark (`markDrain`, a shared lock, which no one holds
   exclusively across a wait: `draining()` takes it exclusively with `tryLock` and lets it go at
-  once); tokens, op files and promises (`take`, `isFree`, `scan`, `promises`: `tryLock`, never a
+  once; a drain continued takes it again under the pool lock, shared, so waiting for no
+  one); tokens, op files and promises (`take`, `isFree`, `scan`, `promises`: `tryLock`, never a
   wait); a dead holder's leftovers (`killLeftovers`: SIGKILL, then at most 200 ms for each leader
   to be gone); file I/O. `cpuq status` takes the lock with `lockWithin(5000)` and gives up after
   5 s. A new lock taken under the pool lock must be split in the model the same way, as
@@ -193,7 +215,7 @@ The timed bound (L4) is not done.
   two (Finding 3).
 - **For liveness:** every task ends (A-term: `-t`, the 1 h machine default); no process is
   stopped holding the pool lock (A-sched); urgent operations are finite in number and in work
-  (A-urgent; Finding 7 shows the second half is needed); no task waits on a `cpuq run` outside
+  (A-urgent; with `urgentOnce` the line needs only the first half, Finding 7); no task waits on a `cpuq run` outside
   its own tree (A-nest: nesting is not modelled); the fallback hand-out pass happens (A-wake:
   the head looks every second, everyone else every 10 s); whoever sends a Ctrl-Z sends a SIGCONT
   (A-cont); no more crashes, kills or Ctrl-Z after some time. The fair-run check makes every
@@ -213,6 +235,10 @@ The timed bound (L4) is not done.
 - Nesting, the build jobserver, the event log, output files, `--max` on a drain.
 - A drain's mark outliving its record: the code closes the mark when `run` returns, just after it
   leaves the line; the model drops both at once.
+- A continued drain takes its mark again in its own critical section after the continue; the
+  model does both in one step.
+- A SIGCONT that continues a parent the kernel stopped also clears a Ctrl-Z noted meanwhile; in
+  the model the parent acts on that Ctrl-Z once more, finds the continue, and goes on.
 - Which slot drains ("youngest process oldest"): any slot may. Retry order ("behind the tasks
   not yet started"): the lowest pending task runs first. Both choices only widen what the search
   covers for safety.
@@ -248,14 +274,14 @@ two liveness scenarios (Findings 1, 2). With both fixes, every scenario passes.
 The code on branch `slots` (`pool`) has Findings 1 and 2 fixed and Finding 3's safe reading,
 and fails three scenarios (Findings 4, 5). The code at 8f997ec (`poolFixed`) passes them, and
 fails on two drains (`CS stuck`, the deadlock of 2026-11-26) and on a lost SIGCONT (`Z stuck`,
-Finding 8). The released code (`released`) passes two drains and a drain beside a crash, and
-still fails `Z stuck`. With the stop check (`releasedFixed`), every earlier scenario passes.
-Finding 7's scenario fails on all of them, and a drain stopped by Ctrl-Z idles the pool
-(Finding 9).
+Finding 8). The code at 0.30.2 (`code0302`) passes two drains, and fails Findings 7, 8 and 9.
+The code as released (`released`, 0.30.3) passes every scenario but one: two drains, one stopped
+and continued (Finding 10). Each of 0.30.3's three fixes is needed: take one out and its
+scenario fails again. With `drainMost` the drain scenarios all pass.
 
 ## Findings
 
-Sent to the cpuq lead and Rig - Final on 2026-11-25 (1 to 6) and 2026-11-26 (7 to 9). Traces:
+Sent to the cpuq lead and Rig - Final on 2026-11-25 (1 to 6) and 2026-11-26 (7 to 10). Traces:
 `narrate` in `Explore.lean` prints any failure step by step.
 
 **1. A waiter holding nothing starves behind a head no one may yield to.** 3 CPUs. A (project
@@ -316,10 +342,9 @@ project.** 2 CPUs. U (project P, urgent, endless work) holds one CPU, B (project
 C (project P) waits holding nothing; C is head. U may not give: holding nothing it would be
 urgent again (`urgentNow` checks only that it holds nothing) and rank before C, so
 `behindAfter` refuses it. B may not give: Q would hold 0 and P 1, so B would rank before C. No
-one gives, and C waits as long as U has work (`urgentHolds`, every code rule set). P holds its
-fair share through U, so this is fair to projects but not to C. Proposed fix, not checked: an
-operation is urgent only until it first holds a CPU ("urgent only for an operation's first CPU",
-as `ahead`'s comment says). Else A-urgent must say every urgent operation's work ends.
+one gives, and C waits as long as U has work (`urgentHolds`). P holds its fair share through U,
+so this is fair to projects but not to C. Fix (`urgentOnce`, 0.30.3): an operation is urgent only
+until it first holds a CPU (the record's `served`).
 
 **8. (src/op.zig) A SIGCONT is lost while a parent stops.** 0.30.2 cancels a Ctrl-Z the loop has
 not yet acted on. But once the loop takes it, `suspend_` gives the CPUs back under the pool
@@ -329,12 +354,26 @@ again; a sender outside job control (an agent's `kill -TSTP; kill -CONT`) leaves
 for good (`Z stuck`, the Ctrl-Z scenario, before 0.30.2 and since). Fix (`haltChecks`): `onCont`
 counts continues; `suspend_` notes the count when it takes the Ctrl-Z and skips the SIGSTOP if
 the count has moved. That leaves only the instructions between the check and the raise, which a
-raise of SIGSTOP cannot close.
+raise of SIGSTOP cannot close. In 0.30.3.
 
 **9. (src/pool.zig, src/op.zig) A stopped drain idles the pool.** While a `cpuq drain` is in the
 line, `handOut` gives every free CPU to the first drain, and to no one while that drain wants
 none. A drain stopped by Ctrl-Z wants nothing, its record stays, and it still holds the drain
 mark, so every other operation keeps emptying its CPUs and every freed CPU idles until the drain
 continues (2 CPUs, the drain and one operation with endless work: `L2 idle`, "drain, Ctrl-Z").
-Proposed fix, not checked: `suspend_` lets the drain mark go and the continue takes it again (a
-shared lock, so it waits for no one), and `handOut` passes over a stopped drain.
+Fix (`drainLets`, 0.30.3): `suspend_` lets the drain mark go and the continue takes it again (a
+shared lock, so it waits for no one), and `handOut` gives free CPUs to the first drain that wants
+some.
+
+**10. (src/pool.zig) A drain stopped and continued while a newer drain holds part of the pool:
+the two drains wait for each other.** 2 CPUs, an operation A with endless work, and drains B
+and C (B older). B is stopped by Ctrl-Z and lets its mark go; C arrives and is the first drain
+that wants CPUs, so A empties a CPU and it is promised to C. B is continued, takes its mark
+again, and is first again (its ticket is older: `suspend_` doesn't renew it), so the next CPU A
+empties goes to B. Each drain holds one CPU and waits for the other's; a drain never gives one
+(`giver` passes over drains, and a waiting drain keeps its slots), and every other operation
+keeps emptying for the marks. The pool idles until a drain's `--max` runs out, and for good
+without one (`L3 never`, "two drains, Ctrl-Z" on `released`). Proposed fix, checked
+(`drainMost`): `handOut` gives free CPUs to the drain that holds or is promised the most, then
+the older ticket. A stopped drain gives every CPU back, so at most one drain ever holds a CPU,
+and it is served first. Renewing a stopping drain's ticket may also do; that is not checked.
