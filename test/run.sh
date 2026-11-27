@@ -1076,6 +1076,18 @@ print("named" if named else "missed", "own-out" if own_out else "own-listed", "%
   wait
   echo "  $got (stray pid $stray)"
   check "status names an outside process and leaves the operation's own out ($got)" "[[ '$got' == 'named own-out '* ]] && fl '${got##* } > 0.1'"
+  # Outside work by what started it: a detached shell running two busy programs is one entry,
+  # with the shell's command, its two processes and their CPUs together.
+  ( sh -c 'busy() { python3 -c "import time
+e = time.time() + 3
+while time.time() < e: pass"; }; busy & busy & wait # cpuq-test-work' & )
+  sleep 0.5
+  got=$("$CPUQ" status --json | python3 -c 'import json, sys
+s = json.load(sys.stdin)
+w = [x for x in s["outside_work"] if "cpuq-test-work" in x["command"]]
+print("found %d %.1f %s" % (w[0]["procs"], w[0]["using"], w[0]["via"] or "-") if w else "missing", len(s["outside_work"]))')
+  sleep 2.6
+  check "status puts outside work down to what started it: one entry, its command, 2 processes (got $got)" "[[ '$got' == 'found 2 '* ]] && fl \"\$(echo '$got' | cut -d' ' -f3) > 1.0\""
 }
 
 t_status_host() {

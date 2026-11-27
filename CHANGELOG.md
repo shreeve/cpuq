@@ -2,6 +2,17 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.31.0 — 2026-11-27
+
+- **`cpuq status` says who runs work outside cpuq.** Work outside cpuq was shown as its five
+  busiest processes (`zig`, `zig`, `zig`, ...), with no way to tell whose. Now it is grouped by
+  what started it: each busy process counts toward the top of its tree just below its starter
+  (an agent's harness, an ssh session, a terminal, a service manager). Each line gives the
+  command (an agent's own command, out of Claude Code's wrapper), where it runs, the starter,
+  how many processes are busy and the CPUs they keep busy. So `ssh burst 'make -j'`, or a build
+  an agent ran without cpuq, shows as one line naming the command and its folder. In
+  `--json` it is `outside_work`.
+
 ## 0.30.5 — 2026-11-26
 
 - **Two drains no longer wait on each other after a Ctrl-Z.** If a drain was stopped and

@@ -2,6 +2,7 @@
 //! waiter waits, each project's CPUs against its fair share, and the machine's busy CPUs and
 //! gates. This machine's and other hosts', as JSON or as boxed tables.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const policy = @import("policy.zig");
 const sys = @import("sys.zig");
@@ -29,6 +30,7 @@ const JsonProject = statusjson.JsonProject;
 const JsonStatus = statusjson.JsonStatus;
 const JsonGate = statusjson.JsonGate;
 const JsonOutside = statusjson.JsonOutside;
+const JsonWork = statusjson.JsonWork;
 
 /// How long `cpuq status` watches the operations' tasks to measure what they keep busy.
 const sample_ms = 500;
@@ -183,7 +185,27 @@ const Measured = struct {
     /// The busiest processes outside every operation, busiest first, and all of them in all.
     outside: []JsonOutside = &.{},
     outside_total: f64 = 0,
+    /// The same load by what started it, busiest first.
+    work: []JsonWork = &.{},
 };
+
+/// Programs that start work rather than do it: busy work outside cpuq is put down to the top
+/// of its tree just below one of these.
+const starters = [_][]const u8{ "claude", "sshd", "sshd-session", "launchd", "systemd", "init", "tmux", "tmux: server", "screen", "login", "cron", "Terminal", "iTerm2" };
+
+/// The top of `procs[i]`'s tree below its starter (or below a parent that can't be seen), and
+/// the starter's name.
+fn workRoot(procs: []const sys.Proc, at: *const std.AutoHashMapUnmanaged(i32, usize), i: usize) struct { i: usize, via: []const u8 } {
+    var cur = i;
+    for (0..64) |_| {
+        const pp = procs[cur].ppid;
+        const j = at.get(pp) orelse return .{ .i = cur, .via = if (pp == 1) (if (builtin.os.tag == .macos) "launchd" else "init") else "" };
+        for (starters) |s| if (std.mem.eql(u8, procs[j].name, s)) return .{ .i = cur, .via = s };
+        if (pp <= 1) return .{ .i = cur, .via = procs[j].name };
+        cur = j;
+    }
+    return .{ .i = cur, .via = "" };
+}
 
 /// An operation's task tree's CPU time: everything under its cpuq, the tasks it has reaped
 /// included (their time is in its children's count), its cpuq's own left out.
@@ -236,11 +258,33 @@ fn measureOps(io: Io, a: std.mem.Allocator, ops: []const Op, ncpu: u32, measure:
     for (before) |p| cpu_before.put(a, p.pid, p.own_ns) catch {};
     const self = sys.getpid();
     var outside: std.ArrayList(JsonOutside) = .empty;
+    var at: std.AutoHashMapUnmanaged(i32, usize) = .empty;
+    for (after, 0..) |p, i| at.put(a, p.pid, i) catch {};
+    var work: std.AutoArrayHashMapUnmanaged(i32, JsonWork) = .empty;
     for (after, 0..) |p, i| {
         if (in_op[i] or p.pid == self) continue;
         const was = cpu_before.get(p.pid) orelse continue;
         const rate = @as(f64, @floatFromInt(p.own_ns -| was)) / wall_ns;
         if (rate >= 0.3) outside.append(a, .{ .pid = p.pid, .name = p.name, .using = rate }) catch {};
+        if (rate < 0.02) continue;
+        const root = workRoot(after, &at, i);
+        const gop = work.getOrPut(a, after[root.i].pid) catch continue;
+        if (!gop.found_existing) gop.value_ptr.* = .{ .pid = after[root.i].pid, .via = root.via };
+        gop.value_ptr.using += rate;
+        gop.value_ptr.procs += 1;
+    }
+    var busy_work: std.ArrayList(JsonWork) = .empty;
+    for (work.values()) |wk| if (wk.using >= 0.3) busy_work.append(a, wk) catch {};
+    std.mem.sortUnstable(JsonWork, busy_work.items, {}, struct {
+        fn busier(_: void, x: JsonWork, y: JsonWork) bool {
+            return x.using > y.using;
+        }
+    }.busier);
+    m.work = busy_work.items[0..@min(busy_work.items.len, 5)];
+    for (m.work) |*wk| {
+        wk.command = agentCommand(sys.procCommand(a, io, wk.pid, 4000));
+        wk.command = wk.command[0..@min(wk.command.len, 300)];
+        wk.cwd = sys.procCwd(a, io, wk.pid);
     }
     std.mem.sortUnstable(JsonOutside, outside.items, {}, struct {
         fn busier(_: void, x: JsonOutside, y: JsonOutside) bool {
@@ -557,6 +601,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
         .projects = projects.items,
         .outside = m.outside,
         .outside_total = m.outside_total,
+        .outside_work = m.work,
         .cpu_ticks = cpuTicksJson(io, a),
         .boot_time = bootSeconds(io),
         .recorder = records.recorderRunning(ctx),
@@ -652,8 +697,25 @@ fn flagNotes(a: std.mem.Allocator, holders: []const JsonHolder) []const []const 
 }
 
 /// Whether outside load is worth showing: a CPU or more of it, or a gate that is not open.
+/// The command an agent ran, out of its harness's wrapper (Claude Code's `zsh -c source
+/// SNAPSHOT ... && eval 'COMMAND' < /dev/null && pwd -P ...`); any other command as it is.
+fn agentCommand(cmd: []const u8) []const u8 {
+    const mark = "&& eval '";
+    const at = std.mem.indexOf(u8, cmd, mark) orelse return cmd;
+    const rest = cmd[at + mark.len ..];
+    for ([_][]const u8{ "' \\< /dev/null", "' < /dev/null", "' && pwd -P" }) |end|
+        if (std.mem.indexOf(u8, rest, end)) |e| return rest[0..e];
+    return rest;
+}
+
+/// A work tree's command for one line: its first 100 bytes, on one line.
+fn workCommand(wk: JsonWork) []const u8 {
+    const line = std.mem.sliceTo(wk.command, '\n');
+    return line[0..@min(line.len, 100)];
+}
+
 fn showOutside(st: JsonStatus) bool {
-    if (st.outside.len == 0) return false;
+    if (st.outside.len == 0 and st.outside_work.len == 0) return false;
     return st.outside_total >= 1.0 or !std.mem.eql(u8, st.gate.state, "open");
 }
 
@@ -843,16 +905,18 @@ fn boxed(ctx: *Ctx, st: JsonStatus, remote: ?[]const u8) void {
 
     if (showOutside(st)) {
         var rows: std.ArrayList([]const C) = .empty;
-        for (st.outside) |o| {
+        for (st.outside_work) |wk| {
             rows.append(a, a.dupe(C, &.{
-                .{ .text = o.name, .tint = .accent },
-                .{ .text = a.print("{d}", .{o.pid}) catch "?", .tint = .dim },
-                .{ .text = a.print("{d:.1}", .{o.using}) catch "?", .tint = if (o.using >= 1) .warn else null },
+                .{ .text = workCommand(wk), .tint = .accent },
+                .{ .text = wk.cwd, .tint = .dim },
+                .{ .text = a.print("{s} {d}", .{ wk.via, wk.pid }) catch "?", .tint = .dim },
+                .{ .text = a.print("{d}", .{wk.procs}) catch "?", .tint = .dim },
+                .{ .text = a.print("{d:.1}", .{wk.using}) catch "?", .tint = if (wk.using >= 1) .warn else null },
             }) catch continue) catch {};
         }
         const t: table.Table = .{
-            .title = a.print("outside cpuq: {d:.1} CPUs busy", .{st.outside_total}) catch "outside cpuq",
-            .columns = &.{ .{ .head = "PROCESS", .flexible = true }, .{ .head = "PID", .alignment = .right }, .{ .head = "BUSY", .alignment = .right } },
+            .title = a.print("outside cpuq: {d:.1} CPUs busy, by what started it", .{st.outside_total}) catch "outside cpuq",
+            .columns = &.{ .{ .head = "WORK", .flexible = true }, .{ .head = "WHERE", .flexible = true }, .{ .head = "VIA PID" }, .{ .head = "PROCS", .alignment = .right }, .{ .head = "BUSY", .alignment = .right } },
             .rows = rows.items,
         };
         w.writeAll("\n") catch {};
@@ -895,9 +959,10 @@ fn plain(ctx: *Ctx, st: JsonStatus) void {
     w.print("load    {d:.2} {d:.2} {d:.2}; memory pressure {s}; gate {s}\n", .{ st.load[0], st.load[1], st.load[2], st.memory_pressure, st.gate.text }) catch {};
     if (st.memory) |mem| w.print("memory  {s}\n", .{memoryText(a, mem)}) catch {};
     if (showOutside(st)) {
-        w.writeAll("outside") catch {};
-        for (st.outside, 0..) |o, k| w.print("{s} {s} (pid {d}, {d:.1})", .{ if (k == 0) "" else ",", o.name, o.pid, o.using }) catch {};
-        w.writeAll("\n") catch {};
+        w.print("outside {d:.1} CPUs busy outside cpuq, by what started it:\n", .{st.outside_total}) catch {};
+        for (st.outside_work) |wk| w.print("  {d:>5.1}  {s}  (pid {d} via {s}, {d} process{s}, in {s})\n", .{
+            wk.using, workCommand(wk), wk.pid, if (wk.via.len == 0) "?" else wk.via, wk.procs, if (wk.procs == 1) "" else "es", if (wk.cwd.len == 0) "?" else wk.cwd,
+        }) catch {};
     }
 
     w.print("\nheld ({d})\n", .{st.holders.len}) catch {};
@@ -997,4 +1062,10 @@ fn tasksJson(a: std.mem.Allocator, now: []const pool_mod.TaskNow) []const status
     const out = a.alloc(statusjson.JsonTask, now.len) catch return &.{};
     for (now, out) |t, *j| j.* = .{ .task = t.task, .attempt = t.attempt, .cpu = if (t.cpu == std.math.maxInt(u32)) null else t.cpu, .pid = t.pid, .since = t.since };
     return out;
+}
+
+test "agentCommand: the command out of Claude Code's wrapper" {
+    const wrapped = "/bin/zsh -c source /x/snapshot.sh 2>/dev/null || true && \\builtin setopt NO_EQUALS 2>/dev/null || true && eval 'cd ~/w && zig build' \\< /dev/null && pwd -P >| /tmp/cwd";
+    try std.testing.expectEqualStrings("cd ~/w && zig build", agentCommand(wrapped));
+    try std.testing.expectEqualStrings("make -j8", agentCommand("make -j8"));
 }

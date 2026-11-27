@@ -336,8 +336,12 @@ drain -- ./bench'`). Work outside cpuq (system services) still runs; `cpuq statu
 
 - **The machine:** the pool (its size and CPUs), CPUs held, free and being emptied; CPUs busy of
   those online, split into cpuq's tasks and work outside; the load, memory pressure and the gate;
-  memory and swap. When work outside cpuq uses a CPU or more, or a gate is closed, the busiest
-  such processes.
+  memory and swap. When work outside cpuq uses a CPU or more, or a gate is closed, that work by
+  what started it: each busy process counts toward the top of its tree just below its starter
+  (an agent's harness, an ssh session, a terminal, a service manager), shown with its command
+  (an agent's own, out of its harness's wrapper), where it runs, the starter and its pid, its
+  busy processes and the CPUs they keep busy. So `ssh burst 'make -j'`, or a build an agent ran
+  without cpuq, shows as one line naming the command and its folder.
 - **Held:** each running run's ticket (`OP`), pid, project, label, tasks done of total and failed,
   tasks running, its CPUs (`×K` with `-x`, and how many it is emptying), CPU busy per CPU held, how
   long, an estimate of the time left, and its command. A note under it flags a run whose CPUs are
@@ -374,6 +378,7 @@ lines.
 | `waiters[]` | in line order: `order` (1 first), `ticket`, `pid`, `project`, `label`, `command`, `since`, `holds`, `cores` (CPUs it waits for), `max` (its limit), `urgent`, `exclusive` (a drain), `why`, `gate`, `eta` (the first's, seconds) |
 | `projects[]` | `name`, `weight`, `ops`, `held`, `want`, `fair` |
 | `outside[]`, `outside_total` | the busiest processes outside cpuq (`pid`, `name`, `using`), and their total |
+| `outside_work[]` | the same load by what started it, busiest first: `pid`, `command`, `cwd`, `via` (the starter's name), `procs`, `using` |
 | `cpu_ticks` | each CPU's time so far, `[busy, total]`, cumulative: two statuses give each CPU's use between them |
 | `boot_time` | when the machine booted, Unix seconds |
 | `recorder` | whether `cpuq record` is sampling this machine |

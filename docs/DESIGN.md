@@ -353,16 +353,21 @@ command inherits it ignored. When the command dies by a signal, cpuq dies by the
 ## Status and history
 
 **Status** (src/status.zig) reads the pool under its lock: the operations, the promises, the free
-CPUs and whether a drain waits. Its sample (skipped with `--no-usage`) watches every process and
-the machine's CPU ticks for half a second: each operation's tasks' CPU is its cpuq's process tree's
-CPU time over the sample, less cpuq's own, with tasks reaped meanwhile counted through cpuq's
-children time; processes outside every operation's tree at 0.3 of a CPU or more are outside work.
-The line's order is `handOut` played one CPU at a time; a waiter's place is where it first gets
-one, and its `why` says what holds it (a gate, outside load, a CPU being emptied for it, its place
-in line). A run's time left comes from its tasks ended so far; the next CPU to free, from the
-operations giving CPUs back and their mean task time. A project's fair share is water-filled by
-weight over each project's demand (held plus wanted). Flags come only after a run's first five
-seconds, and only when measured: under half a CPU busy per CPU held, over 1.2, stopped.
+CPUs and whether a drain waits. Its sample (skipped with `--no-usage`) watches every process and the
+machine's CPU ticks for half a second: each operation's tasks' CPU is its cpuq's process tree's CPU
+time over the sample, less cpuq's own, with tasks reaped meanwhile counted through cpuq's children
+time; processes outside every operation's tree at 0.3 of a CPU or more are outside work. Outside
+work is also put down to what started it: each busy process (0.02 of a CPU or more) counts toward
+the top of its tree just below a starter (`claude`, `sshd`, `sshd-session`, `launchd`, `systemd`,
+`init`, `tmux`, `screen`, `login`, `cron`, a terminal) or below a parent it can't see; trees at 0.3
+of a CPU or more are `outside_work`, with the top's command (an agent's own, out of Claude Code's
+`eval '...'` wrapper) and working directory. The line's order is `handOut` played one CPU at a time;
+a waiter's place is where it first gets one, and its `why` says what holds it (a gate, outside load,
+a CPU being emptied for it, its place in line). A run's time left comes from its tasks ended so far;
+the next CPU to free, from the operations giving CPUs back and their mean task time. A project's
+fair share is water-filled by weight over each project's demand (held plus wanted). Flags come only
+after a run's first five seconds, and only when measured: under half a CPU busy per CPU held, over
+1.2, stopped.
 
 **History.** Each operation appends `queued` when it enters the line, then at its end `started`
 (dated at its first task's start) and `ended`, or `gave_up` for `--wait-max`. The end line holds
