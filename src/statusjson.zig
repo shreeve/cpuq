@@ -153,6 +153,8 @@ pub const JsonStatus = struct {
     outside: []const JsonOutside = &.{},
     /// CPUs busy outside every operation, in all (0 with --no-usage).
     outside_total: f64 = 0,
+    /// The same load by what started it, busiest first (empty with --no-usage).
+    outside_work: []const JsonWork = &.{},
     /// Each CPU's time so far, `[busy, total]` in clock ticks, in the kernel's order: cumulative,
     /// so a reader takes the difference between two statuses. Cpuq.app draws another machine's
     /// CPUs from it.
@@ -162,6 +164,21 @@ pub const JsonStatus = struct {
     boot_time: ?i64 = null,
     /// Whether `cpuq record` is sampling this machine (`cpuq samples` has its past).
     recorder: bool = false,
+};
+
+/// Busy work outside every operation, by what started it: the top of a process tree just
+/// below its starter (an agent's harness, an ssh session, a terminal, a service manager), so
+/// `ssh HOST 'make -j'` or a detached loop of builds shows as one entry with its command.
+pub const JsonWork = struct {
+    /// The tree's top process, and its command line (cut at 300 bytes) and working directory.
+    pid: i32 = 0,
+    command: []const u8 = "",
+    cwd: []const u8 = "",
+    /// What started it: the starter's program name (`claude`, `sshd-session`, `systemd`, ...).
+    via: []const u8 = "",
+    /// The tree's busy processes, and the CPUs they keep busy together.
+    procs: u32 = 0,
+    using: f64 = 0,
 };
 
 /// A busy process that is not part of any operation.
