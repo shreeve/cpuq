@@ -278,7 +278,7 @@ def Run.Calm {cfg : Cfg} (r : Run cfg) (T : Nat) : Prop :=
 
 /-! ### The rules and the drain's context -/
 
-/-- The rules the drain proof needs; the code's rules have them (`CodeRules.released`). With
+/-- The rules the drain proof needs; the code's rules up to 0.32.0 have them (`CodeRules.code0320`). With
 backfill on (`Rules.released`, 0.32.0) the proof starts once the window has closed (`Shut`);
 `Backfill.window_closes` shows every weakly fair run gets there. -/
 structure CodeRules (r : Rules) : Prop where
@@ -291,15 +291,18 @@ structure CodeRules (r : Rules) : Prop where
   markShared : r.markShared = true
   ledger : r.ledger = true
   renewAtRelease : r.renewAtRelease = true
+  drainFifo : r.drainFifo = false
+  drainTurn : r.drainTurn = false
+  drainSize : r.drainSize = false
 
-theorem CodeRules.released : CodeRules Rules.released :=
-  ⟨⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+theorem CodeRules.code0320 : CodeRules Rules.code0320 :=
+  ⟨⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 theorem CodeRules.code0302 : CodeRules Rules.code0302 :=
-  ⟨⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 theorem CodeRules.code0303 : CodeRules Rules.code0303 :=
-  ⟨⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 theorem CodeRules.code0305 : CodeRules Rules.code0305 :=
-  ⟨⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 theorem bit_clrBit {n o d : Nat} (h : d ≠ o) : bit (clrBit n o) d = bit n d := by
   unfold clrBit bit; split
@@ -453,7 +456,7 @@ theorem target_d {d : Nat} (hd : drainOp cfg d = true) (hcap : (cfg.op d).cap = 
         subst he; exact (hX sl.owner c hdg e).1 (h.ownerLock c sl hs hag))
       have h2 : s.grants g = 0 := countP_zero_grants (fun c => (hX g c hdg e).2)
       omega
-  simp [target_shut hsh, drainer_of_first hle hdr hdm, hdm]
+  simp [target_shut hsh hR.drainFifo hR.drainTurn, drainer_of_first hle hdr hdm, hdm]
 
 /-- While `d` is the first drain and waits to run, a pass grants every free CPU to `d` and
 changes nothing else. -/
@@ -973,7 +976,8 @@ theorem drain_frame {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drain
         have hdy := dying_none_of_pending h hpe
         have notd : o ≠ d := by
           intro eo; subst eo
-          simp only [hd, Bool.not_true, Bool.false_or, beq_iff_eq] at hdo
+          simp only [hd, Bool.not_true, Bool.false_or, drainFull, hR.drainSize, Bool.false_eq_true,
+            ite_false, beq_iff_eq] at hdo
           rw [h.len] at hdo; omega
         apply taskStep_ctx x rt ho hi
         · intro eo; exact absurd eo notd
@@ -1791,7 +1795,8 @@ theorem drain_served {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drai
         have hm : (r.st (T + (k + j))).marks ≠ 0 := by
           intro w; have := x.mark; rw [w] at this; simp [bit] at this
         unfold Enabled; rw [move_wild (lockFree j) _ (.inr (.inr (.inl ⟨g, c, rfl⟩)))]
-        simp [Cpuq.step, canDrain, St.isAlive, ha, hb0, hnd, hm, fits_shut (shut (k + j))])
+        simp [Cpuq.step, canDrain, markOn, beforeT, hR.drainTurn, hR.drainSize, St.isAlive, ha, hb0, hnd, hm,
+          fits_shut (shut (k + j))])
       rw [fairKey_class rfl (by intro o i ok w; cases w) hkb] at e
       obtain ⟨l2, d2⟩ := move_drain (lockFree j) e
       have := rank_lock (l2.trans (lj j)) hne

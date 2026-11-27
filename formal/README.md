@@ -33,6 +33,7 @@ fails the build.
 | `CpuqModel/Drains.lean` | Runs and weak fairness; `cpuq drain` is served |
 | `CpuqModel/Line.lean` | Every holder has been served; a head holding nothing is never blocked |
 | `CpuqModel/Backfill.lean` | Backfill: the rules' arithmetic in real time (the shadow never grows), the window closes, a gathering drain is served, no CPU runs two operations |
+| `CpuqModel/DrainCap.lean` | A drain's time limit: under 0.32.0 nothing bounds a drain's run; with the limit it holds CPUs at most limit + grace; FIFO lets no drain pass an older waiter holding nothing |
 
 ## The model
 
@@ -71,6 +72,15 @@ notes it, the loop acts on it (gives every CPU back), the parent raises SIGSTOP 
 a SIGCONT continues it; a SIGCONT before the loop acts cancels the Ctrl-Z, and one after it
 keeps the parent from raising SIGSTOP (`haltChecks`).
 
+A drain's time limit (`drainCap`, after 0.32.0) adds a clock per drain (`St.clock`): its
+command's start sets it to the limit and the grace (`drainLimit`: `-t`, else `Cfg.drainDefault`,
+at most `Cfg.drainCeil`, never off; `Cfg.grace`), each tick counts it down, TERM comes when only
+the grace is left and KILL at 0, and while an alive drain holds CPUs with its clock out or its
+command ended, time doesn't pass (`due`): it gives its CPUs back first. The idle stop is an
+earlier TERM (`timeout` on a drain, at any time), so it is only a sooner end. A stream of drains
+(`OpCfg.again`): a drain that finishes arrives again later, with a new ticket. These live in
+`moveX`, `move` with the extensions, which the search runs; with none on, `moveX` is `move`.
+
 `cpuq drain` (`OpCfg.drain`) is an urgent operation with one command. It wants every CPU of the
 pool while its command waits, starts it only holding them all, and keeps them while it runs.
 While it holds the drain mark every other operation empties its CPUs. A stopped drain lets its
@@ -100,7 +110,18 @@ FINAL-PLAN's (`plan`), the plan read loosely (`planLoose`), the plan with this m
 (`code0302`: the mark shared, a SIGCONT cancels a Ctrl-Z not yet acted on), the code at 0.30.3
 (`code0303`: `code0302` with the fixes of Findings 7, 8 and 9, `urgentOnce`, `haltChecks` and
 `drainLets`), the code at 0.30.5 and 0.31 (`code0305`: `code0303` with the fix of Finding 10,
-`drainMost`), and the code as released in 0.32.0 (`released`: `code0305` with `backfill`).
+`drainMost`), the code at 0.32.0 (`code0320`: `code0305` with `backfill`), at 0.33.0
+(`code0330`: with the drain's time limit), and as released in 0.34.0 (`released`: `code0330` with
+FIFO, `drainFifo`, and drain sizes, `drainSize`). FIFO: while a drain gathers, a free CPU goes
+first to the best waiter that is no drain, holds nothing (no CPU, no promise) and has an older
+ticket than the oldest gathering drain (`olderHead`, src/pool.zig's `before`); the CPU it accepts
+runs a task before it empties for a drain (`place`, as `emptyForDrain` marks only slots that have
+run a task); its give-back renews its ticket. Drain sizes: `-c N` gathers `N` CPUs (`cap`) and is
+owed them by the line's giver; only a gathering `--all` drain (`OpCfg.all`) makes the operations
+that have started empty their CPUs (`markOn`) and has backfill; `-c N` may run 2 hours, `--all` 20
+minutes (`drainCeil`, `drainCeilAll`). Two rules tried on the way, searched only: `turn2087`
+(drain-turn at 2087ebe: a drain takes its turn behind older runs that have yet to start a task,
+`drainTurn`) and `turnEfa` (efa0af3: that with drain sizes and `placeFirst`).
 
 `pool` differs from `fixed` where the code does what the plan doesn't say: the giver's ticket is
 renewed when it gives its CPU back, not when it starts to drain (`renewAtRelease`); one giver
@@ -114,7 +135,9 @@ rules say nothing of how a Ctrl-Z is received, so they have `haltChecks` on.
 No `sorry`. `#print axioms` of `Reach.inv`, `lock_released`, `drain_served`, `Reach.servedOk`,
 `zero_head_unblocked`, `window_closes`, `drain_served_backfill`, `one_op_per_cpu` and
 `Timed.ends_by` lists only `propext`, `Classical.choice`, `Quot.sound` (`Reach.servedOk` and
-`Timed.ends_by` not even `Classical.choice`).
+`Timed.ends_by` not even `Classical.choice`). The same for `hold_bound`, `released_hold_bound`,
+`released_holds_forever`, `code0305_holds_forever`, `code0320_stream_starves`,
+`code0305_stream_starves`, `fifo_no_pass` and `released_fifo_no_pass`.
 
 **Safety** (`Safety.lean`). `Inv` holds initially and every move keeps it, crashes, kills, stops,
 drains and the pool lock included, for any rules with the three safety switches on (`Safe`:
@@ -160,10 +183,17 @@ under the pool lock while the first waits for the pool lock: the search finds th
 | Under the code's rules, with no drain living, a head holding nothing is never blocked: a CPU is unlocked, or one is being emptied, or some holder may start emptying one for it | `zero_head_unblocked` |
 | Backfill, in real time: every task that starts fits the shadow, so the shadow never grows and every task the drain waits for ends by the first shadow `S`: the drain starts by `S` | `Timed.ends_by` |
 | Backfill: with no new drain, in a weakly fair run the window closes and stays closed | `window_closes` |
-| Backfill: once the window has closed, a gathering drain is served (`drain_served` for `released`) | `drain_served_backfill` |
+| Backfill: once the window has closed, a gathering drain is served (`drain_served` for `code0320`) | `drain_served_backfill` |
 | Backfill never puts two operations' tasks on one CPU (with `k_bound`, at most K of one) | `one_op_per_cpu` |
+| 0.31 and 0.32.0: a drain whose command runs holds the pool while a waiter waits, and only the command's own end is enabled; the run that stays there is weakly fair for every other class, so only A-term ends it | `code0305_holds_forever`, `released_holds_forever` |
+| 0.31 and 0.32.0: two drains taking turns starve a one-task run on 1 CPU: a weakly fair lasso (a cycle of moves back to its start, the run waiting holding nothing throughout, every step class enabled throughout taken in it) | `code0305_stream_starves`, `code0320_stream_starves` |
+| 0.34.0: `hold_bound` (limit + grace, the limit at most its ceiling) and `fifo_no_pass` for the released rules | `released_hold_bound`, `released_fifo_no_pass` |
+| With the drain's limit: through any stretch in which a drain is alive, holds a CPU and has started its command, at most limit + grace ticks pass | `hold_bound` |
+| … its start sets the clock to limit + grace, no step raises it, and an idle stop only lowers it | `moveX_start`, `ReachX.clk_le`, `moveX_clk` |
+| … once its command has ended, no time passes before it has given every CPU back | `ended_no_tick` |
+| FIFO: a free CPU goes to a drain only if every waiter that holds nothing and is no drain has a younger ticket | `fifo_no_pass` |
 
-`drain_served` holds for the code's rules (`CodeRules`: `released`, `code0305`, `code0303`,
+`drain_served` holds for the code's rules up to 0.32.0 (`CodeRules`: `code0320`, `code0305`, `code0303`,
 `code0302`), from a time at which backfill is shut (`Shut`: off, or its window closed). A run
 (`Run`) is a sequence of moves and stutters from a reachable state; it is weakly fair
 (`Run.Fair`) when every step class the search calls fair (`fairKey`: a task's exit whether it
@@ -281,7 +311,9 @@ The timed bound (L4) is not done.
 - The Zig code, its files and their formats; `cpuq status`.
 - The outside-load, memory and disk gates; pool changes (CPU offline, config edits); `-c` as a
   percentage (C is a whole number here).
-- Nesting, the build jobserver, the event log, output files, `--max` on a drain.
+- Nesting, the build jobserver, the event log, output files, `--max` on a drain (a bound on its
+  wait, not on its run). The idle stop's measure (0.25 CPU busy over 5 minutes while another run
+  waits): it is only an earlier TERM.
 - A drain's mark outliving its record: the code closes the mark when `run` returns, just after it
   leaves the line; the model drops both at once.
 - A continued drain takes its mark again in its own critical section after the continue; the
@@ -303,7 +335,10 @@ pass or accept can run until some task ends), `CS stuck` (the pool lock's holder
 lock only the pool lock lets go), `Z stuck` (a parent the kernel stopped that no SIGCONT will
 continue). On every drain: `F1 drain not owed`, `F6 drain not for the head`, `F6 giver ahead`
 (not for the emptying a live `cpuq drain` asks of everyone, nor a drain's lending). On the
-graph: `L3 never`, `L3 fair`, and for each drain `D never`, `D fair`.
+graph: `L3 never`, `L3 fair`, and for each drain `D never`, `D fair`. With `drainCap`, on every
+state: `T lock` (time may not pass and no step can be taken). Where a scenario asks (`Cfg.hold`),
+on the graph: `L3 hold`, `L3 fair` with a drain's command not forced to end (no A-term for it),
+and a run may stay in a state where no class is forced.
 
 review2-formal's counterexamples, on FINAL-REPORT-1's rules (`Checks.lean`):
 
@@ -443,3 +478,31 @@ without one (`L3 never`, "two drains, Ctrl-Z, 0.30.3"). Fix (`drainMost`, 0.30.5
 gives free CPUs to the drain that wants some and holds or is promised the most, then the older
 ticket. A stopped drain gives every CPU back, so at most one drain ever holds a CPU, and it is
 served first.
+
+**11. (src/op.zig, 0.32.0) Nothing bounds a drain's run.** `--max` bounds a drain's wait only.
+Once its command starts it holds every CPU until the command ends, however idle (pup: 22 CPUs for
+2h51m at 0.09 busy while 8 runs waited). In the model the only step enabled is the command's
+own end (`released_holds_forever`, 1 CPU; `L3 hold`, "drain holds, 0.32.0"). Fix (`drainCap`):
+a time limit, TERM then KILL a grace later, and the idle stop as an earlier TERM. Proved: it
+holds CPUs at most limit + grace per start (`hold_bound`); searched: `L3 hold` passes.
+
+**12. (src/pool.zig, 0.32.0) A stream of drains starves a waiter.** While a drain wants CPUs every
+free CPU goes to it, and a drain is urgent, so a drain that registers after a 1-CPU waiter still
+goes first. Two drains taking turns (each registers while the other runs) get every CPU forever:
+proved for 0.31 and 0.32.0 on 1 CPU with a one-task run (`code0305_stream_starves`,
+`code0320_stream_starves`); searched: `L3 fair`, "drain stream" (pup showed drains 2173 to 2175
+first in line ahead of 2142 to 2169). The time limit doesn't help ("drain stream, 0.33.0"): it
+bounds each drain, not the stream.
+
+Two fixes tried in src fail a stream: a drain due only once no older operation has never held a
+CPU, and a drain that takes its turn behind older runs that have yet to start a task (`turn2087`,
+`turnEfa`): both are once per operation, so a run with more tasks than one turn, served once, is
+passed by every later drain (`L3 fair`, "drain stream, 2087ebe"). Fix (0.34.0, `drainFifo`): no
+drain passes an older waiter that holds nothing, the CPU it takes runs a task first, and its
+give-back renews its ticket, so after its turn it queues behind the drains that came meanwhile.
+Proved: the hand-out never passes such a waiter (`released_fifo_no_pass`) and each drain's hold is
+bounded (`released_hold_bound`). Searched: every scenario passes on `released`, streams of `--all`
+and `-c N` drains against one-task and endless-work waiters included, and a drain is served
+against a stream of new runs ("waiter stream": `D never`, `D fair`). Not proved: that the waiter
+is served (L3), or a bound on its wait (the drains older than it, each gather + limit + grace,
+plus the line's own wait), which needs ticket order through the wait and L3's open frame.

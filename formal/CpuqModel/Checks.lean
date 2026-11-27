@@ -3,7 +3,8 @@ The exhaustive searches `lake build` runs, each with the result it gave, so a ch
 or the rules that changes what is found shows here. Names of the checks: `Explore.lean`.
 
 Scenarios: up to 4 CPUs, 3 operations, K ≤ 2, with crashes (SIGKILL of a parent), timeouts and
-retries, Ctrl-Z, `cpuq kill`, an urgent operation, project weights, `cpuq drain` and backfill. `forever`
+retries, Ctrl-Z, `cpuq kill`, an urgent operation, project weights, `cpuq drain`, backfill, a
+drain's time limit and streams of drains. `forever`
 operations never run out of work, so a waiter that is not served is starved, not merely late.
 Rule sets: `Rules.report1` (FINAL-REPORT-1, as review2-formal read it), `Rules.plan`
 (FINAL-PLAN), `Rules.planLoose` (FINAL-PLAN with the unsafe reading of "its place frees at
@@ -154,6 +155,53 @@ def backfillUrgent (r : Rules) : Cfg :=
   { cpus := 2, rules := r, window := 2, kills := true
     ops := [{ proj := 0, tasks := 2, forever := true, tlimit := 2 },
             { proj := 0, tasks := 1, urgent := true, tlimit := 1 }, drainOn 2 1] }
+
+/-! A drain's time limit, drain sizes, and streams of drains. `drainOn n` is a drain of `n` CPUs:
+before `drainSize` every drain takes the pool; with it (0.34.0) `drainOn n` is `-c n` and
+`wholeOn n` is `--all`. -/
+
+/-- `cpuq drain --all` on a pool of `n` CPUs (0.34.0). -/
+def wholeOn (n proj : Nat) : OpCfg := { drainOn n proj with all := true }
+
+/-- 2 CPUs: an operation with endless work, the drain `dr`, and another; the drain's command may
+run forever (`hold`: `L3 hold` searched). -/
+def drainHold (r : Rules) (dr : OpCfg := drainOn 2 1) : Cfg :=
+  { cpus := 2, rules := r, hold := true
+    ops := [{ proj := 0, tasks := 1, forever := true }, dr, { proj := 2, tasks := 1, forever := true }] }
+
+/-- `n` CPUs: the waiter `w` and two drains made by `mk` that come back each time they finish. -/
+def streamOf (n : Nat) (w : OpCfg) (mk : Nat → Nat → OpCfg) (r : Rules) : Cfg :=
+  { cpus := n, rules := r, ops := [w, { mk n 1 with again := true }, { mk n 2 with again := true }] }
+
+/-- A waiter with endless work, and a one-task waiter. -/
+def endless : OpCfg := { proj := 0, tasks := 1, forever := true }
+def oneTask : OpCfg := { proj := 0, tasks := 1 }
+
+/-- 1 CPU: a waiter with endless work and a stream of drains. -/
+def drainStream (r : Rules) : Cfg := streamOf 1 endless drainOn r
+
+/-- 2 CPUs: one-task runs that keep coming, and the drain `dr`. -/
+def waiterStream (r : Rules) (dr : OpCfg := drainOn 2 1) : Cfg :=
+  { cpus := 2, rules := r
+    ops := [dr, { proj := 0, tasks := 1, again := true }, { proj := 2, tasks := 1, again := true }] }
+
+/-- 3 CPUs: an operation with endless work, a `-c 1` drain, and another with endless work. -/
+def drainSide (r : Rules) : Cfg :=
+  { cpus := 3, rules := r
+    ops := [{ proj := 0, tasks := 2, forever := true }, drainOn 1 1, { proj := 2, tasks := 1, forever := true }] }
+
+/-- 2 CPUs: an operation with endless work, the drain `dr`, and a one-task run. -/
+def olderWaiter (r : Rules) (dr : OpCfg) : Cfg :=
+  { cpus := 2, rules := r, ops := [{ proj := 0, tasks := 2, forever := true }, dr, { proj := 2, tasks := 1 }] }
+
+/-- 2 CPUs, an operation with endless work and the drains `d1`, `d2`, one Ctrl-Z. -/
+def drainsZ (r : Rules) (d1 d2 : OpCfg) : Cfg :=
+  { cpus := 2, rules := r, stops := true, ops := [{ proj := 0, tasks := 2, forever := true }, d1, d2] }
+
+/-- `backfill` with an `--all` drain. -/
+def backfillAll (r : Rules) : Cfg :=
+  { backfill r with ops := [{ proj := 0, tasks := 2, forever := true, tlimit := 2 },
+                            { proj := 1, tasks := 1, forever := true, tlimit := 1 }, wholeOn 2 2] }
 
 def row (name : String) (cfg : Cfg) : IO Unit :=
   IO.println s!"{name}: {(explore cfg).summary}"
@@ -379,7 +427,7 @@ urgent: ok: 716391 states, 4334356 steps
 
 /-! ## Backfill (0.32.0)
 
-`Rules.released`: 0.30.5 with backfill. Every scenario with a drain, then backfill's own. The
+`Rules.code0320`: 0.30.5 with backfill. Every scenario with a drain, then backfill's own. The
 scenarios without a drain are 0.30.5's: backfill acts only while a drain gathers. A drain now
 gives its CPUs back without renewing its ticket, so the drain scenarios reach fewer states. -/
 
@@ -400,19 +448,86 @@ backfill off: ok: 1512 states, 3708 steps
 -/
 #guard_msgs in
 #eval do
-  row "two drains" (twoDrains .released)
-  row "drain, crash" (drainCrash .released)
-  row "drain, Ctrl-Z" (drainZ .released)
-  row "two drains, Ctrl-Z" (twoDrainsZ .released)
-  row "backfill" (backfill .released)
-  row "backfill, no limit" (backfillOpen .released)
-  row "backfill, crash" (backfillCrash .released)
-  row "backfill, Ctrl-Z" (backfillZ .released)
-  row "backfill, two drains, Ctrl-Z" (backfillTwoZ .released)
-  row "backfill, timeouts" (backfillTimeout .released)
-  row "backfill, 3 CPUs" (backfill3 .released)
-  row "backfill, urgent, kill" (backfillUrgent .released)
+  row "two drains" (twoDrains .code0320)
+  row "drain, crash" (drainCrash .code0320)
+  row "drain, Ctrl-Z" (drainZ .code0320)
+  row "two drains, Ctrl-Z" (twoDrainsZ .code0320)
+  row "backfill" (backfill .code0320)
+  row "backfill, no limit" (backfillOpen .code0320)
+  row "backfill, crash" (backfillCrash .code0320)
+  row "backfill, Ctrl-Z" (backfillZ .code0320)
+  row "backfill, two drains, Ctrl-Z" (backfillTwoZ .code0320)
+  row "backfill, timeouts" (backfillTimeout .code0320)
+  row "backfill, 3 CPUs" (backfill3 .code0320)
+  row "backfill, urgent, kill" (backfillUrgent .code0320)
   row "backfill off" (backfill .code0305)
+
+
+
+
+/-! ## A drain's time limit, drain sizes, streams of drains (0.33.0, 0.34.0)
+
+Under 0.31 and 0.32.0 a drain holds the pool for as long as its command runs (`L3 hold`: its
+command need not end), and two drains taking turns starve a waiter (`L3 fair`; README Findings 11
+and 12, both also proved in `DrainCap.lean`). The time limit (0.33.0) ends each drain but not the
+stream. The turn rule of 2087ebe protects a run only until its first task. The released rules
+(0.34.0: FIFO and drain sizes) pass every stream, `--all` and `-c N`, against one-task and
+endless-work waiters, and serve a drain against a stream of new runs. `T pass` on the Ctrl-Z
+scenarios: a run stopped by Ctrl-Z while the drain gathered wants nothing then, so the CPUs go to
+the drain; continued, it waits for that drain. -/
+
+/--
+info: drain holds, 0.31: FAILED (1143 states): L3 hold
+drain holds, 0.32.0: FAILED (591 states): L3 hold
+drain holds, 0.33.0: ok: 1873 states, 5509 steps
+drain holds, --all: ok: 1957 states, 5727 steps
+drain holds, -c 1: ok: 2761 states, 8307 steps
+drain stream, 0.31: FAILED (340 states): L3 fair
+drain stream, 0.32.0: FAILED (324 states): L3 fair
+drain stream, 0.33.0: FAILED (1746 states): L3 fair
+drain stream, 2087ebe: FAILED (1809 states): L3 fair
+drain stream, --all: ok: 881 states, 2530 steps
+drain stream, one task, 0.31: FAILED (533 states): L3 fair
+drain stream, one task, --all: ok: 1699 states, 4982 steps
+drain stream, 2 CPUs, 0.33.0: FAILED (6668 states): L3 fair
+drain stream, 2 CPUs, --all: ok: 2635 states, 8141 steps
+drain stream, 2 CPUs, -c 1: ok: 9405 states, 33285 steps
+drain stream, 2 CPUs, -c 2: ok: 2635 states, 8141 steps
+waiter stream, --all: ok: 4355 states, 14075 steps
+waiter stream, -c 1: ok: 6714 states, 22011 steps
+-c 1 beside, 3 CPUs: ok: 8717 states, 35061 steps
+older waiter, --all: ok: 3718 states, 11576 steps
+older waiter, -c 1: ok: 5750 states, 18885 steps
+two drains, Ctrl-Z, --all: FAILED (109049 states): T pass
+two drains, Ctrl-Z, -c 1 and --all: FAILED (146712 states): T pass
+backfill, --all: ok: 9758 states, 31168 steps
+-/
+#guard_msgs in
+#eval do
+  row "drain holds, 0.31" (drainHold .code0305)
+  row "drain holds, 0.32.0" (drainHold .code0320)
+  row "drain holds, 0.33.0" (drainHold .code0330)
+  row "drain holds, --all" (drainHold .released (wholeOn 2 1))
+  row "drain holds, -c 1" (drainHold .released (drainOn 1 1))
+  row "drain stream, 0.31" (drainStream .code0305)
+  row "drain stream, 0.32.0" (drainStream .code0320)
+  row "drain stream, 0.33.0" (drainStream .code0330)
+  row "drain stream, 2087ebe" (streamOf 1 endless wholeOn .turn2087)
+  row "drain stream, --all" (streamOf 1 endless wholeOn .released)
+  row "drain stream, one task, 0.31" (streamOf 1 oneTask drainOn .code0305)
+  row "drain stream, one task, --all" (streamOf 1 oneTask wholeOn .released)
+  row "drain stream, 2 CPUs, 0.33.0" (streamOf 2 endless drainOn .code0330)
+  row "drain stream, 2 CPUs, --all" (streamOf 2 endless wholeOn .released)
+  row "drain stream, 2 CPUs, -c 1" (streamOf 2 endless (fun _ p => drainOn 1 p) .released)
+  row "drain stream, 2 CPUs, -c 2" (streamOf 2 endless drainOn .released)
+  row "waiter stream, --all" (waiterStream .released (wholeOn 2 1))
+  row "waiter stream, -c 1" (waiterStream .released (drainOn 1 1))
+  row "-c 1 beside, 3 CPUs" (drainSide .released)
+  row "older waiter, --all" (olderWaiter .released (wholeOn 2 1))
+  row "older waiter, -c 1" (olderWaiter .released (drainOn 1 1))
+  row "two drains, Ctrl-Z, --all" (drainsZ .released (wholeOn 2 1) (wholeOn 2 2))
+  row "two drains, Ctrl-Z, -c 1 and --all" (drainsZ .released (drainOn 1 1) (wholeOn 2 2))
+  row "backfill, --all" (backfillAll .released)
 
 -- Larger: 4 CPUs, and weights over three projects.
 /--
@@ -422,8 +537,8 @@ four CPUs, weights 1 2: ok: 34414 states, 148680 steps
 -/
 #guard_msgs in
 #eval do
-  row "weights 2 1 1" (weighted3 .released)
-  row "four CPUs" (fourCpus .released)
-  row "four CPUs, weights 1 2" (fourWeighted .released)
+  row "weights 2 1 1" (weighted3 .code0320)
+  row "four CPUs" (fourCpus .code0320)
+  row "four CPUs, weights 1 2" (fourWeighted .code0320)
 
 end Cpuq.Checks

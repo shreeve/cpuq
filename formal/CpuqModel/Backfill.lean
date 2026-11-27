@@ -173,15 +173,15 @@ theorem window_closes {cfg : Cfg} (hb : cfg.rules.backfill = true) (r : Run cfg)
 
 /-! ### A gathering drain is served -/
 
-/-- `cpuq drain` is served under the released rules, backfill on: once its window has closed
+/-- `cpuq drain` is served under the 0.32.0 rules (`code0320`), backfill on: once its window has closed
 (which every weakly fair run reaches, `window_closes`) at a time it is first among drains,
 waiting, with every CPU it lent back (`DCtx`), it ends up holding every CPU of the pool. -/
-theorem drain_served_backfill {cfg : Cfg} {d : Nat} (hr : cfg.rules = Rules.released)
+theorem drain_served_backfill {cfg : Cfg} {d : Nat} (hr : cfg.rules = Rules.code0320)
     (hd : drainOp cfg d = true) (hcap : (cfg.op d).cap = cfg.cpus) (hst : cfg.stops = false)
     (hk : cfg.kills = false) (r : Run cfg) (fair : r.Fair) {T : Nat} (calm : r.Calm T)
     (x0 : DCtx cfg d (r.st T)) (hw : (r.st T).window = 0) :
     ∃ m, T ≤ m ∧ (r.st m).owned d = cfg.cpus :=
-  drain_served (by rw [hr]; exact CodeRules.released) hd hcap hst hk r fair calm x0 (.inr hw)
+  drain_served (by rw [hr]; exact CodeRules.code0320) hd hcap hst hk r fair calm x0 (.inr hw)
 
 /-! ### Backfill never puts two operations on one CPU -/
 

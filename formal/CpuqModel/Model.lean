@@ -19,7 +19,8 @@ lock, or of a parent's own step (refill, reap); a critical section publishes und
 by one rename, so an atomic step is faithful to it while nothing in it waits for another
 process. `move` adds the pool lock, a drain's mark and Ctrl-Z as the code receives them: the one
 critical section that takes a second lock, a drain's registration, is two moves (`enter`,
-`mark`), so a wait inside it shows.
+`mark`), so a wait inside it shows. `moveX` adds what `DrainCap.lean` covers: a drain's time
+limit, a stream of drains, and the FIFO rule's accept; with none of them on it is `move`.
 -/
 
 namespace Cpuq
@@ -91,6 +92,12 @@ structure St where
   `shadow` less the time now). A drain's registration opens it (`Cfg.window`); time passing
   (`Act.tick`) only shrinks it, so a task that fits never ends after it. -/
   window : Nat := 0
+  /-- With `drainCap`, each drain's clock (by operation; missing is 0): the ticks left before
+  its command is killed. Its start sets it to the limit and the grace (`drainLimit`, `Cfg.grace`);
+  time passing (`moveX`'s tick) counts it down: TERM when only the grace is left, KILL at 0. -/
+  clock : List Nat := []
+  /-- With `drainTurn`, has run a task (src/pool.zig's `running + done + failed > 0`), as bits. -/
+  ran : Nat := 0
   deriving DecidableEq, Repr, Hashable, Inhabited
 
 /-- Sets of operations as bits. -/
@@ -117,6 +124,11 @@ structure OpCfg where
   /-- `-t`: how long a task of it may run, in the model's ticks (`Act.tick`), the time a kill
   takes included; 0: no limit. Read only by backfill (`fits`). -/
   tlimit : Nat := 0
+  /-- A stream of drains: when this drain finishes, the same drain arrives again with a new
+  ticket (another `cpuq drain` from the same place). Read only by `moveX`. -/
+  again : Bool := false
+  /-- With `drainSize`, a drain of the whole pool (`--all`); else of `cap` CPUs (`-c N`). -/
+  all : Bool := false
   deriving Repr
 
 /-- The rule set. Each switch is one fix; `Rules.report1` has them all off. -/
@@ -191,6 +203,33 @@ structure Rules where
   the waiters that fit (`lends`), giving them back without renewing its ticket. Off: while a
   drain gathers, every free CPU goes to it and every other operation empties its CPUs. -/
   backfill : Bool := false
+  /-- A drain's command has a time limit (`drainLimit`: `-t`, else a default, at most a ceiling,
+  never off): TERM when it is reached, KILL a grace later, and the drain gives its CPUs back
+  before time passes again (`moveX`). The idle stop (under 0.25 CPU busy for 5 minutes while
+  another run waits) is an earlier TERM, which `cpuq drain`'s command may get at any time. -/
+  drainCap : Bool := false
+  /-- No drain passes an older waiter that holds nothing: a free CPU goes to the best such waiter
+  with an older ticket than the gathering drain's before it goes to the drain (`olderHead`), and
+  the CPU a waiter accepts runs one of its tasks before it empties for the drain (src/op.zig's
+  `place` runs before its next settle; `moveX`). A proposed fix, not in src/. -/
+  drainFifo : Bool := false
+  /-- A drain takes its turn (0.34.0): while a drain gathers, a free CPU goes first, in line
+  order, to an operation that queued before the oldest gathering drain (`turnOf`) and has yet to
+  start a task (`starting`: no task of it has run, and it wants or holds CPUs); such an operation
+  keeps its CPUs (it is not made to empty them) until its first task runs. Then backfill, then
+  the drain. Operations that have started empty their CPUs for a gathering drain as before. -/
+  drainTurn : Bool := false
+  /-- A drain's size (0.34.0): `-c N` (`cap`, `OpCfg.all` off) or `--all`. It starts holding its
+  `cap` CPUs, and holds only those. Only a gathering `--all` drain makes the operations that have
+  started empty their CPUs (`markOn`, src/pool.zig's `drainWantsAll`) and only it has backfill
+  (`shadowed`); a `-c N` drain is owed its CPUs by the line's giver, one at a time. A `-c N`
+  drain may run 2 hours at most, an `--all` drain 20 minutes (`drainCeil`, `drainCeilAll`). -/
+  drainSize : Bool := false
+  /-- The CPU an operation accepts runs one of its waiting tasks at once, before the operation
+  looks at drains or the line again (src/op.zig's `place` runs before its next settle; `moveX`).
+  Off: the accept and the refill are two steps, and a drain or the line's giver may come
+  between. -/
+  placeFirst : Bool := false
   deriving Repr
 
 namespace Rules
@@ -243,8 +282,24 @@ def code0303 : Rules :=
 the drain holding the most. -/
 def code0305 : Rules := { code0303 with drainMost := true }
 
-/-- The code as released (0.32.0): `code0305` with backfill. -/
-def released : Rules := { code0305 with backfill := true }
+/-- The code at 0.32.0: `code0305` with backfill. -/
+def code0320 : Rules := { code0305 with backfill := true }
+
+/-- The code at 0.33.0: `code0320` with the drain's time limit. -/
+def code0330 : Rules := { code0320 with drainCap := true }
+
+/-- `code0330` with a drain taking its turn (drain-turn at 2087ebe, before drain sizes). -/
+def turn2087 : Rules := { code0330 with drainTurn := true }
+
+/-- drain-turn at efa0af3: a drain takes its turn, and has a size. -/
+def turnEfa : Rules := { turn2087 with drainSize := true, placeFirst := true }
+
+/-- `code0330` with FIFO between drains and waiters holding nothing (`drainFifo`). -/
+def fifo : Rules := { code0330 with drainFifo := true }
+
+/-- The code as released (0.34.0): the time limit, FIFO between drains and waiters holding
+nothing, and a drain's size (`-c N` or `--all`). -/
+def released : Rules := { fifo with drainSize := true }
 
 end Rules
 
@@ -264,6 +319,16 @@ structure Cfg where
   /-- With backfill, the time a drain's gathering may take at most, in ticks: the window
   (`St.window`) a drain's registration opens. -/
   window : Nat := 0
+  /-- Also search `L3 hold` (a run in which a drain's command never ends). -/
+  hold : Bool := false
+  /-- With `drainCap`, a drain's limit when it gives no `-t` (src/op.zig: 20 minutes), in ticks. -/
+  drainDefault : Nat := 1
+  /-- With `drainCap`, the most a drain's `-t` may ask (src/op.zig: 2 hours), in ticks. -/
+  drainCeil : Nat := 2
+  /-- With `drainSize`, the most an `--all` drain may run (src/op.zig: 20 minutes), in ticks. -/
+  drainCeilAll : Nat := 1
+  /-- With `drainCap`, the ticks from TERM to KILL (src/op.zig: 5 s). -/
+  grace : Nat := 1
 
 /-! ## Reading the state -/
 
@@ -444,7 +509,8 @@ def shadowed (cfg : Cfg) (s : St) : Bool :=
   cfg.rules.backfill && (opIds cfg).countP (gathers cfg s) == 1 &&
   (opIds cfg).all (fun o => !(drainOp cfg o && scanned s o) || gathers cfg s o || s.owned o == 0) &&
   (opIds cfg).any (shades cfg s) &&
-  (opIds cfg).all (fun o => !shades cfg s o || (cfg.op o).tlimit != 0)
+  (opIds cfg).all (fun o => !shades cfg s o || (cfg.op o).tlimit != 0) &&
+  (!cfg.rules.drainSize || (opIds cfg).all (fun o => !gathers cfg s o || (cfg.op o).all))
 
 /-- src/pool.zig's `fits`: a task of `o` started now ends before the gathering drain could start. -/
 def fits (cfg : Cfg) (s : St) (o : Nat) : Bool :=
@@ -459,12 +525,62 @@ def fitHead (cfg : Cfg) (s : St) : Option Nat :=
       | some b => if before cfg s o b then some o else best
     else best) none
 
-/-- Who a free token goes to: while there is a drainer, the best waiter that fits (backfill), else
-the drainer alone (and no one while it wants nothing); with no drainer, the head of the line. -/
+/-- src/pool.zig's `starting`: no drain, no task of it has run yet, and it wants or holds CPUs. -/
+def starting (cfg : Cfg) (s : St) (o : Nat) : Bool :=
+  !drainOp cfg o && liveOp cfg s o && !bit s.ran o &&
+    (decide (demand cfg s o > 0) || decide (s.owned o + s.grants o > 0))
+
+/-- src/pool.zig's `turnOf`: the oldest gathering drain. -/
+def turnOf (cfg : Cfg) (s : St) : Option Nat := s.order.find? (gathers cfg s)
+
+/-- src/pool.zig's `before`: with `drainTurn`, `o` queued before the oldest gathering drain and has
+yet to start. -/
+def beforeT (cfg : Cfg) (s : St) (o : Nat) : Bool :=
+  cfg.rules.drainTurn && starting cfg s o &&
+    match turnOf cfg s with
+    | some t => decide (s.order.findIdx (· == o) < s.order.findIdx (· == t))
+    | none => false
+
+/-- The best waiter in line that goes before the gathering drain (`beforeT`). -/
+def turnHead (cfg : Cfg) (s : St) : Option Nat :=
+  s.order.foldl (fun best o =>
+    if waiter cfg s o && beforeT cfg s o then
+      match best with
+      | none => some o
+      | some b => if before cfg s o b then some o else best
+    else best) none
+
+/-- Where the oldest gathering drain stands in the tickets (0 when none gathers). -/
+def turnIdx (cfg : Cfg) (s : St) : Nat :=
+  match turnOf cfg s with
+  | some t => s.order.findIdx (· == t)
+  | none => 0
+
+/-- With `drainFifo`, the best waiter that holds nothing, is no drain, and has an older ticket than
+the oldest gathering drain (src/pool.zig's `before`). -/
+def olderHead (cfg : Cfg) (s : St) : Option Nat :=
+  s.order.foldl (fun best o =>
+    if cfg.rules.drainFifo && waiter cfg s o && !drainOp cfg o && s.owned o + s.grants o == 0 &&
+       decide (s.order.findIdx (· == o) < turnIdx cfg s) then
+      match best with
+      | none => some o
+      | some b => if before cfg s o b then some o else best
+    else best) none
+
+/-- Who a free token goes to: while there is a drainer, (with `drainFifo`) the best older waiter
+holding nothing, else (with `drainTurn`) the best waiter that goes before the drain, else the best
+waiter that fits (backfill), else the drainer alone (and no one
+while it wants nothing); with no drainer, the head of the line. -/
 def target (cfg : Cfg) (s : St) : Option Nat :=
   match drainer cfg s with
   | some d =>
     if decide (demand cfg s d > 0) then
+      match olderHead cfg s with
+      | some w => some w
+      | none =>
+      match turnHead cfg s with
+      | some w => some w
+      | none =>
       match fitHead cfg s with
       | some f => some f
       | none => some d
@@ -581,11 +697,17 @@ still want is more than it already empties for them. -/
 def lends (cfg : Cfg) (s : St) (o : Nat) : Bool :=
   gathers cfg s o && shadowed cfg s && decide (s.drainOf o < fitWant cfg s)
 
+/-- A drain's mark makes everyone else empty CPUs: some drain holds it (with `drainTurn`, and
+some drain gathers: src/pool.zig's `drainWants`). -/
+def markOn (cfg : Cfg) (s : St) : Bool :=
+  s.marks != 0 && (!(cfg.rules.drainTurn || cfg.rules.drainSize) ||
+    (opIds cfg).any (fun d => gathers cfg s d && (!cfg.rules.drainSize || (cfg.op d).all)))
+
 /-- Drain on demand (rule 6): may `o` mark its slot `c` draining now? While a `cpuq drain` holds
 its mark every other operation does, unless it fits (backfill); the gathering drain lends. -/
 def canDrain (cfg : Cfg) (s : St) (o c : Nat) : Bool :=
   s.isAlive o && (s.cpu c).slot == some { owner := o } &&
-  (s.marks != 0 && !drainOp cfg o && !fits cfg s o || lends cfg s o ||
+  (markOn cfg s && !drainOp cfg o && !fits cfg s o && !beforeT cfg s o || lends cfg s o ||
   if cfg.rules.ledger then
     match head cfg s with
     | none => false
@@ -675,6 +797,10 @@ inductive Act where
   | tick
   deriving DecidableEq, Repr, Hashable, Inhabited
 
+/-- A drain holds all it gathers: every CPU of the pool, or (with `drainSize`) its `cap`. -/
+def drainFull (cfg : Cfg) (s : St) (o : Nat) : Bool :=
+  s.owned o == (if cfg.rules.drainSize then (cfg.op o).cap else s.cpus.length)
+
 def step (cfg : Cfg) (s : St) : Act → Option St
   | .arrive o =>
     if (s.op o).phase == .waiting then
@@ -709,7 +835,7 @@ def step (cfg : Cfg) (s : St) : Act → Option St
   | .refill o c =>
     if s.isAlive o && (s.cpu c).slot == some { owner := o } &&
        decide (s.runningOn o c < (cfg.op o).K) && !anyDrain cfg s o &&
-       (!drainOp cfg o || s.owned o == s.cpus.length) then
+       (!drainOp cfg o || drainFull cfg s o) then
       match firstPending s o with
       | some i => some (s.setTask o i { s.task o i with st := .running c })
       | none => none
@@ -863,7 +989,109 @@ def actions (cfg : Cfg) : List Act :=
     [.refill o c, .release o c, .accept o c, .drain o c, .undrain o c])) ++
   [.handout]
 
+/-! ## The drain's time limit, a stream of drains, and FIFO (`moveX`)
+
+`move` with what the proofs before `DrainCap.lean` leave out: with `Rules.drainCap` a drain's
+command has a clock, with `OpCfg.again` a drain comes back, with `Rules.drainFifo` an accepted
+CPU runs a task first. With none of them, `moveX` is `move` (`moveX_plain`). -/
+
+/-- A drain's limit in ticks: `-t`, else the default, at most the ceiling; never off. -/
+def drainCeilOf (cfg : Cfg) (o : Nat) : Nat :=
+  if cfg.rules.drainSize && (cfg.op o).all then cfg.drainCeilAll else cfg.drainCeil
+
+def drainLimit (cfg : Cfg) (o : Nat) : Nat :=
+  min (if (cfg.op o).tlimit == 0 then cfg.drainDefault else (cfg.op o).tlimit) (drainCeilOf cfg o)
+
+/-- A clock with nothing left is the empty list, so equal clocks are equal states. -/
+def normClock (l : List Nat) : List Nat := if l.all (· == 0) then [] else l
+
+namespace St
+def clk (s : St) (o : Nat) : Nat := s.clock.getD o 0
+def setClk (s : St) (o n : Nat) : St :=
+  { s with clock := normClock ((List.range (max s.clock.length (o + 1))).map
+      (fun j => if j = o then n else s.clk j)) }
+end St
+
+/-- Every task has ended (as `finish` asks). -/
+def ended (s : St) (o : Nat) : Bool :=
+  (s.op o).tasks.all (fun t => (t.st == .done || t.st == .failed || t.st == .gone) && t.dying == none)
+
+/-- With `drainCap`, time may not pass: an alive drain holds CPUs, its command has started (no
+task of it waits), and its clock has run out or its command has ended: the KILL, or giving its
+CPUs back, comes first. -/
+def due (cfg : Cfg) (s : St) : Bool :=
+  (opIds cfg).any (fun o => drainOp cfg o && s.isAlive o && decide (s.owned o > 0) &&
+    s.pendingN o == 0 && (s.clk o == 0 || ended s o))
+
+/-- TERM to every running task of `o` (the limit is reached), as a timeout sends it. -/
+def termAll (cfg : Cfg) (s : St) (o : Nat) : St :=
+  (List.range (s.op o).tasks.length).foldl
+    (fun u i => (step { cfg with timeouts := true } u (.timeout o i)).getD u) s
+
+/-- KILL to every dying attempt of `o` (the grace is over): it exits now. -/
+def killAll (cfg : Cfg) (s : St) (o : Nat) : St :=
+  (List.range (s.op o).tasks.length).foldl (fun u i => (step cfg u (.gone o i)).getD u) s
+
+/-- A tick with `drainCap`: the window and every clock count down; a drain whose clock reaches
+the grace gets TERM, and one whose clock reaches 0 gets KILL. -/
+def tickX (cfg : Cfg) (s : St) : St :=
+  let s1 := { s with window := s.window - 1, clock := normClock (s.clock.map (· - 1)) }
+  (opIds cfg).foldl (fun u o =>
+    if drainOp cfg o && s.isAlive o && decide (s.clk o > 0) then
+      let u1 := if s.clk o - 1 ≤ cfg.grace then termAll cfg u o else u
+      if s.clk o - 1 == 0 then killAll cfg u1 o else u1
+    else u) s1
+
+/-- With `drainFifo`: the CPU `c` that `o` just accepted runs `o`'s first waiting task. -/
+def place (cfg : Cfg) (o c : Nat) (s : St) : St :=
+  if drainOp cfg o || !decide (s.runningOn o c < (cfg.op o).K) then s else
+  match firstPending s o with
+  | some i => { s.setTask o i { s.task o i with st := .running c } with ran := setBit s.ran o }
+  | none => s
+
+/-- A drain of a stream (`again`) that finished arrives again later, as a new drain. -/
+def respawn (cfg : Cfg) (o : Nat) (s : St) : St :=
+  { (s.setClk o 0) with
+    ops := s.ops.set o { phase := .waiting, tasks := List.replicate (cfg.op o).tasks {} }
+    order := s.order.filter (· != o)
+    served := clrBit s.served o
+    ran := clrBit s.ran o }
+
+/-- Some extension is on. -/
+def extended (cfg : Cfg) : Bool :=
+  cfg.rules.drainCap || cfg.rules.drainFifo || cfg.rules.drainTurn || cfg.rules.placeFirst ||
+    cfg.ops.any (·.again)
+
+/-- `move` with the drain's time limit, a stream of drains, and FIFO's accept. -/
+def moveX (cfg : Cfg) (s : St) (a : Act) : Option St :=
+  if !extended cfg then move cfg s a else
+  match a with
+  | .tick =>
+    if cfg.rules.drainCap then
+      if ((cfg.rules.backfill && decide (s.window > 0)) || s.clock.any (fun n => decide (n > 0))) && !due cfg s then
+        some (tickX cfg s)
+      else none
+    else move cfg s a
+  | .refill o _ =>
+    (move cfg s a).map fun t =>
+      let t := if cfg.rules.drainTurn then { t with ran := setBit t.ran o } else t
+      if cfg.rules.drainCap && drainOp cfg o && !s.busy o then
+        t.setClk o (drainLimit cfg o + cfg.grace)
+      else t
+  | .timeout o _ =>
+    if cfg.rules.drainCap && drainOp cfg o then
+      (step { cfg with timeouts := true } s a).map (·.setClk o (min (s.clk o) cfg.grace))
+    else move cfg s a
+  | .accept o c => (move cfg s a).map fun t =>
+    if cfg.rules.drainFifo || cfg.rules.placeFirst then place cfg o c t else t
+  | .finish o => (move cfg s a).map fun t => if (cfg.op o).again then respawn cfg o t else t
+  | a => move cfg s a
+
+theorem moveX_plain {cfg : Cfg} (h : extended cfg = false) (s : St) (a : Act) :
+    moveX cfg s a = move cfg s a := by
+  simp [moveX, h]
+
 def next (cfg : Cfg) (s : St) : List (Act × St) :=
-  (actions cfg).filterMap (fun a => (move cfg s a).map (a, ·))
+  (actions cfg).filterMap (fun a => (moveX cfg s a).map (a, ·))
 
 end Cpuq

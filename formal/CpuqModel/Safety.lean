@@ -227,7 +227,7 @@ def takenCpu (o : Nat) : Cpu := { lock := some o, grant := none, slot := some { 
 def taken (s : St) (o c sv : Nat) : St :=
   St.mk (s.cpus.set c (takenCpu o)) (reclaimOps c s.ops) s.order
     (s.drains - (if drainingC (s.cpu c) then 1 else 0)) s.crashes s.poolLock s.marks s.tstp s.held
-    s.halted s.zs sv s.window
+    s.halted s.zs sv s.window s.clock s.ran
 
 theorem takeTok_eq (cfg : Cfg) (s : St) (o c : Nat) (hr : cfg.rules.reclaim = true) :
     takeTok cfg s o c = taken s o c (serve cfg s.served o) := by
@@ -359,7 +359,7 @@ theorem Inv.takeTok {cfg : Cfg} {s : St} {o c : Nat} (h : Inv cfg s) (hr : cfg.r
 
 /-- `s` with CPU `c`'s record replaced, the drain count and the tickets given. -/
 def withCpu (s : St) (c : Nat) (x : Cpu) (d : Nat) (ord : List Nat) : St :=
-  St.mk (s.cpus.set c x) s.ops ord d s.crashes s.poolLock s.marks s.tstp s.held s.halted s.zs s.served s.window
+  St.mk (s.cpus.set c x) s.ops ord d s.crashes s.poolLock s.marks s.tstp s.held s.halted s.zs s.served s.window s.clock s.ran
 
 theorem withCpu_cpu (s : St) (c : Nat) (x : Cpu) (d : Nat) (ord : List Nat) (c' : Nat)
     (hc : c < s.cpus.length) : (withCpu s c x d ord).cpu c' = if c = c' then x else s.cpu c' := by
@@ -490,6 +490,91 @@ theorem fitHead_waiter {cfg : Cfg} {s : St} {h : Nat} (e : fitHead cfg s = some 
     waiter cfg s h = true ∧ fits cfg s h = true :=
   foldl_fit_waiter cfg s s.order none (by simp) h e
 
+/-- The older waiter that holds nothing (`drainFifo`) is in the line. -/
+theorem olderHead_waiter {cfg : Cfg} {s : St} {h : Nat} (e : olderHead cfg s = some h) :
+    waiter cfg s h = true := by
+  unfold olderHead at e
+  suffices ∀ (l : List Nat) (init : Option Nat), (∀ b, init = some b → waiter cfg s b = true) →
+      l.foldl (fun best o =>
+        if cfg.rules.drainFifo && waiter cfg s o && !drainOp cfg o && s.owned o + s.grants o == 0 &&
+           decide (s.order.findIdx (· == o) < turnIdx cfg s) then
+          match best with
+          | none => some o
+          | some b => if before cfg s o b then some o else best
+        else best) init = some h → waiter cfg s h = true from this _ none (by simp) e
+  intro l
+  induction l with
+  | nil => intro init hi e; exact hi h e
+  | cons o l ih =>
+    intro init hi e
+    simp only [List.foldl_cons] at e
+    refine ih _ ?_ e
+    intro b hb
+    split at hb
+    · rename_i w
+      have w' : waiter cfg s o = true := by simp only [Bool.and_eq_true] at w; exact w.1.1.1.2
+      cases init with
+      | none => simp at hb; subst hb; exact w'
+      | some b' =>
+        simp only at hb
+        split at hb
+        · simp at hb; subst hb; exact w'
+        · exact hi b hb
+    · exact hi b hb
+
+/-- The waiter that goes before the drain (`drainTurn`) is in the line, and goes before it. -/
+theorem turnHead_waiter {cfg : Cfg} {s : St} {h : Nat} (e : turnHead cfg s = some h) :
+    waiter cfg s h = true ∧ beforeT cfg s h = true := by
+  unfold turnHead at e
+  suffices ∀ (l : List Nat) (init : Option Nat),
+      (∀ b, init = some b → waiter cfg s b = true ∧ beforeT cfg s b = true) →
+      l.foldl (fun best o =>
+        if waiter cfg s o && beforeT cfg s o then
+          match best with
+          | none => some o
+          | some b => if before cfg s o b then some o else best
+        else best) init = some h → waiter cfg s h = true ∧ beforeT cfg s h = true from
+    this _ none (by simp) e
+  intro l
+  induction l with
+  | nil => intro init hi e; exact hi h e
+  | cons o l ih =>
+    intro init hi e
+    simp only [List.foldl_cons] at e
+    refine ih _ ?_ e
+    intro b hb
+    split at hb
+    · rename_i w
+      have w' := Bool.and_eq_true_iff.1 w
+      cases init with
+      | none => simp at hb; subst hb; exact w'
+      | some b' =>
+        simp only at hb
+        split at hb
+        · simp at hb; subst hb; exact w'
+        · exact hi b hb
+    · exact hi b hb
+
+/-- Without `drainTurn`, no one goes before the drain. -/
+theorem turnHead_off {cfg : Cfg} (hf : cfg.rules.drainTurn = false) (s : St) :
+    turnHead cfg s = none := by
+  unfold turnHead
+  simp only [beforeT, hf, Bool.false_and, Bool.and_false, Bool.false_eq_true, ite_false]
+  generalize s.order = l
+  induction l with
+  | nil => rfl
+  | cons o l ih => simpa only [List.foldl_cons] using ih
+
+/-- Without `drainFifo`, no older waiter is picked. -/
+theorem olderHead_off {cfg : Cfg} (hf : cfg.rules.drainFifo = false) (s : St) :
+    olderHead cfg s = none := by
+  unfold olderHead
+  simp only [hf, Bool.false_and, Bool.false_eq_true, ite_false]
+  generalize s.order = l
+  induction l with
+  | nil => rfl
+  | cons o l ih => simpa only [List.foldl_cons] using ih
+
 /-! ### Backfill shut: without backfill, or once the window has closed, nothing fits -/
 
 /-- Backfill is off, or its window has closed. -/
@@ -531,11 +616,12 @@ theorem lends_shut {cfg : Cfg} {s : St} (h : Shut cfg s) (o : Nat) : lends cfg s
   simp [lends, fitWant_shut h]
 
 /-- Backfill shut, a free token goes where it went before backfill. -/
-theorem target_shut {cfg : Cfg} {s : St} (h : Shut cfg s) :
+theorem target_shut {cfg : Cfg} {s : St} (h : Shut cfg s) (hf : cfg.rules.drainFifo = false)
+    (ht : cfg.rules.drainTurn = false) :
     target cfg s = match drainer cfg s with
       | some d => if decide (demand cfg s d > 0) then some d else none
       | none => head cfg s := by
-  unfold target; rw [fitHead_shut h]; rfl
+  unfold target; simp only [fitHead_shut h, olderHead_off hf, turnHead_off ht]; rfl
 
 /-- The head is in the line (rule 5). -/
 theorem head_waiter {cfg : Cfg} {s : St} {h : Nat} (e : head cfg s = some h) : waiter cfg s h = true :=
@@ -580,6 +666,10 @@ theorem target_ok {cfg : Cfg} {s : St} {g : Nat} (e : target cfg s = some g) :
   split at e
   · split at e
     · rename_i hd
+      split at e
+      · rename_i f hf; cases e; have w := olderHead_waiter hf; exact ⟨waiter_live w, waiter_room w⟩
+      split at e
+      · rename_i f hf; cases e; have w := (turnHead_waiter hf).1; exact ⟨waiter_live w, waiter_room w⟩
       split at e
       · rename_i f hf; cases e; have w := (fitHead_waiter hf).1; exact ⟨waiter_live w, waiter_room w⟩
       · cases e; simp only [decide_eq_true_eq] at hd
@@ -868,7 +958,7 @@ def dropLock (o : Nat) (x : Cpu) : Cpu := if x.lock == some o then { x with lock
 
 def crashed (s : St) (o : Nat) : St :=
   St.mk (s.cpus.map (dropLock o)) (s.setPhase o .dead).ops s.order s.drains (s.crashes - 1)
-    s.poolLock s.marks s.tstp s.held s.halted s.zs s.served s.window
+    s.poolLock s.marks s.tstp s.held s.halted s.zs s.served s.window s.clock s.ran
 
 theorem crashed_cpu (s : St) (o c : Nat) : (crashed s o).cpu c = dropLock o (s.cpu c) := by
   simp only [St.cpu, crashed]
@@ -964,7 +1054,7 @@ def clearOf (o : Nat) (x : Cpu) : Cpu := if ownsC o x then {} else x
 
 def retired (s : St) (o : Nat) (g : Task → Task) (p : Phase) : St :=
   St.mk (s.cpus.map (clearOf o)) (s.ops.set o { phase := p, tasks := (s.op o).tasks.map g }) s.order
-    (s.drains - s.drainOf o) s.crashes s.poolLock s.marks s.tstp s.held s.halted s.zs s.served s.window
+    (s.drains - s.drainOf o) s.crashes s.poolLock s.marks s.tstp s.held s.halted s.zs s.served s.window s.clock s.ran
 
 theorem retire_eq (s : St) (o : Nat) (g : Task → Task) (p : Phase) (ho : o < s.ops.length) :
     ((releaseAll s o).mapTasks o g).setPhase o p = retired s o g p := by
