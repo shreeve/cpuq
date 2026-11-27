@@ -158,7 +158,7 @@ theorem step_phase_new {cfg : Cfg} {s t : St} {a : Act} (e : step cfg s a = some
       · subst eo; simp
       · simp [eo]
     · cases e
-  | enter o | mark o | tstp o | halt o => simp [Cpuq.step] at e
+  | enter o | mark o | tstp o | halt o | tick => simp [Cpuq.step] at e
 
 /-! ### Without Ctrl-Z, nothing is ever stopped -/
 
@@ -190,6 +190,10 @@ theorem NoStops.move {cfg : Cfg} {s t : St} {a : Act} (hc : cfg.stops = false) (
       · cases e
       · exact viaStep e (fun p x => Act.noConfusion x)
     | enter o =>
+      dsimp only at e; split at e
+      · cases e; exact ⟨h1, h2, h3⟩
+      · cases e
+    | tick =>
       dsimp only at e; split at e
       · cases e; exact ⟨h1, h2, h3⟩
       · cases e
@@ -274,7 +278,9 @@ def Run.Calm {cfg : Cfg} (r : Run cfg) (T : Nat) : Prop :=
 
 /-! ### The rules and the drain's context -/
 
-/-- The rules the drain proof needs; the code's rules have them (`CodeRules.released`). -/
+/-- The rules the drain proof needs; the code's rules have them (`CodeRules.released`). With
+backfill on (`Rules.released`, 0.32.0) the proof starts once the window has closed (`Shut`);
+`Backfill.window_closes` shows every weakly fair run gets there. -/
 structure CodeRules (r : Rules) : Prop where
   safe : Safe r
   standing : r.standing = true
@@ -291,6 +297,8 @@ theorem CodeRules.released : CodeRules Rules.released :=
 theorem CodeRules.code0302 : CodeRules Rules.code0302 :=
   ⟨⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 theorem CodeRules.code0303 : CodeRules Rules.code0303 :=
+  ⟨⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+theorem CodeRules.code0305 : CodeRules Rules.code0305 :=
   ⟨⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 theorem bit_clrBit {n o d : Nat} (h : d ≠ o) : bit (clrBit n o) d = bit n d := by
@@ -423,7 +431,7 @@ theorem owned_grants_lt {d : Nat} {s : St} (h : Inv cfg s) (ha : (s.op d).phase 
 
 /-- `d`, the first drain, alive and still waiting to run: a free token goes to it. -/
 theorem target_d {d : Nat} (hd : drainOp cfg d = true) (hcap : (cfg.op d).cap = cfg.cpus) {s : St}
-    (h : Inv cfg s) (hdr : firstDrain cfg s = some d) (ha : (s.op d).phase = .alive)
+    (hsh : Shut cfg s) (h : Inv cfg s) (hdr : firstDrain cfg s = some d) (ha : (s.op d).phase = .alive)
     (hi : s.busy d = false) (hw : 0 < s.pendingN d) {c : Nat} (hc : c < s.cpus.length)
     (hf : freeC cfg s (s.cpu c) = true)
     (hX : ∀ g c, drainOp cfg g = true → g ≠ d → (s.cpu c).lock ≠ some g ∧ (s.cpu c).grant ≠ some g) :
@@ -445,27 +453,28 @@ theorem target_d {d : Nat} (hd : drainOp cfg d = true) (hcap : (cfg.op d).cap = 
         subst he; exact (hX sl.owner c hdg e).1 (h.ownerLock c sl hs hag))
       have h2 : s.grants g = 0 := countP_zero_grants (fun c => (hX g c hdg e).2)
       omega
-  simp [target, drainer_of_first hle hdr hdm, hdm]
+  simp [target_shut hsh, drainer_of_first hle hdr hdm, hdm]
 
 /-- While `d` is the first drain and waits to run, a pass grants every free CPU to `d` and
 changes nothing else. -/
 theorem handout_to_d {d : Nat} (hd : drainOp cfg d = true) (hcap : (cfg.op d).cap = cfg.cpus)
-    {s : St} (h : Inv cfg s) (hdr : firstDrain cfg s = some d) (ha : (s.op d).phase = .alive)
+    {s : St} (hsh : Shut cfg s) (h : Inv cfg s) (hdr : firstDrain cfg s = some d) (ha : (s.op d).phase = .alive)
     (hi : s.busy d = false) (hw : 0 < s.pendingN d) {c : Nat} (hc : c < s.cpus.length)
     (hX : ∀ g c, drainOp cfg g = true → g ≠ d → (s.cpu c).lock ≠ some g ∧ (s.cpu c).grant ≠ some g) :
     (handout cfg s).cpu c =
       if freeC cfg s (s.cpu c) then { s.cpu c with grant := some d } else s.cpu c := by
   let F : Nat → Cpu := fun c' =>
     if freeC cfg s (s.cpu c') then { s.cpu c' with grant := some d } else s.cpu c'
-  have key : ∀ (cs done : List Nat) (u : St), u.ops = s.ops → u.order = s.order → Inv cfg u →
+  have key : ∀ (cs done : List Nat) (u : St), u.ops = s.ops → u.order = s.order →
+      u.window = s.window → Inv cfg u →
       (∀ c', c' ∈ done → u.cpu c' = F c') → (∀ c', c' ∉ done → u.cpu c' = s.cpu c') →
       (∀ c' ∈ cs, c' ∉ done ∧ c' < s.cpus.length) → cs.Nodup →
       ∀ c', c' ∈ done ++ cs → (handoutOver cfg u cs).cpu c' = F c' := by
     intro cs
     induction cs with
-    | nil => intro done u _ _ _ hd1 _ _ _ c' hc'; simp at hc'; exact hd1 c' hc'
+    | nil => intro done u _ _ _ _ hd1 _ _ _ c' hc'; simp at hc'; exact hd1 c' hc'
     | cons c0 cs ih =>
-      intro done u ho hr hu hd1 hd2 hcs hnd c' hc'
+      intro done u ho hr hwu hu hd1 hd2 hcs hnd c' hc'
       have hc0 := hcs c0 (List.mem_cons_self ..)
       have hu0 : u.cpu c0 = s.cpu c0 := hd2 c0 hc0.1
       have hlen : u.cpus.length = s.cpus.length := by rw [hu.len, h.len]
@@ -486,7 +495,8 @@ theorem handout_to_d {d : Nat} (hd : drainOp cfg d = true) (hcap : (cfg.op d).ca
               · exact hX g c' hg ne
             · rw [hd2 c' hm]; exact hX g c' hg ne
           have ht : target cfg u = some d :=
-            target_d hR hd hcap hu (by rw [firstDrain_congr ho hr]; exact hdr)
+            target_d hR hd hcap (by rcases hsh with z | z; exact .inl z; exact .inr (hwu.trans z)) hu
+              (by rw [firstDrain_congr ho hr]; exact hdr)
               (by rw [phase_of_ops ho]; exact ha) (by rw [busy_congr ho]; exact hi)
               (by rw [pendingN_congr ho]; exact hw) (by rw [hlen]; exact hc0.2) hfu hXu
           rw [ite_eq_left hf]
@@ -505,7 +515,7 @@ theorem handout_to_d {d : Nat} (hd : drainOp cfg d = true) (hcap : (cfg.op d).ca
         · rfl
       have hnd' := List.nodup_cons.1 hnd
       have := ih (done ++ [c0]) (grantOne cfg u c0) ((grantOne_ops ..).trans ho)
-        ((grantOne_order ..).trans hr) (hu.grantOne c0)
+        ((grantOne_order ..).trans hr) ((grantOne_window ..).trans hwu) (hu.grantOne c0)
         (by
           intro c'' hm
           rcases List.mem_append.1 hm with x | x
@@ -530,7 +540,7 @@ theorem handout_to_d {d : Nat} (hd : drainOp cfg d = true) (hcap : (cfg.op d).ca
             · subst y; exact List.mem_append_left _ (List.mem_append_right _ (List.mem_singleton_self _))
             · exact List.mem_append_right _ y)
       simpa only [handoutOver] using this
-  exact key (List.range s.cpus.length) [] s rfl rfl h (by simp) (fun _ _ => rfl)
+  exact key (List.range s.cpus.length) [] s rfl rfl rfl h (by simp) (fun _ _ => rfl)
     (fun c' hm => ⟨by simp, List.mem_range.1 hm⟩) (List.nodup_range) c (by simp [hc])
 
 end
@@ -660,11 +670,12 @@ theorem not_busy {s : St} {o i c : Nat} (hb : s.busy o = false) : (s.task o i).s
 
 /-- A drain never empties its own CPUs (under the ledger). -/
 theorem canDrain_not_drainOp {cfg : Cfg} {s : St} {o c : Nat} (hl : cfg.rules.ledger = true)
-    (h : canDrain cfg s o c = true) : drainOp cfg o = false := by
+    (hsh : Shut cfg s) (h : canDrain cfg s o c = true) : drainOp cfg o = false := by
   cases e : drainOp cfg o
   · rfl
   · unfold canDrain mayGive at h
-    simp only [e, hl, Bool.not_true, Bool.and_false, Bool.false_or, ite_true, Bool.and_eq_true] at h
+    simp only [e, hl, lends_shut hsh, Bool.not_true, Bool.and_false, ite_true,
+      Bool.and_eq_true] at h
     obtain ⟨-, h⟩ := h
     split at h
     · cases h
@@ -763,7 +774,8 @@ theorem handout_len (cfg : Cfg) (s : St) : (handout cfg s).cpus.length = s.cpus.
 /-- With `d` waiting first among drains, a pass grants each free CPU to `d`: it lowers a free
 CPU's rank to 1 and changes nothing else. -/
 theorem rank_handout {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drainOp cfg d = true)
-    (hcap : (cfg.op d).cap = cfg.cpus) {s : St} (h : Inv cfg s) (hdr : firstDrain cfg s = some d)
+    (hcap : (cfg.op d).cap = cfg.cpus) {s : St} (hsh : Shut cfg s) (h : Inv cfg s)
+    (hdr : firstDrain cfg s = some d)
     (ha : (s.op d).phase = .alive) (hi : s.busy d = false) (hw : 0 < s.pendingN d)
     (hX : ∀ g c, drainOp cfg g = true → g ≠ d → (s.cpu c).lock ≠ some g ∧ (s.cpu c).grant ≠ some g) (c : Nat) :
     rank d (handout cfg s) c = (if rank d s c = 2 ∧ c < s.cpus.length then 1 else rank d s c) ∧
@@ -775,7 +787,7 @@ theorem rank_handout {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drai
   have hops := (handout_order_ops cfg s).2
   have hph : ∀ p, ((handout cfg s).op p).phase = (s.op p).phase := fun p => phase_of_ops hops p
   by_cases hc : c < s.cpus.length
-  · have e := handout_to_d hR hd hcap h hdr ha hi hw hc hX
+  · have e := handout_to_d hR hd hcap hsh h hdr ha hi hw hc hX
     have hfr : freeC cfg s (s.cpu c) = true ↔ rank d s c = 2 := by
       rw [freeC_iff hR]
       unfold rank
@@ -848,7 +860,7 @@ theorem rank_setPhase_le {d : Nat} {s : St} {o : Nat} (hne : o ≠ d) (c : Nat) 
 /-- Every step of a calm run keeps the drain's context, and lowers or keeps each CPU's rank. -/
 theorem drain_frame {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drainOp cfg d = true)
     (hcap : (cfg.op d).cap = cfg.cpus) (hst : cfg.stops = false) (hk : cfg.kills = false)
-    {s t : St} {a : Act} (x : DCtx cfg d s) (hfew : s.owned d < cfg.cpus)
+    {s t : St} {a : Act} (x : DCtx cfg d s) (hsh : Shut cfg s) (hfew : s.owned d < cfg.cpus)
     (calm : (∀ o, a ≠ .arrive o) ∧ (∀ o, a ≠ .enter o) ∧ (∀ o, a ≠ .mark o) ∧ (∀ o, a ≠ .crash o))
     (e : move cfg s a = some t) : DCtx cfg d t ∧ Better d s t := by
   have h := x.reach.inv hR.safe
@@ -867,6 +879,12 @@ theorem drain_frame {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drain
   | halt o => simp [ns.2.2 o] at e
   | cont o => simp [bit, ns.2.1] at e
   | undrain o c => simp [Cpuq.step, hR.undrains] at e
+  | tick =>
+    dsimp only at e; split at e
+    · cases e
+      exact ⟨⟨rt, x.first, x.alive, x.idle, x.work, x.mark, rfl, x.others, x.kept⟩,
+        fun c => betterAt_same rfl (fun _ => rfl) (fun _ _ => rfl)⟩
+    · cases e
   | exit o i ok =>
     simp only [Cpuq.step] at e
     split at e
@@ -993,7 +1011,7 @@ theorem drain_frame {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drain
     · cases e
       have hops := (handout_order_ops cfg s).2
       have hord := (handout_order_ops cfg s).1
-      have k := rank_handout hR hd hcap h x.first x.alive x.idle x.work x.others
+      have k := rank_handout hR hd hcap hsh h x.first x.alive x.idle x.work x.others
       have ex := handout_extras cfg s
       simp only [extras, Prod.mk.injEq] at ex
       refine ⟨⟨rt, by rw [firstDrain_congr hops hord]; exact x.first, by rw [phase_of_ops hops]; exact x.alive,
@@ -1057,7 +1075,7 @@ theorem drain_frame {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drain
     split at e
     · rename_i g
       cases e
-      have hnd := canDrain_not_drainOp hR.ledger g
+      have hnd := canDrain_not_drainOp hR.ledger hsh g
       unfold canDrain at g
       simp only [Bool.and_eq_true, beq_iff_eq] at g
       obtain ⟨⟨ha, hsl⟩, -⟩ := g
@@ -1115,7 +1133,8 @@ theorem drain_frame {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drain
           intro i; rcases hdy with z | z
           · simp [hR.safe.releaseWaitsDying] at z
           · have := all_task z (by simp) i; simpa using this
-        simp only [hR.renewAtRelease, ite_true] at rt ⊢
+        simp only [hR.renewAtRelease, hnd, Bool.and_false, Bool.not_false, Bool.true_and,
+          ite_true] at rt ⊢
         generalize hs1 : ({ s.setCpu c0 {} with
           drains := s.drains - (if sl.draining then 1 else 0), order := renewed s sl.owner } : St) = s1
           at rt ⊢
@@ -1129,7 +1148,11 @@ theorem drain_frame {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drain
           intro c; rw [← hs1]; exact St.cpu_setCpu ..
         have hex1 : s1.poolLock = s.poolLock ∧ s1.marks = s.marks := by rw [← hs1]; exact ⟨rfl, rfl⟩
         have hph1 : ∀ p, (s1.op p).phase = (s.op p).phase := fun p => phase_of_ops hops1 p
-        have k := rank_handout hR hd hcap h1 hdr1 (by rw [hph1]; exact x.alive)
+        have hsh1 : Shut cfg s1 := by
+          rcases hsh with z | z
+          · exact .inl z
+          · right; rw [← hs1]; exact z
+        have k := rank_handout hR hd hcap hsh1 h1 hdr1 (by rw [hph1]; exact x.alive)
           (by rw [busy_congr hops1]; exact x.idle) (by rw [pendingN_congr hops1]; exact x.work)
           (fun g c hg ne => by
             rw [hc1]; split
@@ -1208,7 +1231,8 @@ theorem drain_frame {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drain
         · simp at hp
         · exact hp
       have hops1 : ∀ p, ((s.setPhase o .over).op p).tasks = (s.op p).tasks := fun p => St.tasks_setPhase ..
-      have k := rank_handout hR hd hcap h1 hdr1 (by rw [hph1, ite_eq_right hne]; exact x.alive)
+      have k := rank_handout hR hd hcap (show Shut cfg (s.setPhase o .over) from hsh) h1 hdr1
+        (by rw [hph1, ite_eq_right hne]; exact x.alive)
         (by simp only [St.busy, hops1]; exact x.idle) (by simp only [St.pendingN, hops1]; exact x.work)
         (fun g c hg ne => x.others g c hg ne)
       have hops := (handout_order_ops cfg (s.setPhase o .over)).2
@@ -1555,8 +1579,23 @@ with the pool lock free and no later drain holding a CPU or granted one, `d` end
 every CPU of the pool (its command then runs: `refill` needs exactly that). -/
 theorem drain_served {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drainOp cfg d = true)
     (hcap : (cfg.op d).cap = cfg.cpus) (hst : cfg.stops = false) (hk : cfg.kills = false)
-    (r : Run cfg) (fair : r.Fair) {T : Nat} (calm : r.Calm T) (x0 : DCtx cfg d (r.st T)) :
+    (r : Run cfg) (fair : r.Fair) {T : Nat} (calm : r.Calm T) (x0 : DCtx cfg d (r.st T))
+    (hsh0 : Shut cfg (r.st T)) :
     ∃ m, T ≤ m ∧ (r.st m).owned d = cfg.cpus := by
+  have shut : ∀ k, Shut cfg (r.st (T + k)) := by
+    intro k
+    induction k with
+    | zero => exact hsh0
+    | succ k ih =>
+      rw [← Nat.add_assoc]
+      cases ha : r.act (T + k) with
+      | none => rw [r.stays _ ha]; exact ih
+      | some a =>
+        rcases ih with z | z
+        · exact .inl z
+        · right
+          have := move_window (r.moves _ a ha) (calm _ (by omega) a ha).2.2.1
+          omega
   refine Classical.byContradiction fun hno => ?_
   have hfew : ∀ k, (r.st (T + k)).owned d < cfg.cpus := by
     intro k
@@ -1573,7 +1612,7 @@ theorem drain_served {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drai
       cases ha : r.act (T + k) with
       | none => rw [r.stays _ ha]; exact ih
       | some a =>
-        exact (drain_frame hR hd hcap hst hk ih (hfew k) (calm _ (by omega) a ha)
+        exact (drain_frame hR hd hcap hst hk ih (shut k) (hfew k) (calm _ (by omega) a ha)
           (r.moves _ a ha)).1
   have hb : ∀ k, Better d (r.st (T + k)) (r.st (T + (k + 1))) := by
     intro k
@@ -1583,7 +1622,7 @@ theorem drain_served {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drai
       rw [r.stays _ ha]; intro c
       exact betterAt_same rfl (fun _ => rfl) (fun _ _ => rfl)
     | some a =>
-      exact (drain_frame hR hd hcap hst hk (ctx k) (hfew k) (calm _ (by omega) a ha)
+      exact (drain_frame hR hd hcap hst hk (ctx k) (shut k) (hfew k) (calm _ (by omega) a ha)
         (r.moves _ a ha)).2
   have hinv : ∀ k, Inv cfg (r.st (T + k)) := fun k => (r.reach (T + k)).inv hR.safe
   have hlen : ∀ k, (r.st (T + k)).cpus.length = cfg.cpus := fun k => (hinv k).len
@@ -1643,7 +1682,7 @@ theorem drain_served {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drai
       have pass : ∀ j, rank d (handout cfg (r.st (T + (k + j)))) c = 1 := by
         intro j
         have x := ctx (k + j)
-        have k1 := (rank_handout hR hd hcap (hinv (k + j)) x.first x.alive x.idle x.work x.others c).1
+        have k1 := (rank_handout hR hd hcap (shut (k + j)) (hinv (k + j)) x.first x.alive x.idle x.work x.others c).1
         rw [k1, ite_eq_left (⟨by rw [rk, h2], by rw [hlen]; exact hc⟩ :
           rank d (r.st (T + (k + j))) c = 2 ∧ c < (r.st (T + (k + j))).cpus.length)]
       obtain ⟨j, b, hkb, e⟩ := fire .handout rfl (fun j => by
@@ -1752,7 +1791,7 @@ theorem drain_served {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drai
         have hm : (r.st (T + (k + j))).marks ≠ 0 := by
           intro w; have := x.mark; rw [w] at this; simp [bit] at this
         unfold Enabled; rw [move_wild (lockFree j) _ (.inr (.inr (.inl ⟨g, c, rfl⟩)))]
-        simp [Cpuq.step, canDrain, St.isAlive, ha, hb0, hnd, hm])
+        simp [Cpuq.step, canDrain, St.isAlive, ha, hb0, hnd, hm, fits_shut (shut (k + j))])
       rw [fairKey_class rfl (by intro o i ok w; cases w) hkb] at e
       obtain ⟨l2, d2⟩ := move_drain (lockFree j) e
       have := rank_lock (l2.trans (lj j)) hne

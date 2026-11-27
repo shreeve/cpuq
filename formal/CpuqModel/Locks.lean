@@ -61,6 +61,69 @@ theorem step_extras {cfg : Cfg} {s t : St} {a : Act} (e : step cfg s a = some t)
     | (rw [handout_extras]; rfl)
     | simp at e
 
+/-! ### The backfill window: only a drain's registration opens it, and time only shrinks it -/
+
+theorem grantOne_window (cfg : Cfg) (s : St) (c : Nat) : (grantOne cfg s c).window = s.window := by
+  unfold grantOne; split
+  · split <;> rfl
+  · rfl
+
+theorem handoutOver_window (cfg : Cfg) (s : St) (cs : List Nat) :
+    (handoutOver cfg s cs).window = s.window := by
+  induction cs generalizing s with
+  | nil => rfl
+  | cons c cs ih => simp only [handoutOver]; rw [ih, grantOne_window]
+
+theorem handout_window (cfg : Cfg) (s : St) : (handout cfg s).window = s.window :=
+  handoutOver_window cfg s _
+
+theorem takeTok_window (cfg : Cfg) (s : St) (o c : Nat) : (takeTok cfg s o c).window = s.window := by
+  unfold takeTok; split <;> rfl
+
+theorem tryOnce_window (cfg : Cfg) (s : St) (o : Nat) : (tryOnce cfg s o).window = s.window := by
+  unfold tryOnce; split
+  · split
+    · exact takeTok_window ..
+    · rfl
+  · rfl
+
+theorem reap_window (cfg : Cfg) (s : St) (o i : Nat) (ok : Bool) :
+    (reap cfg s o i ok).window = s.window := by
+  unfold reap; rw [tryOnce_window]; rfl
+
+theorem step_window {cfg : Cfg} {s t : St} {a : Act} (e : step cfg s a = some t) :
+    t.window = s.window := by
+  cases a <;> simp only [Cpuq.step] at e <;> (repeat' split at e) <;>
+    (first | cases e | skip) <;>
+    first
+    | rfl
+    | exact reap_window ..
+    | exact handout_window ..
+    | exact takeTok_window ..
+    | (rw [handout_window]; rfl)
+    | simp at e
+
+/-- No move but a drain's registration widens the window. -/
+theorem move_window {cfg : Cfg} {s t : St} {a : Act} (e : move cfg s a = some t)
+    (hm : ∀ o, a ≠ .mark o) : t.window ≤ s.window := by
+  have viaMap : ∀ (b : Act) (f : St → St), (∀ u, (f u).window = u.window) →
+      (step cfg s b).map f = some t → t.window ≤ s.window := by
+    intro b f hf e
+    obtain ⟨u, hu, rfl⟩ := Option.map_eq_some_iff.1 e
+    rw [hf, step_window hu]; exact Nat.le_refl _
+  unfold move at e
+  split at e
+  · cases e
+  · cases a
+    case mark => exact absurd rfl (hm _)
+    all_goals (dsimp only at e; repeat' split at e)
+    all_goals first
+      | (cases e; done)
+      | exact Nat.le_of_eq (step_window e)
+      | exact viaMap _ _ (fun u => by first | rfl | (unfold retake; split <;> rfl)) e
+      | (cases e; exact Nat.le_refl _)
+      | (cases e; exact Nat.sub_le _ _)
+
 /-! ### Phases -/
 
 /-- A step never makes an operation waiting, and makes a waiting one start only by its arrival. -/
@@ -193,7 +256,7 @@ theorem step_phase {cfg : Cfg} {s t : St} {a : Act} (e : step cfg s a = some t) 
       · exact .inl x
       · exact .inr (.inl x)
     · cases e
-  | enter o | mark o | tstp o | halt o => simp [Cpuq.step] at e
+  | enter o | mark o | tstp o | halt o | tick => simp [Cpuq.step] at e
 
 /-! ### The pool lock -/
 
@@ -317,6 +380,11 @@ theorem LockOk.move {cfg : Cfg} {s t : St} {a : Act} (h : LockOk cfg s)
     | accept o c => exact viaFree rfl e
     | drain o c => exact viaFree rfl e
     | undrain o c => exact viaFree rfl e
+    | tick =>
+      dsimp only at e
+      split at e
+      · cases e; exact h
+      · cases e
 
 theorem Reach.lockOk {cfg : Cfg} {s : St} (r : Reach cfg s) : LockOk cfg s := by
   induction r with
@@ -334,7 +402,8 @@ theorem lock_released {cfg : Cfg} {s : St} (r : Reach cfg s) (hm : cfg.rules.mar
     simp only [Cpuq.step, hw, beq_self_eq_true, ite_true]
   refine ⟨{ handout cfg { s.setPhase o .alive with order := s.order ++ [o] } with
       poolLock := none,
-      marks := setBit (handout cfg { s.setPhase o .alive with order := s.order ++ [o] }).marks o },
+      marks := setBit (handout cfg { s.setPhase o .alive with order := s.order ++ [o] }).marks o,
+      window := cfg.window },
     ?_, rfl⟩
   simp only [Cpuq.move, needsLock, Bool.false_and, Bool.false_eq_true, ite_false, hl, beq_self_eq_true,
     hm, Bool.true_or, Bool.and_self, ite_true, hs, Option.map_some]

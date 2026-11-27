@@ -157,7 +157,7 @@ operations'. In order:
 `handOut` gives free CPUs, in the pool's order, one at a time, counting each promise as held at
 once and ranking the line again before the next, so free CPUs spread over projects by weight.
 Only operations with `want` left are in the line. While a drain is in the line, every CPU goes to
-it. `firstWaiter` is the head of the same order once every promise is counted.
+it, except for backfill (`cpuq drain`, below). `firstWaiter` is the head of the same order once every promise is counted.
 
 An operation's ticket is renewed (its record and FIFO renamed, under the lock) each time it gives
 a CPU back, so it takes its turn behind every other: runs that hold one CPU each take turns with
@@ -277,6 +277,18 @@ and every other operation, seeing `v2/drain` held, marks all its CPUs draining: 
 new and gives each CPU back as its tasks end. Once the drain holds every pool CPU its command runs,
 unpinned, and the CPUs go back when it ends. `--max` gives up (exit 75) while it holds less than the
 pool.
+
+**Backfill.** Every record says its tasks' limit (`tlimit`: `-t`, plus 10 s for the kill's grace
+and the start) and when its running tasks may end at the latest (`ends`: the newest task's start
+plus `tlimit`). While exactly one drain gathers and no other drain holds CPUs, `shadow` is the
+latest `ends` over the operations holding CPUs and running tasks: the soonest the drain could
+start. It is null when one of them has no limit. A waiter `fits` when `now + tlimit <= shadow`.
+`handOut` gives a free CPU first to the best waiter that fits, in the line's order, and only then
+to the drain. The drain lends its idle CPUs (`lends`): it marks as many draining as the waiters that fit
+still want, beyond what is promised them, and gives them back without renewing its ticket. A
+waiter that sees a loan owed wakes the drain. An operation that fits keeps filling its CPUs while
+the drain waits. Every task started this way ends by `shadow`, so `shadow` never grows while the
+drain gathers, and the drain starts no later than the first one it had.
 
 ## cpuq kill
 

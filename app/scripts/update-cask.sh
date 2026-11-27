@@ -8,6 +8,8 @@
 # branch cpuq-app-X.Y.Z from the tap's main, pushes, and opens the pull request. Merging it makes
 # `brew install --cask shreeve/tap/cpuq-app` install that version; Sparkle updates it from there.
 set -euo pipefail
+# git acts on the repository each step names, never one found through the caller's GIT_DIR.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 fail() { echo "error: $*" >&2; exit 1; }
 

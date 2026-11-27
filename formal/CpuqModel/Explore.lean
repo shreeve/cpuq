@@ -17,7 +17,9 @@ The checks, by name (README lists which guarantee each one is):
   `F6 drain not for the head`, `F6 giver ahead` (after the drain the giver ranks before the
   waiter it drained for, so the token may come back to the giver);
 - graph: `L3 never` (from some state, no run at all gets a waiter that holds nothing a CPU) and
-  `L3 fair` (a weakly fair run, with no more crashes, where such a waiter never gets one).
+  `L3 fair` (a weakly fair run, with no more crashes, where such a waiter never gets one); and
+  the same for a `cpuq drain` that gathers, whatever it holds: `D never` (no run gives it the
+  pool) and `D fair` (a weakly fair run that never does).
 -/
 import CpuqModel.Model
 import Std.Data.HashMap
@@ -93,8 +95,9 @@ def yieldShare (cfg : Cfg) (s : St) (o h : Nat) : Bool :=
 def stepFails (cfg : Cfg) (s : St) (a : Act) (s' : St) : List String :=
   match a with
   | .drain o _ =>
-    -- While a `cpuq drain` lives, every other operation empties its CPUs: not a line drain.
-    if s.marks != 0 && !drainOp cfg o then [] else
+    -- While a `cpuq drain` lives, every other operation empties its CPUs, and the drain lends
+    -- its own (backfill): not line drains.
+    if s.marks != 0 && !drainOp cfg o || drainOp cfg o then [] else
     (if decide (s.drains < need cfg s) then [] else ["F1 drain not owed"]) ++
     (match head cfg s with
      | some h =>
@@ -107,6 +110,10 @@ def stepFails (cfg : Cfg) (s : St) (a : Act) (s' : St) : List String :=
 /-- A waiter that holds nothing. -/
 def starving (cfg : Cfg) (s : St) (w : Nat) : Bool :=
   s.isAlive w && decide (demand cfg s w > 0) && s.owned w + s.grants w == 0
+
+/-- A `cpuq drain` that gathers: alive and wanting CPUs. -/
+def gathering (cfg : Cfg) (s : St) (d : Nat) : Bool :=
+  drainOp cfg d && s.isAlive d && decide (demand cfg s d > 0)
 
 /-- Steps of the environment that the liveness checks leave out: no more crashes, kills or
 Ctrl-Z (FINAL-PLAN's liveness assumptions). A parent acting on a Ctrl-Z already received, and
@@ -242,9 +249,12 @@ def explore (cfg : Cfg) (limit : Nat := 4000000) : Report := Id.run do
       return { states := states.size, edges, fails := fails.push ("too many states", []) }
     i := i + 1
   let n := states.size
-  -- Liveness, for each operation `w`.
-  for w in opIds cfg do
-    let starve := states.map (starving cfg · w)
+  -- Liveness, for each operation `w`: a waiter holding nothing is served (L3), and a drain
+  -- that gathers is given the pool (D).
+  let goals := (opIds cfg).map (fun w => (w, "L3 never", "L3 fair", fun s => starving cfg s w)) ++
+    ((opIds cfg).filter (drainOp cfg)).map (fun w => (w, "D never", "D fair", fun s => gathering cfg s w))
+  for (w, never, fair, wait) in goals do
+    let starve := states.map wait
     -- L3 never: states from which no run without crashes, kills or stops serves w.
     let mut pred : Array (Array Nat) := Array.replicate n #[]
     for u in [0:n] do
@@ -263,8 +273,8 @@ def explore (cfg : Cfg) (limit : Nat := 4000000) : Report := Id.run do
           work := work.push u
     match (List.range n).find? (fun u => !can[u]!) with
     | some u =>
-      if !fails.any (·.1 == "L3 never") then
-        fails := fails.push ("L3 never", traceOf parent u ++ [.finish (1000 + w)])
+      if !fails.any (·.1 == never) then
+        fails := fails.push (never, traceOf parent u ++ [.finish (1000 + w)])
     | none => pure ()
     -- L3 fair: a strongly connected set of starving states where every step class enabled
     -- in all of them is also taken inside it.
@@ -289,7 +299,7 @@ def explore (cfg : Cfg) (limit : Nat := 4000000) : Report := Id.run do
           let e := enabledAt u
           always := always.filter (e.contains ·)
         if always.all (taken.contains ·) then
-          if !fails.any (·.1 == "L3 fair") then
+          if !fails.any (·.1 == fair) then
             -- The run: reach the set, then go round it taking every class enabled throughout.
             let u0 := us[0]!
             let mut cur := u0
@@ -312,7 +322,7 @@ def explore (cfg : Cfg) (limit : Nat := 4000000) : Report := Id.run do
                   cyc := cyc ++ pathIn succ inside cur x
                   cur := x
             cyc := cyc ++ pathIn succ inside cur u0
-            fails := fails.push ("L3 fair",
+            fails := fails.push (fair,
               traceOf parent u0 ++ [.finish (2000 + w), .finish 999] ++ cyc)
   return { states := n, edges, fails }
 
@@ -342,7 +352,8 @@ def brief (cfg : Cfg) (s : St) : String :=
     | some o => s!", pool lock {opName o}"
     | none => ""
   let mk := if s.marks != 0 then s!", marks {s.marks}" else ""
-  String.intercalate " " cs ++ s!" | head {hd}, drains {s.drains}{lk}{mk}"
+  let wd := if s.window != 0 then s!", window {s.window}" else ""
+  String.intercalate " " cs ++ s!" | head {hd}, drains {s.drains}{lk}{mk}{wd}"
 
 def actName : Act → String
   | .arrive o => s!"{opName o} arrives"
@@ -364,6 +375,7 @@ def actName : Act → String
   | .mark o => s!"{opName o} takes the drain mark and registers"
   | .tstp o => s!"Ctrl-Z to {opName o}"
   | .halt o => s!"{opName o} raises SIGSTOP on itself"
+  | .tick => "a tick passes"
   | .finish o =>
     if o ≥ 2000 then s!"(a weakly fair run that never gets {opName (o - 2000)} a CPU:)"
     else if o ≥ 1000 then s!"(from here no run gets {opName (o - 1000)} a CPU)"
