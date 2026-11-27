@@ -194,7 +194,11 @@ it runs in a delegated systemd user scope of its own, its command in the scope's
 Where `systemd-run --user` doesn't work, it runs as it is, and `cpuq cap` watches the slow way.
 
 `cpuq hook` accepts `--driver` only for a test runner (swarm, rip, a script named `run`, `run.sh`
-or `run-tests*`, or one under `test/` or `tests/`): a build under it would hold no CPU.
+or `run-tests*`, or one under `test/` or `tests/`): a build under it would hold no CPU. One build
+is a driver too: Rig's split build with `RIG_UNIT_LAUNCHER` a `cpuq run`, which makes each unit's
+compile a run of its own, on a CPU of its own (the link runs in the driver):
+
+    cpuq run --driver --label rig:build -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build --units=8 app.rig
 
 ### Nested runs
 

@@ -1229,6 +1229,11 @@ t_hook() {
   drvother=$(call drvother Bash 'cpuq run --driver --label app:x -- ./foo')
   check "--driver passes for a test runner (rc $driver), not for a build (rc $drvbuild) or anything else (rc $drvother)" \
     "[ $driver = 0 ] && [ $drvbuild = 2 ] && grep -q 'under --driver' '$T/drvbuild' && [ $drvother = 2 ] && grep -q 'one task, on one CPU' '$T/drvother'"
+  local rigl rigbare
+  rigl=$(call rigl Bash "cpuq run --driver --label rig:build -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build --units=8 a.rig")
+  rigbare=$(call rigbare Bash 'cpuq run --driver --label rig:build -- rig build --units=8 a.rig')
+  check "--driver passes rig build whose units are cpuq runs (rc $rigl), not without the launcher (rc $rigbare)" \
+    "[ $rigl = 0 ] && [ $rigbare = 2 ] && grep -q 'RIG_UNIT_LAUNCHER' '$T/rigbare'"
 }
 
 # --- Leases ----------------------------------------------------------------------------------

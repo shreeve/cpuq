@@ -145,7 +145,7 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, advisor: 
     if (inner.len == 0) return null;
     const cmds = innerCommands(a, inner, cmd.heredoc) orelse return null;
     if (driver) {
-        if (checkDriver(a, w, cmds)) |r| return r;
+        if (checkDriver(a, w, cmds, cmd.text)) |r| return r;
     } else for (cmds) |ic| {
         const iw = stripWrappers(ic.words);
         if (iw.len == 0 or heavyName(iw) == null) continue;
@@ -208,12 +208,23 @@ fn innerCommands(a: std.mem.Allocator, inner: []const []const u8, heredoc: ?[]co
 }
 
 /// `--driver`: a test runner that starts its own `cpuq run`s, holding no CPU itself. A build
-/// under it would run on no CPU at all.
-fn checkDriver(a: std.mem.Allocator, w: []const []const u8, cmds: []const Simple) ?Refusal {
+/// under it would run on no CPU at all, except `rig build` with RIG_UNIT_LAUNCHER a `cpuq run`:
+/// each unit's compile is then a run of its own, on a CPU of its own.
+fn checkDriver(a: std.mem.Allocator, w: []const []const u8, cmds: []const Simple, text: []const u8) ?Refusal {
     var runner = false;
     for (cmds) |ic| {
         const iw = stripWrappers(ic.words);
         if (iw.len == 0) continue;
+        if (isRigBuild(iw)) {
+            if (launchesUnits(ic.words, text)) {
+                runner = true;
+                continue;
+            }
+            return .{
+                .reason = a.print("`rig {s}` under --driver: it holds no CPU unless each unit's compile is a `cpuq run` (RIG_UNIT_LAUNCHER)", .{iw[1]}) catch "rig build under --driver: set RIG_UNIT_LAUNCHER",
+                .instead = launcherFix(a, w, iw),
+            };
+        }
         if (isBuildTool(iw) or heavyName(iw) != null) return .{
             .reason = a.print("`{s}` under --driver: --driver holds no CPU; run builds as tasks", .{toolLabel(a, iw)}) catch "--driver holds no CPU; run builds as tasks",
             .instead = fixRun(a, w, true).text,
@@ -225,6 +236,42 @@ fn checkDriver(a: std.mem.Allocator, w: []const []const u8, cmds: []const Simple
         .reason = "--driver is for a test runner that starts its own `cpuq run`s (swarm, rip, a script under test/, run, run.sh, run-tests…), and holds no CPU itself",
         .instead = a.print("{s} (one task, on one CPU)", .{fixRun(a, w, true).text}) catch "cpuq run --label P:T -- CMD",
     };
+}
+
+/// `rig build` or `rig run` (rig itself, or a checkout's bin/rig).
+fn isRigBuild(w: []const []const u8) bool {
+    if (!std.mem.eql(u8, std.fs.path.basename(w[0]), "rig") or w.len < 2) return false;
+    return std.mem.eql(u8, w[1], "build") or std.mem.eql(u8, w[1], "run");
+}
+
+/// Whether the command sets RIG_UNIT_LAUNCHER to a `cpuq run`, on the rig command itself
+/// (`RIG_UNIT_LAUNCHER='cpuq run --' rig build`, `env RIG_UNIT_LAUNCHER=…`) or earlier in its
+/// script (`export RIG_UNIT_LAUNCHER=…`).
+fn launchesUnits(words: []const []const u8, text: []const u8) bool {
+    const key = "RIG_UNIT_LAUNCHER=";
+    for (words) |x| if (std.mem.startsWith(u8, x, key) and isCpuqRun(x[key.len..])) return true;
+    var rest = text;
+    while (std.mem.find(u8, rest, key)) |at| {
+        rest = rest[at + key.len ..];
+        if (isCpuqRun(std.mem.trimStart(u8, rest, "'\"$"))) return true;
+    }
+    return false;
+}
+
+fn isCpuqRun(v: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, v, " \t'\"");
+    const prog = it.next() orelse return false;
+    if (!std.mem.eql(u8, std.fs.path.basename(prog), "cpuq")) return false;
+    const sub = it.next() orelse return false;
+    return std.mem.eql(u8, sub, "run");
+}
+
+/// The run with RIG_UNIT_LAUNCHER set on its rig command.
+fn launcherFix(a: std.mem.Allocator, w: []const []const u8, iw: []const []const u8) []const u8 {
+    const at = for (w, 0..) |x, k| {
+        if (x.ptr == iw[0].ptr) break k;
+    } else return "cpuq run --driver --label rig:build -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build ...";
+    return a.print("{s} env RIG_UNIT_LAUNCHER='cpuq run --' {s}", .{ joinQuoted(a, w[0..at]), joinQuoted(a, w[at..]) }) catch "env RIG_UNIT_LAUNCHER='cpuq run --' rig build";
 }
 
 /// A program that builds: never a driver.
@@ -1192,6 +1239,21 @@ test "removed options are refused as cpuq refuses them, with the run they become
     try std.testing.expect(refused("cpuq lease w --priority low -- ./bench"));
     // After `--` an option is the command's.
     try std.testing.expect(!refused("cpuq run --label a:b -- ./x --cores 4"));
+}
+
+test "--driver takes `rig build` whose units are `cpuq run`s, and only those" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expect(!refused("cpuq run --driver --label rig:build -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build --units=8 app.rig"));
+    try std.testing.expect(!refused("cpuq run --driver --label rig:build -- env 'RIG_UNIT_LAUNCHER=cpuq run --label rig:unit --' bin/rig build x.rig"));
+    try std.testing.expect(!refused("cpuq run --driver -- sh -c 'export RIG_UNIT_LAUNCHER=\"cpuq run --\"; ./bin/rig build --units=4 a.rig'"));
+    // Without the launcher, each unit's compile would run on no CPU.
+    const r = refusal(a, "cpuq run --driver --label rig:build -- rig build --units=8 app.rig");
+    try std.testing.expect(std.mem.startsWith(u8, r.reason, "`rig build` under --driver: it holds no CPU"));
+    try std.testing.expectEqualStrings("cpuq run --driver --label rig:build -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build --units=8 app.rig", r.instead);
+    // A launcher that isn't cpuq doesn't count.
+    try std.testing.expect(refused("cpuq run --driver -- env RIG_UNIT_LAUNCHER=nice rig build a.rig"));
 }
 
 test "--driver runs only a test runner, never a build" {
