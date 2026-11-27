@@ -2,6 +2,14 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.30.5 — 2026-11-26
+
+- **Two drains no longer wait on each other after a Ctrl-Z.** If a drain was stopped and
+  continued while a newer drain took part of the pool, the next freed CPU went back to the older
+  one, so each held part of the pool, neither ran, and every other run kept emptying its CPUs for
+  them until `--max` ran out (for good without one). Free CPUs now go to the drain holding the
+  most, then the older. The Lean model found it (`formal/`, Finding 10); a test reproduces it.
+
 ## 0.30.4 — 2026-11-26
 
 - **`cpuq clean` removes only what cpuq made.** It took every folder in `~/cpuq/tmp` for a job's

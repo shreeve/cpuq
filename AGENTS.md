@@ -1,6 +1,8 @@
 # cpuq for agents
 
-Working on cpuq itself? Read [HANDOFF.md](HANDOFF.md) first.
+Working on cpuq itself? Read [HANDOFF.md](HANDOFF.md) first. A change to how the pool shares
+CPUs (the line in src/pool.zig, the stop, drain and give-back in src/op.zig) updates the Lean
+model in `formal/` and passes its search before release.
 
 This machine is shared by several agent sessions. Run every heavy command (a build, a test suite,
 a benchmark, a fuzzer, anything that keeps a CPU busy for more than ~10 seconds) under cpuq. Not
