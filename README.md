@@ -764,9 +764,14 @@ worktree syncs only what changed, and keeps pack versions. Left alone they pile 
 worktree ever sent there leaves a copy of up to tens of GB. `cpuq clean` removes them once
 unused for `clean_after` (3 days); `cpuq record`, where it's installed, runs it every hour.
 
+It removes only what cpuq made, known by its marker or record. A folder made there by hand (a
+setup in `~/cpuq/tmp`, a clone straight under `~/cpuq/worktrees`) is never touched.
+
 - **Copies of repos** (`~/cpuq/worktrees/PROJECT/…`) go by when a `cpuq run --on` run last ran in one or
-  a submitted job last synced it, never while a job holds the copy's lock.
-- **Submitted jobs' scratch** (`~/cpuq/tmp/ID`, their TMPDIR) that a killed job left behind.
+  a submitted job last synced it (`.cpuq-used`, `.cpuq-generation`), never while a job holds the
+  copy's lock.
+- **Submitted jobs' scratch** (`~/cpuq/tmp/ID`, their TMPDIR) that a killed job left behind, while
+  the job's record is there.
 - **Pack versions** go by when a job last used one, never one `latest` or `stable` names.
 - **Submitted jobs' records** go a week after they ended.
 - **Never anything a process is working in**, and never the caches (`~/cpuq/caches`), which are

@@ -2,6 +2,14 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.30.4 — 2026-11-26
+
+- **`cpuq clean` removes only what cpuq made.** It took every folder in `~/cpuq/tmp` for a job's
+  scratch, and every folder under `~/cpuq/worktrees` for a project's copies, so on burst it
+  removed a gate setup made by hand and most of a clone made straight under `~/cpuq/worktrees`.
+  Now a copy goes only with its marker (`.cpuq-used` or `.cpuq-generation`), never a folder that
+  is a clone itself, and scratch only while its job's record is there.
+
 ## 0.30.3 — 2026-11-26
 
 Three faults the Lean model (`formal/`) found, each now with a test that fails on 0.30.2.
