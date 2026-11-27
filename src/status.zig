@@ -415,7 +415,7 @@ fn gateNow(ctx: *Ctx, a: std.mem.Allocator, drain: bool, drain_holds: bool, busy
     const text = if (room == 0)
         a.print("closed: outside load ({d:.1} CPUs busy outside cpuq)", .{outside}) catch "closed: outside load"
     else
-        a.print("outside load leaves {d} of {d} free CPUs idle ({d:.1} busy outside cpuq)", .{ room, free, outside }) catch "outside load";
+        a.print("outside load: {d} of {d} free CPUs usable, {d} held back ({d:.1} busy outside cpuq)", .{ room, free, free - room, outside }) catch "outside load";
     return .{ .{ .state = "outside_load", .load = outside, .text = text }, room };
 }
 

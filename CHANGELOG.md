@@ -14,6 +14,15 @@ User-visible changes to cpuq. Each version's section is its release notes.
   A task that could run past that, or any task while one with no time limit (`-t 0`) is in the
   way, waits for the drain as before.
 
+- **`cpuq status` says plainly what the outside-load gate holds back.** "outside load leaves 8 of
+  9 free CPUs idle" meant 8 usable, and read as 8 held back. It now reads "outside load: 8 of 9
+  free CPUs usable, 1 held back". The gate measures CPUs busy (from the kernel's CPU ticks), not
+  the load average, which the `load` line shows only for reference.
+- **The end-to-end tests never touch another repository.** `test/run.sh` and the app's release
+  scripts unset `GIT_DIR` and the other variables that point git elsewhere, and the suite refuses
+  to run where its scratch folder sits inside a repository. A suite started with another
+  repository's `GIT_DIR` set had committed its test commits there.
+
 ## 0.31.2 — 2026-11-27
 
 - **`cpuq status` lists only work someone ran outside cpuq.** Apps and system services (detached,
