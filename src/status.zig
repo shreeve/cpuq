@@ -313,7 +313,7 @@ fn promisedTo(given: []const Promise, ticket: u64) u32 {
 /// them: `handOut` run one CPU at a time, each CPU counted as promised before the next. An
 /// operation's place is where it first gets one. A `cpuq drain` takes every CPU it wants, so
 /// once placed it leaves the rest of the line to the others.
-fn lineOrder(a: std.mem.Allocator, ops: []const Op, given: []const Promise) []const u64 {
+fn lineOrder(a: std.mem.Allocator, ops: []const Op, given: []const Promise, now: i64) []const u64 {
     var order: std.ArrayList(u64) = .empty;
     var work: std.ArrayList(Op) = .empty;
     work.appendSlice(a, ops) catch return order.items;
@@ -326,7 +326,7 @@ fn lineOrder(a: std.mem.Allocator, ops: []const Op, given: []const Promise) []co
     var n: u32 = 0;
     while (order.items.len < waiting and n < 4096) : (n += 1) {
         const fake = [_]u32{std.math.maxInt(u32) - n};
-        const got = pool_mod.handOut(a, work.items, promised.items, &fake);
+        const got = pool_mod.handOut(a, work.items, promised.items, &fake, now);
         if (got.len == 0) break;
         const t = got[0].ticket;
         if (std.mem.findScalar(u64, order.items, t) == null) order.append(a, t) catch break;
@@ -540,7 +540,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
 
     // The line, in the order free CPUs go.
     var waiters: std.ArrayList(JsonWaiter) = .empty;
-    for (lineOrder(a, ops, given), 1..) |t, place| {
+    for (lineOrder(a, ops, given, now), 1..) |t, place| {
         const o = for (ops) |o| {
             if (o.ticket == t) break o;
         } else continue;
@@ -1034,12 +1034,12 @@ test "the line's order: by project share, and a drain first" {
         .{ .ticket = 3, .project = "rip", .want = 2 },
         .{ .ticket = 4, .project = "emdb", .held = &.{4}, .want = 0 },
     };
-    try std.testing.expectEqualSlices(u64, &.{ 3, 2, 1 }, lineOrder(a, &ops, &.{}));
+    try std.testing.expectEqualSlices(u64, &.{ 3, 2, 1 }, lineOrder(a, &ops, &.{}, 0));
     // A promise already made counts: rip, promised its two, waits no more.
     const given = [_]Promise{ .{ .cpu = 5, .ticket = 3 }, .{ .cpu = 6, .ticket = 3 } };
-    try std.testing.expectEqualSlices(u64, &.{ 2, 1 }, lineOrder(a, &ops, &given));
+    try std.testing.expectEqualSlices(u64, &.{ 2, 1 }, lineOrder(a, &ops, &given, 0));
     const drained = [_]Op{ ops[0], ops[1], .{ .ticket = 9, .project = "x", .drain = true, .want = 8 } };
-    try std.testing.expectEqualSlices(u64, &.{ 9, 2, 1 }, lineOrder(a, &drained, &.{}));
+    try std.testing.expectEqualSlices(u64, &.{ 9, 2, 1 }, lineOrder(a, &drained, &.{}, 0));
 }
 
 test "fair shares by weight: a small demand keeps what it wants" {

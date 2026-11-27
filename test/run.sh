@@ -375,6 +375,37 @@ EOF
     "[ $r1 = 0 ] && [ $r2 = 0 ] && [ $r3 = 0 ] && [ $alone = yes ]"
 }
 
+t_backfill() {
+  # While a drain waits for a long task, the CPUs it gathered don't sit idle: a task whose time
+  # limit ends before the drain could start anyway runs on them (one task or many). A task that
+  # could run past that waits for the drain, and the drain still starts once the long task ends.
+  setup backfill
+  local f=$T/log
+  "$CPUQ" run -t 1h --label b:build -- sh -c "echo build-start >>$f; sleep 4; echo build-end >>$f" & local b=$!
+  wait_held 1
+  "$CPUQ" drain --max 30s --label b:drain -- sh -c "echo drain-start >>$f" & local d=$!
+  wait_held 2
+  local t0; t0=$(now)
+  "$CPUQ" run -t 5s --label b:short -- sh -c "echo short >>$f"; local rs=$?
+  "$CPUQ" run -n 3 -t 5s --label b:many -- sh -c "sleep 0.2; echo many\$CPUQ_TASK >>$f" 2>/dev/null; local rm=$?
+  local dt; dt=$(since "$t0")
+  "$CPUQ" run --label b:long -- sh -c "echo long >>$f" & local l=$!
+  wait $b $d $l
+  local got; got=$(tr '\n' ' ' <"$f")
+  echo "  $got"
+  local verdict; verdict=$(python3 - "$f" <<'EOF2'
+import sys
+lines = [l.strip() for l in open(sys.argv[1])]
+at = {l: i for i, l in enumerate(lines)}
+early = all(at[k] < at["build-end"] for k in ("short", "many1", "many2", "many3"))
+order = at["build-end"] < at["drain-start"] < at["long"]
+print("ok" if early and order else "wrong")
+EOF2
+)
+  check "short tasks run on a waiting drain's CPUs (rc $rs $rm in ${dt}s); a long one waits; the drain starts when the build ends" \
+    "[ '$verdict' = ok ] && [ $rs = 0 ] && [ $rm = 0 ] && fl '$dt < 3.5'"
+}
+
 t_lock_stuck() {
   # A process stuck holding the pool's lock stops every cpuq on the machine. cpuq status waits
   # for the lock at most 5 s, then names the holder (from the note each holder writes) and fails
@@ -2071,7 +2102,7 @@ f = open(sys.argv[1]); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$sp/p/held
 
 # --- cpuq jobs and the agent (until they go) -------------------------------------------------
 
-TESTS=${*:-budget tasks pack cpus_limit timeout retry wait_max share fair order drain lock_stuck storm kill ctrl_z nested driver removed \
+TESTS=${*:-budget tasks pack cpus_limit timeout retry wait_max share fair order drain backfill lock_stuck storm kill ctrl_z nested driver removed \
   kill_holder leftovers leaked_descendant kill_waiter term_waiting lost_seq long_command waiters_cpu \
   exit_status direct_sigint terminal_sigint tasks_sigint ignored_signals stack_limit pin repin narrow \
   status progress usage zombie outside status_host history note wait record min_available min_disk hook \

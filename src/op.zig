@@ -231,6 +231,11 @@ const Run = struct {
             .since = t.since_s,
         }) catch break;
         r.rec.tasks_now = now.items;
+        var newest: i64 = 0;
+        for (r.running.items) |t| if (t.slot != no_slot) {
+            newest = @max(newest, t.since_s);
+        };
+        r.rec.ends = if (newest == 0) 0 else newest + r.rec.tlimit;
         r.pool.write(r.file, r.rec) catch {};
         // A run of many reports its own progress where its caller asked (CPUQ_PROGRESS):
         // `DONE TOTAL FAILING`, whole, by a rename.
@@ -292,6 +297,8 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
             .limit = limit,
             .tasks = total,
             .since = main.nowSeconds(ctx.io),
+            // A task's limit, the 5 s a kill may take after it, and a few for ending and starting.
+            .tlimit = if (timeout_s == 0) 0 else timeout_s +| 10,
             .cmd = @import("runopts.zig").joinCommand(ctx, o.cmd),
         },
     };
@@ -377,8 +384,9 @@ fn loop(r: *Run) void {
                 break;
             }
         }
-        // A drain begun since the last look: stop refilling before placing anything.
-        if (!r.rec.drain and r.pool.draining()) for (r.slots.items) |*sl| {
+        // A drain begun since the last look: stop refilling before placing anything, unless
+        // this operation's tasks end before the drain could start anyway.
+        if (!r.rec.drain and r.pool.draining() and !backfills(r, r.pool.scan(r.a))) for (r.slots.items) |*sl| {
             sl.draining = true;
         };
         consolidate(r);
@@ -690,8 +698,9 @@ fn giveBackEmpty(r: *Run) bool {
         i += 1;
     }
     if (any) {
-        // Given up for the line: take a new turn behind the others.
-        r.pool.renew(r.file, &r.rec) catch {};
+        // Given up for the line: take a new turn behind the others. A drain lending its CPUs
+        // keeps its turn.
+        if (!r.rec.drain) r.pool.renew(r.file, &r.rec) catch {};
         r.syncRecord();
         settleOthers(r);
         r.pool.unlock();
@@ -706,7 +715,7 @@ fn settleOthers(r: *Run) void {
     const ops = r.pool.scan(a);
     const given = r.pool.promises(a, ops, r.pool_cpus);
     const free = freeCpus(r, ops, given);
-    for (pool_mod.handOut(a, ops, given, free)) |p| {
+    for (pool_mod.handOut(a, ops, given, free, main.nowSeconds(r.ctx.io))) |p| {
         r.pool.promise(p.cpu, p.ticket);
         if (p.ticket != r.rec.ticket) r.pool.wakeOp(p.ticket);
     }
@@ -781,7 +790,7 @@ fn settle(r: *Run, released: bool) bool {
     var given = r.pool.promises(a, ops, r.pool_cpus);
     const free = freeCpus(r, ops, given);
     var fresh: std.ArrayList(pool_mod.Promise) = .empty;
-    for (pool_mod.handOut(a, ops, given, free)) |p| {
+    for (pool_mod.handOut(a, ops, given, free, main.nowSeconds(r.ctx.io))) |p| {
         r.pool.promise(p.cpu, p.ticket);
         fresh.append(a, p) catch {};
         if (p.ticket != r.rec.ticket) r.pool.wakeOp(p.ticket);
@@ -816,11 +825,29 @@ fn settle(r: *Run, released: bool) bool {
     given = r.pool.promises(a, ops, r.pool_cpus);
     r.head = if (pool_mod.firstWaiter(a, ops, given)) |w| w.op.ticket == r.rec.ticket else false;
     if (pool_mod.giver(a, ops, given)) |t| if (t == r.rec.ticket) drainOne(r);
-    if (!r.rec.drain and r.pool.draining()) for (r.slots.items) |*s| {
+    if (!r.rec.drain and r.pool.draining() and !backfills(r, ops)) for (r.slots.items) |*s| {
         s.draining = true;
     };
+    // Backfill: a gathering drain empties idle CPUs for the waiters whose tasks end before it
+    // could start; a waiter that finds one owed wakes the drain.
+    if (pool_mod.lends(ops, given, main.nowSeconds(r.ctx.io))) |l| {
+        if (l.ticket == r.rec.ticket) {
+            var n = l.n;
+            for (r.slots.items) |*s| if (n > 0 and !s.draining and s.used == 0) {
+                s.draining = true;
+                n -= 1;
+            };
+        } else r.pool.wakeOp(l.ticket);
+    }
     r.syncRecord();
     return false;
+}
+
+/// Whether this operation's tasks, started now, end before the gathering drain could start,
+/// so it keeps filling its CPUs.
+fn backfills(r: *Run, ops: []const Op) bool {
+    const sh = pool_mod.shadow(ops) orelse return false;
+    return pool_mod.fits(r.rec, sh, main.nowSeconds(r.ctx.io));
 }
 
 /// Marks one held CPU to be emptied: an empty one if there is one, else the one whose newest
