@@ -249,7 +249,9 @@ code at 0.30.2, with the mark shared. It has three faults (README, Findings 7, 8
 an urgent operation with endless work starves an operation of its own project (`L3`); a
 SIGCONT that comes after the parent took the Ctrl-Z and before it raised SIGSTOP on itself is
 lost (`Z stuck`); and a stopped drain idles the pool until it continues (`L2 idle`).
-`Rules.released` (0.30.3) fixes all three; each row below with "without" takes one fix out. -/
+`Rules.code0303` fixes all three, and has a fourth: a drain stopped and continued while a newer
+drain holds part of the pool waits for that drain's CPUs while it waits for its own (Finding 10).
+`Rules.released` (0.30.5) fixes it; each row below with "without" takes one fix out. -/
 
 /--
 info: two drains, before 0.30.1: FAILED (791 states): CS stuck, L2 idle, L3 never
@@ -257,9 +259,11 @@ Ctrl-Z, before 0.30.2: FAILED (3417 states): Z stuck
 Ctrl-Z, 0.30.2: FAILED (2655 states): Z stuck
 drain, Ctrl-Z, 0.30.2: FAILED (1017 states): Z stuck, L2 idle, L3 never
 urgent holds, 0.30.2: FAILED (187 states): L3 never, L3 fair
+two drains, Ctrl-Z, 0.30.3: FAILED (26071 states): L3 never
 Ctrl-Z, without the stop check: FAILED (3801 states): Z stuck
 drain, Ctrl-Z, without letting go: FAILED (1130 states): L2 idle
 urgent holds, without urgent once: FAILED (187 states): L3 never, L3 fair
+two drains, Ctrl-Z, without drain most: FAILED (26071 states): L3 never
 -/
 #guard_msgs in
 #eval do
@@ -268,18 +272,19 @@ urgent holds, without urgent once: FAILED (187 states): L3 never, L3 fair
   row "Ctrl-Z, 0.30.2" (ctrlZ .code0302)
   row "drain, Ctrl-Z, 0.30.2" (drainZ .code0302)
   row "urgent holds, 0.30.2" (urgentHolds .code0302)
+  row "two drains, Ctrl-Z, 0.30.3" (twoDrainsZ .code0303)
   row "Ctrl-Z, without the stop check" (ctrlZ { Rules.released with haltChecks := false })
   row "drain, Ctrl-Z, without letting go" (drainZ { Rules.released with drainLets := false })
   row "urgent holds, without urgent once" (urgentHolds { Rules.released with urgentOnce := false })
+  row "two drains, Ctrl-Z, without drain most" (twoDrainsZ { Rules.released with drainMost := false })
 
--- The code as released (0.30.3), on every scenario: every one passes but two drains with a Ctrl-Z
--- (Finding 10, below).
+-- The code as released (0.30.5), on every scenario.
 /--
 info: two drains: ok: 2091 states, 4931 steps
 drain, crash: ok: 40538 states, 121758 steps
 Ctrl-Z: ok: 3199 states, 11710 steps
 drain, Ctrl-Z: ok: 1667 states, 5277 steps
-two drains, Ctrl-Z: FAILED (26071 states): L3 never
+two drains, Ctrl-Z: ok: 26047 states, 88828 steps
 urgent holds: ok: 348 states, 800 steps
 two CPUs: ok: 1754 states, 4320 steps
 odd split: ok: 11889 states, 40983 steps
@@ -304,21 +309,5 @@ urgent: ok: 716391 states, 4334356 steps
   row "timeout" (timeout .released)
   row "herd" (herd .released)
   row "urgent" (urgent .released)
-
--- A drain stopped and continued while a newer drain holds part of the pool: each waits for the
--- other's CPUs (Finding 10). `drainMost`, the proposed fix, sends free CPUs to the drain that
--- holds the most.
-/--
-info: two drains, Ctrl-Z, most: ok: 26047 states, 88828 steps
-two drains, most: ok: 2091 states, 4931 steps
-drain, crash, most: ok: 40538 states, 121758 steps
-drain, Ctrl-Z, most: ok: 1667 states, 5277 steps
--/
-#guard_msgs in
-#eval do
-  row "two drains, Ctrl-Z, most" (twoDrainsZ { Rules.released with drainMost := true })
-  row "two drains, most" (twoDrains { Rules.released with drainMost := true })
-  row "drain, crash, most" (drainCrash { Rules.released with drainMost := true })
-  row "drain, Ctrl-Z, most" (drainZ { Rules.released with drainMost := true })
 
 end Cpuq.Checks

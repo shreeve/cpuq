@@ -285,12 +285,13 @@ structure CodeRules (r : Rules) : Prop where
   markShared : r.markShared = true
   ledger : r.ledger = true
   renewAtRelease : r.renewAtRelease = true
-  drainMost : r.drainMost = false
 
 theorem CodeRules.released : CodeRules Rules.released :=
-  ⟨⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 theorem CodeRules.code0302 : CodeRules Rules.code0302 :=
-  ⟨⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+theorem CodeRules.code0303 : CodeRules Rules.code0303 :=
+  ⟨⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 theorem bit_clrBit {n o d : Nat} (h : d ≠ o) : bit (clrBit n o) d = bit n d := by
   unfold clrBit bit; split
@@ -424,20 +425,34 @@ theorem owned_grants_lt {d : Nat} {s : St} (h : Inv cfg s) (ha : (s.op d).phase 
 theorem target_d {d : Nat} (hd : drainOp cfg d = true) (hcap : (cfg.op d).cap = cfg.cpus) {s : St}
     (h : Inv cfg s) (hdr : firstDrain cfg s = some d) (ha : (s.op d).phase = .alive)
     (hi : s.busy d = false) (hw : 0 < s.pendingN d) {c : Nat} (hc : c < s.cpus.length)
-    (hf : freeC cfg s (s.cpu c) = true) : target cfg s = some d := by
+    (hf : freeC cfg s (s.cpu c) = true)
+    (hX : ∀ g c, drainOp cfg g = true → g ≠ d → (s.cpu c).lock ≠ some g ∧ (s.cpu c).grant ≠ some g) :
+    target cfg s = some d := by
   have hlt := owned_grants_lt hR h ha hc hf
   rw [h.len] at hlt
   have hdm : demand cfg s d > 0 := by
     simp only [demand, liveOp_eq hR, St.isAlive, ha, beq_self_eq_true, ite_true, hd, hi,
       Bool.not_false, Bool.true_and, decide_eq_true_eq, hw, hcap]
     omega
-  simp [target, drainer_of_first hR.drainMost hdr hdm, hdm]
+  have hle : cfg.rules.drainMost = true → ∀ g ∈ s.order, drainOp cfg g = true →
+      demand cfg s g > 0 → s.owned g + s.grants g ≤ s.owned d + s.grants d := by
+    intro _ g _ hdg hdmg
+    by_cases e : g = d
+    · subst e; exact Nat.le_refl _
+    · have hag : (s.op g).phase = .alive := by
+        have := demand_live hdmg; rw [liveOp_eq hR] at this; simpa [St.isAlive] using this
+      have h1 : s.owned g = 0 := countP_zero_owned (fun c sl hs he => by
+        subst he; exact (hX sl.owner c hdg e).1 (h.ownerLock c sl hs hag))
+      have h2 : s.grants g = 0 := countP_zero_grants (fun c => (hX g c hdg e).2)
+      omega
+  simp [target, drainer_of_first hle hdr hdm, hdm]
 
 /-- While `d` is the first drain and waits to run, a pass grants every free CPU to `d` and
 changes nothing else. -/
 theorem handout_to_d {d : Nat} (hd : drainOp cfg d = true) (hcap : (cfg.op d).cap = cfg.cpus)
     {s : St} (h : Inv cfg s) (hdr : firstDrain cfg s = some d) (ha : (s.op d).phase = .alive)
-    (hi : s.busy d = false) (hw : 0 < s.pendingN d) {c : Nat} (hc : c < s.cpus.length) :
+    (hi : s.busy d = false) (hw : 0 < s.pendingN d) {c : Nat} (hc : c < s.cpus.length)
+    (hX : ∀ g c, drainOp cfg g = true → g ≠ d → (s.cpu c).lock ≠ some g ∧ (s.cpu c).grant ≠ some g) :
     (handout cfg s).cpu c =
       if freeC cfg s (s.cpu c) then { s.cpu c with grant := some d } else s.cpu c := by
   let F : Nat → Cpu := fun c' =>
@@ -459,10 +474,21 @@ theorem handout_to_d {d : Nat} (hd : drainOp cfg d = true) (hcap : (cfg.op d).ca
         show _ = if freeC cfg s (s.cpu c0) then _ else _
         by_cases hf : freeC cfg s (s.cpu c0) = true
         · have hfu : freeC cfg u (u.cpu c0) = true := by rw [hu0, freeC_congr ho]; exact hf
+          have hXu : ∀ g c', drainOp cfg g = true → g ≠ d →
+              (u.cpu c').lock ≠ some g ∧ (u.cpu c').grant ≠ some g := by
+            intro g c' hg ne
+            by_cases hm : c' ∈ done
+            · rw [hd1 c' hm]
+              show (if freeC cfg s (s.cpu c') then { s.cpu c' with grant := some d } else s.cpu c').lock ≠ _ ∧
+                (if freeC cfg s (s.cpu c') then { s.cpu c' with grant := some d } else s.cpu c').grant ≠ _
+              split
+              · exact ⟨(hX g c' hg ne).1, by simpa using Ne.symm ne⟩
+              · exact hX g c' hg ne
+            · rw [hd2 c' hm]; exact hX g c' hg ne
           have ht : target cfg u = some d :=
             target_d hR hd hcap hu (by rw [firstDrain_congr ho hr]; exact hdr)
               (by rw [phase_of_ops ho]; exact ha) (by rw [busy_congr ho]; exact hi)
-              (by rw [pendingN_congr ho]; exact hw) (by rw [hlen]; exact hc0.2) hfu
+              (by rw [pendingN_congr ho]; exact hw) (by rw [hlen]; exact hc0.2) hfu hXu
           rw [ite_eq_left hf]
           unfold grantOne; rw [ite_eq_left hfu, ht]
           rw [St.cpu_setCpu, ite_eq_left (⟨rfl, by rw [hlen]; exact hc0.2⟩ : c0 = c0 ∧ c0 < u.cpus.length), hu0]
@@ -738,7 +764,8 @@ theorem handout_len (cfg : Cfg) (s : St) : (handout cfg s).cpus.length = s.cpus.
 CPU's rank to 1 and changes nothing else. -/
 theorem rank_handout {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drainOp cfg d = true)
     (hcap : (cfg.op d).cap = cfg.cpus) {s : St} (h : Inv cfg s) (hdr : firstDrain cfg s = some d)
-    (ha : (s.op d).phase = .alive) (hi : s.busy d = false) (hw : 0 < s.pendingN d) (c : Nat) :
+    (ha : (s.op d).phase = .alive) (hi : s.busy d = false) (hw : 0 < s.pendingN d)
+    (hX : ∀ g c, drainOp cfg g = true → g ≠ d → (s.cpu c).lock ≠ some g ∧ (s.cpu c).grant ≠ some g) (c : Nat) :
     rank d (handout cfg s) c = (if rank d s c = 2 ∧ c < s.cpus.length then 1 else rank d s c) ∧
     inner d (handout cfg s) c = inner d s c ∧
     ((handout cfg s).cpu c).lock = (s.cpu c).lock ∧
@@ -748,7 +775,7 @@ theorem rank_handout {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drai
   have hops := (handout_order_ops cfg s).2
   have hph : ∀ p, ((handout cfg s).op p).phase = (s.op p).phase := fun p => phase_of_ops hops p
   by_cases hc : c < s.cpus.length
-  · have e := handout_to_d hR hd hcap h hdr ha hi hw hc
+  · have e := handout_to_d hR hd hcap h hdr ha hi hw hc hX
     have hfr : freeC cfg s (s.cpu c) = true ↔ rank d s c = 2 := by
       rw [freeC_iff hR]
       unfold rank
@@ -966,7 +993,7 @@ theorem drain_frame {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drain
     · cases e
       have hops := (handout_order_ops cfg s).2
       have hord := (handout_order_ops cfg s).1
-      have k := rank_handout hR hd hcap h x.first x.alive x.idle x.work
+      have k := rank_handout hR hd hcap h x.first x.alive x.idle x.work x.others
       have ex := handout_extras cfg s
       simp only [extras, Prod.mk.injEq] at ex
       refine ⟨⟨rt, by rw [firstDrain_congr hops hord]; exact x.first, by rw [phase_of_ops hops]; exact x.alive,
@@ -1104,6 +1131,10 @@ theorem drain_frame {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drain
         have hph1 : ∀ p, (s1.op p).phase = (s.op p).phase := fun p => phase_of_ops hops1 p
         have k := rank_handout hR hd hcap h1 hdr1 (by rw [hph1]; exact x.alive)
           (by rw [busy_congr hops1]; exact x.idle) (by rw [pendingN_congr hops1]; exact x.work)
+          (fun g c hg ne => by
+            rw [hc1]; split
+            · exact ⟨by simp, by simp⟩
+            · exact x.others g c hg ne)
         have hops := (handout_order_ops cfg s1).2
         have hord := (handout_order_ops cfg s1).1
         have ex := handout_extras cfg s1
@@ -1179,6 +1210,7 @@ theorem drain_frame {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drain
       have hops1 : ∀ p, ((s.setPhase o .over).op p).tasks = (s.op p).tasks := fun p => St.tasks_setPhase ..
       have k := rank_handout hR hd hcap h1 hdr1 (by rw [hph1, ite_eq_right hne]; exact x.alive)
         (by simp only [St.busy, hops1]; exact x.idle) (by simp only [St.pendingN, hops1]; exact x.work)
+        (fun g c hg ne => x.others g c hg ne)
       have hops := (handout_order_ops cfg (s.setPhase o .over)).2
       have hord := (handout_order_ops cfg (s.setPhase o .over)).1
       have ex := handout_extras cfg (s.setPhase o .over)
@@ -1611,7 +1643,7 @@ theorem drain_served {cfg : Cfg} {d : Nat} (hR : CodeRules cfg.rules) (hd : drai
       have pass : ∀ j, rank d (handout cfg (r.st (T + (k + j)))) c = 1 := by
         intro j
         have x := ctx (k + j)
-        have k1 := (rank_handout hR hd hcap (hinv (k + j)) x.first x.alive x.idle x.work c).1
+        have k1 := (rank_handout hR hd hcap (hinv (k + j)) x.first x.alive x.idle x.work x.others c).1
         rw [k1, ite_eq_left (⟨by rw [rk, h2], by rw [hlen]; exact hc⟩ :
           rank d (r.st (T + (k + j))) c = 2 ∧ c < (r.st (T + (k + j))).cpus.length)]
       obtain ⟨j, b, hkb, e⟩ := fire .handout rfl (fun j => by

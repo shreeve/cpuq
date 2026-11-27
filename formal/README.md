@@ -68,9 +68,10 @@ keeps the parent from raising SIGSTOP (`haltChecks`).
 `cpuq drain` (`OpCfg.drain`) is an urgent operation with one command. It wants every CPU of the
 pool while its command waits, starts it only holding them all, and keeps them while it runs.
 While it holds the drain mark every other operation empties its CPUs. A stopped drain lets its
-mark go and takes it again when continued (`drainLets`); every free CPU goes to the first drain
-in ticket order that wants one (before 0.30.3: to the first living drain, and to no one while it
-wants none). A drain never gives a CPU.
+mark go and takes it again when continued (`drainLets`). Every free CPU goes to the drain that
+wants one and holds or is promised the most, then the older ticket (`drainMost`); in 0.30.3, to
+the first drain in ticket order that wants one; before that, to the first living drain, and to no
+one while it wants none. A drain never gives a CPU.
 
 An urgent operation goes ahead of the line only until it first holds a CPU (`urgentOnce`); before
 0.30.3 it went ahead whenever it held none.
@@ -79,9 +80,10 @@ An urgent operation goes ahead of the line only until it first holds a CPU (`urg
 FINAL-PLAN's (`plan`), the plan read loosely (`planLoose`), the plan with this model's two fixes
 (`fixed`), the rules of the code on branch `slots` (`pool`), those with this model's fixes 4 to 6
 (`poolFixed`, the code at 8f997ec), the code at 0d315ed (`pool0d315ed`), the code at 0.30.2
-(`code0302`: the mark shared, a SIGCONT cancels a Ctrl-Z not yet acted on), and the code as
-released in 0.30.3 (`released`: `code0302` with the fixes of Findings 7, 8 and 9, `urgentOnce`,
-`haltChecks` and `drainLets`). `drainMost` is this model's fix for Finding 10.
+(`code0302`: the mark shared, a SIGCONT cancels a Ctrl-Z not yet acted on), the code at 0.30.3
+(`code0303`: `code0302` with the fixes of Findings 7, 8 and 9, `urgentOnce`, `haltChecks` and
+`drainLets`), and the code as released in 0.30.5 (`released`: `code0303` with the fix of
+Finding 10, `drainMost`).
 
 `pool` differs from `fixed` where the code does what the plan doesn't say: the giver's ticket is
 renewed when it gives its CPU back, not when it starts to drain (`renewAtRelease`); one giver
@@ -139,7 +141,7 @@ under the pool lock while the first waits for the pool lock: the search finds th
 | Under `urgentOnce`, every operation holding a CPU's flock has been served, in every reachable state | `Reach.servedOk` |
 | Under the code's rules, with no drain living, a head holding nothing is never blocked: a CPU is unlocked, or one is being emptied, or some holder may start emptying one for it | `zero_head_unblocked` |
 
-`drain_served` holds for the code's rules (`CodeRules`: `released`, `code0302`). A run
+`drain_served` holds for the code's rules (`CodeRules`: `released`, `code0303`, `code0302`). A run
 (`Run`) is a sequence of moves and stutters from a reachable state; it is weakly fair
 (`Run.Fair`) when every step class the search calls fair (`fairKey`: a task's exit whether it
 passes or fails, refill, release, the pass, accept, drain, undrain, consolidate, stop, halt,
@@ -163,7 +165,7 @@ waiters is checked by the search, in two forms, for every scenario: `L3 never` (
 which no run serves a waiter that holds nothing) and `L3 fair` (no weakly fair run, with no more
 crashes, kills or Ctrl-Z, that never serves one). The search finds counterexamples to FINAL-PLAN
 (Findings 1 and 2) and to the code (Findings 4, 5, 7 and 10). On `released` every scenario
-passes but Finding 10's.
+passes.
 
 **L3 for ordinary waiters: what is proved, and what is left.** Up to 0.30.2, L3 was false for
 the code (Finding 7). The proof of `zero_head_unblocked` shows what `urgentOnce` changes: a
@@ -275,9 +277,9 @@ The code on branch `slots` (`pool`) has Findings 1 and 2 fixed and Finding 3's s
 and fails three scenarios (Findings 4, 5). The code at 8f997ec (`poolFixed`) passes them, and
 fails on two drains (`CS stuck`, the deadlock of 2026-11-26) and on a lost SIGCONT (`Z stuck`,
 Finding 8). The code at 0.30.2 (`code0302`) passes two drains, and fails Findings 7, 8 and 9.
-The code as released (`released`, 0.30.3) passes every scenario but one: two drains, one stopped
-and continued (Finding 10). Each of 0.30.3's three fixes is needed: take one out and its
-scenario fails again. With `drainMost` the drain scenarios all pass.
+The code at 0.30.3 (`code0303`) passes every scenario but two drains, one stopped and continued
+(Finding 10). The code as released (`released`, 0.30.5) passes every scenario. Each of the four
+fixes is needed: take one out and its scenario fails again.
 
 ## Findings
 
@@ -373,7 +375,7 @@ again, and is first again (its ticket is older: `suspend_` doesn't renew it), so
 empties goes to B. Each drain holds one CPU and waits for the other's; a drain never gives one
 (`giver` passes over drains, and a waiting drain keeps its slots), and every other operation
 keeps emptying for the marks. The pool idles until a drain's `--max` runs out, and for good
-without one (`L3 never`, "two drains, Ctrl-Z" on `released`). Proposed fix, checked
-(`drainMost`): `handOut` gives free CPUs to the drain that holds or is promised the most, then
-the older ticket. A stopped drain gives every CPU back, so at most one drain ever holds a CPU,
-and it is served first. Renewing a stopping drain's ticket may also do; that is not checked.
+without one (`L3 never`, "two drains, Ctrl-Z, 0.30.3"). Fix (`drainMost`, 0.30.5): `handOut`
+gives free CPUs to the drain that wants some and holds or is promised the most, then the older
+ticket. A stopped drain gives every CPU back, so at most one drain ever holds a CPU, and it is
+served first.

@@ -220,11 +220,14 @@ def pool0d315ed : Rules := { poolFixed with stoppedGrants := true }
 a Ctrl-Z not yet acted on. -/
 def code0302 : Rules := { poolFixed with markShared := true, contCancels := true }
 
-/-- The code as released (0.30.3): `code0302` with the fixes of README's Findings 7, 8 and 9:
-urgent only until served, the stop check before SIGSTOP, and a stopped drain letting the pool
-go. -/
-def released : Rules :=
+/-- The code at 0.30.3: `code0302` with the fixes of README's Findings 7, 8 and 9: urgent only
+until served, the stop check before SIGSTOP, and a stopped drain letting the pool go. -/
+def code0303 : Rules :=
   { code0302 with urgentOnce := true, haltChecks := true, drainLets := true }
+
+/-- The code as released (0.30.5): `code0303` with the fix of README's Finding 10, free CPUs to
+the drain holding the most. -/
+def released : Rules := { code0303 with drainMost := true }
 
 end Rules
 

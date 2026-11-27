@@ -480,22 +480,59 @@ theorem drainer_none {cfg : Cfg} {s : St} (h : firstDrain cfg s = none) : draine
       rcases wants_living hq.2 with e | e <;> simp [hq.1, e]
   · exact h
 
-/-- The first living drain, while it wants a CPU, is the drainer. -/
-theorem drainer_of_first {cfg : Cfg} {s : St} {d : Nat} (hm : cfg.rules.drainMost = false)
+/-- The first living drain, while it wants a CPU, is the first drain that wants one. -/
+theorem find_wants {cfg : Cfg} {s : St} {d : Nat} (h : firstDrain cfg s = some d)
+    (hw : demand cfg s d > 0) :
+    s.order.find? (fun o => drainOp cfg o && decide (demand cfg s o > 0)) = some d := by
+  unfold firstDrain at h
+  have hd := (List.find?_eq_some_iff_append.1 h).1
+  simp only [Bool.and_eq_true] at hd
+  apply List.find?_eq_some_iff_append.2
+  obtain ⟨_, as, bs, e, hn⟩ := List.find?_eq_some_iff_append.1 h
+  refine ⟨by simp [hd.1, hw], as, bs, e, fun a ha => ?_⟩
+  have := hn a ha
+  cases hda : drainOp cfg a
+  · simp
+  · have hm : ¬ demand cfg s a > 0 := fun hm => by
+      rcases wants_living hm with e | e <;> simp [hda, e] at this
+    simp [hm]
+
+theorem foldl_keep {p : Nat → Bool} {v : Nat → Nat} {d : Nat} :
+    ∀ (l : List Nat), (∀ g ∈ l, p g = true → v g ≤ v d) →
+      l.foldl (fun best o => if p o then
+        (match best with
+          | none => some o
+          | some b => if v o > v b then some o else best) else best) (some d) = some d
+  | [], _ => rfl
+  | x :: l, h => by
+    simp only [List.foldl]
+    have e : (if p x then (if v x > v d then some x else some d) else some d) = some d := by
+      split
+      · rename_i hp; have := h x (List.mem_cons_self ..) hp
+        rw [ite_eq_right (by omega)]
+      · rfl
+    simp only [e]
+    exact foldl_keep l (fun g hg => h g (List.mem_cons_of_mem _ hg))
+
+/-- The first living drain, while it wants a CPU and (with `drainMost`) no drain wanting one
+holds more, is the drainer. -/
+theorem drainer_of_first {cfg : Cfg} {s : St} {d : Nat}
+    (hm : cfg.rules.drainMost = true → ∀ g ∈ s.order, drainOp cfg g = true →
+      demand cfg s g > 0 → s.owned g + s.grants g ≤ s.owned d + s.grants d)
     (h : firstDrain cfg s = some d) (hw : demand cfg s d > 0) : drainer cfg s = some d := by
-  unfold drainer; simp only [hm, Bool.false_eq_true, ite_false]; split
-  · unfold firstDrain at h
-    have hd := (List.find?_eq_some_iff_append.1 h).1
-    simp only [Bool.and_eq_true] at hd
-    apply List.find?_eq_some_iff_append.2
-    obtain ⟨_, as, bs, e, hn⟩ := List.find?_eq_some_iff_append.1 h
-    refine ⟨by simp [hd.1, hw], as, bs, e, fun a ha => ?_⟩
-    have := hn a ha
-    cases hda : drainOp cfg a
-    · simp
-    · have hm : ¬ demand cfg s a > 0 := fun hm => by
-        rcases wants_living hm with e | e <;> simp [hda, e] at this
-      simp [hm]
+  have hf := find_wants h hw
+  unfold drainer; split
+  · split
+    · rename_i hmost
+      obtain ⟨hpd, as, bs, e, hn⟩ := List.find?_eq_some_iff_append.1 hf
+      rw [e, List.foldl_append, foldl_skip as (fun a ha => by
+        have := hn a ha; revert this; cases drainOp cfg a <;> simp)]
+      simp only [List.foldl, hpd, ite_true]
+      apply foldl_keep bs
+      intro g hg hp
+      simp only [Bool.and_eq_true, decide_eq_true_eq] at hp
+      exact hm hmost g (by rw [e]; simp [hg]) hp.1 hp.2
+    · exact hf
   · exact h
 
 /-- L2 for every reachable state under a standing line: right after a hand-out pass, if a token
