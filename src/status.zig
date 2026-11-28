@@ -406,7 +406,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
             paused += o.paused();
             waiting += if (o.drain) 0 else o.waiting;
         }
-        if (o.running == 0 and !(o.drain and o.dstart != 0)) continue;
+        if (o.running == 0 and !(o.drain and o.dstart != 0) and !o.driver) continue;
         var flags: std.ArrayList([]const u8) = .empty;
         if (o.drain and o.dstart != 0 and now - o.since >= @as(i64, ctx.cfg.drain_timeout_s)) flags.append(a, "long_drain") catch {};
         if (o.drain and o.dstart != 0 and o.noise >= op_mod.noisy_min) flags.append(a, "noisy") catch {};
@@ -416,6 +416,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
             if (u / @as(f64, @floatFromInt(o.running - o.paused())) > over_use) flags.append(a, "over_cpu") catch {};
         };
         if (stopped or o.stopped) flags.append(a, "stopped") catch {};
+        if (o.driver and o.dbusy >= pool_mod.driver_min) flags.append(a, "driver_cpu") catch {};
         // Held back by its own -c: tasks queued while the machine has room.
         if (!o.drain and o.running >= o.limit and o.tasks > o.done + o.failed + o.running and room > 0) flags.append(a, "capped") catch {};
         const ended = o.done + o.failed;
@@ -434,6 +435,8 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
             .waiting = if (o.drain) 0 else o.waiting,
             .running_tasks = tasksJson(a, o.tasks_now),
             .stopped = stopped or o.stopped,
+            .driver = o.driver,
+            .driver_busy = o.dbusy,
             .drain = o.drain,
             .pin = o.pin,
             .cpus = o.cpus,
@@ -568,6 +571,7 @@ fn tasksText(a: std.mem.Allocator, h: JsonRun) []const u8 {
 /// Its tasks running, with those cpuq has stopped, its -c, or a drain's CPUs: "3 · 1 stopped",
 /// "2 of -c 2", "drain 6-7".
 fn runText(a: std.mem.Allocator, h: JsonRun) []const u8 {
+    if (h.driver) return a.print("driver · {d:.1} busy itself", .{h.driver_busy}) catch "driver";
     if (h.drain) {
         const iso = if (h.cpus.len > h.pin.len) a.print(" (isolates {s})", .{cpuText(a, h.cpus)}) catch "" else "";
         return a.print("drain {s}{s}", .{ cpuText(a, h.pin), iso }) catch "drain";
@@ -606,6 +610,8 @@ fn flagNotes(a: std.mem.Allocator, runs: []const JsonRun) []const []const u8 {
             a.print("{s}: {d} tasks queued under its -c {d} while the machine has room; raise it with cpuq limit {d} -c N", .{ whoText(a, h), h.tasks -| (h.done + h.failed + h.running), h.limit, h.ticket })
         else if (std.mem.eql(u8, f, "idle_drain"))
             a.print("{s}: a drain whose command keeps {d:.2} CPUs busy; under {d:.2} for `drain_idle` while others wait, it is stopped", .{ whoText(a, h), h.using orelse 0, op_mod.drain_idle_busy })
+        else if (std.mem.eql(u8, f, "driver_cpu"))
+            a.print("{s}: driver computes {d:.1} CPUs itself; run its work as tasks (it counts against its project's share meanwhile)", .{ whoText(a, h), h.driver_busy })
         else if (std.mem.eql(u8, f, "noisy"))
             a.print("{s}: work from outside it keeps {d:.2} CPUs busy on its CPUs{s}{s}: its timing is noisy", .{ whoText(a, h), h.noise, if (h.noisy_top.len != 0) ", most " else "", h.noisy_top })
         else if (std.mem.eql(u8, f, "long_drain"))

@@ -167,10 +167,13 @@ t_budget() {
   for i in $(seq 6); do "$CPUQ" run -- sleep 5 & pids+=($!); done
   "$CPUQ" run -n 6 -- sleep 5 2>/dev/null & pids+=($!)
   local max=0 samples=0 h any=1
+  # Looks a tenth of a second apart, for at most 40 s: a fast machine answers status in
+  # milliseconds, and a count of looks would end before a waiter finds room.
   while [ $any = 1 ] && [ $samples -lt 400 ]; do
     h=$(running); samples=$((samples + 1))
     [ -n "$h" ] && [ "$h" -gt "$max" ] && max=$h
     any=0; for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && any=1; done
+    sleep 0.1
   done
   local rc=0
   for p in "${pids[@]}"; do wait "$p" || rc=1; done
@@ -766,6 +769,18 @@ t_driver() {
   local inner; inner=$(CPUQ_OP=1 "$CPUQ" run --driver -- sh -c 'echo "${CPUQ_OP:-none}"')
   check "a driver is no task, its runs are their own, its exit is its command's (got '$out', rc $rc); CPUQ_OP stays out ($inner)" \
     "[ '$out' = 'running 0 case op ' ] && [ $rc = 3 ] && [ '$inner' = 'none' ]"
+  # A driver that computes itself counts against its project's share: on a pool of 2, a runner
+  # keeping 2 CPUs busy is flagged, its project's run waits while the machine is busy, and another
+  # project's starts under its share.
+  setup driver-cpu "budget = 2"
+  "$CPUQ" run --driver --label dr:runner -- "$BURN" -2 --until "$T/stop" 30 & local d=$!
+  poll 10 '[ "$(sj "[h[\"driver_busy\"] for h in s[\"runs\"] if h[\"driver\"]][0] > 1.2" 2>/dev/null)" = True ]'
+  local flags; flags=$(sj '" ".join(f for h in s["runs"] for f in h["flags"])')
+  "$CPUQ" run --wait-max 2 --label dr:task -- touch "$T/ran" 2>/dev/null; local rw=$?
+  "$CPUQ" run --wait-max 2 --label other:task -- touch "$T/other"; local ro=$?
+  touch "$T/stop"; wait $d
+  check "a driver computing 2 CPUs itself is flagged ($flags); its project's run waits (rc $rw), another project's starts under its share (rc $ro)" \
+    "[[ '$flags' == *driver_cpu* ]] && [ $rw = 75 ] && [ ! -e '$T/ran' ] && [ $ro = 0 ]"
 }
 
 t_removed() {

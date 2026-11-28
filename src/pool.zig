@@ -478,6 +478,11 @@ pub const Op = struct {
     drain: bool = false,
     /// One task, sharing its cpuq's process group (`cpuq run -- CMD`).
     single: bool = false,
+    /// `cpuq run --driver`: a test runner, no task of its own; `dbusy` is the CPUs its own process
+    /// tree keeps busy, the runs it starts left out (measured by its cpuq once a second). It
+    /// counts against its project's share and as busy.
+    driver: bool = false,
+    dbusy: f64 = 0,
     /// Its cpuq is stopped (Ctrl-Z): its tasks are stopped, and it starts none.
     stopped: bool = false,
     pid: i32 = 0,
@@ -514,10 +519,10 @@ pub const Op = struct {
     cmd: []const u8 = "",
 
     pub fn format(r: Op, w: *Io.Writer) Io.Writer.Error!void {
-        try w.print("pid={d}\nurgent={d}\nserved={d}\ndrain={d}\nsingle={d}\nstopped={d}\nproject={s}\nlabel={s}\nweight={d}\nlimit={d}\ntasks={d}\ndone={d}\nfailed={d}\nrunning={d}\nwaiting={d}\ncpus=", .{
-            r.pid,     @intFromBool(r.urgent), @intFromBool(r.served), @intFromBool(r.drain), @intFromBool(r.single), @intFromBool(r.stopped),
-            r.project, r.label,                r.weight,               r.limit,               r.tasks,                r.done,
-            r.failed,  r.running,              r.waiting,
+        try w.print("pid={d}\nurgent={d}\nserved={d}\ndrain={d}\nsingle={d}\ndriver={d}\ndbusy={d:.3}\nstopped={d}\nproject={s}\nlabel={s}\nweight={d}\nlimit={d}\ntasks={d}\ndone={d}\nfailed={d}\nrunning={d}\nwaiting={d}\ncpus=", .{
+            r.pid,     @intFromBool(r.urgent), @intFromBool(r.served), @intFromBool(r.drain), @intFromBool(r.single), @intFromBool(r.driver), r.dbusy,  @intFromBool(r.stopped),
+            r.project, r.label,                r.weight,               r.limit,               r.tasks,                r.done,                 r.failed, r.running,
+            r.waiting,
         });
         for (r.cpus, 0..) |cpu, i| try w.print("{s}{d}", .{ if (i == 0) "" else ",", cpu });
         try w.writeAll("\npin=");
@@ -541,6 +546,8 @@ pub const Op = struct {
             if (eq(k, "served")) r.served = eq(v, "1");
             if (eq(k, "drain")) r.drain = eq(v, "1");
             if (eq(k, "single")) r.single = eq(v, "1");
+            if (eq(k, "driver")) r.driver = eq(v, "1");
+            if (eq(k, "dbusy")) r.dbusy = std.fmt.parseFloat(f64, v) catch 0;
             if (eq(k, "stopped")) r.stopped = eq(v, "1");
             if (eq(k, "project")) r.project = v;
             if (eq(k, "label")) r.label = v;
@@ -742,18 +749,31 @@ pub const Wait = enum {
 };
 
 /// A project's running tasks and weight, among those running or waiting.
-const Proj = struct { running: u32 = 0, weight: u32 = 1 };
+/// A project's running tasks, the CPUs its drivers keep busy themselves (`extra`), and its
+/// weight, among those running or waiting.
+const Proj = struct { running: u32 = 0, extra: f64 = 0, weight: u32 = 1 };
+
+/// A driver whose own tree keeps at least this many CPUs busy computes, and counts: against its
+/// project's share, and in status's flag.
+pub const driver_min: f64 = 0.5;
 
 fn projects(a: std.mem.Allocator, ops: []const Op) std.StringArrayHashMapUnmanaged(Proj) {
     var m: std.StringArrayHashMapUnmanaged(Proj) = .empty;
     for (ops) |o| {
-        if (!o.counts() or (o.running == 0 and o.waiting == 0)) continue;
+        const computes = o.driver and o.dbusy >= driver_min;
+        if (!o.counts() or (o.running == 0 and o.waiting == 0 and !computes)) continue;
         const gop = m.getOrPut(a, o.project) catch continue;
         if (!gop.found_existing) gop.value_ptr.* = .{ .weight = o.weight };
         gop.value_ptr.running += o.running;
+        if (computes) gop.value_ptr.extra += o.dbusy;
         gop.value_ptr.weight = @max(gop.value_ptr.weight, o.weight);
     }
     return m;
+}
+
+/// A project's load for the line: its tasks running and its drivers' own busy CPUs.
+fn loadOf(p: Proj) f64 {
+    return @as(f64, @floatFromInt(p.running)) + p.extra;
 }
 
 fn weights(m: std.StringArrayHashMapUnmanaged(Proj)) u64 {
@@ -770,11 +790,11 @@ pub fn fairShare(a: std.mem.Allocator, ops: []const Op, project: []const u8, t: 
     return @as(f64, @floatFromInt(t)) * @as(f64, @floatFromInt(p.weight)) / @as(f64, @floatFromInt(weights(m)));
 }
 
-/// Whether the project's running tasks are under its share: running × Σw < t × w, without
-/// division.
+/// Whether the project's load (running tasks, and its drivers' own busy CPUs) is under its
+/// share: load × Σw < t × w.
 fn under(m: std.StringArrayHashMapUnmanaged(Proj), project: []const u8, t: u32) bool {
     const p = m.get(project) orelse return t > 0;
-    return @as(u64, p.running) * weights(m) < @as(u64, t) * p.weight;
+    return loadOf(p) * @as(f64, @floatFromInt(weights(m))) < @as(f64, @floatFromInt(@as(u64, t) * p.weight));
 }
 
 /// Tasks started or continued in the last `fresh_ms`, which the sample can't have measured yet.
@@ -801,8 +821,8 @@ fn ahead(m: std.StringArrayHashMapUnmanaged(Proj), x: Op, y: Op) bool {
     if (ux != uy) return ux;
     const px = m.get(x.project) orelse Proj{};
     const py = m.get(y.project) orelse Proj{};
-    const lx = @as(u64, px.running) * py.weight;
-    const ly = @as(u64, py.running) * px.weight;
+    const lx = loadOf(px) * @as(f64, @floatFromInt(py.weight));
+    const ly = loadOf(py) * @as(f64, @floatFromInt(px.weight));
     if (lx != ly) return lx < ly;
     if (x.running != y.running) return x.running < y.running;
     if (x.last != y.last) return x.last < y.last;
@@ -864,10 +884,15 @@ pub fn mayStart(a: std.mem.Allocator, ops: []const Op, me: u64, cx: Cx) Wait {
 /// sample (tasks that ended since count no more; tasks cpuq stopped use nothing), plus, with the
 /// outside check on, the load outside cpuq beyond the CPUs the pool leaves to it (`ncpu` −
 /// `pool_n`). What drains isolate is left out: their commands, and on Linux every tick of their
-/// CPUs (other tasks are kept off them), as those CPUs are out of the capacity.
+/// CPUs (other tasks are kept off them), as those CPUs are out of the capacity. A driver's own
+/// busy CPUs (its record's) count as cpuq's.
 pub fn busyNow(a: std.mem.Allocator, ops: []const Op, s: ?Sample, outside_check: bool, ncpu: u32, pool_n: u32, now_ms: i64) f64 {
-    const sample = s orelse return 0;
-    var tasks: f64 = 0;
+    var drivers: f64 = 0;
+    for (ops) |o| if (o.driver and !o.stopped) {
+        drivers += o.dbusy;
+    };
+    const sample = s orelse return drivers;
+    var tasks: f64 = drivers;
     for (ops) |o| if (o.counts()) for (o.tasks_now) |t| {
         if (t.paused) continue;
         if (sample.find(t.pid, t.start)) |b| tasks += b.busy;
@@ -881,11 +906,11 @@ pub fn busyNow(a: std.mem.Allocator, ops: []const Op, s: ?Sample, outside_check:
         for (sample.cpus) |c| if (std.mem.findScalar(u32, iso, c.cpu) == null) {
             machine += c.frac;
         };
-        outside = @max(0, machine - (sample.tasks - sample.drains));
+        outside = @max(0, machine - (sample.tasks - sample.drains) - drivers);
     } else {
         // macOS: the whole machine, less every task (drains' commands included).
         const machine = sample.machine orelse return tasks;
-        outside = @max(0, machine - sample.tasks);
+        outside = @max(0, machine - sample.tasks - drivers);
     }
     const spill = @max(0, outside - @as(f64, @floatFromInt(ncpu -| pool_n)));
     return tasks + spill;
@@ -932,6 +957,14 @@ pub fn pausePlan(a: std.mem.Allocator, ops: []const Op, s: ?Sample, cx: Cx) []co
             live.append(a, l) catch {};
             r += l.load;
         }
+    };
+    // A driver computing keeps CPUs busy too, and counts toward its project, though it can't be
+    // stopped: its project's tasks are, if any.
+    for (ops) |o| if (o.driver and !o.stopped and o.dbusy >= driver_min) {
+        const gop = run.getOrPut(a, o.project) catch continue;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += o.dbusy;
+        r += o.dbusy;
     };
     const tf: f64 = @floatFromInt(t);
     const w: f64 = @floatFromInt(weights(m));
@@ -1085,6 +1118,30 @@ test "admission: spare room goes to the first waiter over its share" {
     var urgent = ops;
     urgent[0].urgent = true;
     try std.testing.expectEqual(Wait.go, mayStart(a, &urgent, 1, cx));
+}
+
+test "admission: a driver that computes counts against its project's share" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Pool of 4, two projects: rig's driver keeps 2.5 CPUs busy itself; rig's run of tasks is
+    // then at its share of 2 with no task running, trig under its share.
+    const ops = [_]Op{
+        .{ .ticket = 1, .project = "rig", .driver = true, .dbusy = 2.5 },
+        .{ .ticket = 2, .project = "rig", .waiting = 4 },
+        .{ .ticket = 3, .project = "trig", .waiting = 4 },
+    };
+    // The machine busy (the driver's 2.5 and others'): rig waits; with room, rig would start.
+    const cx: Cx = .{ .pool_n = 4, .busy = 3.5, .now_ms = 100_000 };
+    try std.testing.expectEqual(Wait.busy, mayStart(a, &ops, 2, cx));
+    try std.testing.expectEqual(Wait.go, mayStart(a, &ops, 3, cx));
+    try std.testing.expectApproxEqAbs(2.0, fairShare(a, &ops, "rig", 4), 1e-9);
+    // A driver under 0.5 CPUs is a runner that only waits: it counts for nothing.
+    var idle = ops;
+    idle[0].dbusy = 0.2;
+    try std.testing.expectEqual(Wait.go, mayStart(a, &idle, 2, cx));
+    // Its busy counts as busy: with outside load off, only cpuq's work counts.
+    try std.testing.expectApproxEqAbs(2.5, busyNow(a, &ops, null, false, 4, 4, 0), 1e-9);
 }
 
 test "admission: within a project, the run running the fewest goes first" {

@@ -192,6 +192,11 @@ the kernel enforces. The runs it starts stay in that scope. Whatever it leaves i
 killed when it ends. Where `systemd-run --user` doesn't work, it runs as it is, and `cpuq cap`
 watches the slow way.
 
+A driver is in the pool as a run with no task, so status lists it. Once a second it measures what
+its runner's own process tree keeps busy, the runs it starts left out. From 0.5 CPUs that counts
+against its project's share and as busy, and status flags it (`driver_cpu`: the driver computes
+N CPUs itself; run its work as tasks).
+
 `cpuq hook` accepts `--driver` only for a test runner (swarm, rip, a script named `run`, `run.sh`
 or `run-tests*`, or one under `test/` or `tests/`): a build under it would be no task of its own.
 One build is a driver too: Rig's split build with `RIG_UNIT_LAUNCHER` a `cpuq run`, which makes

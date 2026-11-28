@@ -31,6 +31,10 @@ pub const JsonRun = struct {
     running_tasks: []const JsonTask = &.{},
     /// Its cpuq is stopped (Ctrl-Z): its tasks are stopped, and it counts in no share.
     stopped: bool = false,
+    /// `cpuq run --driver`: a test runner, no task of its own, and the CPUs its own process tree
+    /// keeps busy, the runs it starts left out (counted against its project's share from 0.5).
+    driver: bool = false,
+    driver_busy: f64 = 0,
     /// `cpuq drain`: the CPUs its command runs on (`pin`), the CPUs it isolates (those with their
     /// SMT siblings), and the busy CPUs work from outside it keeps on them (Linux), with the
     /// busiest such process ("name (pid)").
@@ -46,7 +50,8 @@ pub const JsonRun = struct {
     /// runs more than one job), "stopped" (its cpuq is stopped), "capped" (tasks queued under
     /// its own -c while the machine has room: `cpuq limit` raises it); for a drain, "idle_drain"
     /// (its command keeps under 0.25 CPUs busy), "long_drain" (past config `drain_timeout`) and
-    /// "noisy" (work from outside it keeps 0.1 CPUs or more busy on its CPUs).
+    /// "noisy" (work from outside it keeps 0.1 CPUs or more busy on its CPUs); for a driver,
+    /// "driver_cpu" (its own tree keeps 0.5 CPUs or more busy).
     flags: []const []const u8 = &.{},
     /// Its tasks ended (passed or failed) of all, with those that failed.
     progress: ?JsonProgress = null,

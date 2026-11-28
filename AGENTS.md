@@ -138,7 +138,8 @@ A runner whose tests are independent runs them as tasks:
     cpuq run --label proj:test -n "$(./test/count)" -t 2m -- sh -c './test/one "$CPUQ_TASK"'
 
 A runner that starts a `cpuq run` per test (swarm, `test/run`) runs under `--driver`: it is no task
-of its own, and each run it starts is admitted on its own. Limit each program it starts with `cpuq cap`, never with
+of its own, and each run it starts is admitted on its own. What the runner computes itself (from
+0.5 CPUs) counts against its project's share, and status flags it: run that work as tasks. Limit each program it starts with `cpuq cap`, never with
 a watchdog that lists every process (`ps`):
 
     cpuq run --label proj:test --driver -- ./test/run

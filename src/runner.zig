@@ -226,7 +226,7 @@ fn runDriver(ctx: *Ctx, o: RunOptions) u8 {
         return if (err == error.FileNotFound) exit_notfound else exit_noexec;
     };
     sys.setChild(pid);
-    const w = sys.waitChild(pid);
+    const w = op.watchDriver(ctx, o.label, runopts.joinCommand(ctx, o.cmd), pid);
     if (kill_path) |kp| _ = writeSmall(kp, "1");
     switch (w.exit) {
         .code => |c| return c,

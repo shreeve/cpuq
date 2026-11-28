@@ -1244,6 +1244,87 @@ fn envBudget(ctx: *Ctx) ?u32 {
     return policy.parseCount(s) orelse main.fail("CPUQ_BUDGET must be a whole number of CPUs, at least 1, not '{s}'", .{s});
 }
 
+// --- Drivers -------------------------------------------------------------------------------
+
+/// A `--driver`'s cpuq while its runner runs: in the pool as a record of its own (no task), it
+/// measures once a second what the runner's process tree keeps busy itself, the trees of the runs
+/// it starts left out, and notes it (`dbusy`) for the line, which counts it against the project's
+/// share and as busy, and for status. Returns how the runner ended.
+pub fn watchDriver(ctx: *Ctx, label: []const u8, cmd: []const u8, child: c.pid_t) sys.Waited {
+    const a = ctx.arena;
+    var pool = Pool.open(ctx.io, a, main.stateDir(ctx)) catch return sys.waitChild(child);
+    const project = projectOf(ctx, .{ .label = label });
+    var rec: Op = .{
+        .driver = true,
+        .pid = sys.getpid(),
+        .project = project,
+        .label = if (label.len != 0) label else "driver",
+        .weight = weightOf(ctx, project),
+        .tasks = 0,
+        .limit = 0,
+        .since = main.nowSeconds(ctx.io),
+        .cmd = cmd,
+    };
+    pool.lock();
+    const file = pool.enter(&rec) catch {
+        pool.unlock();
+        return sys.waitChild(child);
+    };
+    pool.unlock();
+    var last_ms: i64 = 0;
+    var last_ns: u64 = 0;
+    while (true) {
+        if (sys.reapChild(child)) |w| {
+            pool.lock();
+            pool.leave(file, rec);
+            pool.unlock();
+            return w;
+        }
+        const now = sys.monoMs();
+        if (now - last_ms >= 1000) {
+            var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            defer arena.deinit();
+            const sa = arena.allocator();
+            pool.lock();
+            const ops = pool.scan(sa);
+            pool.unlock();
+            const own = driverCpu(sa, sys.processes(ctx.io, sa), child, ops);
+            if (last_ms != 0) {
+                rec.dbusy = @as(f64, @floatFromInt(own -| last_ns)) / 1e6 / @as(f64, @floatFromInt(@max(now - last_ms, 1)));
+                pool.lock();
+                pool.write(file, rec) catch {};
+                pool.unlock();
+            }
+            last_ms = now;
+            last_ns = own;
+        }
+        var ts: c.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+        _ = c.nanosleep(&ts, null);
+    }
+}
+
+/// The CPU time (ns, each process's own) of the runner's process tree, less the trees of the runs
+/// in it (`cpuq run`s it started, each a record in the pool). A process that ends between two
+/// looks counts until it ends.
+fn driverCpu(a: std.mem.Allocator, procs: []const sys.Proc, runner: c.pid_t, ops: []const Op) u64 {
+    const in_tree = a.alloc(bool, procs.len) catch return 0;
+    @memset(in_tree, false);
+    sys.markTree(procs, runner, in_tree);
+    const runs = a.alloc(bool, procs.len) catch return 0;
+    @memset(runs, false);
+    for (ops) |o| if (!o.driver) {
+        const at = for (procs, 0..) |p, i| {
+            if (p.pid == o.pid) break i;
+        } else continue;
+        if (in_tree[at]) sys.markTree(procs, o.pid, runs);
+    };
+    var total: u64 = 0;
+    for (procs, in_tree, runs) |p, mine, theirs| if (mine and !theirs) {
+        total += p.own_ns;
+    };
+    return total;
+}
+
 // --- Nested runs ---------------------------------------------------------------------------
 
 /// Whether this process runs inside a task: CPUQ_OP names a live run, or else an ancestor
@@ -1257,12 +1338,13 @@ pub fn nested(ctx: *Ctx) bool {
     if (ops.len == 0) return false;
     if (ctx.env.get("CPUQ_OP")) |op_text| {
         const ticket = std.fmt.parseInt(u64, op_text, 10) catch 0;
-        for (ops) |o| if (o.ticket == ticket) return true;
+        for (ops) |o| if (o.ticket == ticket and !o.driver) return true;
     }
+    // A driver's runs are runs of their own, not nested in it.
     var pid = c.getppid();
     var hops: u32 = 0;
     while (pid > 1 and hops < 64) : (hops += 1) {
-        for (ops) |o| if (o.pid == pid) return true;
+        for (ops) |o| if (o.pid == pid and !o.driver) return true;
         pid = sys.parentOf(pid) orelse return false;
     }
     return false;
