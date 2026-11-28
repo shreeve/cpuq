@@ -47,6 +47,8 @@ It fails if a ranking no longer exists (a weakly fair run that starves, the sear
 | `CpuqModel/Certs/*.lean` | The certificates, written by `scripts/GenCerts.lean`, each with the theorems the kernel checks |
 | `CpuqModel/Served.lean` | Waiters and drains served, proved for the configurations certified |
 | `CpuqModel/Contest.lean` | 0.40.0, contested CPUs: the admission rules; the five properties proved for every configuration with two rule changes, and the gaps of the design as written as reachable states |
+| `CpuqModel/Stream.lean` | 0.40: runs and drains that leave and arrive again, so arrivals never stop; `run_starts`, no-starvation's strongest true form |
+| `CpuqModel/StreamCex.lean` | 0.40: renamed states look alike to the rules (`Sh`); a cycle repeated forever is a run (`cycle_run`); the two infinite runs where a run waits forever while arrivals go on |
 | `CpuqModel/Contest035.lean` | The slot rules before 0.40.0 hold a CPU idle while a task waits (a reachable state of `moveX` under `Rules.released`) |
 
 ## The model
@@ -388,15 +390,79 @@ file).
 | The line: a run starts only as its project's first waiter; over share, only with room and first in line among the projects' first waiters | `line_order` | any rules |
 | Within a project a run never starts a task while a waiter of its project comes before it: a newer run holding nothing goes before a long run, and a run that has just started goes behind the others holding nothing | `project_turn` | any rules |
 | … the long run's task ends and the newer run, never started, goes first | `newer_run_turn` | (trace) |
-| … each new run of a project goes before a run of the project that started before and waits holding nothing; a stream of new runs would hold it as long as the stream lasts | `newcomers_first` | (trace) |
+| … each new run of a project goes before a run of the project that started before and waits holding nothing | `newcomers_first` | (trace) |
+| 3 with arrivals that never stop (`Stream.lean`): a waiting run starts a task if no new run of its own project arrives, its project's tasks end, one tick passes, and again and again the gates are open while fewer than 4T tasks run | `run_starts` | any rules |
+| … the last condition holds when fewer than 4 × (pool − `drainMax`) tasks ever run at once and the gates open again and again | `run_starts_gates` | any rules |
+| 3 as asked fails: new runs of its own project starve a waiting run, every other condition holding | `same_project_starves` | (infinite run) |
+| 3 as asked fails: under share, gates always open, no run of its project arriving, 4T tasks run at every step and each place freed under 4T goes to another project's run first in the pass | `backstop_starves` | (infinite run) |
 
 `no_starvation` assumes a time after which nothing arrives (`calm`), that a run with a task
 running later sees one end (`ends`, A-term), that the gates are open at times without end
 (`gates`) and that ticks keep coming (`time`), and a pool of at least one CPU. A configuration
 has finitely many runs and drains and each arrives once, so `calm` always holds
-(`no_starvation_all`). Arrivals that never stop (a stream of new runs) are not modelled and not
-proved: the 4T backstop is a shared limit that under-share starts race for, and the pass takes
-them in no order the design fixes, so a stream could take every opening ahead of one waiter.
+(`no_starvation_all`).
+
+### Arrivals that never stop (`Stream.lean`, `StreamCex.lean`)
+
+`Stream.lean` adds two moves: a run with nothing waiting or running leaves (`leave`), a drain that
+is over leaves (`leaveD`), and the slot may then arrive again as a new run or drain with a new
+ticket. So runs and drains arrive forever, with at most `nr` runs and `nd` drains present at once;
+the theorems hold for every configuration, so for every such bound. Each move ends with the pass.
+The invariant, the closed pass and start stamps never in the future carry over (`reachS_inv`,
+`reachS_last`).
+
+The property as asked ("under fairness, a waiting run eventually starts a task while arrivals never
+stop") is false, in two ways, each an infinite run of the model checked by the kernel:
+
+- **New runs of its own project** (`same_project_starves`, 1 CPU, one project). A run that has
+  started before waits; each new run of its project has never started, so it goes first
+  (`projFirst`), and a new one arrives while the last one runs. Every task ends, ticks come, the
+  gates are always open and the backstop never holds a task.
+- **The backstop race** (`backstop_starves`, 1 CPU, five projects). The waiting run's project is
+  under share at every step, the gates are always open, and no run of its project arrives. One run
+  of each of four other projects holds a task (each under share at 0), so 4T = 4 run. Each task that
+  ends frees a place under 4T that two under-share runs may take, the waiting run and the next run
+  of that project; the design fixes no order between them, the pass takes the other, and the
+  waiting run never starts. Argued, not proved: the race needs more than 3T active projects or a
+  stream of urgent runs, since under-share starts give each project at most ⌈T·w/W⌉ tasks and,
+  once the waiting run's project holds nothing, only urgent first tasks outrank it for room.
+
+The candidate "a project stays over share forever while room never opens" is not a counterexample:
+`run_starts` shows the run starts once its project's tasks end, as long as no new run of its
+project arrives and the backstop leaves room.
+
+`run_starts` is the strongest form that holds. A run `r` waits at time `n`; from then on:
+
+- (`noNew`) no new run of `r`'s project arrives (other projects' runs and drains arrive freely);
+- (`ends`) every task of `r`'s project that runs later ends (each `-t`);
+- (`htime`) one tick passes;
+- (`hroom`) at times without end, the gates are open and fewer than 4T tasks run.
+
+Then `r` starts a task. Nothing is assumed about `-c` (once `r`'s tasks end, its `-c` ≥ 1 allows
+one), `drain_max`, drains, or other projects' tasks. The proof: `r` starts nothing, so its own
+tasks end; a run of its project whose last start is no later than `r`'s may start at most once
+more (after a tick its new stamp is later, and `r` goes before it); so the project's running tasks
+plus twice those runs only go down (`phi`, `pre_phi`, `pass_phi`), and every task of the project
+ending lowers it. The project then holds nothing, is under share, and at the next time the gates
+are open under the backstop its first waiter starts (`first_exists`), against the closed pass.
+Proved needed: `noNew` (`same_project_starves`) and the backstop half of `hroom`
+(`backstop_starves`). Argued, not proved: the gates half (closed gates start nothing); `htime` (a
+run of the project that starts in the tick of `r`'s last start, with an older ticket, ties `r`'s
+stamp and goes first again and again); `ends` (a task that never ends keeps the project over
+share). `run_starts_gates` gives `hroom` from a
+bound: fewer than 4 × (pool − `drainMax`) tasks ever running at once, and gates open again and
+again.
+
+The counterexamples are cycles repeated forever. A cycle never returns to the same state, since
+tickets and the tick count grow; it returns to the same state with tickets and stamps renamed
+(values below a bound kept, the others moved up). The rules read tickets and stamps only through
+comparisons, so renamed states take the same moves to renamed states (`Sh.stepS_`); `cycle_run`
+turns one kernel-checked round into an infinite run.
+
+Not proved with arrivals that never stop: a waiting drain starts. A drain waits for older drains,
+the `drainMax` bound and (`drainFifo`) older runs that hold nothing; the first two are finitely many
+and end, but an older run that waits holding nothing can be starved as above, and the drain behind
+it waits with it.
 
 What it does not cover: CPU time between running tasks (the kernel's part); measurement noise
 and multi-threaded tasks (busy is exactly the computing tasks); separate cpuq processes racing
