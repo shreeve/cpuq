@@ -1089,7 +1089,7 @@ t_stack_limit() {
 
 t_status() {
   setup status
-  "$CPUQ" run -n 4 --label s:build -- "$BURN" -4 1.5 2>/dev/null & wait_running 2
+  "$CPUQ" run -n 4 -c 2 --label s:build -- "$BURN" -2 5 2>/dev/null & local sb=$!; wait_running 2
   "$CPUQ" run --label s:big -- true & wait_waiters 1
   local s; s=$("$CPUQ" status --no-usage)
   local j; j=$("$CPUQ" status --json | python3 -c 'import json, sys
@@ -1099,7 +1099,7 @@ h = s["runs"][0]; w = s["waiters"][0]
 print(s["schema"], s["version"] == sys.argv[1].split()[1], s["admit"], s["budget"], len(s["pool"]), s["capacity"], s["running"], s["gate"]["state"], s["memory_pressure"],
       0 < m["used"] <= m["total"], h["label"], h["tasks"], h["running"], w["label"], w["order"], w["why"].startswith("1st in line"),
       " ".join(sorted("%s:%.1f" % (p["name"], p["fair"]) for p in s["projects"])))' "$("$CPUQ" --version)")
-  wait
+  kill -TERM $sb 2>/dev/null; wait
   echo "$s" | sed 's/^/  | /'
   check "status shows the pool, the run and the waiter with why it waits" "[[ '$s' == *\"dir     $CPUQ_DIR/v3\"* && '$s' == *'pool    2 CPUs'* && '$s' == *s:build* && '$s' == *s:big* && '$s' == *'1st in line'* && '$s' == *'memory  '*' GB used'* ]]"
   check "status --json: schema 3, the pool, runs, waiters and projects with their share (got '$j')" "[ '$j' = '3 True contested 2 2 2 2 open off True s:build 4 2 s:big 1 True s:2.0' ]"
