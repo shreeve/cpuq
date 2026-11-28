@@ -4,6 +4,10 @@ User-visible changes to cpuq. Each version's section is its release notes.
 
 ## 0.41.1 — 2026-11-28
 
+- **A run's project is its label's.** A run took its project from the repository it ran in
+  before its label, and on burst every run sits inside the home folder, itself a repository: em,
+  emdb and trig all became one project, "shreeve", and shared nothing fairly. The label's
+  `project` now comes first.
 - **A drain holds its cores at most `drain_timeout` while anyone waits.** Its own `-t` (up to
   2h) now runs on only on an otherwise idle machine: past `drain_timeout` (default 20m) with any
   run or drain waiting, it is stopped (exit 124; history `stopped: drain_timeout, others

@@ -1323,10 +1323,13 @@ fn outDir(ctx: *Ctx, project: []const u8) ![]const u8 {
 
 /// The project a run counts for: the repo it runs in (each worktree counts as its repo), else
 /// its label's project, else "-".
+/// A run's project: its label's (`project:task`), else the repository it runs in, else "-". The
+/// label comes first: on burst every run sits inside the home folder, itself a repository, which
+/// made every project one.
 pub fn projectOf(ctx: *Ctx, o: Opts) []const u8 {
+    if (o.label.len != 0) return std.mem.sliceTo(o.label, ':');
     const cwd = std.process.currentPathAlloc(ctx.io, ctx.arena) catch "";
     if (repos.repoAt(ctx, cwd)) |name| return name;
-    if (o.label.len != 0) return std.mem.sliceTo(o.label, ':');
     return "-";
 }
 
