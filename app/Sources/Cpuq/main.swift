@@ -17,6 +17,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var status: Status?
     private var problem: String?
     private var timer: Timer?
+    /// Held while the window is open, so App Nap leaves the poll timer on time.
+    private var napGuard: NSObjectProtocol?
     private var polling = false
     /// A poll asked for while one was under way: run once it is done.
     private var repoll = false
@@ -96,7 +98,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     /// Polls every 3 seconds while the window is open, every 10 while it is closed: the chip and
     /// the notifications need no more.
     private func schedulePolls() {
-        let every: TimeInterval = graphsWindow?.isVisible ?? false ? 3 : 10
+        let visible = graphsWindow?.isVisible ?? false
+        // While the window is open its polls are what it shows: keep macOS's App Nap from
+        // stretching the timer to a minute or more behind other windows (gaps read as idle).
+        if visible, napGuard == nil {
+            napGuard = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep], reason: "cpuq polls the machines its open window shows")
+        } else if !visible, let g = napGuard {
+            ProcessInfo.processInfo.endActivity(g)
+            napGuard = nil
+        }
+        let every: TimeInterval = visible ? 3 : 10
         guard timer?.timeInterval != every else { return }
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: every, repeats: true) { [weak self] _ in
