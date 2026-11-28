@@ -315,6 +315,17 @@ filling them:
   kills those groups still running (a group whose leader has a different start time is someone
   else's by now), so a CPU is never shared with an orphan.
 
+## cpuq limit: change a run's -c
+
+    cpuq limit TICKET|PID|LABEL -c C [--host HOST]
+
+A run's `-c` can change while it runs: `cpuq limit emdb:model -c 64`, or `-c 75%` of the pool.
+Name it as `cpuq kill` does, by the ticket `cpuq status` shows, its cpuq's pid, or its label when
+only one run has it. Raised, the run takes free CPUs at once, in the line's order. Lowered, it
+stops filling the CPUs beyond the new limit and gives each back as its tasks end; nothing is
+killed. `cpuq status` flags a run held back by its own `-c` (`capped`): tasks queued while CPUs
+are free. A drain's CPUs are fixed when it starts.
+
 ## cpuq drain: timing
 
     cpuq drain -c N  [--max T] [-t T] [--label L] [--] CMD ARGS...

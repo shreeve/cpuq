@@ -386,7 +386,7 @@ fn loop(r: *Run) void {
         reap(r);
         signals(r);
         timeouts(r);
-        if (r.rec.drain) idleDrain(r);
+        if (r.rec.drain) idleDrain(r) else if (r.pool.takeLimit(r.rec.pid)) |n| setLimit(r, n);
         if (r.running.items.len == 0 and (r.pending() == 0 or r.stopping_since != 0)) break;
         if (got_tstp.swap(false, .acq_rel)) suspend_(r);
         // A single run's signal while it waits ends it: nothing runs.
@@ -517,6 +517,22 @@ fn idleDrain(r: *Run) void {
         t.timed_out = true;
         signalTask(r, t.*, .TERM);
     };
+}
+
+/// `cpuq limit`: hold at most `n` CPUs from now on. Raised, it asks the line for more at once;
+/// lowered, it stops filling the CPUs beyond `n` and gives each back as its tasks end. Nothing
+/// is killed.
+fn setLimit(r: *Run, n_in: u32) void {
+    const n = @max(1, @min(n_in, @as(u32, @intCast(r.pool_cpus.len))));
+    if (!r.single) std.debug.print("cpuq: now up to {d} CPU{s} (was {d}), by cpuq limit\n", .{ n, if (n == 1) "" else "s", r.limit });
+    r.limit = n;
+    r.rec.limit = n;
+    var kept: u32 = 0;
+    for (r.slots.items) |s| if (!s.draining) {
+        kept += 1;
+    };
+    while (kept > n) : (kept -= 1) drainOne(r);
+    r.event = true;
 }
 
 fn signalTask(r: *Run, t: Task, sig: c.SIG) void {
@@ -1181,6 +1197,65 @@ pub fn cmdDrain(ctx: *Ctx, args: []const [:0]const u8) u8 {
     if (o.timeout_s == null) o.timeout_s = @min(@max(ctx.cfg.drain_timeout_s, 1), drain_ceiling_s);
     if (o.drain_all and o.timeout_s.? > drain_all_ceiling_s) return main.usageError("a drain with --all holds the whole machine for at most 20m (-t); time on fewer CPUs with -c N for longer", .{});
     return run(ctx, o);
+}
+
+/// `cpuq limit OP -c C [--host HOST]`: changes how many CPUs a running operation of this
+/// user's may hold (its -c), named by its ticket, its cpuq's pid or its label: a count, or a
+/// percentage of the pool. Raised, it takes free CPUs in the line's order; lowered, it gives
+/// CPUs back as their tasks end.
+pub fn cmdLimit(ctx: *Ctx, args: []const [:0]const u8) u8 {
+    var want: ?[]const u8 = null;
+    var cpus: ?[]const u8 = null;
+    var host: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg: []const u8 = args[i];
+        if ((std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--host")) and i + 1 < args.len) {
+            if (arg[1] == 'c') cpus = args[i + 1] else host = args[i + 1];
+            i += 1;
+        } else if (want == null and arg.len != 0 and arg[0] != '-') {
+            want = arg;
+        } else return main.usageError("limit takes one operation (its ticket, pid or label) and -c C", .{});
+    }
+    const target = want orelse return main.usageError("limit needs the operation: its ticket, pid or label (cpuq status shows them)", .{});
+    const value = cpus orelse return main.usageError("limit needs -c C: the CPUs it may hold, a count or a percentage (50%)", .{});
+    const pct = std.mem.endsWith(u8, value, "%");
+    const count = policy.parseCount(if (pct) value[0 .. value.len - 1] else value) orelse return main.usageError("-c needs a whole number of CPUs or a percentage (50%), not '{s}'", .{value});
+    if (pct and count > 100) return main.usageError("-c takes at most 100%, not '{s}'", .{value});
+    if (host) |h| return @import("records.zig").onHost(ctx, h, ctx.arena.print("cpuq limit {s} -c {s}", .{ target, value }) catch return 125);
+    main.loadConfig(ctx);
+    const a = ctx.arena;
+    var pool = Pool.open(ctx.io, a, main.stateDir(ctx)) catch |err| main.fail("pool: {t}", .{err});
+    const pool_cpus = cpus_mod.list(ctx.io, a, if (ctx.cfg.cpus.len != 0) ctx.cfg.cpus else null, envBudget(ctx) orelse ctx.cfg.budget);
+    pool.lock();
+    const ops = pool.scan(a);
+    pool.unlock();
+    const n_num = std.fmt.parseInt(i64, target, 10) catch -1;
+    var hits: std.ArrayList(Op) = .empty;
+    for (ops) |o| {
+        if ((n_num >= 0 and (o.ticket == @as(u64, @intCast(n_num)) or o.pid == n_num)) or std.mem.eql(u8, o.label, target)) hits.append(a, o) catch {};
+    }
+    if (hits.items.len == 0) {
+        std.debug.print("cpuq: no operation here is {s}\n", .{target});
+        return 1;
+    }
+    if (hits.items.len > 1) {
+        std.debug.print("cpuq: {d} operations are {s}; name one by its ticket:\n", .{ hits.items.len, target });
+        for (hits.items) |o| std.debug.print("  {d}  pid {d}  {s}  -c {d}  {s}\n", .{ o.ticket, o.pid, o.label, o.limit, o.cmd });
+        return 1;
+    }
+    const o = hits.items[0];
+    if (o.drain) {
+        std.debug.print("cpuq: {d} ({s}) is a drain: its CPUs are fixed when it starts\n", .{ o.ticket, o.label });
+        return 1;
+    }
+    const pool_n: u32 = @intCast(pool_cpus.len);
+    const n = @max(1, @min(if (pct) @as(u32, @intCast(@max(1, (@as(u64, pool_n) * count) / 100))) else count, pool_n));
+    pool.askLimit(o.pid, n) catch |err| main.fail("pool: {t}", .{err});
+    pool.wakeOp(o.ticket);
+    ctx.out.print("{d} ({s}): up to {d} CPU{s}, was {d}\n", .{ o.ticket, o.label, n, if (n == 1) "" else "s", o.limit }) catch {};
+    ctx.out.flush() catch {};
+    return 0;
 }
 
 /// `cpuq kill OP`: ends an operation of this user's on this machine, named by its ticket, its

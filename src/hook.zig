@@ -28,6 +28,25 @@ pub const Advisor = struct {
     advise: *const fn (ctx: *anyopaque, cmd: []const u8) ?Refusal,
 };
 
+/// Whether the command points cpuq at a pool of its own (`CPUQ_DIR=...`): its runs then wait in
+/// a line nobody else's are in, and the load they make falls on the machine's real line unseen.
+pub fn privatePool(command: []const u8) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, command, i, "CPUQ_DIR=")) |at| : (i = at + 1) {
+        // The name alone, not the tail of another (MY_CPUQ_DIR=).
+        if (at == 0 or !(std.ascii.isAlphanumeric(command[at - 1]) or command[at - 1] == '_')) return true;
+    }
+    return false;
+}
+
+test "a private pool is seen" {
+    try std.testing.expect(privatePool("CPUQ_DIR=/tmp/x cpuq run -- ./burn"));
+    try std.testing.expect(privatePool("export CPUQ_DIR=$TMP/pool; ./test/hunt"));
+    try std.testing.expect(privatePool("env CPUQ_DIR=/tmp/p ./hunt.sh"));
+    try std.testing.expect(!privatePool("MY_CPUQ_DIR=/tmp/x ./run"));
+    try std.testing.expect(!privatePool("echo $CPUQ_DIR"));
+}
+
 /// Checks one shell command line. `project` names the job in suggested labels.
 pub fn check(a: std.mem.Allocator, command: []const u8, project: []const u8, advisor: ?Advisor) ?Refusal {
     const ctx: Ctx = .{ .a = a, .project = project, .advisor = advisor };

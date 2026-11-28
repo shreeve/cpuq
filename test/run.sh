@@ -462,6 +462,25 @@ EOF
   check "a drain of the whole machine holds it at most 20m (${long##*rc })" "[ '${long##*rc }' = 2 ]"
 }
 
+t_limit() {
+  # cpuq limit OP -c C: a running run's -c changes. Raised, it takes free CPUs at once; lowered,
+  # it gives CPUs back as its tasks end, killing none. Status flags a run held back by its -c.
+  setup limit "budget = 4"
+  "$CPUQ" run -n 12 -c 1 -t 1h --label l:many -- sh -c 'sleep 1' 2>/dev/null & local r=$!
+  wait_held 1
+  local flag; flag=$("$CPUQ" status --json --no-usage | python3 -c 'import json,sys; s=json.load(sys.stdin); print(",".join(f for h in s["holders"] for f in h["flags"]))')
+  local out; out=$("$CPUQ" limit l:many -c 3); local rc=$?
+  local up=no; wait_held 3 5 && up=yes
+  "$CPUQ" limit l:many -c 25% >/dev/null
+  local down=no; wait_held 1 5 && down=yes
+  wait $r; local rr=$?
+  check "cpuq limit raises a run's -c at once and lowers it as tasks end, killing none (flag: $flag; $out; up: $up, down: $down, rc $rr)" \
+    "[ $rc = 0 ] && [ $up = yes ] && [ $down = yes ] && [ $rr = 0 ] && [ '$flag' = capped ]"
+  local miss; miss=$("$CPUQ" limit l:nothing -c 2 2>&1; echo "rc $?")
+  local bad; bad=$("$CPUQ" limit l:many 2>&1 >/dev/null; echo "rc $?")
+  check "cpuq limit names no operation: 1; no -c: 2 (${miss##*rc } ${bad##*rc })" "[ '${miss##*rc }' = 1 ] && [ '${bad##*rc }' = 2 ]"
+}
+
 t_backfill() {
   # While a drain waits for a long task, the CPUs it gathered don't sit idle: a task whose time
   # limit ends before the drain could start anyway runs on them (one task or many). A task that
@@ -2189,7 +2208,7 @@ f = open(sys.argv[1]); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$sp/p/held
 
 # --- cpuq jobs and the agent (until they go) -------------------------------------------------
 
-TESTS=${*:-budget tasks pack cpus_limit timeout retry wait_max share fair order drain backfill drain_turn drain_part lock_stuck storm kill ctrl_z nested driver removed \
+TESTS=${*:-budget tasks pack cpus_limit timeout retry wait_max share fair order drain backfill drain_turn drain_part limit lock_stuck storm kill ctrl_z nested driver removed \
   kill_holder leftovers leaked_descendant kill_waiter term_waiting lost_seq long_command waiters_cpu \
   exit_status direct_sigint terminal_sigint tasks_sigint ignored_signals stack_limit pin repin narrow \
   status progress usage zombie outside status_host history note wait record min_available min_disk hook \

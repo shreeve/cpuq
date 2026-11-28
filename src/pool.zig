@@ -34,6 +34,8 @@ pub const Pool = struct {
     ops: Io.Dir,
     wake: Io.Dir,
     grants: Io.Dir,
+    /// `cpuq limit`'s requests: a file named by the operation's pid, holding its new -c.
+    limits: Io.Dir,
     lock_file: Io.File,
 
     /// Opens (making it if need be) the pool under `state_dir`.
@@ -50,6 +52,7 @@ pub const Pool = struct {
             .ops = try subdir(io, dir, "ops"),
             .wake = try subdir(io, dir, "wake"),
             .grants = try subdir(io, dir, "grants"),
+            .limits = try subdir(io, dir, "limits"),
             .lock_file = try createShared(io, dir, "lock"),
         };
     }
@@ -163,6 +166,28 @@ pub const Pool = struct {
         const fd = std.c.open(fifo, .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true });
         if (fd < 0) return error.FifoFailed;
         return fd;
+    }
+
+    /// Asks the operation whose cpuq is `pid` to hold at most `n` CPUs from now on (`cpuq
+    /// limit`): a file named by its pid, which outlives a new ticket, written whole by a rename.
+    pub fn askLimit(p: *Pool, pid: i32, n: u32) !void {
+        var name_buf: [24]u8 = undefined;
+        var tmp_buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "{d}", .{pid});
+        const tmp = try std.fmt.bufPrint(&tmp_buf, ".{d}.tmp", .{pid});
+        var text_buf: [16]u8 = undefined;
+        try p.limits.writeFile(p.io, .{ .sub_path = tmp, .data = try std.fmt.bufPrint(&text_buf, "{d}\n", .{n}) });
+        try p.limits.rename(tmp, p.limits, name, p.io);
+    }
+
+    /// The new limit asked for the operation whose cpuq is `pid`, if any: read once and removed.
+    pub fn takeLimit(p: *Pool, pid: i32) ?u32 {
+        var name_buf: [24]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "{d}", .{pid}) catch return null;
+        var buf: [32]u8 = undefined;
+        const text = p.limits.readFile(p.io, name, &buf) catch return null;
+        p.limits.deleteFile(p.io, name) catch {};
+        return std.fmt.parseInt(u32, std.mem.trim(u8, text, " \n"), 10) catch null;
     }
 
     /// Wakes a waiting operation: one byte to its FIFO, never blocking. A full FIFO already

@@ -495,7 +495,7 @@ pub fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
 }
 
 /// Runs a cpuq command line on HOST through ssh: its output and exit status come back as its own.
-fn onHost(ctx: *Ctx, host: []const u8, remote: []const u8) u8 {
+pub fn onHost(ctx: *Ctx, host: []const u8, remote: []const u8) u8 {
     const r = std.process.run(ctx.arena, ctx.io, .{ .argv = &.{ "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, remote } }) catch return exit_failure;
     ctx.out.writeAll(r.stdout) catch {};
     ctx.out.flush() catch {};
