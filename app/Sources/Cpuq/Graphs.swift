@@ -74,7 +74,7 @@ final class GraphModel {
         let outside: Double
         let load: Double
         /// cpuq's gate then: open, or shut by memory pressure or a full disk; jobs wait even
-        /// beside room while it is shut.
+        /// beside free tokens while it is shut.
         var gate = "open"
         var gateText = "open"
         var gateOpen: Bool { gate == "open" }
@@ -82,9 +82,12 @@ final class GraphModel {
         var busy: Double? = nil
         /// The same for each CPU, in the kernel's order.
         var perCPU: [Double]? = nil
-        /// Room for more of cpuq's tasks (cpuq's `room`): positive, the first waiter starts a task
-        /// at its next look. Nil when unknown (the recorder's samples from before the app watched).
-        var room: Double? = nil
+        /// cpuq's tokens free: a waiter beside one starts at once. Nil when unknown (the
+        /// recorder's samples from before the app watched).
+        var free: Int? = nil
+        /// Each CPU whose token a run's task held (or a drain's command ran on), by the project
+        /// it counts for.
+        var holders: [Int: String] = [:]
     }
 
     /// A project's finished jobs, summed.
@@ -242,7 +245,8 @@ final class GraphModel {
         }
         cpuTicks = each
         samples.append(Sample(at: now, outside: s.outside.reduce(0) { $0 + $1.using }, load: s.load.first ?? 0,
-                              gate: s.gate.state, gateText: s.gate.text, busy: busy, perCPU: perCPU, room: s.room))
+                              gate: s.gate.state, gateText: s.gate.text, busy: busy, perCPU: perCPU, free: s.free,
+                              holders: Self.holders(s)))
         let cutoff = now.addingTimeInterval(-Self.keep)
         samples.removeAll { $0.at < cutoff }
         blocks.removeAll { ($0.to ?? now) < cutoff }
@@ -356,6 +360,12 @@ final class GraphModel {
 
     /// "1 task", "7 tasks".
     static func tasks(_ n: Int) -> String { n == 1 ? "1 task" : "\(n) tasks" }
+
+    /// Each CPU whose token a run's task holds (or a drain's command runs on), by the project
+    /// that run counts for.
+    static func holders(_ s: Status) -> [Int: String] {
+        s.holders.mapValues { group(s.runs[$0].label, s.runs[$0].note) }
+    }
 
     /// The CPUs a run keeps busy: its tasks', and a driver's own process tree's; nil while
     /// unmeasured.

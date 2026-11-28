@@ -3,6 +3,24 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.28.0 — 2026-11-28
+
+- **Reads cpuq 0.42's status (schema 4),** a strict token pool: the pool's CPUs less the reserve
+  are its tokens, and a task holds one while it runs. Needs cpuq 0.42.0 or later; a machine on
+  an older cpuq shows why it can't be read.
+- **The pool reads "8 tokens, 2 reserved"** beside Right Now, in the Jobs header (with the
+  tokens held and free, and any held back for work outside cpuq), in the chip's tooltip ("cpuq:
+  7 tasks · 8 tokens, 2 reserved · 1 free · 9.1 busy · 2 waiting") and under a large machine's
+  tiles.
+- **Tasks show on their token's CPU.** A cell whose token a run's task holds is tinted and filled
+  in that run's project color; in Per Core, each lane takes the color of the project whose task
+  held its token, pale while held and solid while busy. The reserve's CPUs have a dashed rim and
+  "R". A job's tooltip names the CPUs whose tokens it holds.
+- **Rose** means runs waiting while a token is free and the gate is open, and only a free token's
+  empty glass glows. A waiting run gives cpuq's reason ("1st in line; every token is held").
+- A run's tasks paused for a token show in its row ("1 paused for a token"). Tasks in the
+  background are gone, as cpuq has none.
+
 ## 0.27.0 — 2026-11-28
 
 - **A run says what's done and what failed:** "206 of 208 done · none failed", so its last tasks

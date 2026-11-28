@@ -45,7 +45,7 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
             } footer: {
-                Text("The menu bar item stays calm while all is well. It turns orange when jobs wait with room to spare or cpuq's gate is shut, and shows ☁ while a cloud machine runs, and for how long.")
+                Text("The menu bar item stays calm while all is well. It turns orange when jobs wait beside free tokens or cpuq's gate is shut, and shows ☁ while a cloud machine runs, and for how long.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -58,7 +58,7 @@ struct SettingsView: View {
             Section {
                 Toggle("Notify when something goes wrong", isOn: $notify)
             } footer: {
-                Text("Once each time it happens and lasts, on any machine watched: cpuq's gate shut (30 seconds); jobs waiting with room to spare (a minute); heavy work outside cpuq (3 minutes); a job that looks stuck, or a machine overloaded while another has room (10 minutes); a cloud machine up with nothing to do (15 minutes: its idle stop failed, and it is billing), with a button to stop it.")
+                Text("Once each time it happens and lasts, on any machine watched: cpuq's gate shut (30 seconds); jobs waiting beside free tokens (a minute); heavy work outside cpuq (3 minutes); a job that looks stuck, or a machine overloaded while another has room (10 minutes); a cloud machine up with nothing to do (15 minutes: its idle stop failed, and it is billing), with a button to stop it.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {

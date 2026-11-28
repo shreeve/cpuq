@@ -2,6 +2,50 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.42.0 — 2026-11-28
+
+A strict token pool. A machine has N tokens, one per CPU of the pool less the reserve. A task
+holds one while it runs and gives it back the moment it ends, so at most N tasks run at once,
+ever. Runs asking for 500 tasks between them still run N.
+
+- **Tokens.** N = the pool's CPUs less the reserve, at least 1. A task holds one token while it
+  runs; on Linux it is pinned to that token's CPU. `-c C` (or `-c P%`, of the tokens) is the most
+  a run holds at once; `cpuq limit` changes it while the run runs.
+- **`cpuq reserve N [--host HOST]`** sets aside the pool's last N CPUs, which are never handed
+  out (default 2). It is kept in the machine's config (`reserve = N`) and in force at once:
+  running tasks finish, and fewer start until fewer than the new N run. `cpuq reserve` alone
+  prints "N tokens, R reserved", and `cpuq budget` prints N. The `budget` config key and
+  `CPUQ_BUDGET` are gone (the key fails, naming `reserve`).
+- **A freed token goes to the first in line,** in 0.41's order, which the Lean model proves
+  starvation-free. Projects under their share go first (share = N × weight ÷ Σ weights), then
+  an `--urgent` run's first task, then the project running the fewest for its weight, then the
+  run running the fewest, then ticket. Within a project the order is: an urgent first task, then
+  fewer running, then the older of last start or arrival, then ticket.
+- **Drains take whole cores' tokens in one step.** Once its turn has come and the tokens of k
+  whole cores (siblings included, within `drain_max` of the tokens) are free, a drain takes them
+  all at once. Until then it holds nothing, and freed tokens go to runs as usual, so on a busy
+  machine a drain may wait; `--max` bounds that, and status says why it waits ("waits for 2 whole
+  cores to be free"). No task is on a drain's CPUs, since every task is on its own token's CPU.
+  `--cpus` must name tokens.
+- **Ctrl-Z gives tokens back.** A stopped run's tasks hold none. Continued, each task goes on
+  once it holds a token again.
+- **The outside-load gate holds tokens back.** While work outside cpuq keeps more CPUs busy
+  than cpuq leaves it (the reserve, and any CPU outside the pool), a token is held back for
+  each whole CPU over.
+- **Gone:** admission by measured busy, under-share starts past N, the 4T backstop, macOS
+  background demotion, and per-project cgroup slices and weights. A `--driver` keeps its
+  delegated scope (in `cpuq.slice`) for `cpuq cap`.
+- **Status:** "N tokens, R reserved; H held, F free" (and any held back), and each run's tasks
+  on their CPUs ("3 on 0-2"). The JSON is schema 4: `admit` is "tokens"; `tokens`,
+  `token_cpus`, `reserve`, `held`, `held_back` and `free` are added; `budget`, `capacity`,
+  `room` and each run's `demoted` and `demoted_for` are removed; each running task has its
+  `cpu`. The pool's state is in `v4/`.
+- Kept from 0.40 and 0.41: a drain past `drain_timeout` while anyone waits is stopped and its
+  tokens freed, whatever its `-t`; the line's two starvation fixes; drains' named and fast CPUs, SMT
+  siblings, noise watch and `--quiet-max`; a drain's history as its CPUs × the time held; a
+  waiting drain rereading `drain_max`; driver accounting; the tail and done/failed wording; the
+  hook.
+
 ## 0.41.1 — 2026-11-28
 
 - **A run's project is its label's.** A run took its project from the repository it ran in

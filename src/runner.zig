@@ -59,10 +59,6 @@ pub fn cmdRun(ctx: *Ctx, args: []const [:0]const u8) u8 {
         return remotes.runOn(ctx, o, h);
     }
     const inside = !o.driver and op.nested(ctx);
-    // Linux: a run of its own (not one inside a task) runs in a scope in its project's slice,
-    // so the kernel shares CPU time among projects by weight. This execs, or goes on as it is.
-    if (!inside and !o.driver) enterSlice(ctx, args, op.projectOf(ctx, .{ .label = o.label }));
-    if (ctx.env.get("CPUQ_SCOPE") != null) sliceWeight(ctx, op.projectOf(ctx, .{ .label = o.label }));
     if (o.tethered) tether();
     if (o.driver) return runDriver(ctx, o);
     // Where the command may report its progress (`DONE TOTAL FAILING`): the file `cpuq submit`
@@ -90,101 +86,10 @@ pub fn cmdRun(ctx: *Ctx, args: []const [:0]const u8) u8 {
     });
 }
 
-/// The systemd slice a project's runs go in: `cpuq-PROJECT.slice`, the name escaped as
-/// systemd-escape does (a dash would make it a slice inside another).
-pub fn sliceUnit(a: std.mem.Allocator, project: []const u8) []const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    out.appendSlice(a, "cpuq-") catch return "cpuq.slice";
-    for (project, 0..) |ch, i| {
-        const plain = std.ascii.isAlphanumeric(ch) or ch == '_' or ch == ':' or (ch == '.' and i != 0);
-        if (plain) out.append(a, ch) catch {} else out.print(a, "\\x{x:0>2}", .{ch}) catch {};
-    }
-    out.appendSlice(a, ".slice") catch {};
-    return out.items;
-}
-
-/// The cgroup folder of a unit in this user's systemd under the slice `slice`.
-fn unitCgroup(a: std.mem.Allocator, slice: []const u8, unit: []const u8) ?[:0]const u8 {
+/// The cgroup folder of a unit in this user's systemd under `cpuq.slice`.
+fn unitCgroup(a: std.mem.Allocator, unit: []const u8) ?[:0]const u8 {
     const uid = std.c.getuid();
-    return a.printSentinel("/sys/fs/cgroup/user.slice/user-{d}.slice/user@{d}.service/cpuq.slice/{s}/{s}", .{ uid, uid, slice, unit }, 0) catch null;
-}
-
-/// Linux, with `cgroups` on and systemd user scopes working: re-runs this `cpuq run` in a scope
-/// of its own (`cpuq-run-PID.scope`, delegated, so `cpuq cap` can give each program a cgroup
-/// beside the run's) in its project's slice. systemd-run and `cpuq _job` exec in place, so the
-/// pid, terminal and signals stay as they are. CPUQ_SCOPE marks the run inside, which never
-/// passes it on. Returns, to run as it is, when any of that isn't so.
-fn enterSlice(ctx: *Ctx, args: []const [:0]const u8, project: []const u8) void {
-    if (@import("builtin").os.tag != .linux or !ctx.cfg.cgroups) return;
-    if (ctx.env.get("CPUQ_SCOPE") != null) return;
-    const a = ctx.arena;
-    // A run a test runner starts stays in the runner's scope (`--driver`), in its project's
-    // slice already, and is stopped with it.
-    if (inDriverScope(ctx)) return;
-    const run = findExecutable(ctx, "systemd-run") orelse return;
-    const scopes = scopesWork(ctx, run);
-    if (scopes == .none) return;
-    const self = selfExe(a) orelse return;
-    var argv: std.ArrayList(?[*:0]const u8) = .empty;
-    const z = struct {
-        fn of(al: std.mem.Allocator, x: []const u8) ?[*:0]const u8 {
-            return (al.dupeSentinel(u8, x, 0) catch return null).ptr;
-        }
-    };
-    for ([_][]const u8{ run, "--user", "--scope", "--quiet", "--collect" }) |w| argv.append(a, z.of(a, w)) catch return;
-    if (scopes == .literal) argv.append(a, z.of(a, "--expand-environment=no")) catch return;
-    argv.append(a, z.of(a, a.print("--slice={s}", .{sliceUnit(a, project)}) catch return)) catch return;
-    argv.append(a, z.of(a, "--property=Delegate=yes")) catch return;
-    argv.append(a, z.of(a, "--property=OOMPolicy=continue")) catch return;
-    // A weight of its own (the default) turns the cpu controller on down the slices, so the kernel
-    // shares time among projects at all.
-    argv.append(a, z.of(a, "--property=CPUWeight=100")) catch return;
-    argv.append(a, z.of(a, a.print("--unit=cpuq-run-{d}", .{sys.getpid()}) catch return)) catch return;
-    for ([_][]const u8{ "--", self, "_job", "--", self, "run" }) |w| argv.append(a, z.of(a, w)) catch return;
-    for (args) |w| argv.append(a, w.ptr) catch return;
-    const out = a.allocSentinel(?[*:0]const u8, argv.items.len, null) catch return;
-    @memcpy(out, argv.items);
-    ctx.env.put("CPUQ_SCOPE", "1") catch return;
-    const envp = ctx.env.createPosixBlock(a, .{}) catch return;
-    _ = std.c.execve(out[0].?, out.ptr, @ptrCast(envp.slice.ptr));
-    // It didn't run: go on as it is.
-    _ = ctx.env.swapRemove("CPUQ_SCOPE");
-}
-
-/// Whether this process is in a `--driver`'s scope: CPUQ_CGROUP names one, and /proc/self/cgroup
-/// is inside it.
-fn inDriverScope(ctx: *Ctx) bool {
-    const scope = ctx.env.get("CPUQ_CGROUP") orelse return false;
-    if (!std.mem.startsWith(u8, std.fs.path.basename(scope), "cpuq-driver-")) return false;
-    var buf: [1024]u8 = undefined;
-    const text = Io.Dir.cwd().readFile(ctx.io, "/proc/self/cgroup", &buf) catch return false;
-    const at = std.mem.find(u8, text, "0::") orelse return false;
-    const own = std.mem.trimEnd(u8, std.mem.sliceTo(text[at + 3 ..], '\n'), " ");
-    const rel = std.mem.cutPrefix(u8, scope, "/sys/fs/cgroup") orelse return false;
-    return std.mem.startsWith(u8, own, rel);
-}
-
-/// Inside its scope: sets the project's slice to CPUWeight 100 × the project's weight, when it
-/// has another (systemctl, only then: a project of weight 1 has the default already, which a slice
-/// not yet showing its cpu.weight has too).
-fn sliceWeight(ctx: *Ctx, project: []const u8) void {
-    if (@import("builtin").os.tag != .linux) return;
-    const a = ctx.arena;
-    const slice = sliceUnit(a, project);
-    const path = unitCgroup(a, slice, "cpu.weight") orelse return;
-    var buf: [32]u8 = undefined;
-    const text = Io.Dir.cwd().readFile(ctx.io, path, &buf) catch "100";
-    const now = std.fmt.parseInt(u32, std.mem.trim(u8, text, " \n"), 10) catch 100;
-    const want = 100 * @import("policy.zig").weightFor(ctx.cfg, project);
-    if (now == want) return;
-    const ctl = findExecutable(ctx, "systemctl") orelse return;
-    var child = std.process.spawn(ctx.io, .{
-        .argv = &.{ ctl, "--user", "set-property", "--runtime", slice, a.print("CPUWeight={d}", .{want}) catch return },
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    }) catch return;
-    _ = child.wait(ctx.io) catch {};
+    return a.printSentinel("/sys/fs/cgroup/user.slice/user-{d}.slice/user@{d}.service/cpuq.slice/{s}", .{ uid, uid, unit }, 0) catch null;
 }
 
 /// The first option given that cpuq does not take (hook.removed_options: `cpuq run`'s and
@@ -214,12 +119,11 @@ fn runDriver(ctx: *Ctx, o: RunOptions) u8 {
     const argv = ctx.arena.allocSentinel(?[*:0]const u8, o.cmd.len, null) catch fail("out of memory", .{});
     for (o.cmd, 0..) |a, i| argv[i] = a.ptr;
     const unit = ctx.arena.print("cpuq-driver-{d}", .{sys.getpid()}) catch fail("out of memory", .{});
-    const slice = sliceUnit(ctx.arena, op.projectOf(ctx, .{ .label = o.label }));
-    const scoped = if (ctx.cfg.cgroups) scopedArgv(ctx, exe, argv, unit, slice) else null;
+    const scoped = if (ctx.cfg.cgroups) scopedArgv(ctx, exe, argv, unit) else null;
     // After scopedArgv, which may give the environment the user's XDG_RUNTIME_DIR.
     const envp = ctx.env.createPosixBlock(ctx.arena, .{}) catch fail("out of memory", .{});
     // Where that scope's cgroup is: when the runner ends, whatever it left in it is stopped.
-    const kill_path: ?[:0]const u8 = if (scoped != null) unitCgroup(ctx.arena, slice, ctx.arena.print("{s}.scope/cgroup.kill", .{unit}) catch "") else null;
+    const kill_path: ?[:0]const u8 = if (scoped != null) unitCgroup(ctx.arena, ctx.arena.print("{s}.scope/cgroup.kill", .{unit}) catch "") else null;
     sys.installForwarding();
     const spawned = if (scoped) |sv| sys.spawn(sv[0].?, sv, @ptrCast(envp.slice.ptr), .unchanged, .{ .pdeath = true }) else sys.spawn(exe, argv.ptr, @ptrCast(envp.slice.ptr), .unchanged, .{ .pdeath = true });
     const pid = spawned catch |err| {
@@ -259,7 +163,7 @@ fn untether() void {
 /// systemd-run and `cpuq _job` exec the command in place, so its pid stays the same. Whether
 /// scopes work is probed once and remembered for ten minutes ("scopes-ok" in the state
 /// directory), so a run never fails for want of one.
-fn scopedArgv(ctx: *Ctx, exe: [:0]const u8, argv: [:null]?[*:0]const u8, unit: []const u8, slice: []const u8) ?[*:null]const ?[*:0]const u8 {
+fn scopedArgv(ctx: *Ctx, exe: [:0]const u8, argv: [:null]?[*:0]const u8, unit: []const u8) ?[*:null]const ?[*:0]const u8 {
     if (@import("builtin").os.tag != .linux) return null;
     const run = findExecutable(ctx, "systemd-run") orelse return null;
     const scopes = scopesWork(ctx, run);
@@ -272,9 +176,8 @@ fn scopedArgv(ctx: *Ctx, exe: [:0]const u8, argv: [:null]?[*:0]const u8, unit: [
     // the command's shell sees it: `sh -c 'echo ${x%/job}'` would fail, or quietly change.
     if (scopes == .literal) head.append(a, "--expand-environment=no") catch return null;
     // A cgroup OOM inside it (a capped program's) is the program's business: the runner goes on.
-    head.appendSlice(a, &.{ "--property=Delegate=yes", "--property=OOMPolicy=continue", "--property=CPUWeight=100" }) catch return null;
+    head.appendSlice(a, &.{ "--property=Delegate=yes", "--property=OOMPolicy=continue", "--slice=cpuq.slice" }) catch return null;
     head.append(a, a.print("--unit={s}", .{unit}) catch return null) catch return null;
-    head.append(a, a.print("--slice={s}", .{slice}) catch return null) catch return null;
     head.appendSlice(a, &.{ "--", self, "_job", "--" }) catch return null;
     const out = a.allocSentinel(?[*:0]const u8, head.items.len + 1 + argv.len - 1, null) catch return null;
     for (head.items, 0..) |h, i| out[i] = (a.dupeSentinel(u8, h, 0) catch return null).ptr;

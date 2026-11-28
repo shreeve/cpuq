@@ -69,14 +69,16 @@ const usage =
     \\       cpuq jobs [--all]
     \\       cpuq job [ID|last] [--wait [--max-wait S]] [--tail N] [--json] [--cancel]
     \\       cpuq hook                (an agent harness's pre-command hook)
-    \\       cpuq budget | --version | --help
+    \\       cpuq reserve [N] [--host HOST] | cpuq budget
+    \\       cpuq --version | --help
     \\
-    \\run: M tasks of CMD (none: one, with the terminal), each counting as one CPU. A run starts
-    \\a task at once while its project runs under its fair share of the pool, else when the
-    \\machine has room (a task that waits on I/O leaves room); the kernel shares the CPUs:
+    \\run: M tasks of CMD (none: one, with the terminal). The machine has N tokens, one per CPU
+    \\less the reserve; a task holds one while it runs (pinned to its CPU on Linux), so at most
+    \\N run at once. A freed token goes to the first in line, projects under their fair share
+    \\first:
     \\  -n M                  M tasks; each gets CPUQ_TASK (1..M) and CPUQ_TASKS, and its
     \\                        output goes to a file of its own
-    \\  -c C | -c P%          run at most C tasks at once, or P% of the pool (default: as the
+    \\  -c C | -c P%          run at most C tasks at once, or P% of the tokens (default: as the
     \\                        line allows)
     \\  -t T                  each task's time limit, wall time (30s, 10m, 2h; config
     \\                        `timeout`, 1h)
@@ -95,10 +97,10 @@ const usage =
     \\
     \\commands:
     \\  drain                 for timing: after the runs queued before it that run nothing yet,
-    \\                        N whole cores (-c N, their SMT siblings too, at most drain_max,
-    \\                        half the pool by default) are isolated for CMD at once: pinned on Linux (CPUQ_CPUS
-    \\                        lists them), others' tasks kept off them; macOS demotes others'
-    \\                        tasks (background priority). --cpus LIST names them,
+    \\                        it takes the tokens of N whole cores (-c N, their SMT siblings
+    \\                        too, at most drain_max, half the tokens by default) at once, when
+    \\                        they are free, for CMD: pinned on Linux (CPUQ_CPUS lists them);
+    \\                        it holds none while it waits. --cpus LIST names them,
     \\                        --prefer fast takes performance cores first; --quiet-max X
     \\                        starts CMD once outside work keeps at most X CPUs busy
     \\                        there; --max T gives up (exit 75); -t T ends CMD (exit 124;
@@ -110,8 +112,8 @@ const usage =
     \\                        come first served; --host holds it on HOST over ssh, --hold prints
     \\                        `held NAME@HOST ENTRY` and holds until stdin closes
     \\  wait                  until no run whose label matches (PATTERN* a prefix) runs or waits
-    \\  status                running and waiting tasks per project against fair share, the
-    \\                        machine's busy CPUs, why each run waits; --json for programs,
+    \\  status                the tokens, running and waiting tasks per project against fair
+    \\                        share, the machine's busy CPUs, why each run waits; --json for programs,
     \\                        --watch on a terminal, --host HOST
     \\  history               newest first: --label PATTERN, --limit N (20), --json
     \\  record                sample this machine every 3 s (CPUs busy, load, tasks running,
@@ -124,10 +126,13 @@ const usage =
     \\                        of its own; elsewhere its process tree read once a second
     \\  hook                  Claude Code PreToolUse hook: refuses heavy commands
     \\                        outside cpuq or misusing it (exit 2, fix on stderr)
-    \\  budget                print the pool's size in CPUs
+    \\  reserve               set aside the pool's last N CPUs, never handed out (default 2;
+    \\                        kept in the config, in force at once); alone, print
+    \\                        "N tokens, R reserved"; --host HOST on HOST
+    \\  budget                print N, the machine's tokens
     \\
     \\environment: CPUQ_DIR (state directory), CPUQ_CONFIG (~/.config/cpuq/config),
-    \\CPUQ_BUDGET (the pool's size), CPUQ_HISTORY. A task gets CPUQ_TASK, CPUQ_TASKS, CPUQ_OP,
+    \\CPUQ_HISTORY. A task gets CPUQ_TASK, CPUQ_TASKS, CPUQ_OP,
     \\CPUQ_ATTEMPT and CPUQ_ATTEMPTS; a lease's command gets CPUQ_LEASES.
     \\
     \\exit: one task: its own status, 124 at its time limit; many: 0 when every task
@@ -233,8 +238,10 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
     }
     if (std.mem.eql(u8, cmd, "samples")) return records.cmdSamples(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "clean")) return records.cmdClean(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "reserve")) return @import("op.zig").cmdReserve(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "budget")) {
-        ctx.out.print("{d}\n", .{poolCpus(ctx).len}) catch {};
+        ctx.out.print("{d}\n", .{@import("pool.zig").tokens(poolCpus(ctx), ctx.cfg.reserve).len}) catch {};
+        ctx.out.flush() catch {};
         return 0;
     }
     for (removed_commands) |r| if (std.mem.eql(u8, cmd, r[0])) {
@@ -289,11 +296,15 @@ pub fn loadConfig(ctx: *Ctx) void {
         error.FileNotFound => return,
         else => fail("{s}: {t}", .{ path, err }),
     };
+    // Read into a fresh one: a second load (a command that loads it again) reads the file anew,
+    // never adding its remote lines to those already read.
+    var cfg: policy.Config = .{};
     var diag: policy.Diagnostic = .{};
-    policy.parseConfig(text, &ctx.cfg, &diag) catch {
+    policy.parseConfig(text, &cfg, &diag) catch {
         std.debug.print("cpuq: {s}:{d}: {s} ({s})\n", .{ path, diag.line, diag.message, diag.key });
         std.process.exit(exit_usage);
     };
+    ctx.cfg = cfg;
 }
 
 /// Re-reads the config file when it has changed since it was read, so a cpuq
@@ -369,11 +380,7 @@ fn leastDisk(ctx: *Ctx) ?policy.Disk {
 }
 
 /// The pool's CPUs, in the order they are handed out (cpus.zig): the config's `cpus`, else
-/// the machine's, the first CPUQ_BUDGET (else `budget`) of them.
+/// the machine's. The first of them less the reserve are the tokens (pool.tokens).
 pub fn poolCpus(ctx: *Ctx) []const u32 {
-    const env_budget: ?u32 = if (ctx.env.get("CPUQ_BUDGET")) |s|
-        policy.parseCount(s) orelse fail("CPUQ_BUDGET must be a whole number of CPUs, at least 1, not '{s}'", .{s})
-    else
-        null;
-    return cpus.list(ctx.io, ctx.arena, if (ctx.cfg.cpus.len != 0) ctx.cfg.cpus else null, env_budget orelse ctx.cfg.budget);
+    return cpus.list(ctx.io, ctx.arena, if (ctx.cfg.cpus.len != 0) ctx.cfg.cpus else null);
 }

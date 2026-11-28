@@ -8,8 +8,8 @@ binary, [AGENTS.md](AGENTS.md) is enough.
 1. [README.md](README.md): what cpuq does and every command, as a user sees it.
 2. [AGENTS.md](AGENTS.md): how coding agents on these machines are told to use cpuq. Keep it
    true whenever a command or flag changes.
-3. [docs/DESIGN.md](docs/DESIGN.md): how it works inside: the pool's files, an operation's loop,
-   admission, sharing the time, drains, the gates, nesting, leases, and a test's tasks.
+3. [docs/DESIGN.md](docs/DESIGN.md): how it works inside: the pool's files, the tokens, an operation's loop,
+   admission, where tasks run, drains, the gates, nesting, leases, and a test's tasks.
 4. [docs/SUBMIT.md](docs/SUBMIT.md): specs, `cpuq submit` and `cpuq test`.
 5. [docs/RELEASING.md](docs/RELEASING.md): cutting a CLI release and a Cpuq.app release;
    [docs/CUTOVER.md](docs/CUTOVER.md): moving a machine onto the pool, once.
@@ -20,9 +20,10 @@ binary, [AGENTS.md](AGENTS.md) is enough.
 
 ## Where things stand
 
-- **0.40.0 is built, not released**, on branch `claude/contested-6a7fad`: CPUs are contested, not
-  owned (admission, no slots; drains isolate instead of gathering). cpuq 0.35.0 stays installed
-  until 0.40.0 passes every suite and the Lean model (`formal/`, updated by another session).
+- **0.42.0 is built, not released**, on branch `claude/tokens-042`: a strict token pool (one
+  token per CPU of the pool less the reserve, at most that many tasks running, drains taking
+  whole cores' tokens). A release waits for every suite and the Lean model (`formal/`, updated by
+  another session).
 - **Released:** cpuq 0.30.0 (`v0.30.0`, 2026-11-26): the CPU pool (one CPU per task, the fair
   line, `cpuq drain`, `cpuq kill`, `cpuq test` through the pool). Cpuq.app 0.22.0
   (`app-v0.22.0`) predates it: its Move to Front, Start Now and Cancel items and its jobs panel
@@ -31,8 +32,8 @@ binary, [AGENTS.md](AGENTS.md) is enough.
   old binary (`~/.local/bin/cpuq.0.29.0`, burst's `.0.28.0`) and config (`config.before-pool`)
   for a rollback. CHANGELOG 0.30.0 lists what each project changed.
 - **The Lean model** of the pool is in `formal/` (its README says what is proved, what is only
-  searched, and every finding). A change to the line (src/pool.zig) or to the loop's demotion, drain
-  and isolation (src/op.zig) goes past it before release:
+  searched, and every finding). A change to the tokens or the line (src/pool.zig), or to the loop's
+  token taking, drain and reserve (src/op.zig), goes past it before release:
   1. Add the change to `Model.lean` as a rule switch, and make `Rules.released` the code as it
      will ship.
   2. Run `cd formal && cpuq run --label cpuq:lean -- lake build` (a few minutes). It checks every
@@ -78,7 +79,7 @@ Run everything heavy under cpuq, even here:
   so it doesn't depend on the machine's load. Run it on pup too when a change touches Linux
   (affinity, cgroups, `cap`, `/proc`, `PR_SET_PDEATHSIG`).
 - `test/stress/pool.py` runs three projects' tasks against the pool under random SIGKILLs and
-  checks from each task's log: never more CPUs held than the pool, none shared, no leftovers.
+  checks from each task's log: never more tokens held than the machine has, none shared, no leftovers.
 - The app: `cd app && swift build`, under `cpuq run --label cpuq:app-build`.
   `scripts/release.sh` already wraps itself in cpuq.
 - CI: `.github/workflows/ci.yml` (CLI), `app.yml` (app) and `release.yml` (tags).
@@ -88,13 +89,13 @@ Run everything heavy under cpuq, even here:
 | Area | Files |
 |---|---|
 | Entry and options | `main.zig` (dispatch, usage, removed commands), `runopts.zig` (`cpuq run`'s options), `texts.zig`, `table.zig`, `layout.zig` |
-| The pool | `pool.zig` (the `v3/` files: records, wake FIFOs, limits, the sample; the pure rules: `mayStart`, `projectFirst`, `lineFirst`, `lineOrder`, `fairShare`, `capacity`, `busyNow`, `drainMayStart`, `demotePlan`), `op.zig` (an operation's loop: `look`, the demote plan's steps, `drainStep` and `isolateOthers`, Ctrl-Z, nesting, `cpuq drain`, `cpuq limit`, `cpuq kill`), `cpus.zig` (the pool's CPUs and their order), `runner.zig` (`cpuq run`: removed options, the Linux slice and scope (`enterSlice`, `sliceWeight`), `--driver`, `--tethered`; `cpuq wait`; `cpuq hook`'s entry) |
-| Config and gates | `policy.zig` (config keys, removed keys with their pointers, the gates, weights, CPU lists) |
+| The pool | `pool.zig` (the `v4/` files: records, wake FIFOs, limits, the sample; the pure rules: `tokens`, `heldCount`, `freeTokens`, `freeCpu`, `heldBack`, `mayStart`, `projectFirst`, `lineFirst`, `lineOrder`, `fairShare`, `drainMayStart`), `op.zig` (an operation's loop: `look`, `takeToken`, `drainStep`, Ctrl-Z (`suspend_`), nesting, `cpuq drain`, `cpuq limit`, `cpuq reserve`, `cpuq kill`), `cpus.zig` (the pool's CPUs and their order), `runner.zig` (`cpuq run`: removed options, the `--driver` scope in `cpuq.slice`, `--tethered`; `cpuq wait`; `cpuq hook`'s entry) |
+| Config and gates | `policy.zig` (config keys (`reserve`), removed keys with their pointers, the gates, weights, CPU lists) |
 | Named leases | `leasing.zig`, `state.zig` (a lease's queue) |
 | Machine signals | `sys.zig` (CPU ticks, memory, spawning, affinity, `PR_SET_PDEATHSIG`), `records.zig` (record, samples, history, clean), `history.zig`, `joblog.zig`, `runtimes.zig` |
 | A test's tasks, limits | `tasks.zig` (`cpuq test`'s task folder, `cpuq _task`), `cap.zig` |
 | Other machines | `remotes.zig` (`--on`), `submit.zig` (`submit`, `test`, `job`; a spec's removed `cores`), `gitship.zig`, `place.zig`, `packs.zig`, `repos.zig` |
-| Showing and guarding | `status.zig`, `statusjson.zig` (schema 3), `hook.zig` (rules, `removed_options`), `clean.zig` |
+| Showing and guarding | `status.zig`, `statusjson.zig` (schema 4), `hook.zig` (rules, `removed_options`), `clean.zig` |
 
 Each file's `//!` header says what it owns.
 
@@ -127,7 +128,7 @@ Each file's `//!` header says what it owns.
 
 - **Cpuq.app** for the pool: Stop (`cpuq kill`) in place of Move to Front, Start Now and Cancel;
   each operation's tasks (`running_tasks`) and why it waits; projects' shares.
-- **Cpuq.app must move to status schema 3** (`runs`, `waiters`, `projects`): busy per CPU coloured
-  by project share, not held slots.
+- **Cpuq.app must move to status schema 4** (`runs`, `waiters`, `projects`, `tokens`, `held`,
+  `free`, each task's `cpu`): each CPU coloured by the project whose task holds its token.
 - **Not decided. Don't build without Steve's yes:** run a run's longest tasks first, by each
   task's last duration (this needs durations per task).

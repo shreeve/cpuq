@@ -1,5 +1,5 @@
-//! The pool's CPUs: how many CPUs the line shares (its capacity), and which ones, in what order
-//! (a drain isolates CPUs from the end of it). Every cpuq on the machine works the list out the
+//! The pool's CPUs, and in what order: tokens are its first CPUs (the reserve is its last, never
+//! handed out), a task takes the first free token, and a drain isolates CPUs from the tokens' end. Every cpuq on the machine works the list out the
 //! same way, so they agree on it.
 //!
 //! - `cpus = LIST` in the config (a Linux CPU list, "12-19,2") is the pool, in that order.
@@ -7,14 +7,14 @@
 //!   the machine's init may use (a container's CPU set), one hyperthread of each physical core
 //!   first, then their siblings. macOS: 0 to the active CPU count less one (it cannot pin, so
 //!   the numbers only count).
-//! - `budget = N` (or CPUQ_BUDGET) keeps the first N.
+//! - `reserve = N` keeps the last N out of the tokens (pool.tokens).
 const std = @import("std");
 const Io = std.Io;
 const builtin = @import("builtin");
 const policy = @import("policy.zig");
 const sys = @import("sys.zig");
 
-pub fn list(io: Io, a: std.mem.Allocator, configured: ?[]const u8, budget: ?u32) []const u32 {
+pub fn list(io: Io, a: std.mem.Allocator, configured: ?[]const u8) []const u32 {
     var cpus: []const u32 = if (configured) |text|
         policy.cpuList(a, text) catch &.{}
     else if (builtin.os.tag == .linux) linuxOrder(io, a) else &.{};
@@ -24,7 +24,6 @@ pub fn list(io: Io, a: std.mem.Allocator, configured: ?[]const u8, budget: ?u32)
         for (all, 0..) |*c, i| c.* = @intCast(i);
         cpus = all;
     }
-    if (budget) |b| if (b >= 1 and b < cpus.len) return cpus[0..b];
     return cpus;
 }
 
