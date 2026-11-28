@@ -81,6 +81,7 @@ structure DSh (R : Ren) (x y : DrainSt) : Prop where
   age : y.age = x.age
   idle : y.idle = x.idle
   ticket : x.ph ≠ .absent → y.ticket = ren R.kt R.ct x.ticket
+  held : y.held = x.held
 
 /-- `t` is `s` with tickets and stamps renamed. -/
 structure Sh (cfg : Cfg) (R : Ren) (s t : St) : Prop where
@@ -293,12 +294,47 @@ theorem Sh.olderEmptyWaits_ (h : Sh cfg R s t) {d : Nat} (hd : d < cfg.nd) (na :
   · have : (s.run r).here = true := by simp only [emptyWaiter, Bool.and_eq_true] at e; exact e.1.1
     rw [(h.run r hr).ticket this, (h.drain d hd).ticket na, (mono_dec (ren_lt R.kt R.ct) _ _).1]
 
+theorem Sh.heldBy_ (h : Sh cfg R s t) (c : Nat) : heldBy cfg t c = heldBy cfg s c :=
+  anyLT_congr (fun e he => by rw [(h.drain e he).ph, (h.drain e he).held])
+
+theorem Sh.reserved_ (h : Sh cfg R s t) {d : Nat} (hd : d < cfg.nd) (na : (s.drain d).ph ≠ .absent) (c : Nat) :
+    reserved cfg t d c = reserved cfg s d c := by
+  unfold reserved
+  apply anyLT_congr
+  intro e he
+  rw [(h.drain e he).ph]
+  by_cases w : (s.drain e).ph = .waiting
+  · rw [(h.drain e he).ticket (by rw [w]; simp), (h.drain d hd).ticket na,
+      (mono_dec (ren_lt R.kt R.ct) _ _).1]
+  · simp [w]
+
+theorem Sh.pickCpus_ (h : Sh cfg R s t) {d : Nat} (hd : d < cfg.nd) (na : (s.drain d).ph ≠ .absent) :
+    pickCpus cfg t d = pickCpus cfg s d := by
+  unfold pickCpus
+  simp only [h.heldBy_, h.reserved_ hd na]
+
+theorem Sh.fits_ (h : Sh cfg R s t) {d : Nat} (hd : d < cfg.nd) (na : (s.drain d).ph ≠ .absent) :
+    fits cfg t d = fits cfg s d := by
+  unfold fits
+  rw [h.pickCpus_ hd na]
+  simp only [h.heldBy_, h.reserved_ hd na]
+
+theorem Sh.olderSum_ (h : Sh cfg R s t) {d : Nat} (hd : d < cfg.nd) (na : (s.drain d).ph ≠ .absent) :
+    olderSum cfg t d = olderSum cfg s d := by
+  unfold olderSum
+  apply rsum_congr
+  intro e he
+  rw [(h.drain e he).ph]
+  by_cases w : (s.drain e).ph = .waiting
+  · simp only [(h.drain e he).ticket (by rw [w]; simp), (h.drain d hd).ticket na, ren_lt]
+  · simp [w]
+
 theorem Sh.canDrain_ (h : Sh cfg R s t) {d : Nat} (hd : d < cfg.nd) : canDrain cfg t d = canDrain cfg s d := by
   unfold canDrain
   rw [(h.drain d hd).ph]
   by_cases w : (s.drain d).ph = .waiting
   · have na : (s.drain d).ph ≠ .absent := by rw [w]; simp
-    rw [h.gate, h.iso_, h.olderDrainWaits_ hd na, h.olderEmptyWaits_ hd na]
+    rw [h.gate, h.iso_, h.fits_ hd na, h.olderDrainWaits_ hd na, h.olderEmptyWaits_ hd na, h.olderSum_ hd na]
   · simp [w]
 
 theorem Sh.work_ (h : Sh cfg R s t) : work cfg t = work cfg s := by
@@ -343,10 +379,11 @@ section
 variable {cfg : Cfg} {R : Ren} {s t : St}
 
 theorem Sh.startD_ (h : Sh cfg R s t) {d : Nat} (hd : d < cfg.nd) (hw : (s.drain d).ph = .waiting) :
-    Sh cfg R (startD s d) (startD t d) := by
+    Sh cfg R (startD cfg s d) (startD cfg t d) := by
   have x := h.drain d hd
+  have na : (s.drain d).ph ≠ .absent := by rw [hw]; simp
   exact h.setDrain_ ⟨by simp [startDr], by simp [startDr], by simp [startDr], by simp [startDr],
-    fun _ => by simp only [startDr]; exact x.ticket (by rw [hw]; simp)⟩
+    fun _ => by simp only [startDr]; exact x.ticket na, by simp only [startDr]; exact h.pickCpus_ hd na⟩
 
 theorem Sh.admit_ (h : Sh cfg R s t) {r : Nat} (hr : r < cfg.nr) : Sh cfg R (admit s r) (admit t r) := by
   have x := h.run r hr
@@ -388,7 +425,7 @@ theorem Sh.pass_ (h : Sh cfg R s t) : Sh cfg R (pass cfg s) (pass cfg t) := by
 
 theorem DSh.tickD_ {R : Ren} {x y : DrainSt} (hx : DSh R x y) (w : Bool) (d : Nat) :
     DSh R (tickD cfg w d x) (tickD cfg w d y) := by
-  obtain ⟨h1, h2, h3, h4, h5⟩ := hx
+  obtain ⟨h1, h2, h3, h4, h5, h6⟩ := hx
   have ho : overdue cfg w d y ↔ overdue cfg w d x := by simp only [overdue, idleNext, h2, h3, h4]
   unfold tickD
   rw [h1]
@@ -397,10 +434,10 @@ theorem DSh.tickD_ {R : Ren} {x y : DrainSt} (hx : DSh R x y) (w : Bool) (d : Na
     rw [ite_t hs, ite_t hs]
     by_cases hov : overdue cfg w d x
     · rw [ite_t hov, ite_t (ho.2 hov)]
-      exact ⟨rfl, h2, h3, h4, fun _ => h5 na⟩
+      exact ⟨rfl, h2, h3, h4, fun _ => h5 na, h6⟩
     · rw [ite_f hov, ite_f (fun h => hov (ho.1 h))]
-      exact ⟨rfl, h2, by simp [h3], by simp [idleNext, h2, h4], fun _ => h5 na⟩
-  · rw [ite_f hs, ite_f hs]; exact ⟨h1, h2, h3, h4, h5⟩
+      exact ⟨rfl, h2, by simp [h3], by simp [idleNext, h2, h4], fun _ => h5 na, h6⟩
+  · rw [ite_f hs, ite_f hs]; exact ⟨h1, h2, h3, h4, h5, h6⟩
 
 /-- A record change that leaves presence, ticket, `ran` and last start alone. -/
 theorem RSh.frame {R : Ren} {ak : Bool} {x y x' y' : RunSt} (hx : RSh R ak x y)
@@ -438,7 +475,7 @@ theorem Sh.act_ (h : Sh cfg R s t) (a : Act) : OSh cfg R (act cfg s a) (act cfg 
       by_cases ha : (s.drain d).ph = .absent
       · rw [ite_t ⟨hd, ha⟩, ite_t ⟨hd, ha⟩]
         have h2 := h.setDrain_ (d := d) (x := { ph := .waiting, ticket := s.next })
-          (y := { ph := .waiting, ticket := t.next }) ⟨rfl, rfl, rfl, rfl, fun _ => h.next⟩
+          (y := { ph := .waiting, ticket := t.next }) ⟨rfl, rfl, rfl, rfl, fun _ => h.next, rfl⟩
         exact { h2 with
           next := by show t.next + 1 = ren R.kt R.ct (s.next + 1); rw [h.next, ren_succ h.nextk]
           nextk := by show R.kt ≤ s.next + 1; have := h.nextk; omega }
@@ -474,7 +511,7 @@ theorem Sh.act_ (h : Sh cfg R s t) (a : Act) : OSh cfg R (act cfg s a) (act cfg 
       split
       · rename_i hc
         exact h.setDrain_ ⟨by simp, by simp [x.busy], by simp [x.age], by simp [x.idle],
-          fun _ => by simp only; exact x.ticket (by rw [hc.2]; simp)⟩
+          fun _ => by simp only; exact x.ticket (by rw [hc.2]; simp), by simp [x.held]⟩
       · trivial
     · rw [ite_f (fun c => hd c.1), ite_f (fun c => hd c.1)]; trivial
   | tick =>
@@ -522,7 +559,7 @@ theorem Sh.stepS_ (h : Sh cfg R s t) (m : Move) : OSh cfg R (stepS cfg s m) (ste
     by_cases hd : d < cfg.nd
     · rw [(h.drain d hd).ph]
       split
-      · exact (h.setDrain_ ⟨rfl, rfl, rfl, rfl, fun e => absurd rfl e⟩).pass_
+      · exact (h.setDrain_ ⟨rfl, rfl, rfl, rfl, fun e => absurd rfl e, rfl⟩).pass_
       · trivial
     · rw [ite_f (fun c => hd c.1), ite_f (fun c => hd c.1)]; trivial
 
@@ -538,7 +575,7 @@ theorem Sh.trans_ {cfg : Cfg} {kt ct ct' ks cs cs' : Nat} {a b c : St}
   drain d hd := by
     have x := h1.drain d hd; have y := h2.drain d hd
     exact ⟨by rw [y.ph, x.ph], by rw [y.busy, x.busy], by rw [y.age, x.age], by rw [y.idle, x.idle],
-      fun e => by rw [y.ticket (by rw [x.ph]; exact e), x.ticket e]; exact ren_comp _ _ _ _⟩
+      fun e => by rw [y.ticket (by rw [x.ph]; exact e), x.ticket e]; exact ren_comp _ _ _ _, by rw [y.held, x.held]⟩
   gate := by rw [h2.gate, h1.gate]
   outside := by rw [h2.outside, h1.outside]
   next := by rw [h2.next, h1.next]; exact ren_comp _ _ _ _
@@ -549,7 +586,7 @@ theorem Sh.trans_ {cfg : Cfg} {kt ct ct' ks cs cs' : Nat} {a b c : St}
 theorem Sh.refl_ {cfg : Cfg} {kt ks : Nat} {s : St} (h1 : kt ≤ s.next) (h2 : ks ≤ s.now) :
     Sh cfg ⟨kt, 0, ks, 0⟩ s s where
   run _ _ := ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, fun _ => (ren_zero _ _).symm, fun _ _ => (ren_zero _ _).symm⟩
-  drain _ _ := ⟨rfl, rfl, rfl, rfl, fun _ => (ren_zero _ _).symm⟩
+  drain _ _ := ⟨rfl, rfl, rfl, rfl, fun _ => (ren_zero _ _).symm, rfl⟩
   gate := rfl
   outside := rfl
   next := (ren_zero _ _).symm
@@ -572,7 +609,7 @@ def RShB (R : Ren) (ak : Bool) (x y : RunSt) : Bool :=
 
 def DShB (R : Ren) (x y : DrainSt) : Bool :=
   y.ph == x.ph && y.busy == x.busy && y.age == x.age && y.idle == x.idle &&
-    (x.ph == .absent || y.ticket == ren R.kt R.ct x.ticket)
+    (x.ph == .absent || y.ticket == ren R.kt R.ct x.ticket) && y.held == x.held
 
 def ShB (cfg : Cfg) (R : Ren) (s t : St) : Bool :=
   allLT cfg.nr (fun r => RShB R cfg.rules.arrivalKey (s.run r) (t.run r)) && allLT cfg.nd (fun d => DShB R (s.drain d) (t.drain d)) &&
@@ -598,8 +635,8 @@ theorem ShB_sound {cfg : Cfg} {R : Ren} {s t : St} (h : ShB cfg R s t = true) : 
       · exact x
   · have := allLT_iff.1 hd d hd'
     simp only [DShB, Bool.and_eq_true, beq_iff_eq, Bool.or_eq_true] at this
-    obtain ⟨⟨⟨⟨a1, a2⟩, a3⟩, a4⟩, a5⟩ := this
-    refine ⟨a1, a2, a3, a4, fun e => ?_⟩
+    obtain ⟨⟨⟨⟨⟨a1, a2⟩, a3⟩, a4⟩, a5⟩, a6⟩ := this
+    refine ⟨a1, a2, a3, a4, fun e => ?_, a6⟩
     rcases a5 with x | x
     · exact absurd x e
     · exact x
