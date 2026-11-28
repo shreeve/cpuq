@@ -962,6 +962,19 @@ t_driver() {
   local inner; inner=$(CPUQ_OP=1 "$CPUQ" run --driver -- sh -c 'echo "${CPUQ_OP:-none}"')
   check "a driver is no task, its runs are their own, its exit is its command's (got '$out', rc $rc); CPUQ_OP stays out ($inner)" \
     "[ '$out' = 'running 0 case op ' ] && [ $rc = 3 ] && [ '$inner' = 'none' ]"
+  # A runner that only starts runs computes nothing itself, however its runs come and go: four
+  # loops of short runs at once (as swarm -w 4), each a burner and its cpuq, never read as the
+  # runner's. (driverDelta's unit test holds the rule exactly: a process moving out of a run's tree
+  # brings none of its past.)
+  setup driver-churn "tokens = 4"
+  "$CPUQ" run --driver --label dc:runner -- sh -c 'for w in 1 2 3 4; do (i=0; while [ $i -lt 12 ]; do "$1" run --label dc:case -- "$2" 0.2; i=$((i + 1)); done) & done; wait' sh "$CPUQ" "$BURN" & local dc=$!
+  local most=0 b k=0
+  while kill -0 $dc 2>/dev/null && [ $k -lt 200 ]; do
+    b=$(sj '"%.2f" % max([h["driver_busy"] for h in s["runs"] if h["driver"]] or [0])' 2>/dev/null)
+    most=$(python3 -c "print(max($most, ${b:-0}))"); k=$((k + 1)); sleep 0.2
+  done
+  wait $dc; local rdc=$?
+  check "a runner whose runs churn reads no CPU of its own (most $most over $k looks; rc $rdc)" "[ $rdc = 0 ] && fl '$most < 0.3'"
   # A driver that computes itself counts against its project's share: on 2 tokens held by q
   # (weight 3), with dr's runner keeping CPUs busy itself (flagged), dr's run and another project's
   # wait; the first token q frees goes to the other project's run, under its share, not to dr's,

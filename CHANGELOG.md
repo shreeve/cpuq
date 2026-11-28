@@ -11,6 +11,10 @@ User-visible changes to cpuq. Each version's section is its release notes.
   threads (9 and 11), and a drain naming those cores failed: their twins were no tokens. A core
   that would take the reserve past N is taken whole (a reserve of 3 on two-thread cores is 4
   CPUs); `cpuq reserve` and status show the reserve as it is.
+- **A `--driver`'s own CPU counts only its own processes' time since the last look.** It took
+  the tree's total less the runs' trees, and the runs come and go between looks, so a process
+  moving out of a run's tree brought its whole past CPU time along. On the Mac, Rig's swarm read
+  "3.9 busy itself" with its runner idle, and the outside-load gate held back 4 of 9 tokens.
 
 ## 0.42.0 — 2026-11-28
 

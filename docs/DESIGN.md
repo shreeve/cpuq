@@ -308,7 +308,8 @@ A `--driver` run is no task: it runs its command with the terminal, `CPUQ_OP` re
 it starts aren't nested, and its exit status or signal is cpuq's. It has a record in the pool
 (`driver`, no task, never waiting; `nested` passes over it), where its cpuq notes once a second
 `dbusy`: the CPU time of the runner's process tree (each process's own), the trees of the runs in
-it left out (`driverCpu`). From `driver_min` (0.5 CPUs) the line counts `dbusy` as its project's
+it left out, by each process's time since the last look (`driverTree`, `driverDelta`: a process
+that moves out of a run's tree as the run ends brings none of its past). From `driver_min` (0.5 CPUs) the line counts `dbusy` as its project's
 load beside its running tasks (`under`, `lineBefore`); it holds no token. Status flags it `driver_cpu`. A process that ends between two looks counts until it ends. On Linux with `cgroups` it runs as
 
     systemd-run --user --scope --quiet --collect --expand-environment=no
