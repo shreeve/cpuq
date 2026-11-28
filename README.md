@@ -8,10 +8,11 @@
   A machine-wide CPU pool for builds, tests, benchmarks and coding agents, on macOS and Linux.
 </p>
 
-cpuq is a CPU queue (say "CPU queue" or, lovingly, "see puke"). Every task started under it, from
-any shell, session or agent, is admitted through one fair line, and the kernel shares the machine's
-CPUs among the tasks that run. One binary, no daemon: every run's record is a file its cpuq holds a
-`flock(2)` on, so the kernel releases it however its holder dies.
+cpuq is a CPU queue (say "CPU queue" or, lovingly, "see puke"). A machine has one token per CPU,
+less a reserve. Every task started under cpuq, from any shell, session or agent, waits in one
+fair line for a token, holds it while it runs, and gives it back when it ends. One binary, no
+daemon: every run's record is a file its cpuq holds a `flock(2)` on, so the kernel releases it
+however its holder dies.
 
 The pool is per user. "Machine-wide" means across every process that user runs on the machine;
 another user on the same machine has a pool of their own.
@@ -30,9 +31,9 @@ another user on the same machine has a pool of their own.
     cpuq status
 
 The first is one task: it waits for its turn, then runs the build, at one job, with the terminal.
-The second runs 40 tasks, as many at once as the machine has room for; each learns which it is
+The second runs 40 tasks, as many at once as the line gives it tokens; each learns which it is
 from `$CPUQ_TASK`, which cpuq sets for the command, so it is expanded inside `sh -c '…'`, in single
-quotes. The third shows what runs, who waits and why, and how busy the machine is.
+quotes. The third shows the tokens, what runs on them, who waits and why.
 
 Agents: read [AGENTS.md](AGENTS.md).
 
@@ -58,12 +59,11 @@ that depends on everything else the machine runs, and no single process sees tha
   CPUs, and every job crawls.
 - **Each job reserving cores by guess** leaves them idle: a job that asks for 16 and keeps 2 busy
   holds 14 that nobody else may use.
-
-cpuq reserves nothing. CPUs are contested, not owned: cpuq bounds how many tasks run, the kernel
-shares CPU time among them, and a task that waits (on a disk, a socket, a child, a sleep) uses
-nothing while others take the time. A project under its fair share starts its next task at once;
-over it, a run starts one only while the machine has room. Parallel work is many tasks, and
-every task runs at one job.
+cpuq hands out CPUs, not wishes. The machine has as many tokens as CPUs less a reserve; a task holds
+one while it runs, pinned to its CPU on Linux, and gives it back the moment it ends. At most that
+many tasks run, however many runs ask, and a job holds the one token it runs on, never the 14 it
+might have asked for. A project under its fair share is first in line for a freed token. Parallel
+work is many tasks, and every task runs at one job.
 
 **Hasn't someone solved this already?** Pieces of it, many times over: global make jobservers,
 job spoolers, Google's Borg, Meta's Buck2, benchmark locks, and in 2026 a wave of build locks for
@@ -76,17 +76,18 @@ borrows, and what is new here.
 |---|---|
 | CPU | a logical processor, as the OS counts them |
 | pool | the CPUs cpuq counts: by default every CPU online (see [The pool](#the-pool)) |
-| capacity | the pool's CPUs less those a `-c` drain isolates: how many tasks' worth of CPU the line shares |
+| reserve | the pool's last CPUs, never handed out (config `reserve`, 2 by default) |
+| token | one CPU of the pool less the reserve, held by one task at a time: the machine has N of them |
 | run | one `cpuq run` (status calls it an operation, `OP`): M tasks of one command |
-| task | one process of a run, which counts as one CPU of work |
-| line | the order in which waiting runs start their next task |
+| task | one process of a run, which holds one token while it runs |
+| line | the order in which waiting runs take a freed token |
 | ticket | a run's number, its age in the line |
 | project | the repo a run is started in (a worktree counts as its repo), else its label's project |
-| weight | a project's share of the capacity, relative to others (config `weights`; default 1) |
-| fair share | a project's capacity by its weight, among the projects with tasks running or waiting |
+| weight | a project's share of the tokens, relative to others (config `weights`; default 1) |
+| fair share | a project's tokens by its weight, among the projects with tasks running or waiting |
 | label | a run's name, `project:task`; history is kept by label |
 | gate | a machine check that holds every start: memory pressure, low memory, low disk |
-| drain | `cpuq drain`: N whole cores isolated for one command, for timing |
+| drain | `cpuq drain`: N whole cores' tokens taken for one command, for timing |
 | named lease | a queue for something that is not CPUs: a database, a device, another machine |
 
 ## cpuq run
@@ -97,14 +98,14 @@ borrows, and what is new here.
 | option | meaning |
 |---|---|
 | `-n M` | M tasks of CMD; each gets `CPUQ_TASK` (1 to M) and `CPUQ_TASKS`, and its output goes to a file of its own. Without `-n`, one task, with the terminal |
-| `-c C`, `-c P%` | run at most C tasks at once, or P% of the pool (at least 1); default: none of its own (the machine-wide backstop applies) |
+| `-c C`, `-c P%` | hold at most C tokens at once, or P% of the tokens (at least 1); default: none of its own |
 | `-t T` | each task's time limit, wall time (not the time you stop it with Ctrl-Z): `30s`, `10m`, `2h`, or `off`; default the config's `timeout` (1h) |
 | `-r N` | try a failed task up to N more times; `CPUQ_ATTEMPT` says which try it is |
 | `--label PROJECT:TASK` | the run's name in status and history |
 | `--note TEXT` | what the run is for, kept beside its label in history |
 | `--urgent` | its first task goes ahead of the line: a rebuild someone is waiting on |
 | `--wait-max S` | give up (exit 75) if no task starts within S seconds; nothing runs. `0`: now or not |
-| `--driver` | a test runner that starts `cpuq run`s of its own: it is no task, and each run it starts is admitted on its own |
+| `--driver` | a test runner that starts `cpuq run`s of its own: it is no task, and each run it starts takes its own turn |
 | `--on HOST` | run on HOST, one of this machine's remotes (see [Other machines](#other-machines---on-host)) |
 
 ### One task
@@ -114,7 +115,7 @@ are inherited (a terminal stays a terminal), it shares cpuq's process group (so 
 signals sent to cpuq are forwarded, and CMD's exit status is cpuq's. When CMD dies by a signal,
 cpuq dies by the same one. At its time limit CMD gets SIGTERM, and cpuq exits 124.
 
-A task counts as one CPU of work, so run what it runs at one job:
+A task holds one CPU, so run what it runs at one job:
 
 | tool | after `cpuq run --label … --` |
 |---|---|
@@ -127,20 +128,20 @@ A task counts as one CPU of work, so run what it runs at one job:
 | pytest | `pytest` (no `-n`) |
 
 A bare `zig build`, `cargo`, `go build` or `swift build` starts a job for every CPU of the machine,
-and one task keeps them all busy: cpuq sees them as busy and starts fewer tasks, and the kernel
-shares the CPUs among everything that runs. Parallel work is tasks: `-n M`.
+and one task holds one token: on Linux its jobs share the one CPU it is pinned to, and on macOS
+they take other tasks' CPUs. Parallel work is tasks: `-n M`.
 
 ### Many tasks: -n M
 
-`cpuq run -n M -- CMD` runs CMD M times. It starts a task whenever the line lets it, at most `-c`
-at once, until all M have run:
+`cpuq run -n M -- CMD` runs CMD M times. It takes a token for a task whenever the line lets it, at
+most `-c` at once, until all M have run:
 
     cpuq run --label app:test -n 40 -- sh -c './test/shard "$CPUQ_TASK" 40'
     cpuq run --label app:fuzz -n 500 -t 2m -r 1 -- sh -c './fuzz "$(sed -n "${CPUQ_TASK}p" cases.txt)"'
     cpuq run --label app:fetch -n 200 -- sh -c 'curl -fsS "$(sed -n "${CPUQ_TASK}p" urls)" >/dev/null'
 
 - **Before it starts** it says what it will do, so a misread `-n` shows at once:
-  `cpuq: 40 tasks, up to 10 at once, timeout 3600s`.
+  `cpuq: 40 tasks, up to 40 at once, timeout 3600s`.
 - **Each task** runs in a process group of its own, with stdin from `/dev/null` and stdout and
   stderr to `~/.local/state/cpuq/runs/PROJECT/STAMP-PID/N` (a retry's to `N.ATTEMPT`). When a task
   ends, whatever it left running in its group is killed.
@@ -153,23 +154,23 @@ at once, until all M have run:
 
 - **Exit status:** 0 when every task passed, else 1. A run stopped by a signal (`^C`, `cpuq kill`)
   passes it to every task, kills what is left 5 seconds later, and dies by that signal.
-- **Work that waits** (network, a server, sleeps) needs no option: a task that waits keeps almost
-  no CPU busy, so the machine has room and cpuq starts more tasks.
+- **Work that waits** (network, a server, sleeps) holds its token while it waits, and keeps the CPU
+  idle: keep waits out of tasks, or give the run a `-c` that suits.
 - **`-t T`** limits each task: at T it gets SIGTERM, then SIGKILL 5 seconds later; it counts as
   failed (124), and the next task starts. It counts wall time, less any time you stop the run
   with Ctrl-Z. A sensible T is about ten times the task's usual time. With
   no `-t`, the config's `timeout` (1 hour) applies, so no task runs forever.
 - **`-r N`** tries a task that failed (non-zero exit or its time limit) up to N more times, after
   the tasks not yet started. Tasks stopped by a signal are not tried again.
-- **`-c C`** is a hard limit: the most tasks the run has running at once, as a count or a
-  percentage of the pool, worked out when the run starts. It is a ceiling, never a claim: the line
-  decides how many run below it.
+- **`-c C`** is a hard limit: the most tokens the run holds at once, as a count or a
+  percentage of the tokens, worked out when the run starts. It is a ceiling, never a claim: the line
+  decides how many it holds below it.
 
 ### Environment
 
 Each task gets `CPUQ_TASK` (1 to M, 1 for a single task), `CPUQ_TASKS`, `CPUQ_OP` (its run's
-ticket), `CPUQ_ATTEMPT` and `CPUQ_ATTEMPTS` (`-r` + 1). A task is not pinned: the kernel decides
-which CPU it runs on.
+ticket), `CPUQ_ATTEMPT` and `CPUQ_ATTEMPTS` (`-r` + 1). On Linux a task is pinned to its token's CPU;
+on macOS the kernel decides which CPU it runs on.
 
 ### --wait-max, --urgent
 
@@ -186,13 +187,13 @@ A test runner that starts a `cpuq run` per test (swarm, a `test/run` script) run
 `--driver`: it is no task of its own and takes no turn, and each run it starts is admitted on
 its own. It runs with the terminal, and its exit status (or signal) is cpuq's. On Linux, with
 `cgroups` (on by default), it runs in a delegated systemd user scope of its own
-(`cpuq-driver-PID`, in its project's slice), its command in the scope's `job/`, and `$CPUQ_CGROUP`
+(`cpuq-driver-PID`, in `cpuq.slice`), its command in the scope's `job/`, and `$CPUQ_CGROUP`
 names the scope, so `cpuq cap` can give each program it starts a cgroup beside `job/`, with limits
 the kernel enforces. The runs it starts stay in that scope. Whatever it leaves in the scope is
 killed when it ends. Where `systemd-run --user` doesn't work, it runs as it is, and `cpuq cap`
 watches the slow way.
 
-A driver is in the pool as a run with no task, so status lists it. Once a second it measures what
+A driver is in the pool as a run with no task and no token, so status lists it. Once a second it measures what
 its runner's own process tree keeps busy, the runs it starts left out. From 0.5 CPUs that counts
 against its project's share, and status flags it (`driver_cpu`: the driver computes
 N CPUs itself; run its work as tasks).
@@ -222,9 +223,10 @@ command.
 
 ## How CPUs are shared
 
-cpuq decides how many tasks run, never which CPU they run on. It admits a task when the machine
-has room for it or its project is under its fair share; the kernel shares the CPUs among the
-tasks that run, and a task that waits uses none.
+The machine has N **tokens**, one per CPU of the pool less the reserve. A task holds one while it
+runs, and gives it back the moment it ends, so at most N tasks run at once, however many runs
+ask: runs asking for 500 tasks between them still run N. On Linux a task is pinned to the CPU of
+its token, so no two tasks of cpuq's share a CPU.
 
 ### The pool
 
@@ -236,78 +238,57 @@ same way:
 - Otherwise, on Linux: the CPUs online, less those isolated from the scheduler, within the CPUs the
   machine's init may use (a container's CPU set); one hyperthread of each physical core first,
   then their siblings. On macOS: CPU 0 to the active count less one.
-- `budget = N` (or `CPUQ_BUDGET`) keeps the first N. `cpuq budget` prints the pool's size.
 
-The pool is a number to cpuq, its **capacity** T: the pool's CPUs less those a `-c` drain
-isolates. Nothing holds a CPU.
+The **reserve** is the pool's last R CPUs in that order, never handed out (config `reserve`,
+default 2). The rest are the tokens: N = the pool less R, at least 1. A 10-CPU Mac has 8 tokens.
+`cpuq reserve` prints them (`8 tokens, 2 reserved`), `cpuq reserve 4` sets the reserve (`--host
+HOST`: on HOST), and `cpuq budget` prints N alone, for a script that sizes its load by it
+(`-n $(( $(cpuq budget) / 2 ))`). A new reserve is kept in the config and is in force at once:
+running tasks finish, and fewer start until fewer than the new N run.
 
 ### Admission
 
-A run starts its next task when the line lets it:
+A run takes a token for its next task when it is first in line for one:
 
-- **Fair share.** A project's share is F = T × its weight ÷ the weights of the projects with
+- **A token per task.** A task holds a token from its start until it ends. Tokens free are N,
+  less those held (by each running task, and by each drain's CPUs), less those held back for work
+  outside cpuq (below). A run with no free token waits; its `-c` is the most it holds at once.
+- **Fair share.** A project's share is F = N × its weight ÷ the weights of the projects with
   tasks running or waiting. Weights are per project, `weights = rig:2 trig:1` in the config; a
   project not named weighs 1.
 - **One line.** Each project's first waiter is its run that goes first: an `--urgent` run's
   first task, then the run running the fewest tasks, then the older turn (when its last task
   started, or, for a run that has started none, when it arrived), then the older ticket. So a long
   `-n` run never keeps a newer run of its project waiting, and a stream of newer runs never keeps
-  the long run waiting. Of the projects' first waiters, only the first in line starts a task:
-  projects under their share first, then an `--urgent` run's first task, then the project running
-  the fewest tasks for its weight, then the run running the fewest, then the older ticket. Two
-  runs never race for one place.
-- **Under its share,** the first in line starts its next task at once, however busy the machine
-  is (only a gate, its `-c` or the 4T backstop holds it). The kernel gives it its share of CPU
-  time; nobody's task is stopped for it.
-- **Over its share,** it starts a task only while the machine has room: busy + starting <
-  T − 0.5. A task that waits on I/O leaves room, and more start.
-  - **busy** is the CPUs the running tasks keep busy (each task's process-tree CPU time, from one
-    machine-wide sample that whichever cpuq finds it a second old renews), plus, with
-    `outside_check` on, the load outside cpuq beyond the CPUs the pool leaves to it (the CPUs
-    online less the pool).
-  - **starting** counts each task started or continued in the last 2 seconds as one CPU, since
-    the sample can't have seen it yet.
-- **Hard limits** hold whatever the share: a run's `-c`, the gates, and 4 × T tasks running
-  machine-wide, a backstop for when every waiting task wakes at once.
+  the long run waiting. Of the projects' first waiters, only the first in line takes a freed
+  token: projects under their share first, then an `--urgent` run's first task, then the project
+  running the fewest tasks for its weight, then the run running the fewest, then the older
+  ticket. Two runs never race for one token.
+- **Hard limits** hold whatever the share: a run's `-c`, and the gates.
 
-So ten runs of one task each on a ten-CPU Mac start at once, an eleventh waits for room (or its
-project's share), and a 5,000-task run that fills the machine makes room for a second project's
-share by the kernel's weights (Linux) or by demoting tasks (macOS), not by waiting for its tasks
-to end.
+So ten runs of one task each on a ten-CPU Mac start eight at once, and the other two wait for a
+token in line order. A 5,000-task run that fills the machine gives a second project its share as
+its tasks end: each freed token goes to the project under its share, not to the long run's next
+task.
 
-### Sharing the time
+### Where tasks run
 
-**Linux.** Each run (one inside a task, or a `--driver`'s, excepted) re-executes itself through
-`systemd-run --user --scope` into the scope `cpuq-run-PID.scope`, delegated so `cpuq cap` works
-per run, in the slice `cpuq-PROJECT.slice` (the project's name escaped as `systemd-escape` does,
-so a dash doesn't nest it). The slice gets `CPUWeight` 100 × the project's weight
-(`systemctl set-property --runtime`, only when it differs; weight 1 is the default), so the kernel
-shares CPU time among projects by weight, and among a project's tasks equally. Tasks are
-unpinned. It needs config `cgroups` on and user scopes working (probed once and remembered);
-otherwise the run runs as it is, and the kernel shares CPUs among tasks alike.
+**Linux.** Each task's process tree is pinned (`sched_setaffinity`) to its token's CPU, and
+its children inherit that, so a task that starts several jobs shares its one CPU among them. A
+run stopped with Ctrl-Z gives its tokens back; continued, each task goes on, on the CPU of the
+token it then holds, which may be another's.
 
-**macOS** has no cgroups, and cpuq never stops a task to share time: a stopped task can hold a
-lock others wait on (five zig builds once stalled on one cache lock). Tasks are *demoted*
-instead: `setpriority(PRIO_DARWIN_PROCESS, pid, PRIO_DARWIN_BG)` on the task's process tree puts
-it in the background (efficiency cores, throttled disk), and clearing it restores it. Once a
-second, every run with tasks works out the same plan from the records, and carries out the steps
-for its own tasks, re-applying them to new child processes:
-
-- while cpuq's tasks not demoted keep more than T + 0.5 CPUs busy, demote the newest task of the
-  project furthest over its share (by its tasks running and its drivers' own CPUs); a project at
-  or under its share is never demoted;
-- restore a demoted task once all cpuq's tasks keep no more than T CPUs busy, or once its project
-  is no longer over its share: checked at every look, and a run that frees room wakes the runs
-  with demoted tasks, so a demoted lock holder's disk is throttled as briefly as can be;
-- never demote the only task of a run (`cpuq run -- CMD`, `-n 1`), nor a project's only task
-  running, beside a drain too: a lone build holding a lock is the worst case for the throttle.
+**macOS** has no affinity: a token is a count, and the kernel places tasks. cpuq never stops a
+task to share time: a stopped task can hold a lock others wait on (five zig builds once stalled
+on one cache lock).
 
 ### Outside load and the gates
 
-**Outside load.** Work cpuq doesn't run (Spotlight, a build typed outside cpuq) counts as busy
-beyond the CPUs the pool leaves to it, so it makes room scarcer while it runs. The busy figure
-is the kernel's CPU ticks, never the load average, which counts threads waiting on I/O and lags
-a minute. `outside_check = off` leaves the pool alone to limit CPU work.
+**Outside load.** Work cpuq doesn't run (Spotlight, a build typed outside cpuq) takes CPUs too.
+The CPUs cpuq leaves to it are the reserve and any CPU outside the pool; for each whole CPU it
+keeps busy beyond those, one token is held back while it runs (3 CPUs busy outside with a reserve
+of 2 hold back 1). The busy figure is the kernel's CPU ticks, never the load average, which
+counts threads waiting on I/O and lags a minute. `outside_check = off` holds none back.
 
 **The gates** hold every start while they are closed; running tasks keep running:
 
@@ -321,10 +302,11 @@ a minute. `outside_check = off` leaves the pool alone to limit CPU work.
 
 ### Ctrl-Z, kill and a dead run
 
-- **Ctrl-Z** on a run stops every task and then stops cpuq. While stopped it counts in no share
-  and starts nothing, so the line passes it by (a stopped `cpuq drain` ends its isolation). A
-  continue sent at once after the stop leaves it running, as `kill -TSTP; kill -CONT` from a
-  script expects. Continued (`fg`), its tasks continue. Time stopped doesn't count against a task's limit.
+- **Ctrl-Z** on a run stops every task and then stops cpuq. While stopped its tasks hold no
+  token and it starts nothing, so the line passes it by (a stopped `cpuq drain` ends its
+  isolation). A continue sent at once after the stop leaves it running, as `kill -TSTP; kill
+  -CONT` from a script expects. Continued (`fg`), each task goes on once it holds a token again.
+  Time stopped doesn't count against a task's limit.
 - **`cpuq kill TICKET|PID|LABEL`** ends a run on this machine, waiting or running: its cpuq gets
   SIGTERM, passes it to every task, and kills what is left 5 seconds later. A label that names
   several runs lists them, to be named by ticket. It acts on anyone's runs, not only the caller's.
@@ -337,11 +319,12 @@ a minute. `outside_check = off` leaves the pool alone to limit CPU work.
 
     cpuq limit TICKET|PID|LABEL -c C [--host HOST]
 
-A run's `-c` can change while it runs: `cpuq limit emdb:model -c 64`, or `-c 75%` of the pool, up
-to 4 × the pool. Name it as `cpuq kill` does, by the ticket `cpuq status` shows, its cpuq's pid,
-or its label when only one run has it. Raised, the run starts more as the line allows. Lowered,
-it starts none until fewer run; nothing is killed. `cpuq status` flags a run held back by its own
-`-c` (`capped`): tasks queued under it while the machine has room. A drain's CPUs are fixed when
+A run's `-c` can change while it runs: `cpuq limit emdb:model -c 8`, or `-c 75%` of the tokens.
+Name it as `cpuq kill` does, by the ticket `cpuq status` shows, its cpuq's pid,
+or its label when only one run has it. Raised, the run takes more tokens as the line allows. Lowered,
+it takes none until it holds fewer; nothing is killed. `cpuq status` flags a run held back by its own
+`-c` (`capped`): tasks queued under it while tokens are free. A drain's CPUs are fixed when
+it starts.
 it starts.
 
 ## cpuq drain: timing
@@ -352,26 +335,29 @@ For timing, nothing else. A drain times CMD on CPUs of its own while the rest of
 keeps working. It takes its turn, then isolates at once: nothing is gathered or held while it
 waits.
 
-- **`-c N`**: N CPUs, the ones CMD runs on. By default they come from the end of the pool's order;
+- **`-c N`**: N CPUs, the ones CMD runs on. By default they come from the end of the tokens' order;
   `--prefer fast` takes performance cores first (Linux: `/sys/devices/cpu_core/cpus`, then
   `cpu_capacity`, then `cpuinfo_max_freq`). `--cpus LIST` names them instead (a Linux CPU list,
-  all in the pool; `-c`, if given, must agree; it can't combine with `--prefer`).
+  all tokens, so none in the reserve; `-c`, if given, must agree; it can't combine with `--prefer`).
 - **Whole cores.** A drain isolates its CPUs and their SMT siblings (`thread_siblings_list`), so
   no other work shares their cores. `CPUQ_CPUS` and the pin are only the N CPUs (as `taskset -c`
-  takes them; use it, not CPUs of your own); the siblings stay idle. Siblings in the pool count
-  toward the capacity and `drain_max`; one outside the pool is kept free of cpuq tasks but
-  counts for neither. N whole cores whose CPUs in the pool exceed `drain_max` are a usage error.
-- **Linux:** CMD is pinned to its CPUs, and every other cpuq task's threads get an affinity
-  without the isolated ones (the drain sets it at once, each run follows for its own tasks, and
-  new tasks start with that mask). **macOS:** the capacity drops by the isolated CPUs and the
-  every other cpuq task is demoted while any drain isolates (cores can't be isolated there). All drains together isolate at most `drain_max` of the pool (config; half by default).
+  takes them; use it, not CPUs of your own); the siblings stay idle. Siblings that are tokens are
+  taken with them and count toward `drain_max`; one that is no token (the reserve, or outside the
+  pool) has no task of cpuq's anyway and counts for neither. N whole cores whose tokens exceed
+  `drain_max` are a usage error.
+- **Tokens.** Every task holds a token and runs on that token's CPU, so a drain takes the tokens
+  of its cores, all at once, when all of them are free. **Linux:** CMD is pinned to its CPUs, and
+  no task of cpuq's is on them. **macOS:** the same, without the pin. All drains together hold at
+  most `drain_max` of the tokens (config; half by default).
 
-A drain's turn comes after the older runs that wait with no task running yet, and after older
-drains; it also waits for the `drain_max` bound (a change to the config reaches a drain already
-waiting), and (with `--cpus`, or when too few whole cores
-are free) for CPUs another drain holds. A run already running tasks goes on beside it. Runs that
-queue after it don't wait for it. `--max T` (`90s`, `10m`) gives up if CMD hasn't started by then
-(exit 75), and nothing runs. Ctrl-Z on a drain ends its isolation; continued, it takes its turn
+A drain's turn comes after the older runs that wait holding nothing (no task running yet), and
+after older drains; it also waits for the `drain_max` bound (a change to the config reaches a
+drain already waiting). Once its turn has come, it waits until the tokens of N whole cores are
+all free (with `--cpus`, those CPUs'). It holds none while it waits, and freed tokens go to runs
+as usual, so on a busy machine it may wait: `cpuq status` says so (`waits for 2 whole cores to be
+free`), and `--max T` (`90s`, `10m`) gives up if CMD hasn't started by then (exit 75), and nothing
+runs. A run already running tasks goes on beside it. Runs that queue after it don't wait for it.
+Ctrl-Z on a drain ends its isolation and gives its tokens back; continued, it takes its turn
 again before its command continues.
 
 A drain must end on time and use what it isolates:
@@ -412,11 +398,11 @@ runs; `cpuq status` shows it.
 
     cpuq status [--host HOST]... [--json] [--no-usage] [--watch[=SECONDS]]
 
-`cpuq status` shows the capacity and who runs, the line and why each run in it waits:
+`cpuq status` shows the tokens and who holds them, the line and why each run in it waits:
 
-- **The machine:** the pool (its size and CPUs), the capacity (less the CPUs drains isolate),
-  tasks running and waiting, the machine's busy CPUs and the room left for a run over its share;
-  CPUs busy of those online, split into cpuq's tasks and work outside; the load, memory pressure
+- **The machine:** the pool's CPUs, the tokens (`8 tokens, 2 reserved; 5 held, 3 free`, and any
+  held back for outside work), tasks running and waiting, the CPUs busy
+  of those online, split into cpuq's tasks and work outside; the load, memory pressure
   and the gate; memory and swap. When work outside cpuq uses a CPU or more, or a gate is closed,
   that work by what started it: each busy process counts toward the top of its tree just below its
   starter (an agent's harness, an ssh session, a terminal, a service manager), shown with its
@@ -426,14 +412,14 @@ runs; `cpuq status` shows it.
   (detached, running in `/`) count in the load but aren't listed; `--json` keeps them.
 - **Running:** each run's ticket (`OP`), pid, project, label, tasks done of total and failed (once only running tasks are left, the tail: `last task,
   running 32m`, `last 3 tasks, oldest running 32m`; a single task: `running 32m`), its
-  tasks running (with ` · N background: over share` (or `: drain`) for tasks demoted on macOS and ` · N on I/O` for tasks with a process in state D on Linux), the CPUs they keep busy, how long, an estimate of the time left, and
+  tasks running and the CPUs whose tokens they hold (`3 on 0-2`; ` · N stopped` for tasks cpuq has stopped, ` · N on I/O` for tasks with a process in state D on Linux), the CPUs they keep busy, how long, an estimate of the time left, and
   its command. A note under it flags a run whose tasks keep more than 1.2 CPUs busy each
   (`over_cpu`), one held back by its own `-c` (`capped`), one stopped (Ctrl-Z), and a drain that
   idles (`idle_drain`), runs past `drain_timeout` (`long_drain`) or has work from outside on its
   CPUs (`noisy`).
 - **Waiting:** in line order, each run's ticket, project, label, the tasks it could start and the
-  ones it runs, and why it waits: `1st in line; over its share (2.0 of 4); the machine is busy`,
-  a closed gate, a drain.
+  ones it runs, and why it waits: `1st in line; every token is held`, a closed gate, a drain
+  (`waits for 2 whole cores to be free`).
 - **Projects:** each project's weight, runs, tasks running and waiting, and its fair share.
 
 On a terminal it draws boxed tables in color (`NO_COLOR` drops the color); anywhere else, plain
@@ -446,23 +432,23 @@ lines.
   machine, so `cpuq status --host local --host buildbox` is one view of both.
 
 `cpuq status --json` is one object (with several `--host`s, one per host, keyed by host). Its
-`schema` (3) changes only when a field is removed or changes meaning; new fields may appear.
+`schema` (4) changes only when a field is removed or changes meaning; new fields may appear.
 
 | field | meaning |
 |---|---|
-| `schema`, `version`, `dir`, `admit` | 3, cpuq's version, the pool's directory, and `contested` |
-| `budget`, `pool` | the pool's size, and its CPUs |
-| `capacity`, `isolated` | the capacity the line shares (the pool less the isolated CPUs), and the CPUs drains isolate |
-| `running`, `paused`, `waiting` | cpuq's tasks running, a drain's command waiting for its turn again after a Ctrl-Z (`paused`), and tasks waiting to start |
+| `schema`, `version`, `dir`, `admit` | 4, cpuq's version, the pool's directory, and `tokens` |
+| `pool`, `tokens`, `token_cpus`, `reserve` | the pool's CPUs; the number of tokens (N: at most N tasks run at once); their CPUs (the pool's first N); the reserve (the pool's last CPUs, never handed out) |
+| `held`, `held_back`, `free` | tokens held (by tasks running and by drains), held back while work outside cpuq keeps more than the CPUs cpuq leaves it busy, and free |
+| `isolated` | the CPUs drains isolate |
+| `running`, `paused`, `waiting` | cpuq's tasks running (each holding a token), tasks cpuq has stopped (holding none: after a Ctrl-Z, until each holds a token again; a drain's command waiting for its turn again), and tasks waiting to start |
 | `busy`, `tasks_busy` | CPUs busy on the machine, and of those, cpuq's tasks |
-| `room` | spare room for a run over its share: capacity − 0.5 − busy − tasks just started; positive: the first in line, over its share, starts at its next look |
 | `cores`, `active_cores` | the machine's CPUs, and those active now |
 | `load`, `memory_pressure` | the 1-, 5- and 15-minute load; `normal`, `high`, `unknown` or `off` |
 | `memory` | bytes: `total`, `used`, `swap_total`, `swap_used`; null when unreadable |
 | `gate` | `state` (`open`, `pressure`, `low_memory` or `low_disk`), `available`, `disk_free`, `disk_path`, `text` |
-| `runs[]` | runs with tasks running (or a drain isolating): `ticket`, `pid` (its cpuq), `project`, `weight`, `label`, `command`, `since`, `limit` (its `-c`), `tasks`, `done`, `failed`, `running`, `paused`, `demoted` (macOS: tasks in the background), `io_wait` (Linux: tasks with a process in state D; null with `--no-usage` and on macOS), `tail` and `oldest` (only running tasks are left, and when the oldest started), `waiting`, `running_tasks` (each task: `task`, `attempt`, `pid`, `since`, `paused`, `demoted`), `stopped` (Ctrl-Z), `drain`, `pin` (the CPUs a drain's command runs on), `cpus` (those it isolates, siblings included), `noise` and `noisy_top` (work from outside on them, and the busiest process), `urgent`, `using` (CPUs busy), `progress`, `left`, `left_from`, `flags` |
+| `runs[]` | runs with tasks running (or a drain isolating): `ticket`, `pid` (its cpuq), `project`, `weight`, `label`, `command`, `since`, `limit` (its `-c`), `tasks`, `done`, `failed`, `running`, `paused`, `io_wait` (Linux: tasks with a process in state D; null with `--no-usage` and on macOS), `tail` and `oldest` (only running tasks are left, and when the oldest started), `waiting`, `running_tasks` (each task: `task`, `attempt`, `pid`, `since`, `paused`, `cpu`: the CPU whose token it holds), `stopped` (Ctrl-Z), `drain`, `pin` (the CPUs a drain's command runs on), `cpus` (those it isolates, siblings included), `noise` and `noisy_top` (work from outside on them, and the busiest process), `urgent`, `using` (CPUs busy), `progress`, `left`, `left_from`, `flags` |
 | `waiters[]` | in line order: `order` (1 first), `ticket`, `pid`, `project`, `label`, `command`, `since`, `waiting`, `running`, `max` (its limit), `drain`, `urgent`, `why` |
-| `projects[]` | `name`, `weight`, `runs`, `running`, `waiting`, `fair` |
+| `projects[]` | `name`, `weight`, `runs`, `running`, `waiting`, `fair` (its share of the tokens) |
 | `outside[]`, `outside_total` | the busiest processes outside cpuq (`pid`, `name`, `using`), and their total |
 | `outside_work[]` | the same load by what started it, busiest first: `pid`, `command`, `cwd`, `via` (the starter's name), `procs`, `using` |
 | `cpu_ticks` | each CPU's time so far, `[busy, total]`, cumulative: two statuses give each CPU's use between them |
@@ -681,7 +667,7 @@ that submits it picks the host. cpuq does the rest:
   the host (one of the remotes, or this machine); a full host queues it;
 - **runs a test suite as a job of task files** with `cpuq test SPEC` and a spec whose `tasks`
   command (after `setup`) writes a file per test into `$CPUQ_TODO`: the host runs them one per
-  CPU of its pool (see [A test's tasks](#a-tests-tasks)), each task with `$CPUQ_CODE`, the copy's
+  token of its pool (see [A test's tasks](#a-tests-tasks)), each task with `$CPUQ_CODE`, the copy's
   path. A worktree has one test at a time: the same code
   attaches to it, changed code replaces it. The failures are listed by name with their last line,
   and their files come back to `.cpuq/fail/`, which git ignores;
@@ -963,7 +949,7 @@ Every machine is laid out the same way, the Mac you work on and the hosts it sen
 ~/cpuq/worktrees/        copies of repos sent from another machine
 ~/cpuq/caches/PROJECT/   build caches shared across branches
 ~/cpuq/tmp/              scratch
-/tmp/cpuq-UID/v3/        the pool: its lock, runs' records, wakes, limit requests and the sample
+/tmp/cpuq-UID/v4/        the pool: its lock, runs' records, wakes, limit requests and the sample
 ```
 
 Work started on a machine runs in its own checkout, not a copy: `~/cpuq/worktrees/` there holds
@@ -981,19 +967,19 @@ says so.
 
 | key | default | meaning |
 |---|---|---|
-| `budget` | every pool CPU | keep only the first this many CPUs of the pool (`CPUQ_BUDGET` overrides) |
+| `reserve` | 2 | the pool's last this many CPUs are never handed out; the rest are the tokens, at least 1 (`cpuq reserve N` sets it, in force at once) |
 | `cpus` | worked out | the pool's CPUs, in order, as a Linux CPU list (`12-19,2`) |
 | `timeout` | 1h | each task's time limit when a run gives no `-t`; off: none |
 | `drain_timeout` | 20m | a drain's time limit when it gives no `-t`; at most 2h |
 | `drain_idle` | 5m | a drain whose command keeps under 0.25 CPUs busy this long while another run waits is stopped; off: never |
-| `drain_max` | 50% | the most of the pool's CPUs drains isolate at once, all together: a count (`13`) or a percentage of the pool; always fewer than the pool. A drain bigger than it exits 2 |
+| `drain_max` | 50% | the most tokens drains hold at once, all together: a count (`13`) or a percentage of the tokens; at least 1, and fewer than all of them where there are several. A drain bigger than it exits 2 |
 | `weights` | none | project weights for sharing the pool, `rig:2 trig:1`; a project not named weighs 1 |
 | `pressure_check` | on | start no task under memory pressure |
-| `outside_check` | on | count work outside cpuq against the machine's room |
+| `outside_check` | on | hold back a token for each whole CPU that work outside cpuq keeps busy beyond the CPUs cpuq leaves it |
 | `pressure_psi` | 10 | Linux: the `some avg10` percentage that counts as pressure |
 | `min_available` | off | start no task while available memory is under this (e.g. `6G`) |
 | `min_disk` | 5G | start no task while `$HOME`'s, the temp directory's or `~/cpuq`'s filesystem has less free than this; off turns it off |
-| `cgroups` | on | Linux: run each `cpuq run` in a systemd scope in its project's slice (CPU weight by project) and each `--driver` runner in a delegated scope, its command in `job/`, for `cpuq cap` |
+| `cgroups` | on | Linux: run each `--driver` runner in a delegated systemd scope in `cpuq.slice`, its command in `job/`, for `cpuq cap` |
 | `clean_after` | 3d | what jobs left on this machine (copies of jobs sent here, pack versions no link names, job records after a week) is removed once unused this long, by `cpuq record` hourly and `cpuq clean`; off keeps everything |
 | `remotes` | none | ssh hosts this machine sends work to (`cpuq run --on`, `cpuq submit`), in order (commas or spaces) |
 | `submit_slots` | 3 | copies of a worktree a submitted job may use on its host (1–8): so many of its jobs run at once |
@@ -1007,7 +993,6 @@ says so.
 |---|---|
 | `CPUQ_DIR` | the state directory, an absolute path (default `/tmp/cpuq-UID`) |
 | `CPUQ_CONFIG` | the config file (default `~/.config/cpuq/config`) |
-| `CPUQ_BUDGET` | keep only the first this many CPUs of the pool, over the config file |
 | `CPUQ_HISTORY` | the history file |
 | `CPUQ_HOLD_QUIET` | seconds a `--hold` that has had heartbeats waits for the next before it ends (60) |
 | `CPUQ_HOOK` | `off` turns `cpuq hook` off |
@@ -1041,9 +1026,9 @@ instead. The removed variables are simply not set; `cpuq hook` rewrites a `cpuq 
 
 | removed | instead |
 |---|---|
-| `--cores K`, `--cores MIN-MAX` | one task counts as one CPU; parallel work as `-n M` tasks, at most `-c C` at once |
-| `-x K` | nothing: cpuq starts more tasks when its tasks wait (I/O, sleep, a server) |
-| `$CPUQ_CPU` | nothing: a task has no CPU of its own |
+| `--cores K`, `--cores MIN-MAX` | one task holds one CPU; parallel work as `-n M` tasks, at most `-c C` at once |
+| `-x K` | nothing: a task holds one token while it runs, waiting or not |
+| `$CPUQ_CPU` | nothing: on Linux a task is pinned to its token's CPU |
 | `$CPUQ_CORES`, `$CPUQ_CPUS` in a run's tasks (a drain's command alone gets it), `$CPUQ_TOKEN`, the make jobserver in `MAKEFLAGS` | one job per task (`zig build -j1`, `make`); `CPUQ_TASK` picks a task's work |
 | `--priority high\|normal\|low` | `--urgent` for a run's first task; no low |
 | `--max-wait` (run, lease) | `--wait-max` |
@@ -1052,7 +1037,7 @@ instead. The removed variables are simply not set; `cpuq hook` rewrites a `cpuq 
 | `cpuq drain --all` | `-c N`: its N CPUs are isolated at once, and the rest of the machine keeps working |
 | `--no-load-check` | outside load is measured, never the load average |
 | `--qos` | tasks run as they are |
-| `--opaque` | every task counts as one CPU, in a container or not |
+| `--opaque` | every task holds one token, in a container or not |
 | `cpuq first` | `--urgent` |
 | `cpuq start` | the line admits tasks by itself |
 | `cpuq cancel`, `cpuq stop` | `cpuq kill TICKET` |
@@ -1064,25 +1049,27 @@ instead. The removed variables are simply not set; `cpuq hook` rewrites a `cpuq 
 | `cpuq agent`, `cpuq attach` | the pool shares the machine by itself; `cpuq status --json` shows every run |
 | config `admit`, `target`, `settle`, `right_size`, `poll`, `aging`, `note`, `backfill`, `window_backfill`, `patience`, `lend`, `lend_after` | the line admits tasks by itself (`weights` for shares) |
 | config `exclusive`, `window_gap`, `window_lend` | `cpuq drain` |
-| config `cpu_weights`, `affinity` | the kernel shares CPUs by project weight on Linux; tasks are unpinned |
+| config `cpu_weights`, `affinity` | each task holds a token, pinned to its CPU on Linux; `weights` for shares |
 | config `load_check`, `load_margin` | outside load is measured |
-| config `active_cap` | the pool is the CPUs online; `budget` or `cpus` narrows it |
+| config `budget`, `$CPUQ_BUDGET` | `reserve = N` sets aside the pool's last N CPUs (`cpuq reserve N`); the rest are the tokens, which `cpuq budget` prints |
+| config `active_cap` | the pool is the CPUs online; `reserve` or `cpus` narrows it |
 | config `qos` | tasks run as they are |
 | config `max_memory` | `cpuq cap --mem` |
 | spec `cores` | a spec's job runs as one task |
 
 ## Limits
 
-- Cooperative: cpuq admits what runs under it. Work not run under cpuq is seen only as outside
-  load. A task that starts more threads than one job takes CPUs from other tasks; `cpuq status`
-  flags it, and the hook refuses the common cases.
+- Cooperative: cpuq hands tokens to what runs under it. Work not run under cpuq is seen only as
+  outside load. A task that starts more threads than one job shares its one CPU among them on
+  Linux, and takes other tasks' CPUs on macOS; `cpuq status` flags it, and the hook refuses the
+  common cases.
 - Per user: the state directory is `/tmp/cpuq-UID`, so two users on one machine each have their
   own pool, and neither sees the other's runs except as outside load.
 - One machine: the state directory must be on a local file system with working `flock(2)`.
 - One pool per `/tmp`: a container has its own `/tmp`, and with it its own pool. Containers
   share the host's pool only through a common `CPUQ_DIR` on a bind mount.
-- On macOS, time is shared by stopping and continuing tasks once a second, so a task is paused
-  for seconds at a time while its project is over its share and the machine is full.
+- On macOS a task is not pinned to its token's CPU (there is no affinity there), so a token bounds
+  how many tasks run, and the kernel places them.
 
 ## More
 

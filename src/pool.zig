@@ -970,19 +970,24 @@ pub fn mayStart(a: std.mem.Allocator, ops: []const Op, me: u64, cx: Cx) Wait {
 }
 
 /// The CPUs work outside cpuq keeps busy, from the sample: on Linux the CPUs drains don't
-/// isolate less the tasks that run there; on macOS the whole machine less every task. 0 with no
-/// sample yet.
+/// isolate less the tasks that run there; on macOS the whole machine less every task. A computing
+/// driver's own CPUs are left out too: they count against its project's share. 0 with no sample
+/// yet.
 fn outsideBusy(a: std.mem.Allocator, ops: []const Op, sample: Sample, now_ms: i64) f64 {
+    var drivers: f64 = 0;
+    for (ops) |o| if (o.driver and !o.stopped and o.dbusy >= driver_min) {
+        drivers += o.dbusy;
+    };
     if (sample.cpus.len != 0) {
         const iso = isolated(a, ops, now_ms);
         var machine: f64 = 0;
         for (sample.cpus) |c| if (std.mem.findScalar(u32, iso, c.cpu) == null) {
             machine += c.frac;
         };
-        return @max(0, machine - (sample.tasks - sample.drains));
+        return @max(0, machine - (sample.tasks - sample.drains) - drivers);
     }
     const machine = sample.machine orelse return 0;
-    return @max(0, machine - sample.tasks);
+    return @max(0, machine - sample.tasks - drivers);
 }
 
 /// Tokens held back for work outside cpuq (the outside-load gate, `outside_check`): the whole
@@ -1122,6 +1127,9 @@ test "tokens: held back while work outside cpuq keeps more than the CPUs it leav
     try std.testing.expectEqual(0, freeTokens(&ops, 8, 3, 0));
     try std.testing.expectEqual(Wait.full, mayStart(a, &ops, 1, .{ .n = 8, .held_back = 3 }));
     try std.testing.expectEqual(Wait.go, mayStart(a, &ops, 1, .{ .n = 8 }));
+    // A computing driver's own CPUs count against its project's share, not as outside work.
+    const with_driver = [_]Op{ ops[0], .{ .ticket = 2, .project = "rig", .driver = true, .dbusy = 2.0 } };
+    try std.testing.expectEqual(1, heldBack(a, &with_driver, s, true, 10, 8, 0));
     // Under a whole CPU over: nothing held back.
     const s2: Sample = .{ .ms = 1, .machine = 4.4, .tasks = 1.5 };
     try std.testing.expectEqual(0, heldBack(a, &ops, s2, true, 10, 8, 0));
