@@ -2,6 +2,14 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.41.1 — 2026-11-28
+
+- **A drain holds its cores at most `drain_timeout` while anyone waits.** Its own `-t` (up to
+  2h) now runs on only on an otherwise idle machine: past `drain_timeout` (default 20m) with any
+  run or drain waiting, it is stopped (exit 124; history `stopped: drain_timeout, others
+  waiting`). On pup, drains with long `-t`s held 12–16 cores for 25 minutes while six timing
+  jobs queued.
+
 ## 0.41.0 — 2026-11-28
 
 No stream of arrivals starves a waiting run: the two rule changes that the Lean model proves
