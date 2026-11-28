@@ -6,8 +6,10 @@ cpuq 0.43.0: tasks that hold several tokens (`cpuq run -j K`, `RunCfg.width`, `C
 Each task of a run holds `K` tokens while it runs (`tokT`, so `used`); it takes them in one step
 when `K` are free (`used + K ≤ capTok`) and gives all `K` back when it ends. The line is 0.41's
 and 0.42's. A wide task first in line that does not fit:
-- rule 4(a), `Rules.hold` (`Rules.wide043a`): holds the line; freed tokens go to no one else;
-- rule 4(b), no hold (`Rules.wide043b`): the line skips it (`cand`), and the next that fits starts.
+- rule 4(a), the design, `Rules.hold` (`Rules.wide043a`): holds the line; freed tokens go to no one
+  else;
+- rule 4(b), not chosen, no hold (`Rules.wide043b`): the line skips it (`cand`), and the next that
+  fits starts. Kept for its counterexample (`wide_waits_forever`).
 
 With every `K = 1` both are 0.42 (`Token.lean`). Tokens are counted, not named: which CPUs a task
 gets (whole cores, the fewest cores) is not modelled.

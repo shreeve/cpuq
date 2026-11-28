@@ -554,9 +554,9 @@ it waits with it.
 `used` = Σ running × `K` + started drains' cores. It starts when its `K` are free
 (`used + K ≤ capTok`), in one step, and gives all `K` back when it ends. A wide task first in line
 that does not fit:
-- rule 4(a), `Rules.hold` (default; `Rules.wide043a`): holds the line, so freed tokens go to no
+- rule 4(a), the design (`Rules.hold`, default; `Rules.wide043a`): holds the line, so freed tokens go to no
   other run;
-- rule 4(b), `hold := false` (`Rules.wide043b`): the line skips it (`cand`: waiting, and it fits),
+- rule 4(b), not chosen (`hold := false`, `Rules.wide043b`; kept for its counterexample): the line skips it (`cand`: waiting, and it fits),
   and the next run that fits starts.
 
 With every `K = 1` the two agree and are 0.42. Drains are unchanged: a hold does not stop a drain on
