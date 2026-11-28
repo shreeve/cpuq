@@ -182,7 +182,7 @@ const Run = struct {
     stopped: bool = false,
     /// A task ended, a signal or a wake came: look at the pool now.
     event: bool = true,
-    /// Something here freed room for others (a task ended, tasks stopped): wake them.
+    /// Something here freed a token for others (a task ended, tasks stopped): wake them.
     freed: bool = false,
     /// When the next look is due (monotonic ms).
     next_look: i64 = 0,

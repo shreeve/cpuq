@@ -187,8 +187,8 @@ t_tokens() {
   local rc=0
   for p in "${pids[@]}"; do wait "$p" || rc=1; done
   check "12 sleeping tasks on 2 tokens: never more than 2 at once (most $max over $samples looks), and every run passed (rc $rc)" "[ $max = 2 ] && [ $rc = 0 ]"
-  local said; said=$("$CPUQ" reserve)
-  check "cpuq reserve prints the tokens and the reserve ($said)" "[[ '$said' == '2 tokens, '*' reserved' ]]"
+  local said budget; said=$("$CPUQ" reserve); budget=$("$CPUQ" budget)
+  check "cpuq reserve prints the tokens and the reserve ($said); cpuq budget prints the tokens ($budget)" "[[ '$said' == '2 tokens, '*' reserved' ]] && [ '$budget' = 2 ]"
 }
 
 t_reserve() {
@@ -340,24 +340,25 @@ t_wait_max() {
 t_share() {
   # A freed token goes to a project under its share first: a holds both tokens with burners; b
   # comes; the first token a frees goes to b, not to a's next task. Then each keeps its share of
-  # 1: b never runs a second task while a runs.
+  # 1: in every status snapshot (one consistent read of the records), b never holds 2 tokens while
+  # a has a task waiting: the line gives b a second token only once a waits for none.
   setup share
   local f=$T/starts
   "$CPUQ" run -n 4 --label a:work -- sh -c 'echo "a$CPUQ_TASK" >>"$1"; "$2" -2 2' sh "$f" "$BURN" 2>/dev/null & local a=$!
   wait_running 2
-  "$CPUQ" run -n 4 --label b:work -- sh -c 'echo "b$CPUQ_TASK" >>"$1"; "$2" -2 0.5' sh "$f" "$BURN" 2>/dev/null & local b=$!
+  "$CPUQ" run -n 6 --label b:work -- sh -c 'echo "b$CPUQ_TASK" >>"$1"; "$2" -2 0.5' sh "$f" "$BURN" 2>/dev/null & local b=$!
   wait_waiters 2
-  local most_b=0 both=0 looks=0 line
-  while kill -0 $b 2>/dev/null && kill -0 $a 2>/dev/null && [ $looks -lt 200 ]; do
-    line=$(sj '" ".join("%s=%d" % (p["name"], p["running"]) for p in sorted(s["projects"], key=lambda p: p["name"]))')
+  local bad=0 both=0 looks=0 line
+  while kill -0 $b 2>/dev/null && kill -0 $a 2>/dev/null && [ $looks -lt 300 ]; do
+    line=$(sj '" ".join("%s=%d/%d" % (p["name"], p["running"], p["waiting"]) for p in sorted(s["projects"], key=lambda p: p["name"]))')
     looks=$((looks + 1))
-    case " $line " in *" b=1 "*) case " $line " in *" a=0 "*) ;; *) both=$((both + 1)) ;; esac ;; esac
-    case " $line " in *" b=2 "*) most_b=2 ;; esac
+    case " $line " in *" a=1/"*" b=1/"*) both=$((both + 1)) ;; esac
+    case " $line " in *" a="[0-9]"/"[1-9]*" b=2/"*) bad=$((bad + 1)); echo "  b holds 2 while a waits: $line" ;; esac
   done
   wait $a; local ra=$?; wait $b; local rb=$?
   local got; got=$(head -3 "$f" | tr '\n' ' ')
   check "the first token a frees goes to b, under its share (starts: $got)" "[[ '$got' == 'a'[12]' a'[12]' b1 ' ]]"
-  check "while a runs, b runs one task, never two ($most_b; both running in $both of $looks looks); both finish (rc $ra $rb)" "[ $most_b = 0 ] && [ $both -ge 2 ] && [ $ra = 0 ] && [ $rb = 0 ]"
+  check "b never holds 2 tokens while a has a task waiting ($bad of $looks snapshots); each holds one in $both; both finish (rc $ra $rb)" "[ $bad = 0 ] && [ $both -ge 2 ] && [ $ra = 0 ] && [ $rb = 0 ]"
 }
 
 t_fair() {
@@ -982,7 +983,7 @@ t_removed() {
   done
   out=$("$CPUQ" jobs run 2>&1); rc=$?
   { [ $rc = 2 ] && [[ "$out" == "cpuq: jobs run is gone: "* ]]; } || wrong="$wrong [jobs run: $rc $out]"
-  for f in agent attach budget; do
+  for f in agent attach; do
     out=$("$CPUQ" $f 2>&1); rc=$?
     { [ $rc = 2 ] && [[ "$out" == "cpuq: $f is gone: "* ]]; } || wrong="$wrong [$f: $rc $out]"
   done

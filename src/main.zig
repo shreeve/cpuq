@@ -69,7 +69,7 @@ const usage =
     \\       cpuq jobs [--all]
     \\       cpuq job [ID|last] [--wait [--max-wait S]] [--tail N] [--json] [--cancel]
     \\       cpuq hook                (an agent harness's pre-command hook)
-    \\       cpuq reserve [N] [--host HOST]
+    \\       cpuq reserve [N] [--host HOST] | cpuq budget
     \\       cpuq --version | --help
     \\
     \\run: M tasks of CMD (none: one, with the terminal). The machine has N tokens, one per CPU
@@ -129,6 +129,7 @@ const usage =
     \\  reserve               set aside the pool's last N CPUs, never handed out (default 2;
     \\                        kept in the config, in force at once); alone, print
     \\                        "N tokens, R reserved"; --host HOST on HOST
+    \\  budget                print N, the machine's tokens
     \\
     \\environment: CPUQ_DIR (state directory), CPUQ_CONFIG (~/.config/cpuq/config),
     \\CPUQ_HISTORY. A task gets CPUQ_TASK, CPUQ_TASKS, CPUQ_OP,
@@ -238,6 +239,12 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
     if (std.mem.eql(u8, cmd, "samples")) return records.cmdSamples(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "clean")) return records.cmdClean(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "reserve")) return @import("op.zig").cmdReserve(ctx, args[1..]);
+    if (std.mem.eql(u8, cmd, "budget")) {
+        loadConfig(ctx);
+        ctx.out.print("{d}\n", .{@import("pool.zig").tokens(poolCpus(ctx), ctx.cfg.reserve).len}) catch {};
+        ctx.out.flush() catch {};
+        return 0;
+    }
     for (removed_commands) |r| if (std.mem.eql(u8, cmd, r[0])) {
         std.debug.print("cpuq: {s}\n", .{r[1]});
         return exit_usage;
@@ -258,7 +265,6 @@ const removed_commands = [_][2][]const u8{
     .{ "qos", "qos is gone: tasks run as they are" },
     .{ "agent", "agent is gone: the pool shares the machine by itself; stop an installed agent with launchctl bootout gui/$UID/com.github.shreeve.cpuq.agent (macOS) or systemctl --user disable --now cpuq-agent (Linux)" },
     .{ "attach", "attach is gone: cpuq status --json shows every run" },
-    .{ "budget", "budget is gone: cpuq reserve prints the tokens and the reserve, and sets the reserve" },
 };
 
 fn submitCx(ctx: *Ctx) submit.Cx {

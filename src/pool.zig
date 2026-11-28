@@ -853,7 +853,7 @@ fn weights(m: std.StringArrayHashMapUnmanaged(Proj)) u64 {
     return @max(w, 1);
 }
 
-/// A project's fair share of capacity `t`: t × its weight ÷ the weights of the projects running
+/// A project's fair share of `t` tokens: t × its weight ÷ the weights of the projects running
 /// or waiting.
 pub fn fairShare(a: std.mem.Allocator, ops: []const Op, project: []const u8, t: u32) f64 {
     const m = projects(a, ops);

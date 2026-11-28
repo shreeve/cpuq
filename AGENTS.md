@@ -12,8 +12,9 @@ git, grep, editors or quick one-off commands.
 
     cpuq run --label PROJECT:TASK [-n M] [-t T] [-r N] -- CMD ARGS...
 
-A task counts as one CPU of work. `cpuq run -- CMD` is one task: CMD runs with your terminal, and its exit
-status is cpuq's. Run it at one job:
+A task holds one CPU (a token) while it runs, pinned to it on Linux; the machine has as many
+tokens as CPUs less a reserve, so at most that many tasks run at once. `cpuq run -- CMD` is one
+task: CMD runs with your terminal, and its exit status is cpuq's. Run it at one job:
 
     cpuq run --label app:build -- zig build -j1
     cpuq run --label app:build -- make                    # no -j
@@ -28,8 +29,8 @@ task. Always give the one-job option.
 
 ## Parallel work: -n M tasks
 
-Split parallel work into tasks. `-n M` runs CMD M times, as many tasks at once as the
-machine has room for. Each gets `CPUQ_TASK` (1 to M) and `CPUQ_TASKS` to pick its piece. cpuq sets
+Split parallel work into tasks. `-n M` runs CMD M times, one task on each token the line gives
+it. Each gets `CPUQ_TASK` (1 to M) and `CPUQ_TASKS` to pick its piece. cpuq sets
 them for CMD, not for your shell: use `sh -c` with SINGLE quotes.
 
     cpuq run --label app:test -n 16 -- sh -c './test/shard "$CPUQ_TASK" "$CPUQ_TASKS"'
@@ -38,9 +39,9 @@ them for CMD, not for your shell: use `sh -c` with SINGLE quotes.
 - Each task's output goes to a file of its own. The summary at the end names the failed tasks with
   their last lines, and the folder. Exit 0 when every task passed, else 1.
 - `-t T`: each task's time limit (wall time), about ten times its usual time (`-t 30s`; default 1h).
-  Tasks that wait (network, sleep, a server) need no option: cpuq starts more while they wait.
+  A task holds its token while it waits (network, sleep, a server): keep waits out of tasks.
 - `-r N`: try a failed task up to N more times (`CPUQ_ATTEMPT` says which try). Flaky work only.
-- `-c C`: run at most C tasks at once, or `-c 25%`. Usually leave it out. `cpuq limit LABEL -c C` changes it while
+- `-c C`: hold at most C tokens at once, or `-c 25%` of them. Usually leave it out. `cpuq limit LABEL -c C` changes it while
   the run runs (raised: it starts more as the line allows; lowered: none start until fewer run).
 - One run per phase: build with one task, then test with `-n M`.
 
@@ -55,7 +56,8 @@ branch names: history is kept by label.
   in the background, or pass `--wait-max SECONDS` below your tool's timeout.
 - `--wait-max` gives up with exit 75, and the command never ran. Rerun it later; never retry in
   a loop.
-- `cpuq status` shows what runs, who waits and why, and the machine's room; `--json` for programs.
+- `cpuq status` shows the tokens (held, free), what runs on which CPUs, who waits and why;
+  `--json` for programs. `cpuq reserve` prints "N tokens, R reserved".
 - `cpuq wait --label 'proj:*' --max-wait 600` waits until no run with a matching label runs or
   waits.
 - `--urgent` puts a run's first task ahead of the line: only for a rebuild a human is waiting on.
@@ -64,11 +66,13 @@ branch names: history is kept by label.
 
     cpuq drain -c 4 --label app:bench --max 10m -t 20m -- ./bench
 
-A drain takes its turn (older runs that wait with no task running go first), then at once isolates
-N whole cores for CMD (its CPUs and their SMT siblings): CMD is pinned to the N CPUs on Linux,
-others' tasks are kept off; the rest of the machine keeps working. Use `$CPUQ_CPUS`, never a
-`taskset` of your own. `-c` is as many CPUs as the measurement uses (whole cores, at most the
-config's `drain_max`, half the pool by default); `--cpus LIST` names them, `--prefer fast` takes performance cores first. `-t` ends it
+A drain takes its turn (older runs that wait with no task running go first), then, once N whole
+cores' tokens are free (its CPUs and their SMT siblings), takes them all at once for CMD: CMD is
+pinned to the N CPUs on Linux, and no task is on them; the rest of the machine keeps working. It
+holds nothing while it waits, so on a busy machine it may wait: give `--max`. Use `$CPUQ_CPUS`,
+never a `taskset` of your own. `-c` is as many CPUs as the measurement uses (whole cores, at most
+the config's `drain_max`, half the tokens by default); `--cpus LIST` names them (tokens only),
+`--prefer fast` takes performance cores first. `-t` ends it
 (default 20m, at most 2h, counted from the isolation); one round of timing per drain. A drain whose
 command keeps under 0.25 CPUs busy for 5 min while others wait is stopped: time, don't sleep.
 `--max` gives up with exit 75. On Linux `cpuq status` flags a drain `noisy` (work from outside on
@@ -201,5 +205,13 @@ ten times its run).
 - `cpuq kill` on runs you did not start: it acts on anyone's.
 - Kill a waiting cpuq to retry it, or wrap a whole session or interactive shell in `cpuq run`.
 
-A `cpuq run` inside a task starts at once, within that task: `-n M` there runs its tasks one
-at a time. More: [README.md](README.md).
+A `cpuq run` inside a task starts at once, within that task (on its CPU): `-n M` there runs its
+tasks one at a time.
+
+## Reserve
+
+    cpuq reserve [N] [--host HOST]
+
+Sets aside the pool's last N CPUs, never handed out (default 2), in the machine's config, in force
+at once. Alone, it prints "N tokens, R reserved"; `cpuq budget` prints N, to size a script's
+load. The owner's call: don't change the reserve unasked. More: [README.md](README.md).
