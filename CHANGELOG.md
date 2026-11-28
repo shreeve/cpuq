@@ -2,6 +2,28 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.41.0 — unreleased
+
+No stream of arrivals starves a waiting run: the two rule changes that the Lean model proves
+starvation-free (`run_starts_fixed`, `Rules.nostarve` in `formal/`).
+
+- **New runs of a project no longer pass a run of it that started before them.** Within a
+  project, a run that has started no task counts its arrival as its last start, instead of going
+  first. The order is: an `--urgent` run's first task, then the run running the fewest, then the
+  older of last start or arrival, then ticket. A stream of new runs kept a long `-n` run's next
+  task waiting as long as the stream lasted.
+- **One line for every start.** A run starts a task only as the first in one line among the
+  projects' first waiters: projects under their share first, then an `--urgent` run's first task,
+  then the project running the fewest for its weight, then the run running the fewest, then
+  ticket. It must also be under its share or have room, as before. At the 4T backstop, the place a
+  task frees goes to the first in line; two runs under their share raced for it, and a waiting run
+  could lose every time. Status's waiting list is in this order, and a run behind another says
+  "another run is first in line".
+- **A waiting drain takes up a raised `drain_max`.** It rereads the config while it waits. On pup
+  a cap raised from 13 to 16 never reached a drain already waiting.
+- **History counts a drain as the CPUs it isolated,** from its isolation to its end, not as one
+  task: its task-hours are those CPUs over the time held. A drain's share of CPU time read 211%.
+
 ## 0.40.3 — 2026-11-28
 
 - **`cpuq status` says what's done and what failed:** "206/208 done · none failed", so a run's

@@ -79,7 +79,7 @@ borrows, and what is new here.
 | capacity | the pool's CPUs less those a `-c` drain isolates: how many tasks' worth of CPU the line shares |
 | run | one `cpuq run` (status calls it an operation, `OP`): M tasks of one command |
 | task | one process of a run, which counts as one CPU of work |
-| line | the order in which waiting runs start their next task in spare room |
+| line | the order in which waiting runs start their next task |
 | ticket | a run's number, its age in the line |
 | project | the repo a run is started in (a worktree counts as its repo), else its label's project |
 | weight | a project's share of the capacity, relative to others (config `weights`; default 1) |
@@ -176,8 +176,8 @@ which CPU it runs on.
 `--wait-max S` gives up after S seconds while the run has started no task, with exit 75; the
 command never ran. `--wait-max 0` starts now or not at all.
 
-`--urgent` puts the run's first task ahead of everything else in the line, once per project at a
-time (while another of its project's urgent runs has not started its first task, it waits its
+`--urgent` puts the run's first task ahead of the other runs of its project, and in the line ahead
+of every project not under its share, once per project at a time (while another of its project's urgent runs has not started its first task, it waits its
 turn). It never stops a running task. Use it for a rebuild someone is waiting on.
 
 ### --driver: a test runner
@@ -248,16 +248,19 @@ A run starts its next task when the line lets it:
 - **Fair share.** A project's share is F = T × its weight ÷ the weights of the projects with
   tasks running or waiting. Weights are per project, `weights = rig:2 trig:1` in the config; a
   project not named weighs 1.
-- **Under its share,** a project starts its next task at once, however busy the machine is
-  (only a gate, its `-c` or the 4T backstop holds it). The kernel gives it its share of CPU time;
-  nobody's task is stopped for it.
-- **Over its share,** a run starts a task only while the machine has room: busy + starting <
-  T − 0.5. Only the first such waiter in line takes it: an `--urgent` run's first task, then the
-  project running the fewest tasks for its weight, then the run running the fewest, then the run
-  whose last task started longest ago, then the older ticket. Within a project the same order
-  picks which run starts the project's next task, so a long `-n` run never keeps a newer run of
-  its project waiting. A task that waits on
-  I/O leaves room, and more start.
+- **One line.** Each project's first waiter is its run that goes first: an `--urgent` run's
+  first task, then the run running the fewest tasks, then the older turn (when its last task
+  started, or, for a run that has started none, when it arrived), then the older ticket. So a long
+  `-n` run never keeps a newer run of its project waiting, and a stream of newer runs never keeps
+  the long run waiting. Of the projects' first waiters, only the first in line starts a task:
+  projects under their share first, then an `--urgent` run's first task, then the project running
+  the fewest tasks for its weight, then the run running the fewest, then the older ticket. Two
+  runs never race for one place.
+- **Under its share,** the first in line starts its next task at once, however busy the machine
+  is (only a gate, its `-c` or the 4T backstop holds it). The kernel gives it its share of CPU
+  time; nobody's task is stopped for it.
+- **Over its share,** it starts a task only while the machine has room: busy + starting <
+  T − 0.5. A task that waits on I/O leaves room, and more start.
   - **busy** is the CPUs the running tasks keep busy (each task's process-tree CPU time, from one
     machine-wide sample that whichever cpuq finds it a second old renews), plus, with
     `outside_check` on, the load outside cpuq beyond the CPUs the pool leaves to it (the CPUs
@@ -364,7 +367,8 @@ waits.
   every other cpuq task is demoted while any drain isolates (cores can't be isolated there). All drains together isolate at most `drain_max` of the pool (config; half by default).
 
 A drain's turn comes after the older runs that wait with no task running yet, and after older
-drains; it also waits for the `drain_max` bound, and (with `--cpus`, or when too few whole cores
+drains; it also waits for the `drain_max` bound (a change to the config reaches a drain already
+waiting), and (with `--cpus`, or when too few whole cores
 are free) for CPUs another drain holds. A run already running tasks goes on beside it. Runs that
 queue after it don't wait for it. `--max T` (`90s`, `10m`) gives up if CMD hasn't started by then
 (exit 75), and nothing runs. Ctrl-Z on a drain ends its isolation; continued, it takes its turn
@@ -451,7 +455,7 @@ lines.
 | `capacity`, `isolated` | the capacity the line shares (the pool less the isolated CPUs), and the CPUs drains isolate |
 | `running`, `paused`, `waiting` | cpuq's tasks running, a drain's command waiting for its turn again after a Ctrl-Z (`paused`), and tasks waiting to start |
 | `busy`, `tasks_busy` | CPUs busy on the machine, and of those, cpuq's tasks |
-| `room` | spare room for a run over its share: capacity − 0.5 − busy − tasks just started; positive: the first such waiter starts at its next look |
+| `room` | spare room for a run over its share: capacity − 0.5 − busy − tasks just started; positive: the first in line, over its share, starts at its next look |
 | `cores`, `active_cores` | the machine's CPUs, and those active now |
 | `load`, `memory_pressure` | the 1-, 5- and 15-minute load; `normal`, `high`, `unknown` or `off` |
 | `memory` | bytes: `total`, `used`, `swap_total`, `swap_used`; null when unreadable |
@@ -473,7 +477,8 @@ Every run is recorded as it enters the line, starts and ends, in
 `~/.local/state/cpuq/history.jsonl` (`$XDG_STATE_HOME/cpuq/` when set; beside the state directory
 when `CPUQ_DIR` is set; `CPUQ_HISTORY` names the file outright). `cpuq history` lists the last 20
 runs (`--limit N`), newest first: label, pool (`cpus`, a lease's name, or `remote` for `--on`), the
-most tasks it ran at once, tasks done of total (and failed), how long it waited and ran, its active
+most tasks it ran at once (a drain: the CPUs it isolated, its run from its isolation), tasks done
+of total (and failed), how long it waited and ran, its active
 CPUs (its tasks' CPU time over its run time), and how it ended: an exit status, `signal N`,
 `gave up` (`--wait-max`), or `lost` (its cpuq died uncaught, or the machine restarted). A summary
 follows: the median and longest wait, and CPUs busy against tasks running on average. `--label`

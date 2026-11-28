@@ -1,6 +1,6 @@
 //! A run: `cpuq run [-n M] [-c C] [-t T] [-r N] -- CMD`, M tasks of CMD. This process is the
-//! run's one loop. It starts a task whenever the line lets it (pool.zig: under its project's
-//! share at once; over it, in spare room), up to C at once, and never decides which CPU a task
+//! run's one loop. It starts a task whenever the line lets it (pool.zig: first in line, and under
+//! its project's share or with room), up to C at once, and never decides which CPU a task
 //! runs on: the kernel shares the CPUs. On macOS, which has nothing to share time by project, it
 //! also demotes and restores its own tasks (runs them in the background) as the pool's plan says,
 //! never stopping one. It never sleeps while the line would let it start a task.
@@ -199,6 +199,10 @@ const Run = struct {
     job: joblog.JobLog = undefined,
     queued_t: f64 = 0,
     peak_running: u32 = 0,
+    /// A drain: when it first isolated its CPUs (real clock, Unix seconds), and the most CPUs it
+    /// isolated. History counts its task-hours as those CPUs over the time it held them.
+    iso_t: f64 = 0,
+    iso_n: u32 = 0,
     /// A drain's watch on its command's CPU: the last sample (monotonic ms, task-tree CPU ns),
     /// since when it has kept under `drain_idle_busy` while others wait, and whether it was
     /// warned or stopped for it.
@@ -359,6 +363,7 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
             .limit = limit,
             .tasks = total,
             .since = main.nowSeconds(ctx.io),
+            .arrived = sys.monoMs(),
             // A task's limit, the 5 s a kill may take after it, and a few for ending and starting.
             .tlimit = if (timeout_s == 0) 0 else timeout_s +| 10,
             .cmd = @import("runopts.zig").joinCommand(ctx, o.cmd),
@@ -413,8 +418,13 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
 fn logEnd(r: *Run) void {
     const ctx = r.ctx;
     if (r.gave_up) return joblog.logEvent(ctx, r.job, "gave_up", .{});
-    if (r.first_start_ms != 0) joblog.logEvent(ctx, r.job, "started", .{ .t = r.first_start_t });
-    var extra: joblog.EventExtra = .{ .cores = r.peak_running, .cpu = sys.childrenCpu(), .done = r.rec.done, .failed = r.rec.failed };
+    // A drain holds its CPUs from its isolation, its command's quiet wait included: it starts
+    // then, and counts as the CPUs it isolated.
+    const held = r.rec.drain and r.iso_t != 0;
+    if (held) {
+        joblog.logEvent(ctx, r.job, "started", .{ .t = r.iso_t, .cores = r.iso_n });
+    } else if (r.first_start_ms != 0) joblog.logEvent(ctx, r.job, "started", .{ .t = r.first_start_t });
+    var extra: joblog.EventExtra = .{ .cores = if (held) r.iso_n else r.peak_running, .cpu = sys.childrenCpu(), .done = r.rec.done, .failed = r.rec.failed };
     if (r.noise_max >= noisy_min) extra.noisy = .{ .cpus = r.noise_sum / @as(f64, @floatFromInt(@max(r.noise_n, 1))), .max = r.noise_max, .top = r.noise_top };
     if (r.single) {
         const last: ?Outcome = if (r.outcomes.items.len != 0) r.outcomes.items[r.outcomes.items.len - 1] else null;
@@ -815,6 +825,9 @@ fn look(r: *Run) void {
             r.pool.renewSample(a, ops, r.ncpu);
         }
     }
+    // A drain waiting for its turn takes up a change to drain_max (or any other setting) made
+    // while it waits.
+    if (r.rec.drain and r.rec.dstart == 0) main.reloadConfig(r.ctx);
     const why = gate(r, a);
     r.pool.lock();
     r.syncRecord();
@@ -891,7 +904,7 @@ fn look(r: *Run) void {
         }
         if (r.waitingNow() > 0) {
             const t = pool_mod.capacity(ops, pool_n, now);
-            head = pool_mod.firstWaiter(a, ops, t) == r.rec.ticket;
+            head = pool_mod.lineFirst(a, ops, t) == r.rec.ticket;
         } else if (r.pending() > 0 and r.running.items.len >= r.limit) {
             r.setWhy(a.print("at its -c ({d})", .{r.limit}) catch "at its -c");
         }
@@ -995,6 +1008,8 @@ fn drainStep(r: *Run, a: std.mem.Allocator, ops: []Op, why: []const u8, now: i64
     r.rec.pin = r.a.dupe(u32, pick.pin) catch pick.pin;
     r.rec.npool = need;
     r.rec.dstart = now;
+    if (r.iso_t == 0) r.iso_t = joblog.nowFloat(r.ctx.io);
+    r.iso_n = @max(r.iso_n, @as(u32, @intCast(pick.cpus.len)));
     r.rec.noise = 0;
     r.rec.noisy_top = "";
     r.noise_measured = false;
@@ -1155,7 +1170,7 @@ fn whyText(r: *Run, w: pool_mod.Wait, cx: pool_mod.Cx, ops: []const Op, a: std.m
         .go, .idle => "",
         .backstop => a.print("{d} tasks run, {d} times the capacity", .{ pool_mod.backstop * t, pool_mod.backstop }) catch "too many tasks run",
         .busy => a.print("over its share ({d:.1} of {d}); the machine is busy ({d:.1} of {d} CPUs)", .{ pool_mod.fairShare(a, ops, r.rec.project, t), t, cx.busy + @as(f64, @floatFromInt(pool_mod.starting(ops, cx.now_ms))), t }) catch "the machine is busy",
-        .behind => "over its share; another run goes first",
+        .behind => "another run is first in line",
         .project => "another run of its project goes first",
     };
 }

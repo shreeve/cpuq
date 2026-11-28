@@ -43,7 +43,7 @@ pub fn newJobLog(ctx: *Ctx, base: history.Event) JobLog {
 
 /// What an event carries beyond the job's own fields.
 pub const EventExtra = struct {
-    /// The most tasks it ran at once (ended).
+    /// The most tasks it ran at once (ended); a drain's, the CPUs it isolated (started, ended).
     cores: ?u32 = null,
     exit: ?u8 = null,
     signal: ?u32 = null,

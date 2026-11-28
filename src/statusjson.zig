@@ -79,9 +79,8 @@ pub const JsonProgress = struct { done: u64 = 0, total: u64 = 0, failing: u64 = 
 
 /// A run with tasks waiting to start, or a drain waiting for its turn.
 pub const JsonWaiter = struct {
-    /// Its place in the line for spare room, from 1: runs under their project's share start at
-    /// once, so the line orders those over it (the project running the fewest for its weight,
-    /// then the older ticket); drains follow, in their order.
+    /// Its place in the line, from 1: the order the runs start their next task if nothing else
+    /// changes (`pool.lineOrder`); drains follow, in their order.
     order: usize = 0,
     ticket: u64 = 0,
     pid: i32 = 0,
