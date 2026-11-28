@@ -2,6 +2,77 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.40.0 — unreleased
+
+CPUs are contested, not owned. cpuq bounds how many tasks run; the kernel shares CPU time among
+them; nothing holds an idle CPU. On 2026-11-27 drains collected CPUs and held them idle for hours,
+and tasks blocked on I/O kept their CPUs while other runs waited. A task no longer holds a CPU,
+and a drain no longer gathers any.
+
+- **Admission replaces CPU slots.** Capacity T is the pool's CPUs less those a `-c` drain
+  isolates. A project's fair share is T by its weight among the projects running or waiting.
+  Under its share, a run starts its next task at once, however busy the machine. Over it, a run
+  starts a task only while the machine has room (busy + starting < T − 0.5), the first waiter
+  in line first. Within a project, the run running the fewest tasks goes first, so a long `-n`
+  run never keeps a newer run of its project waiting. A run has no `-c` of its own unless given. A task that waits on I/O frees room, and more start. Hard limits: a run's `-c`,
+  the memory, disk and pressure gates, and 4T tasks running machine-wide.
+- **The kernel shares the time.** Linux: each run enters a systemd scope `cpuq-run-PID.scope` in
+  the slice `cpuq-PROJECT.slice` with `CPUWeight` 100 × the project's weight (config `cgroups`;
+  where user scopes don't work the run runs as it is); tasks are unpinned. macOS: cpuq never stops a task
+  (a stopped task can hold a lock others wait on; five zig builds stalled on one cache lock); once
+  a second it demotes the newest task of the project furthest over its share to background
+  priority (efficiency cores, throttled disk) while its tasks keep more than T + 0.5 CPUs busy,
+  and restores it once they keep no more than T or its project is no longer over its share. `-t`
+  counts wall time, less time stopped with Ctrl-Z.
+- **A drain takes its turn, then isolates at once.** `cpuq drain -c N | --cpus LIST [--prefer
+  fast] [--quiet-max X]` waits only for older runs waiting with no task running, older drains, the
+  `drain_max` bound and (with `--cpus`, or too few whole cores) CPUs another drain holds; then it
+  isolates N whole cores, the CPUs and their SMT siblings: its command is pinned to the N CPUs
+  (`CPUQ_CPUS`; Linux), and others' tasks are kept off all of them (Linux) or, on macOS, demoted. Nothing is gathered or held while it waits. Siblings in the
+  pool count toward the capacity and `drain_max`. Ctrl-Z on a drain ends its isolation. A drain isolates at
+  most its limit plus 60 s, and its `-t` counts from its isolation.
+- **Noise.** A drain measures the work from outside on its CPUs once a second (on macOS the
+  machine's busy CPUs less its command's, beyond the CPUs it leaves to others).
+  `cpuq status` flags `noisy` at 0.1 CPUs and names the busiest process; history's ended line
+  carries `noisy: {cpus, max, top}`. `--quiet-max X` starts the command once that work is X CPUs
+  or less, and gives up with exit 75 at `--max` or `-t`.
+- **The hook refuses benchmarks outside cpuq** (`hyperfine`, `cargo bench`, `zig build bench`, a
+  `node`, `bun`, `deno` or `python` script with "bench" in its path), naming `cpuq drain -c 1 -t
+  20m --label PROJECT:bench -- CMD`.
+- **`cpuq drain --all` is gone** and exits 2 naming `-c N`: a drain no longer stops the
+  machine.
+- **`cpuq limit RUN -c C`** changes the running-task cap: raised, it starts more as the line
+  allows; lowered, it starts none until fewer run. Up to 4 × the pool.
+- **`--driver` takes any command** but a bare build directly under it (zig, cargo, make, go, swift,
+  xcodebuild): no list of runner names. `rig/tools/light` hit the old list.
+- **A `--driver` that computes counts.** Its record notes what its runner's own process tree
+  keeps busy, the runs it starts left out; from 0.5 CPUs that counts against its project's share,
+  and status flags it `driver_cpu`. On the Mac, `rig/tools/light` under `--driver`
+  kept 2.5 CPUs busy unseen.
+- **A run whose cpuq dies** has its tasks killed by whoever next scans the pool.
+- **`cpuq status`** shows tasks running with ` · N background: over share` or `: drain` (macOS demoted) and ` · N on
+  I/O` (Linux, a process in state D), the tail of a run once only running tasks are left (`last
+  task, running 32m`), and capacity, tasks running and waiting, machine busy and room; tables of
+  running runs, waiting runs (with why) and projects (weight, runs, running, waiting, fair
+  share). Flags: `over_cpu`, `capped`, `stopped`, `idle_drain`, `long_drain`, `noisy`, `driver_cpu` (`low_use` is
+  gone). `cpuq record` samples write `running` (tasks) in place of `held`.
+- **State lives in `v3/`** under the state directory; v2 files are never read. The plan line
+  reads `cpuq: N tasks, up to C at once, timeout Ts`.
+
+What each project changes:
+
+- Drop `-x K`: `cpuq run -x` exits 2 ("-x is gone: cpuq starts more tasks when its tasks wait
+  (I/O, sleep, a server); drop -x"). Tasks that wait leave room, and more start.
+- Stop reading `CPUQ_CPU`: it is not set; a task has no CPU of its own. `CPUQ_CPUS` still names a
+  drain's CPUs.
+- `cpuq drain -c N` takes N whole cores that fit in `drain_max` (config: a count or a percentage of the pool, default 50%, always fewer than the pool; more is a usage error); `drain --all` is gone, use `-c N`.
+- `cpuq status --json` is schema 3: top-level `budget`, `pool`, `capacity`, `isolated`,
+  `running`, `paused`, `waiting`, `busy`, `tasks_busy`, `room`, `gate` (`open`, `pressure`,
+  `low_memory`, `low_disk`), `runs[]`, `waiters[]`, `projects[]`; `runs[]` add `demoted`, `io_wait`, `tail`, `oldest`, and `paused` is only a drain's
+  command waiting for its turn again after a Ctrl-Z. The fields `held`,
+  `emptying`, `promised`, `free`, `next_free` and `holders[]` are gone.
+- Cpuq.app reads schema 2 and needs a release for schema 3.
+
 ## 0.35.0 — 2026-11-27
 
 - **`cpuq limit OP -c C` changes a running run's `-c`.** Name the run by its ticket, its cpuq's

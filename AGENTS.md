@@ -1,7 +1,7 @@
 # cpuq for agents
 
 Working on cpuq itself? Read [HANDOFF.md](HANDOFF.md) first. A change to how the pool shares
-CPUs (the line in src/pool.zig, the stop, drain and give-back in src/op.zig) updates the Lean
+CPUs (the line in src/pool.zig, the pause, drain and isolation in src/op.zig) updates the Lean
 model in `formal/` and passes its search before release.
 
 This machine is shared by several agent sessions. Run every heavy command (a build, a test suite,
@@ -10,9 +10,9 @@ git, grep, editors or quick one-off commands.
 
 ## Shape
 
-    cpuq run --label PROJECT:TASK [-n M] [-x K] [-t T] [-r N] -- CMD ARGS...
+    cpuq run --label PROJECT:TASK [-n M] [-t T] [-r N] -- CMD ARGS...
 
-Every task gets one CPU. `cpuq run -- CMD` is one task: CMD runs with your terminal, and its exit
+A task counts as one CPU of work. `cpuq run -- CMD` is one task: CMD runs with your terminal, and its exit
 status is cpuq's. Run it at one job:
 
     cpuq run --label app:build -- zig build -j1
@@ -23,13 +23,13 @@ status is cpuq's. Run it at one job:
     cpuq run --label py:test   -- pytest                  # no -n
     cpuq run --label app:unit  -- ./single_threaded_tests
 
-A bare `zig build`, `cargo`, `go build` or `swift build` starts a job per CPU of the machine, all on
-one task's CPU. Always give the one-job option. Linux pins a task to its CPU; macOS can't.
+A bare `zig build`, `cargo`, `go build` or `swift build` starts a job per CPU of the machine, in one
+task. Always give the one-job option.
 
 ## Parallel work: -n M tasks
 
-Split parallel work into tasks. `-n M` runs CMD M times, each task on a CPU of its own, as many at
-once as the pool gives. Each gets `CPUQ_TASK` (1 to M) and `CPUQ_TASKS` to pick its piece. cpuq sets
+Split parallel work into tasks. `-n M` runs CMD M times, as many tasks at once as the
+machine has room for. Each gets `CPUQ_TASK` (1 to M) and `CPUQ_TASKS` to pick its piece. cpuq sets
 them for CMD, not for your shell: use `sh -c` with SINGLE quotes.
 
     cpuq run --label app:test -n 16 -- sh -c './test/shard "$CPUQ_TASK" "$CPUQ_TASKS"'
@@ -37,12 +37,11 @@ them for CMD, not for your shell: use `sh -c` with SINGLE quotes.
 
 - Each task's output goes to a file of its own. The summary at the end names the failed tasks with
   their last lines, and the folder. Exit 0 when every task passed, else 1.
-- `-x K`: K tasks share each CPU. Only for work that mostly waits (network, sleep, a server):
-  K = 1 + time waiting ÷ time computing. Never for computing.
-- `-t T`: each task's time limit, about ten times its usual time (`-t 30s`; default 1h).
+- `-t T`: each task's time limit (wall time), about ten times its usual time (`-t 30s`; default 1h).
+  Tasks that wait (network, sleep, a server) need no option: cpuq starts more while they wait.
 - `-r N`: try a failed task up to N more times (`CPUQ_ATTEMPT` says which try). Flaky work only.
-- `-c C`: hold at most C CPUs, or `-c 25%`. Usually leave it out. `cpuq limit LABEL -c C` changes it while the run runs
-  (raised: it takes free CPUs at once; lowered: it gives CPUs back as tasks end).
+- `-c C`: run at most C tasks at once, or `-c 25%`. Usually leave it out. `cpuq limit LABEL -c C` changes it while
+  the run runs (raised: it starts more as the line allows; lowered: none start until fewer run).
 - One run per phase: build with one task, then test with `-n M`.
 
 ## Labels
@@ -56,21 +55,25 @@ branch names: history is kept by label.
   in the background, or pass `--wait-max SECONDS` below your tool's timeout.
 - `--wait-max` gives up with exit 75, and the command never ran. Rerun it later; never retry in
   a loop.
-- `cpuq status` shows who holds which CPU and why each waiter waits; `--json` for programs.
+- `cpuq status` shows what runs, who waits and why, and the machine's room; `--json` for programs.
 - `cpuq wait --label 'proj:*' --max-wait 600` waits until no run with a matching label runs or
   waits.
-- `--urgent` puts a run's first CPU ahead of the line: only for a rebuild a human is waiting on.
+- `--urgent` puts a run's first task ahead of the line: only for a rebuild a human is waiting on.
 
 ## Timing
 
     cpuq drain -c 4 --label app:bench --max 10m -t 20m -- ./bench
 
-A drain gathers N CPUs ahead of the line (runs queued before it go first) and runs CMD alone on
-them, pinned on Linux; the rest of the machine keeps working. Use `$CPUQ_CPUS`, never a `taskset`
-of your own. `-c` is as many CPUs as the measurement uses. `--all` empties the whole machine, for
-at most 20 min: rarely. `-t` ends it (default 20m, at most 2h); one round of timing per drain. A
-drain whose command keeps under 0.25 CPUs busy for 5 min while others wait is stopped: time,
-don't sleep. `--max` gives up with exit 75. Only for real timing.
+A drain takes its turn (older runs that wait with no task running go first), then at once isolates
+N whole cores for CMD (its CPUs and their SMT siblings): CMD is pinned to the N CPUs on Linux,
+others' tasks are kept off; the rest of the machine keeps working. Use `$CPUQ_CPUS`, never a
+`taskset` of your own. `-c` is as many CPUs as the measurement uses (whole cores, at most the
+config's `drain_max`, half the pool by default); `--cpus LIST` names them, `--prefer fast` takes performance cores first. `-t` ends it
+(default 20m, at most 2h, counted from the isolation); one round of timing per drain. A drain whose
+command keeps under 0.25 CPUs busy for 5 min while others wait is stopped: time, don't sleep.
+`--max` gives up with exit 75. On Linux `cpuq status` flags a drain `noisy` (work from outside on
+its CPUs); `--quiet-max X` starts CMD only once that work is X CPUs or less (exit 75 if it never
+is). Only for real timing.
 
 ## Another machine
 
@@ -134,17 +137,19 @@ A runner whose tests are independent runs them as tasks:
 
     cpuq run --label proj:test -n "$(./test/count)" -t 2m -- sh -c './test/one "$CPUQ_TASK"'
 
-A runner that starts a `cpuq run` per test (swarm, `test/run`) runs under `--driver`: it holds no
-CPU, and each run it starts takes its own. Limit each program it starts with `cpuq cap`, never with
+A runner that starts a `cpuq run` per test (swarm, `test/run`) runs under `--driver`: it is no task
+of its own, and each run it starts is admitted on its own. What the runner computes itself (from
+0.5 CPUs) counts against its project's share, and status flags it: run that work as tasks. Limit each program it starts with `cpuq cap`, never with
 a watchdog that lists every process (`ps`):
 
     cpuq run --label proj:test --driver -- ./test/run
     cpuq run --label proj:case -- cpuq cap --mem 2G --time 120s --output 1M --pids 512 -- PROGRAM ARGS...   # in the runner
 
-- **`--driver` is for a test runner only.** A build under it holds no CPU; the hook refuses it.
-  One exception: `rig build` with `RIG_UNIT_LAUNCHER='cpuq run --'` set on it, so each unit's
-  compile takes a CPU of its own (`cpuq run --driver -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build …`).
-- **cap is a limit, not a queue:** it takes no CPU, and the hook judges what it runs as if typed
+- **`--driver` is for a runner.** Any command may be one; what it computes itself counts against
+  its project's share, and status flags it. A bare build directly under it (zig, cargo, make, go,
+  swift, xcodebuild) is refused: a build is a task. Rig's split build is a runner:
+  `cpuq run --driver -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build …` makes each unit a run.
+- **cap is a limit, not a queue:** it takes no turn, and the hook judges what it runs as if typed
   alone.
 - **Put it inside `cpuq run`, never around it:** its `--time` would count the time spent waiting.
 - **Exit:**
@@ -185,11 +190,16 @@ a removed option, or a `cpuq run` whose command would start more than one job, i
 the corrected command: run that instead. Mark a command `# cpuq: skip` only when it truly must
 run as it is.
 
+A benchmark outside cpuq (`hyperfine`, `cargo bench`, `zig build bench`, or `node`, `bun`,
+`deno`, `python` on a script with "bench" in its path) is refused too: time it with
+`cpuq drain -c 1 -t 20m --label PROJECT:bench -- CMD` (`-c` as many CPUs as it times on; `-t` about
+ten times its run).
+
 ## Don't
 
 - `--urgent` (except a rebuild a human is waiting on), `cpuq drain` for anything but timing.
 - `cpuq kill` on runs you did not start: it acts on anyone's.
 - Kill a waiting cpuq to retry it, or wrap a whole session or interactive shell in `cpuq run`.
 
-A `cpuq run` inside a task starts at once on that task's CPU: `-n M` there runs its tasks `-x` at
-a time on that one CPU. More: [README.md](README.md).
+A `cpuq run` inside a task starts at once, within that task: `-n M` there runs its tasks one
+at a time. More: [README.md](README.md).

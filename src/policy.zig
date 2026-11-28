@@ -12,18 +12,19 @@ pub const Qos = enum { unchanged, utility, background, niced };
 pub const Config = struct {
     /// The pool's size: the first this many of its CPUs (`budget`); null: every one.
     budget: ?u32 = null,
-    /// Hand out no CPU while the OS reports memory pressure.
+    /// Start no task while the OS reports memory pressure.
     pressure_check: bool = true,
-    /// Hand out only the CPUs the machine has idle, judged by its busy CPUs against the CPUs
-    /// held (`outside_check`). Off, the pool alone limits CPU work.
+    /// Count the machine's load outside cpuq (beyond the CPUs the pool leaves to it) as busy
+    /// when deciding whether there is spare room (`outside_check`). Off, only cpuq's own tasks
+    /// count.
     outside_check: bool = true,
     /// Linux: the `some avg10` percentage of /proc/pressure/memory that
     /// counts as pressure.
     pressure_psi: f64 = 10,
-    /// Hand out no CPU while the memory the kernel says is available falls
+    /// Start no task while the memory the kernel says is available falls
     /// under this, in bytes (`min_available`, e.g. 6G); 0 leaves it unchecked.
     min_available: u64 = 0,
-    /// Hand out no CPU while the filesystem holding $HOME or cpuq's state
+    /// Start no task while the filesystem holding $HOME or cpuq's state
     /// directory (the temp directory) has less than this free, in bytes
     /// (`min_disk`, e.g. 5G); 0 leaves it unchecked. A full disk fails every
     /// task and every tool that writes a file; on 2026-10-11 one session's
@@ -45,6 +46,9 @@ pub const Config = struct {
     /// A drain whose command keeps under `drain_idle_busy` CPUs busy this long while another
     /// run waits is stopped (`drain_idle`, e.g. 5m; off: never).
     drain_idle_s: u32 = 5 * 60,
+    /// The most of the pool's CPUs drains isolate at once, all of them together (`drain_max`: a
+    /// count, or a percentage of the pool such as 50%); always less than the whole pool.
+    drain_max: Share = .{ .n = 50, .percent = true },
     /// Project weights for sharing the pool (`weights`, e.g. "rig:2 trig:1"); a project not
     /// named weighs 1.
     weights: []const u8 = "",
@@ -114,7 +118,40 @@ pub const Diagnostic = struct {
 };
 
 /// What a key's value is, and so how it is read.
-const Kind = enum { on_off, whole, number, bytes, age, text };
+const Kind = enum { on_off, whole, number, bytes, age, text, share };
+
+/// A count of CPUs, or a percentage of the pool.
+pub const Share = struct { n: u32, percent: bool };
+
+/// "13" or "50%": a count of 1 to 4096, or a percentage of 1 to 99; null otherwise.
+pub fn parseShare(s: []const u8) ?Share {
+    if (std.mem.endsWith(u8, s, "%")) {
+        const n = parseWhole(u32, s[0 .. s.len - 1]) orelse return null;
+        return if (n >= 1 and n <= 99) .{ .n = n, .percent = true } else null;
+    }
+    const n = parseWhole(u32, s) orelse return null;
+    return if (n >= 1 and n <= 4096) .{ .n = n, .percent = false } else null;
+}
+
+/// The most of a pool of `pool_n` CPUs drains may isolate at once (`drain_max`): at least one,
+/// and fewer than the pool where the pool has more than one.
+pub fn drainMax(cfg: Config, pool_n: u32) u32 {
+    const v: u32 = if (cfg.drain_max.percent) @intCast(@as(u64, pool_n) * cfg.drain_max.n / 100) else cfg.drain_max.n;
+    return @max(1, @min(v, pool_n -| 1));
+}
+
+test "drainMax: a count or a share of the pool, below the pool" {
+    try std.testing.expectEqual(11, drainMax(.{}, 22));
+    try std.testing.expectEqual(5, drainMax(.{}, 10));
+    try std.testing.expectEqual(1, drainMax(.{}, 2));
+    try std.testing.expectEqual(1, drainMax(.{}, 1));
+    try std.testing.expectEqual(13, drainMax(.{ .drain_max = .{ .n = 13, .percent = false } }, 22));
+    try std.testing.expectEqual(21, drainMax(.{ .drain_max = .{ .n = 40, .percent = false } }, 22));
+    try std.testing.expectEqual(17, drainMax(.{ .drain_max = .{ .n = 80, .percent = true } }, 22));
+    try std.testing.expectEqual(Share{ .n = 13, .percent = false }, parseShare("13").?);
+    try std.testing.expectEqual(Share{ .n = 50, .percent = true }, parseShare("50%").?);
+    for ([_][]const u8{ "0", "100%", "0%", "x", "5000", "1.5" }) |v| try std.testing.expectEqual(null, parseShare(v));
+}
 
 /// A config key: the Config field it sets, how its value reads, and the bounds of a number.
 const Key = struct {
@@ -133,6 +170,7 @@ const Key = struct {
             .number => std.fmt.comptimePrint("{s} must be a number{s}, {d} to {d}", .{ k.name, of, k.min, k.max }),
             .bytes => k.name ++ " must be off or a size such as 5G or 512M",
             .age => k.name ++ " must be off or a time such as 3d, 36h or 90m",
+            .share => k.name ++ " must be a count of CPUs or a percentage of the pool, such as 13 or 50%",
             .text => unreachable,
         };
     }
@@ -150,6 +188,7 @@ const keys = [_]Key{
     .{ .name = "timeout", .field = "timeout_s", .kind = .age },
     .{ .name = "drain_timeout", .field = "drain_timeout_s", .kind = .age },
     .{ .name = "drain_idle", .field = "drain_idle_s", .kind = .age },
+    .{ .name = "drain_max", .field = "drain_max", .kind = .share },
     .{ .name = "weights", .field = "weights", .kind = .text },
     .{ .name = "submit_roots", .field = "submit_roots", .kind = .text },
     .{ .name = "clean_after", .field = "clean_after_s", .kind = .age },
@@ -219,6 +258,7 @@ pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{Conf
                 },
                 .bytes => field.* = parseBytes(value) orelse return bad(diag, comptime k.message()),
                 .age => field.* = parseAge(value) orelse return bad(diag, comptime k.message()),
+                .share => field.* = parseShare(value) orelse return bad(diag, comptime k.message()),
                 .text => field.* = value,
             }
             continue :next;

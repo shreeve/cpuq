@@ -2,8 +2,9 @@
 # test/run.sh [TEST...]: the end-to-end tests. Each test gets its own state directory, config and
 # HOME, and runs in a folder of its own (not a repo, so a run's project is its label's). The pool
 # is small (budget 2 unless a test says otherwise) and the memory and disk gates are off, so the
-# tests depend neither on the machine's size nor on its memory. The outside-load gate, which
-# reads the real machine, is off too, except where a test says otherwise (t_narrow).
+# tests depend neither on the machine's size nor on its memory. Outside load, which reads the real
+# machine, is off too: the line counts only the tests' own tasks as busy. A test that needs the
+# pool busy runs CPU burners ($BURN); a sleeping task leaves room, and more start.
 # CPUQ=/path/to/cpuq tests another binary.
 set -u
 cd "$(dirname "$0")/.."
@@ -28,7 +29,7 @@ descendants() { local p; for p in $(pgrep -P "$1"); do echo "$p"; descendants "$
 alive() { [ -s "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
 trap 'killtree $$; rm -rf "$ROOT"' EXIT
 # Linux: the suite runs with every CPU the machine's init may use, even when started inside a
-# narrower CPU set (an outer `cpuq run` pins its job), so each task can be pinned to its pool CPU.
+# narrower CPU set (an outer drain's isolation), so a drain's pinning is seen against all of them.
 if [ "$(uname)" = Linux ]; then
   SUITE_PID=$$ python3 -c 'import os, re
 m = re.search(r"Cpus_allowed_list:\s*(\S+)", open("/proc/1/status").read())
@@ -37,6 +38,34 @@ for part in m.group(1).split(","):
     a, _, b = part.partition("-"); cpus.update(range(int(a), int(b or a) + 1))
 os.sched_setaffinity(int(os.environ["SUITE_PID"]), cpus)' 2>/dev/null
 fi
+# burn [-K] SECONDS: keeps a CPU busy for SECONDS of its own CPU time; burn [-K] --until PATH
+# [SECONDS]: busy until PATH exists (at most SECONDS, default 60). -K burns in K processes, so a
+# task holding the pool busy shows busy even on a loaded machine that gives each less than a CPU.
+BURN=$ROOT/burn
+cat >"$BURN" <<'EOF'
+#!/usr/bin/env python3
+import os, sys, time
+args = sys.argv[1:]
+kids = []
+if args[0][:1] == "-" and args[0][1:].isdigit():
+    for _ in range(int(args[0][1:]) - 1):
+        pid = os.fork()
+        if pid == 0:
+            kids = []
+            break
+        kids.append(pid)
+    args = args[1:]
+if args[0] == "--until":
+    end = time.time() + float(args[2] if len(args) > 2 else 60)
+    while not os.path.exists(args[1]) and time.time() < end:
+        for _ in range(20000): pass
+else:
+    t = time.process_time() + float(args[0])
+    while time.process_time() < t: pass
+for pid in kids:
+    os.waitpid(pid, 0)
+EOF
+chmod +x "$BURN"
 PASS=0
 FAIL=0
 KNOWN=0
@@ -55,7 +84,7 @@ setup() {
   T=$ROOT/$CUR
   mkdir -p "$T/home"
   export CPUQ_DIR=$T/state CPUQ_CONFIG=$T/config HOME=$T/home
-  unset CPUQ_BUDGET CPUQ_CPU CPUQ_OP CPUQ_TASK CPUQ_TASKS CPUQ_ATTEMPT CPUQ_ATTEMPTS CPUQ_PROGRESS \
+  unset CPUQ_BUDGET CPUQ_CPU CPUQ_OP CPUQ_SCOPE CPUQ_TASK CPUQ_TASKS CPUQ_ATTEMPT CPUQ_ATTEMPTS CPUQ_PROGRESS \
     CPUQ_PROGRESS_AT CPUQ_LEASES CPUQ_TOKEN CPUQ_CORES CPUQ_HISTORY MAKEFLAGS XDG_STATE_HOME
   # Each key at most once: a line given here replaces the default for its key.
   local line keys=" "
@@ -79,7 +108,7 @@ os.execvp(sys.argv[1], sys.argv[1:])' "$@"; }
 
 # sj EXPR: EXPR in Python over `cpuq status --json --no-usage`, as s.
 sj() { "$CPUQ" status --json --no-usage | python3 -c 'import json, sys; s = json.load(sys.stdin); print(eval(sys.argv[1]))' "$1"; }
-held() { sj 's["held"]'; }
+running() { sj 's["running"]'; }
 waiting() { sj 'len(s["waiters"])'; }
 # The pool's CPUs, by the machine's numbers, space-separated.
 poolcpus() { sj '" ".join(map(str, s["pool"]))'; }
@@ -100,13 +129,13 @@ try: p.wait(5); sys.exit(124)
 except subprocess.TimeoutExpired: p.kill(); p.wait(); sys.exit(137)' "$@"; }
 # poll SECONDS CONDITION: until CONDITION (evaluated) holds, about every 0.05 s; 1 if it never does.
 poll() { local i=0 n=$(($1 * 20)); until eval "$2"; do i=$((i + 1)); [ $i -ge $n ] && return 1; sleep 0.05; done; }
-holds() { "$CPUQ" status --json --no-usage | python3 -c 'import json, sys
+runs() { "$CPUQ" status --json --no-usage | python3 -c 'import json, sys
 s = json.load(sys.stdin)
-sys.exit(0 if any(h["label"] == sys.argv[1] and h["cores"] > 0 for h in s["holders"]) else 1)' "$1"; }
-# wait_held N [seconds]: until N CPUs are held.
-wait_held() { poll "${2:-10}" "[ \"\$(held)\" = $1 ]"; }
-# wait_holder LABEL [seconds]: until a run labelled LABEL holds a CPU.
-wait_holder() { poll "${2:-10}" "holds '$1'"; }
+sys.exit(0 if any(h["label"] == sys.argv[1] and h["running"] > 0 for h in s["runs"]) else 1)' "$1"; }
+# wait_running N [seconds]: until N tasks run.
+wait_running() { poll "${2:-10}" "[ \"\$(running)\" = $1 ]"; }
+# wait_run LABEL [seconds]: until a run labelled LABEL runs a task.
+wait_run() { poll "${2:-10}" "runs '$1'"; }
 # wait_waiters N [seconds]: until the line holds N runs.
 wait_waiters() { poll "${2:-10}" "[ \"\$(waiting)\" = $1 ]"; }
 # wait_file PATH [seconds]: until PATH exists and is not empty.
@@ -128,81 +157,85 @@ fake_ssh() {
   ln -sf "$CPUQ" "$T/bin/cpuq"
 }
 
-# --- The pool: CPUs, tasks, packing ----------------------------------------------------------
+# --- The pool: admission, tasks, the line -----------------------------------------------------
 
 t_budget() {
-  # The pool never hands out more CPUs than it has: 12 runs and a run of 6 tasks on a pool of 2.
+  # The backstop: tasks waiting on I/O let more start, past the pool, but never past 4 × it: 6
+  # single runs and a run of 6, all asleep, on a pool of 2. And cpuq budget.
   setup budget
   local pids=() i p
-  for i in $(seq 12); do "$CPUQ" run -- sleep 0.3 & pids+=($!); done
-  "$CPUQ" run -n 6 -- sleep 0.3 2>/dev/null & pids+=($!)
+  for i in $(seq 6); do "$CPUQ" run -- sleep 5 & pids+=($!); done
+  "$CPUQ" run -n 6 -- sleep 5 2>/dev/null & pids+=($!)
   local max=0 samples=0 h any=1
-  while [ $any = 1 ] && [ $samples -lt 200 ]; do
-    h=$(held); samples=$((samples + 1))
+  # Looks a tenth of a second apart, for at most 40 s: a fast machine answers status in
+  # milliseconds, and a count of looks would end before a waiter finds room.
+  while [ $any = 1 ] && [ $samples -lt 400 ]; do
+    h=$(running); samples=$((samples + 1))
     [ -n "$h" ] && [ "$h" -gt "$max" ] && max=$h
     any=0; for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && any=1; done
+    sleep 0.1
   done
   local rc=0
   for p in "${pids[@]}"; do wait "$p" || rc=1; done
-  check "never more than the pool's 2 CPUs held (most $max over $samples looks), and every run passed (rc $rc)" "[ $max -le 2 ] && [ $max -gt 0 ] && [ $rc = 0 ]"
+  check "sleeping tasks run past the pool of 2, never past 4 × it (most $max over $samples looks), and every run passed (rc $rc)" "[ $max -le 8 ] && [ $max -gt 2 ] && [ $rc = 0 ]"
   local b1 b2; b1=$("$CPUQ" budget); b2=$(CPUQ_BUDGET=1 "$CPUQ" budget)
   check "cpuq budget prints the pool's size: budget 2 ($b1), CPUQ_BUDGET=1 ($b2)" "[ '$b1' = 2 ] && [ '$b2' = 1 ]"
 }
 
 t_tasks() {
-  # -n M: M tasks, each with CPUQ_TASK, CPUQ_TASKS, CPUQ_CPU (one of the pool's), CPUQ_OP and
-  # CPUQ_ATTEMPT, stdin from /dev/null, and its output (both streams) in a file of its own; a plan
-  # line first; 0 when every task passed, 1 when any failed, with the failed task's last lines.
+  # -n M: M tasks, each with CPUQ_TASK, CPUQ_TASKS, CPUQ_OP and CPUQ_ATTEMPT (and no CPUQ_CPU),
+  # stdin from /dev/null, and its output (both streams) in a file of its own; a plan line first; 0
+  # when every task passed, 1 when any failed, with the failed task's last lines.
   setup tasks
-  local pool; pool=$(poolcpus)
-  "$CPUQ" run -n 5 --label t:env -- sh -c 'echo "$CPUQ_TASK/$CPUQ_TASKS $CPUQ_CPU op=$CPUQ_OP try=$CPUQ_ATTEMPT"; echo err >&2; cat' 2>"$T/err"; local rc=$?
+  "$CPUQ" run -n 5 --label t:env -- sh -c 'echo "$CPUQ_TASK/$CPUQ_TASKS ${CPUQ_CPU-unset} op=$CPUQ_OP try=$CPUQ_ATTEMPT"; echo err >&2; cat' 2>"$T/err"; local rc=$?
   local d; d=$(rundir t)
   local files; files=$(ls "$d" 2>/dev/null | sort -n | tr '\n' ' ')
-  local good=0 i cpu
+  local good=0 i
   for i in 1 2 3 4 5; do
-    cpu=$(sed -n 's/^[0-9]*\/5 \([0-9]*\) op=[0-9][0-9]* try=1$/\1/p' "$d/$i" 2>/dev/null)
-    [ -n "$cpu" ] && [[ " $pool " == *" $cpu "* ]] && grep -qx err "$d/$i" && good=$((good + 1))
+    grep -qx "$i/5 unset op=[0-9][0-9]* try=1" "$d/$i" 2>/dev/null && grep -qx err "$d/$i" && good=$((good + 1))
   done
-  check "5 tasks, each with its own output file ($files) holding its variables, a CPU of the pool ($pool) and its stderr ($good of 5); rc $rc" "[ $rc = 0 ] && [ '$files' = '1 2 3 4 5 ' ] && [ $good = 5 ]"
+  check "5 tasks, each with its own output file ($files) holding its variables, no CPUQ_CPU, and its stderr ($good of 5); rc $rc" "[ $rc = 0 ] && [ '$files' = '1 2 3 4 5 ' ] && [ $good = 5 ]"
   check "a plan line first, then the summary ('$(head -1 "$T/err")' ... '$(tail -1 "$T/err" | cut -c1-40)')" \
-    "grep -q '^cpuq: 5 tasks, up to 2 CPUs, overload 1, timeout 3600s\$' '$T/err' && grep -q '^cpuq: 5 of 5 tasks passed, in .*; output in $d\$' '$T/err'"
+    "grep -q '^cpuq: 5 tasks, up to 5 at once, timeout 3600s\$' '$T/err' && grep -q '^cpuq: 5 of 5 tasks passed, in .*; output in $d\$' '$T/err'"
   "$CPUQ" run -n 4 --label u:fail -- sh -c 'echo "line of $CPUQ_TASK"; [ "$CPUQ_TASK" != 3 ] || exit 7' 2>"$T/err2"; rc=$?
   check "a failed task makes it 1 (rc $rc), and the summary names it with its last lines" \
     "[ $rc = 1 ] && grep -q '3 of 4 tasks passed, 1 failed' '$T/err2' && grep -q 'task 3 (attempt 1) exited 7' '$T/err2' && grep -qx '    line of 3' '$T/err2'"
 }
 
-t_pack() {
-  # -x K: up to K tasks share a CPU, and a CPU fills to K before the next is taken: 5 tasks at -x 3
-  # put 3 on one CPU and 2 on another; 3 tasks at -x 3 hold one CPU.
-  setup pack
-  "$CPUQ" run -n 5 -x 3 --label p:five -- sh -c 'echo "$CPUQ_CPU" >"$1/five.$CPUQ_TASK"; sleep 0.5' sh "$T" 2>/dev/null; local rc=$?
-  local per first
-  per=$(cat "$T"/five.* | sort | uniq -c | awk '{print $1}' | sort -rn | tr '\n' ' ')
-  first=$(cat "$T/five.1" "$T/five.2" "$T/five.3" | sort -u | wc -l | tr -d ' ')
-  check "5 tasks at -x 3: tasks 1-3 share a CPU, 4-5 another (tasks per CPU: $per; CPUs of 1-3: $first; rc $rc)" "[ $rc = 0 ] && [ '$per' = '3 2 ' ] && [ $first = 1 ]"
-  "$CPUQ" run -n 3 -x 3 --label p:three -- sh -c 'echo "$CPUQ_CPU" >"$1/three.$CPUQ_TASK"; sleep 0.6' sh "$T" 2>"$T/err" & local p=$!
-  local max=0 h
-  while kill -0 $p 2>/dev/null; do h=$(held); [ -n "$h" ] && [ "$h" -gt "$max" ] && max=$h; done
-  wait $p; rc=$?
-  local cpus; cpus=$(cat "$T"/three.* | sort -u | wc -l | tr -d ' ')
-  check "3 tasks at -x 3 hold one CPU (most held $max, CPUs used $cpus, '$(head -1 "$T/err")')" "[ $rc = 0 ] && [ $max = 1 ] && [ $cpus = 1 ] && grep -q 'up to 1 CPU, overload 3' '$T/err'"
+t_io() {
+  # A task blocked on I/O (here a sleep) leaves the CPU to others, and another starts: 3 sleepers
+  # of 5 s on a pool of 1 overlap. Tasks that compute don't: of 2 burners, the second starts once
+  # the first ends.
+  setup io "budget = 1"
+  local t0 rc dt; t0=$(now)
+  "$CPUQ" run -n 3 --label io:sleep -- sleep 5 2>/dev/null; rc=$?
+  dt=$(since "$t0")
+  check "3 sleepers of 5 s on a pool of 1 overlap: ${dt}s, not 15 (rc $rc)" "[ $rc = 0 ] && fl '$dt < 12'"
+  "$CPUQ" run -n 2 --label io:burn -- sh -c 'echo "s$CPUQ_TASK" >>"$1"; "$2" -2 1.5; echo "e$CPUQ_TASK" >>"$1"' sh "$T/burn" "$BURN" 2>/dev/null; rc=$?
+  local order; order=$(tr '\n' ' ' <"$T/burn")
+  check "2 burners on a pool of 1 take turns: the second starts once the first ends (got $order; rc $rc)" "[ $rc = 0 ] && [ '$order' = 's1 e1 s2 e2 ' ]"
 }
 
 t_cpus_limit() {
-  # -c C or -c P%: the most CPUs a run holds, against the pool (here 4, named, so a machine with
-  # fewer CPUs has the same pool), at least 1, and never more than its tasks need; the plan line
-  # says it, and the tasks keep to it.
+  # -c C or -c P%: the most tasks a run runs at once: a count, or a share of the pool (here 4,
+  # named, so a machine with fewer CPUs has the same pool), at least 1, at most 4 × the pool, and
+  # never more than its tasks; none given, as the line allows. The plan line says it, and the
+  # tasks keep to it.
   setup cpus-limit "budget = 4" "cpus = 0-3"
-  local got="" spread=1 c n
-  for c in 1 2 50% 25% 10% 100% 9; do
-    n=$("$CPUQ" run -n 8 -c "$c" --label c:x -- sh -c 'echo "$CPUQ_CPU" >>"$1"; sleep 0.1' sh "$T/cpus.$c" 2>&1 >/dev/null | sed -n 's/^cpuq: 8 tasks, up to \([0-9]*\) CPUs*,.*/\1/p')
+  local got="" c n
+  for c in 1 2 50% 25% 10% 100% 9 99; do
+    n=$("$CPUQ" run -n 20 -c "$c" --label c:x -- true 2>&1 >/dev/null | sed -n 's/^cpuq: 20 tasks, up to \([0-9]*\) at once,.*/\1/p')
     got="$got$c:$n "
-    [ "$(sort -u "$T/cpus.$c" | wc -l | tr -d ' ')" -le "${n:-0}" ] || spread=0
   done
-  local few; few=$("$CPUQ" run -n 3 --label c:few -- true 2>&1 | sed -n 's/^cpuq: 3 tasks, up to \([0-9]*\) CPUs*,.*/\1/p')
-  local x; x=$("$CPUQ" run -n 8 -x 3 -c 100% --label c:x3 -- true 2>&1 | sed -n 's/^cpuq: 8 tasks, up to \([0-9]*\) CPUs*,.*/\1/p')
-  check "-c on a pool of 4: a count, a percentage (at least 1), clamped to the pool ($got); never more than the tasks need (3 tasks: $few; 8 at -x 3: $x); the tasks keep to it ($spread)" \
-    "[ '$got' = '1:1 2:2 50%:2 25%:1 10%:1 100%:4 9:4 ' ] && [ '$few' = 3 ] && [ '$x' = 3 ] && [ $spread = 1 ]"
+  local few; few=$("$CPUQ" run -n 3 --label c:few -- true 2>&1 | sed -n 's/^cpuq: 3 tasks, up to \([0-9]*\) at once,.*/\1/p')
+  local many; many=$("$CPUQ" run -n 40 --label c:many -- true 2>&1 | sed -n 's/^cpuq: 40 tasks, up to \([0-9]*\) at once,.*/\1/p')
+  check "-c on a pool of 4: a count, a share of the pool (at least 1), at most 16 ($got); none given: its tasks, at most 16 (3 tasks: $few; 40: $many)" \
+    "[ '$got' = '1:1 2:2 50%:2 25%:1 10%:1 100%:4 9:9 99:16 ' ] && [ '$few' = 3 ] && [ '$many' = 16 ]"
+  "$CPUQ" run -n 6 -c 2 --label c:keep -- sleep 2.5 2>/dev/null & local p=$!
+  local max=0 h
+  while kill -0 $p 2>/dev/null; do h=$(running); [ -n "$h" ] && [ "$h" -gt "$max" ] && max=$h; done
+  wait $p; local rc=$?
+  check "6 sleepers at -c 2 run 2 at once, never more, though the pool has room (most $max, rc $rc)" "[ $max = 2 ] && [ $rc = 0 ]"
   local bad=0 v
   for v in 0 101% x 2.5; do "$CPUQ" run -c "$v" -- true 2>/dev/null; [ $? = 2 ] || bad=$((bad + 1)); done
   check "a -c of 0, over 100%, or not a whole number is a usage error (wrong: $bad)" "[ $bad = 0 ]"
@@ -255,261 +288,335 @@ case $CPUQ_TASK in 1) exit 0 ;; 2) [ "$CPUQ_ATTEMPT" = 3 ] ;; 3) exit 1 ;; esac'
 }
 
 t_wait_max() {
-  # --wait-max S: no CPU within S seconds and the run gives up with 75, nothing run; 0 takes a
-  # free CPU at once or gives up at once.
+  # --wait-max S: no task started within S seconds and the run gives up with 75, nothing run; 0
+  # starts at once or gives up at once. The waiters are of the busy run's project, over its share.
   setup wait-max "budget = 1"
-  "$CPUQ" run --label w:hold -- sleep 3 & local h=$!
-  wait_held 1
+  "$CPUQ" run --label w:hold -- "$BURN" -2 4 & local h=$!
+  wait_running 1
   local t0 rc0 rc1 dt0 dt1 rcn
-  t0=$(now); "$CPUQ" run --wait-max 0 -- touch "$T/ran" 2>"$T/err"; rc0=$?; dt0=$(since "$t0")
-  t0=$(now); "$CPUQ" run --wait-max 1 -- touch "$T/ran" 2>/dev/null; rc1=$?; dt1=$(since "$t0")
-  "$CPUQ" run -n 3 --wait-max 0 -- touch "$T/ran" 2>/dev/null; rcn=$?
+  t0=$(now); "$CPUQ" run --wait-max 0 --label w:x -- touch "$T/ran" 2>"$T/err"; rc0=$?; dt0=$(since "$t0")
+  t0=$(now); "$CPUQ" run --wait-max 1 --label w:x -- touch "$T/ran" 2>/dev/null; rc1=$?; dt1=$(since "$t0")
+  "$CPUQ" run -n 3 --wait-max 0 --label w:x -- touch "$T/ran" 2>/dev/null; rcn=$?
   wait $h
-  "$CPUQ" run --wait-max 0 -- true; local free=$?
+  "$CPUQ" run --wait-max 0 --label w:x -- true; local free=$?
   local ran=no; [ -e "$T/ran" ] && ran=yes
-  check "the pool full: --wait-max 0 gives up at once (rc $rc0 after ${dt0}s, '$(cat "$T/err")'), --wait-max 1 after a second (rc $rc1 after ${dt1}s), a run of 3 too (rc $rcn), nothing ran ($ran); a free CPU: 0 runs (rc $free)" \
+  check "the pool busy: --wait-max 0 gives up at once (rc $rc0 after ${dt0}s, '$(cat "$T/err")'), --wait-max 1 after a second (rc $rc1 after ${dt1}s), a run of 3 too (rc $rcn), nothing ran ($ran); the pool idle: 0 runs (rc $free)" \
     "[ $rc0 = 75 ] && fl '$dt0 < 1' && [ $rc1 = 75 ] && fl '0.9 < $dt1 < 3' && [ $rcn = 75 ] && [ $ran = no ] && [ $free = 0 ] && grep -q 'nothing ran' '$T/err'"
 }
 
 t_share() {
-  # Two operations of different projects share a pool of 2: a holds both until b comes; then, as
-  # a's tasks end, b gets a CPU, and each holds one while both run; both finish.
+  # A project under its share starts at once on a busy pool: a fills a pool of 2 with burners; b's
+  # first task starts within a second of b coming. Then each keeps its share of 1: b never runs a
+  # second task while a runs.
   setup share
-  "$CPUQ" run -n 16 --label a:work -- sleep 0.4 2>/dev/null & local a=$!
-  wait_held 2
-  "$CPUQ" run -n 6 --label b:work -- sleep 0.4 2>/dev/null & local b=$!
-  local both=0 most_b=0 looks=0 line
-  while kill -0 $b 2>/dev/null && [ $looks -lt 200 ]; do
-    line=$(sj '" ".join("%s=%d" % (p["name"], p["held"]) for p in sorted(s["projects"], key=lambda p: p["name"]))')
+  "$CPUQ" run -n 4 --label a:work -- "$BURN" -2 3 2>/dev/null & local a=$!
+  wait_running 2
+  sleep 0.5
+  local t0; t0=$(now)
+  "$CPUQ" run -n 4 --label b:work -- sh -c 'python3 -c "import time; print(time.time())" >>"$1"; "$2" -2 0.5' sh "$T/b" "$BURN" 2>/dev/null & local b=$!
+  wait_file "$T/b"
+  local first; first=$(python3 -c "print('%.2f' % ($(head -1 "$T/b") - $t0))")
+  local most_b=0 both=0 looks=0 line demoted=0 stopped=0 d
+  while kill -0 $b 2>/dev/null && kill -0 $a 2>/dev/null && [ $looks -lt 200 ]; do
+    line=$(sj '" ".join("%s=%d" % (p["name"], p["running"]) for p in sorted(s["projects"], key=lambda p: p["name"]))')
+    # macOS shares time by demoting a's newest task (never stopping it); Linux by weights.
+    d=$(sj 'sum(h["demoted"] for h in s["runs"] if h["label"] == "a:work")'); [ "${d:-0}" -gt 0 ] && demoted=$((demoted + 1))
+    for k in $(descendants $a); do ps -o stat= -p "$k" 2>/dev/null; done | grep -q '^T' && stopped=$((stopped + 1))
     looks=$((looks + 1))
-    case " $line " in *" a=1 b=1 "*) both=$((both + 1)) ;; esac
-    case " $line " in *" b=2 "*) most_b=2 ;; esac
+    case " $line " in *" b=1 "*) case " $line " in *" a=0 "*) ;; *) both=$((both + 1)) ;; esac ;; esac
+    case " $line " in *" b=2 "*|*" b=3 "*|*" b=4 "*) most_b=2 ;; esac
   done
   wait $a; local ra=$?; wait $b; local rb=$?
-  check "while both run each project holds a CPU ($both of $looks looks), b never both ($most_b), both finish (rc $ra $rb)" "[ $both -ge 3 ] && [ $most_b = 0 ] && [ $ra = 0 ] && [ $rb = 0 ]"
+  check "b's first task starts ${first}s after b came, on a pool a keeps busy" "fl '$first < 1.5'"
+  check "while a runs, b runs one task, never two ($most_b; both running in $both of $looks looks); both finish (rc $ra $rb)" "[ $most_b = 0 ] && [ $both -ge 2 ] && [ $ra = 0 ] && [ $rb = 0 ]"
+  if [ "$(uname)" = Linux ]; then
+    check "Linux demotes nothing: the kernel shares by weight ($demoted looks with a task demoted)" "[ $demoted = 0 ]"
+  else
+    check "macOS demotes a's newest task while b runs ($demoted looks), and never stops one ($stopped looks)" "[ $demoted -ge 1 ] && [ $stopped = 0 ]"
+  fi
 }
 
 t_fair() {
-  # The line takes turns by project: with two CPUs freeing, b's one run starts beside a's first,
-  # before a's second and third (all came before b's).
+  # Projects take turns by share: on a pool of 2 kept busy by h, the first runs of a and b start
+  # at once (each under its share); a's second and third wait (a at its share) until h ends.
   setup fair
-  local f=$T/order n k=0
-  "$CPUQ" run -n 2 --label h:x -- sh -c "while [ ! -e $T/go ]; do sleep 0.05; done" 2>/dev/null & wait_held 2
+  local f=$T/order n
+  "$CPUQ" run -n 2 --label h:x -- "$BURN" -2 --until "$T/go" 2>/dev/null & local h=$!
+  wait_running 2
   for n in a1 a2 a3 b1; do
-    "$CPUQ" run --label "${n:0:1}:x" -- sh -c "echo $n >>$f; sleep 2" &
-    k=$((k + 1)); wait_waiters $k
+    "$CPUQ" run --label "${n:0:1}:x" -- sh -c "echo $n >>$f; \"$BURN\" --until $T/go 20" &
+    sleep 0.3
   done
+  sleep 1.5
+  local early; early=$(sort "$f" 2>/dev/null | tr '\n' ' ')
   touch "$T/go"
   wait
-  local got first; got=$(tr '\n' ' ' <"$f"); first=$(head -2 "$f" | sort | tr '\n' ' ')
-  check "projects take turns: b's run starts with a's first, before a's second (got: $got)" "[ '$first' = 'a1 b1 ' ]"
+  local got; got=$(tr '\n' ' ' <"$f")
+  check "under their shares, a's first run and b's start at once beside h; a's others wait (early: $early; all: $got)" "[ '$early' = 'a1 b1 ' ] && [ \$(wc -l <'$f') = 4 ]"
 }
 
 t_order() {
-  # The line: an --urgent run first, then the others in the order they came (each its own
-  # project, all holding nothing).
+  # The line: within a project an --urgent run's first task first, then the runs in the order
+  # they came; across projects the one running fewer for its weight.
   setup order "budget = 1"
   local f=$T/order k=0 n
-  "$CPUQ" run --label h:x -- sh -c "while [ ! -e $T/go ]; do sleep 0.05; done" & wait_held 1
+  "$CPUQ" run --label p:h -- "$BURN" -2 --until "$T/go" & wait_running 1
   for n in a b c d; do
-    "$CPUQ" run --label "$n:x" -- sh -c "echo $n >>$f" &
+    "$CPUQ" run --label "p:$n" -- sh -c "echo $n >>$f" &
     k=$((k + 1)); wait_waiters $k
   done
-  "$CPUQ" run --urgent --label u:x -- sh -c "echo U >>$f" & wait_waiters 5
+  "$CPUQ" run --urgent --label p:u -- sh -c "echo U >>$f" & wait_waiters 5
   touch "$T/go"
   wait
   local got; got=$(tr -d '\n' <"$f")
   check "--urgent goes first, then first come first served (got $got)" "[ '$got' = Uabcd ]"
-  # --urgent counts for an operation's first CPU only: an urgent run with long work that holds
-  # one CPU gives it up for a waiter of its own project, rather than rank first again.
+  # Within a project the run running the fewest goes first: a newer run of an urgent run's
+  # project starts before the urgent run's next task.
   setup urgent-once "budget = 2"
-  "$CPUQ" run -n 30 --label q:b -- sleep 0.5 2>/dev/null & local b=$!
-  wait_held 2
-  "$CPUQ" run --urgent -n 30 --label p:u -- sleep 0.5 2>/dev/null & local u=$!
-  poll 5 '[ "$(sj "len([h for h in s[\"holders\"] if h[\"cores\"]])")" = 2 ]'
+  "$CPUQ" run -n 30 --label q:b -- "$BURN" -2 0.3 2>/dev/null & local b=$!
+  wait_running 2
+  "$CPUQ" run --urgent -n 30 --label p:u -- "$BURN" -2 0.3 2>/dev/null & local u=$!
+  poll 5 '[ "$(sj "len([h for h in s[\"runs\"] if h[\"label\"] == \"p:u\" and h[\"running\"]])")" = 1 ]'
   local t0 rc dt; t0=$(now)
   "$CPUQ" run --wait-max 6 --label p:c -- true; rc=$?; dt=$(since "$t0")
   kill -TERM $u $b; reap $u; reap $b
-  check "an urgent run holding a CPU gives way to a waiter of its project (rc $rc after ${dt}s)" "[ $rc = 0 ] && fl '$dt < 4'"
+  check "a newer run of a busy project starts before that project's long run takes another (rc $rc after ${dt}s)" "[ $rc = 0 ] && fl '$dt < 4'"
 }
 
 t_drain() {
-  # cpuq drain -- CMD: every run stops taking CPUs and gives them back as its tasks end; once the
-  # drain holds the whole pool, CMD runs alone; what waited runs after it. --max gives up (75).
+  # cpuq drain -c N: after the runs queued before it, N CPUs are isolated for its command at once,
+  # without waiting for any task to end, and the rest of the machine keeps working; CPUQ_CPUS
+  # names them (the last of the pool). Its -t, its idle stop and --max hold.
   setup drain
   local f=$T/log
-  "$CPUQ" run -n 4 --label d:a -- sh -c "echo a\$CPUQ_TASK-start >>$f; sleep 1; echo a\$CPUQ_TASK-end >>$f" 2>/dev/null & local a=$!
-  wait_held 2
-  "$CPUQ" drain --all --max 20s --label d:timing -- sh -c "echo drain-start >>$f; \"$CPUQ\" status --json --no-usage | python3 -c 'import json, sys; s = json.load(sys.stdin); print(\"drain-held\", s[\"held\"], \" \".join(h[\"label\"] for h in s[\"holders\"] if h[\"cores\"]))' >>$f; sleep 1; echo drain-end >>$f" & local d=$!
+  "$CPUQ" run -n 2 --label d:a -- sh -c "echo a\$CPUQ_TASK-start >>$f; \"$BURN\" -2 3; echo a\$CPUQ_TASK-end >>$f" 2>/dev/null & local a=$!
+  wait_running 2
+  local t0; t0=$(now)
+  "$CPUQ" drain -c 1 --max 20s --label d:timing -- sh -c "echo drain-start \$CPUQ_CPUS >>$f; sleep 0.5; echo drain-end >>$f"; local rd=$?
+  local dt; dt=$(since "$t0")
+  wait $a; local ra=$?
+  local last; last=$(poolcpus); last=${last##* }
+  echo "  $(tr '\n' ' ' <"$f")"
+  check "a drain of 1 CPU starts at once beside running tasks (${dt}s; rc $rd), on the pool's last CPU ($(grep drain-start "$f")), and they finish (rc $ra)" \
+    "[ $rd = 0 ] && [ $ra = 0 ] && fl '$dt < 2' && grep -qx 'drain-start $last' '$f' && [ \$(grep -n drain-end '$f' | cut -d: -f1) -lt \$(grep -n a1-end '$f' | cut -d: -f1) ]"
+  # A drain passes no run that queued before it: with one waiting, --max gives up (75).
+  "$CPUQ" run -n 2 --label d:hold -- "$BURN" -2 4 2>/dev/null & local h=$!
+  wait_running 2
+  "$CPUQ" run --label d:older -- touch "$T/older" & local o=$!
   wait_waiters 1
-  "$CPUQ" run --label d:late -- sh -c "echo late >>$f" & local l=$!
-  wait $a $d $l
-  local got; got=$(tr '\n' ' ' <"$f")
-  echo "  $got"
-  python3 - "$f" <<'EOF' >"$T/verdict"
-import sys
-lines = [l.strip() for l in open(sys.argv[1])]
-at = {l: i for i, l in enumerate(lines)}
-ok = (at["drain-start"] > max(at["a1-end"], at["a2-end"])
-      and "drain-held 2 d:timing" in lines and at["late"] > at["drain-end"])
-held_back = at["a3-start"] > at["drain-end"] and at["a4-start"] > at["drain-end"]
-print("ok" if ok else "wrong", "held-back" if held_back else "refilled")
-EOF
-  local verdict; verdict=$(cat "$T/verdict")
-  check "the drain's command starts once the running tasks end, holds the pool alone, and what waited runs after it" "[ '${verdict% *}' = ok ]"
-  # An operation asleep in poll() hears of the drain only at its next settle(), and on waking it
-  # place()s its next task on the freed CPU first (seen on pup: a3 started after a1 ended).
-  check "a run stops starting tasks once a drain waits (${verdict#* })" "[ '${verdict#* }' = held-back ]"
-  "$CPUQ" run --label d:long -- sleep 3 & local h=$!
-  wait_held 1
-  local t0 rc dt; t0=$(now)
-  "$CPUQ" drain --all --max 1s -- touch "$T/ran" 2>/dev/null; rc=$?; dt=$(since "$t0")
-  wait $h
+  local t1 rc dt1; t1=$(now)
+  "$CPUQ" drain -c 1 --max 1s -- touch "$T/ran" 2>/dev/null; rc=$?; dt1=$(since "$t1")
+  wait $h $o
   local ran=no; [ -e "$T/ran" ] && ran=yes
-  check "drain --max 1s gives up with 75 while a task runs on (rc $rc after ${dt}s, ran: $ran)" "[ $rc = 75 ] && [ $ran = no ] && fl '$dt < 2.5'"
-  # Two drains at once: the second waits in the line, never on the first's hold of the drain
-  # mark under the pool's lock (that deadlocked every cpuq on the machine). Each runs alone, in
-  # turn, and a run behind them follows.
-  local g=$T/two
-  "$CPUQ" drain --all --max 20s --label d:one -- sh -c "echo one-start >>$g; sleep 1; echo one-end >>$g" & local d1=$!
-  wait_line "$g" one-start
-  "$CPUQ" drain --all --max 20s --label d:two -- sh -c "echo two-start >>$g; sleep 1; echo two-end >>$g" & local d2=$!
-  wait_waiters 1
-  "$CPUQ" run --wait-max 20 --label d:after -- sh -c "echo after >>$g" & local d3=$!
-  local r1 r2 r3; wait $d1; r1=$?; wait $d2; r2=$?; wait $d3; r3=$?
-  local order; order=$(tr '\n' ' ' <"$g" 2>/dev/null)
-  local alone=no
-  case "$order" in "one-start one-end two-start two-end "*|"two-start two-end one-start one-end "*) alone=yes ;; esac
-  check "two drains at once each run alone, in turn, and a run follows (rc $r1 $r2 $r3: $order)" \
-    "[ $r1 = 0 ] && [ $r2 = 0 ] && [ $r3 = 0 ] && [ $alone = yes ]"
-  # A drain holds the whole machine, so its command has a time limit too (default 30m).
-  local t1 rt dt1; t1=$(now)
-  "$CPUQ" drain --all --max 20s -t 1s -- sleep 30 2>/dev/null; rt=$?; dt1=$(since "$t1")
+  check "a drain behind an older waiter, with --max 1s, gives up with 75 (rc $rc after ${dt1}s, ran: $ran)" "[ $rc = 75 ] && [ $ran = no ] && fl '$dt1 < 2.5'"
+  local rt; t1=$(now)
+  "$CPUQ" drain -c 1 --max 20s -t 1s -- sleep 30 2>/dev/null; rt=$?; dt1=$(since "$t1")
   check "drain -t 1s ends its command with 124 (rc $rt after ${dt1}s)" "[ $rt = 124 ] && fl '$dt1 < 10'"
-  local bad; bad=$("$CPUQ" drain --all -t off -- true 2>&1 >/dev/null; echo "rc $?")
-  check "a drain has no -t off, and -t goes no higher than 2h (${bad##*rc })" "[ '${bad##*rc }' = 2 ] && \"$CPUQ\" drain -t 3h -- true 2>/dev/null; [ \$? = 2 ]"
-  # A drain that holds the machine while its command idles, with others waiting, is stopped
-  # (drain_idle); one that computes, even on a single CPU, runs on.
+  local bad; bad=$("$CPUQ" drain -c 1 -t off -- true 2>&1 >/dev/null; echo "rc $?")
+  local half; half=$("$CPUQ" drain -c 2 -- true 2>&1 >/dev/null; echo "rc $?")
+  check "a drain has no -t off, -t goes no higher than 2h, and -c takes at most half the pool (${bad##*rc } ${half##*rc })" \
+    "[ '${bad##*rc }' = 2 ] && [ '${half##*rc }' = 2 ] && \"$CPUQ\" drain -t 3h -c 1 -- true 2>/dev/null; [ \$? = 2 ]"
+  local none; none=$("$CPUQ" drain -- true 2>&1 >/dev/null; echo "rc $?")
+  local all; all=$("$CPUQ" drain --all -- touch "$T/ran-all" 2>&1 >/dev/null; echo "rc $?")
+  check "a drain needs -c N or --cpus (${none##*rc }); --all is gone and says -c N, running nothing (${all})" "[ '${none##*rc }' = 2 ] && [[ '$all' == *'--all is gone: use -c N'*'rc 2' ]] && [ ! -e '$T/ran-all' ]"
+  # A drain whose command idles while others wait is stopped (drain_idle); one that computes,
+  # even on a single CPU, runs on.
   echo "drain_idle = 3s" >>"$CPUQ_CONFIG"
   local w=$T/idle
-  "$CPUQ" drain --all --max 20s --label d:idle -- sh -c "echo idle-start >>$w; sleep 30; echo idle-end >>$w" 2>"$T/idle.err" & local di=$!
+  "$CPUQ" drain -c 1 --max 20s --label d:idle -- sh -c "echo idle-start >>$w; sleep 30; echo idle-end >>$w" 2>"$T/idle.err" & local di=$!
   wait_line "$w" idle-start
-  "$CPUQ" run --wait-max 30 --label d:waiter -- sh -c "echo waiter >>$w" & local dw=$!
-  local ri rw; wait $di; ri=$?; wait $dw; rw=$?
+  "$CPUQ" run --label q:hold -- "$BURN" -2 6 & local qh=$!
+  wait_run q:hold
+  "$CPUQ" run --wait-max 30 --label q:waiter -- sh -c "echo waiter >>$w" & local dw=$!
+  local ri rw; wait $di; ri=$?; wait $dw; rw=$?; wait $qh
   local hist; hist=$("$CPUQ" history --label d:idle --json | python3 -c 'import json,sys; print(json.load(sys.stdin)[0].get("stopped"))')
   check "an idle drain with a run waiting is stopped (rc $ri, history: $hist), and the run follows (rc $rw: $(tr '\n' ' ' <"$w"))" \
     "[ $ri = 124 ] && [ $rw = 0 ] && [ '$hist' = idle ] && grep -q waiter $w && ! grep -q idle-end $w && grep -q 'kept under' $T/idle.err"
   local u=$T/busy
-  "$CPUQ" drain --all --max 20s --label d:busy -- python3 -c "import time
+  "$CPUQ" drain -c 1 --max 20s --label d:busy -- python3 -c "import time
 open('$u','a').write('busy-start\n')
 e = time.time() + 6
 while time.time() < e: pass
 open('$u','a').write('busy-end\n')" & local db=$!
   wait_line "$u" busy-start
-  "$CPUQ" run --wait-max 30 --label d:waiter2 -- sh -c "echo waiter2 >>$u" & local dw2=$!
-  local rb rw2; wait $db; rb=$?; wait $dw2; rw2=$?
+  "$CPUQ" run --label r:hold -- "$BURN" -2 7 & local rh=$!
+  wait_run r:hold
+  "$CPUQ" run --wait-max 30 --label r:waiter2 -- sh -c "echo waiter2 >>$u" & local dw2=$!
+  local rb rw2; wait $db; rb=$?; wait $dw2; rw2=$?; wait $rh
   check "a drain computing on one CPU runs on with a run waiting (rc $rb $rw2: $(tr '\n' ' ' <"$u"))" \
-    "[ $rb = 0 ] && [ $rw2 = 0 ] && [ \"\$(tr '\n' ' ' <$u)\" = 'busy-start busy-end waiter2 ' ]"
+    "[ $rb = 0 ] && [ $rw2 = 0 ] && grep -q busy-end $u"
+}
+
+t_drain_cpus() {
+  # A drain names its CPUs (--cpus), or picks whole cores (--prefer fast: performance cores
+  # first); all its drains together isolate at most half the pool, so a second waits for the
+  # first. On Linux a drain isolates its CPUs' SMT siblings too.
+  setup drain-cpus
+  local first last; first=$(poolcpus); last=${first##* }; first=${first%% *}
+  local got; got=$("$CPUQ" drain --cpus "$first" --max 20s -- sh -c 'echo "$CPUQ_CPUS"')
+  local fast; fast=$("$CPUQ" drain -c 1 --prefer fast --max 20s -- sh -c 'echo "$CPUQ_CPUS"')
+  local bad=""
+  "$CPUQ" drain -c 2 --cpus "$first" -- true 2>/dev/null; bad="$bad$? "
+  "$CPUQ" drain --cpus 4095 -- true 2>/dev/null; bad="$bad$? "
+  "$CPUQ" drain -c 1 --prefer slow -- true 2>/dev/null; bad="$bad$? "
+  "$CPUQ" drain --cpus "$first" --prefer fast -- true 2>/dev/null; bad="$bad$? "
+  check "--cpus $first names its CPU ($got); --prefer fast takes one of the pool ($fast: $(poolcpus)); a -c that disagrees, a CPU not in the pool, --prefer other than fast, --prefer with --cpus are usage errors ($bad)" \
+    "[ '$got' = '$first' ] && [[ ' $(poolcpus) ' == *\" $fast \"* ]] && [ '$bad' = '2 2 2 2 ' ]"
+  # Two drains of 1 on a pool of 2: half the pool is 1, so they run one at a time, in turn.
+  local g=$T/two
+  "$CPUQ" drain -c 1 --max 20s --label g:one -- sh -c "echo one-start >>$g; sleep 1; echo one-end >>$g" & local d1=$!
+  wait_line "$g" one-start
+  "$CPUQ" drain -c 1 --max 20s --label g:two -- sh -c "echo two-start >>$g; sleep 0.3; echo two-end >>$g" & local d2=$!
+  local r1 r2; wait $d1; r1=$?; wait $d2; r2=$?
+  local order; order=$(tr '\n' ' ' <"$g")
+  check "two drains of 1 CPU on a pool of 2 run one at a time (rc $r1 $r2: $order)" "[ $r1 = 0 ] && [ $r2 = 0 ] && [ '$order' = 'one-start one-end two-start two-end ' ]"
+  if [ "$(uname)" != Linux ]; then
+    # macOS measures the machine's work beyond what the drain leaves to it: under a bound it
+    # meets (8 CPUs past the rest of the machine), the command starts once measured.
+    local q; "$CPUQ" drain -c 1 --quiet-max 8 --max 20s -- touch "$T/ran-mac"; q=$?
+    check "--quiet-max on macOS starts the command under a bound it meets (rc $q)" "[ $q = 0 ] && [ -e '$T/ran-mac' ]"
+    return
+  fi
+  # Linux: a drain of 1 isolates its CPU's SMT siblings too.
+  local sib; sib=$("$CPUQ" drain -c 1 --max 20s -- sh -c '"$1" status --json --no-usage | python3 -c "import json, sys; print(\",\".join(map(str, sorted(json.load(sys.stdin)[\"isolated\"]))))"; cat /sys/devices/system/cpu/cpu$CPUQ_CPUS/topology/thread_siblings_list' sh "$CPUQ" | tr '\n' ' ')
+  local want; want=$(python3 -c "
+import sys
+t = '${sib#* }'.strip()
+s = set()
+for p in t.split(','):
+    if p:
+        a, _, b = p.partition('-'); s.update(range(int(a), int(b or a) + 1))
+print(','.join(map(str, sorted(s))))")
+  check "a drain isolates its CPU with its SMT siblings (isolated ${sib%% *}; siblings $want)" "[ '${sib%% *}' = '$want' ]"
+  # Linux: work from outside on a drain's CPU (a burner pinned there, which cpuq doesn't run)
+  # makes it noisy: status flags it live and history records it; --quiet-max holds the command
+  # until the CPU is quiet, and gives up at --max.
+  if ! command -v taskset >/dev/null; then echo "  skipped: noise needs taskset"; return; fi
+  taskset -c "$last" "$BURN" --until "$T/quiet" 30 & local noise=$!
+  sleep 0.5
+  "$CPUQ" drain --cpus "$last" --max 20s --label n:noisy -- sh -c 'sleep 2.5; "$1" status --json --no-usage | python3 -c "import json, sys; print(\" \".join(f for h in json.load(sys.stdin)[\"runs\"] for f in h[\"flags\"]))"' sh "$CPUQ" >"$T/flags"; local rn=$?
+  local t0 rq dq; t0=$(now)
+  "$CPUQ" drain --cpus "$last" --quiet-max 0.2 --max 3s --label n:quiet -- touch "$T/ran-loud" 2>"$T/quiet.err"; rq=$?; dq=$(since "$t0")
+  touch "$T/quiet"; wait $noise
+  # Under a bound it meets (a shared machine's own work may stay on the core: 8 CPUs is more than
+  # any core holds), the command starts once measured.
+  local rq2; "$CPUQ" drain --cpus "$last" --quiet-max 8 --max 20s --label n:quiet2 -- touch "$T/ran-quiet"; rq2=$?
+  local hist; hist=$("$CPUQ" history --label n:noisy --json | python3 -c 'import json,sys; n = json.load(sys.stdin)[0].get("noisy") or {}; print("%.1f %s" % (n.get("max", 0), n.get("top", "-")))')
+  check "outside work on its CPU: status flags the drain noisy ($(cat "$T/flags"); rc $rn) and history records it ($hist)" "[ $rn = 0 ] && grep -qw noisy '$T/flags' && fl \"${hist%% *} >= 0.5\" && [[ '$hist' == *python* ]]"
+  check "--quiet-max waits for a quiet CPU and gives up at --max (rc $rq after ${dq}s: $(cat "$T/quiet.err"), ran: $([ -e "$T/ran-loud" ] && echo yes || echo no)); under a bound it meets it runs (rc $rq2)" \
+    "[ $rq = 75 ] && [ ! -e '$T/ran-loud' ] && fl '2.5 < $dq < 6' && grep -q 'never quieted' '$T/quiet.err' && [ $rq2 = 0 ] && [ -e '$T/ran-quiet' ]"
 }
 
 t_drain_turn() {
-  # A drain takes its turn: a run that queued before it starts first, and one that queues after
-  # it waits for it. So a stream of drains can't starve one-CPU runs.
-  setup drain_turn
+  # A drain takes its turn: a run that queued before it and waits starts first; the drain then
+  # starts at once, with no task ending for it.
+  setup drain_turn "budget = 1"
   local f=$T/log
-  "$CPUQ" run -n 2 -t 1h --label t:busy -- sh -c "sleep 2; echo busy\$CPUQ_TASK-end >>$f" 2>/dev/null & local b=$!
-  wait_held 2
-  "$CPUQ" run -t 1h --label t:older -- sh -c "echo older-start >>$f; sleep 1; echo older-end >>$f" & local o=$!
+  "$CPUQ" run --label t:busy -- sh -c "\"$BURN\" -2 3; echo busy-end >>$f" & local b=$!
+  wait_running 1
+  "$CPUQ" run --label t:older -- sh -c "echo older-start >>$f; \"$BURN\" 0.5; echo older-end >>$f" & local o=$!
   wait_waiters 1
-  "$CPUQ" drain --all --max 30s --label t:drain -- sh -c "echo drain-start >>$f; sleep 1; echo drain-end >>$f" & local d=$!
+  "$CPUQ" drain -c 1 --max 30s --label t:drain -- sh -c "echo drain-start >>$f; sleep 0.5; echo drain-end >>$f" & local d=$!
   wait_waiters 2
-  local why; why=$("$CPUQ" status --no-usage | grep 't:drain' | grep -o '[0-9]* runs* queued before it go[es]* first' | head -1)
-  # The newer run's -t (2h) runs past the drain's start, so it can't backfill.
-  "$CPUQ" run -t 2h --label t:newer -- sh -c "echo newer >>$f" & local n=$!
-  wait $b $o $d $n
+  local why; why=$("$CPUQ" status --no-usage | grep 't:drain' | grep -o 'runs queued before it go first' | head -1)
+  wait $b $o $d
   local got; got=$(tr '\n' ' ' <"$f")
-  python3 - "$f" <<'EOF' >"$T/verdict"
+  # By history's start times: the drain takes the pool's one CPU as it starts, so the older run's
+  # task may only get to write once the drain has ended.
+  local order; order=$("$CPUQ" history --json | python3 -c 'import json, sys
+j = {x["label"]: x for x in json.load(sys.stdin)}
+print("ok" if j["t:older"]["started"] < j["t:drain"]["started"] else "wrong")')
+  check "an older run starts before the drain (${why:-no turn shown}; by history $order: $got)" "[ '$order' = ok ] && [ -n '$why' ]"
+  # Drains isolate at most drain_max of the pool together (half by default), a drain's CPUs
+  # counting with their SMT siblings: a second drain that would pass it waits for the first, and
+  # starts once it ends. On a pool of 4, its size is set from what the first isolates (1 CPU, or a
+  # whole core of 2), so it always needs the cap's room. On Linux with SMT, again on a pool of two
+  # whole cores.
+  half_case drain_half "budget = 4"
+  if [ "$(uname)" = Linux ]; then
+    local cores; cores=$(python3 -c '
+import glob, re
+seen, out = set(), []
+def cpus(t):
+    s = []
+    for p in t.split(","):
+        a, _, b = p.partition("-"); s += range(int(a), int(b or a) + 1)
+    return s
+for f in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*/topology/thread_siblings_list"), key=lambda f: int(re.search(r"cpu(\d+)/", f).group(1))):
+    sib = tuple(cpus(open(f).read().strip()))
+    if len(sib) >= 2 and sib not in seen:
+        seen.add(sib); out.append(sib[:2])
+    if len(out) == 2: break
+if len(out) == 2: print(",".join(str(c) for c in (out[0][0], out[1][0], out[0][1], out[1][1])))')
+    if [ -n "$cores" ]; then half_case drain_half_smt "cpus = $cores" "budget = 4"; else echo "  skipped: no SMT here"; fi
+  fi
+}
+
+# half_case NAME [config lines]: drain_turn's half-pool case on the pool its config makes.
+half_case() {
+  local name=$1; shift
+  setup "$name" "$@"
+  if [ "$(poolcpus | wc -w | tr -d ' ')" -lt 4 ]; then echo "  skipped: needs a pool of 4"; return; fi
+  local g=$T/half
+  "$CPUQ" drain -c 1 --max 20s --label h:first -- sh -c "echo first-start >>$g; sleep 2; echo first-end \$(python3 -c 'import time; print(time.time())') >>$g" & local d1=$!
+  wait_line "$g" first-start
+  local k; k=$(sj 'len(set(s["isolated"]) & set(s["pool"]))')
+  local c2=2; [ "${k:-1}" -ge 2 ] && c2=1
+  "$CPUQ" drain -c $c2 --max 20s --label h:second -- sh -c "echo second-start \$(python3 -c 'import time; print(time.time())') >>$g" & local d2=$!
+  local r1 r2; wait $d1; r1=$?; wait $d2; r2=$?
+  local order gap; order=$(cut -d' ' -f1 <"$g" | tr '\n' ' ')
+  gap=$(python3 -c "
 import sys
-at = {l.strip(): i for i, l in enumerate(open(sys.argv[1]))}
-print("ok" if at["older-start"] < at["drain-start"] and at["older-end"] < at["drain-start"] and at["drain-end"] < at["newer"] else "wrong")
-EOF
-  check "an older run starts before the drain, a newer one after it (${why:-no turn shown}: $got)" "[ \"\$(cat $T/verdict)\" = ok ]"
+t = {l.split()[0]: float(l.split()[1]) for l in open('$g') if len(l.split()) > 1}
+print('%.1f' % (t['second-start'] - t['first-end']) if len(t) == 2 else 'none')")
+  check "drains isolate at most drain_max: the first isolates $k of the pool ($(poolcpus)), a second of -c $c2 waits for it, and starts ${gap}s after it ends (rc $r1 $r2: $order)" \
+    "[ $r1 = 0 ] && [ $r2 = 0 ] && [ '$order' = 'first-start first-end second-start ' ] && fl '$gap < 2.5'"
 }
 
 t_drain_part() {
-  # cpuq drain -c 1: the drain gathers one CPU ahead of the line and runs on it alone, pinned
-  # (CPUQ_CPUS), while the rest of the machine keeps working: a run behind it uses the other CPU.
+  # Linux: tasks are unpinned (a task's CPUs are its cpuq's); a drain of 1 CPU pins its command
+  # there at once and moves every other task's threads off it (and its siblings), and they get it
+  # back when it ends.
   setup drain_part
-  local f=$T/log
-  "$CPUQ" run -n 2 -t 1h --label p:busy -- sh -c "sleep \$((CPUQ_TASK * 3 - 2)); echo busy\$CPUQ_TASK-end >>$f" 2>/dev/null & local b=$!
-  wait_held 2
-  "$CPUQ" drain -c 1 --max 30s --label p:drain -- sh -c "echo drain-start \$CPUQ_CPUS >>$f; sleep 4; echo drain-end >>$f" & local d=$!
-  wait_waiters 1
-  "$CPUQ" run -t 1h --label p:after -- sh -c "echo after-start >>$f" & local l=$!
-  wait $b $d $l
-  local got; got=$(tr '\n' ' ' <"$f")
-  python3 - "$f" <<'EOF' >"$T/verdict"
-import sys
-rows = [l.split() for l in open(sys.argv[1])]
-at = {r[0]: i for i, r in enumerate(rows)}
-cpus = [r[1:] for r in rows if r[0] == "drain-start"][0]
-print("ok" if at["drain-start"] < at["busy2-end"] and at["after-start"] < at["drain-end"] and len(cpus) == 1 and "," not in cpus[0] else "wrong")
-EOF
-  check "a drain of 1 CPU runs beside other work, and a run behind it takes the other CPU ($got)" "[ \"\$(cat $T/verdict)\" = ok ]"
-  local none; none=$("$CPUQ" drain -- true 2>&1 >/dev/null; echo "rc $?")
-  check "a drain needs -c N or --all (${none##*rc })" "[ '${none##*rc }' = 2 ]"
-  local long; long=$("$CPUQ" drain --all -t 30m -- true 2>&1 >/dev/null; echo "rc $?")
-  check "a drain of the whole machine holds it at most 20m (${long##*rc })" "[ '${long##*rc }' = 2 ]"
+  if [ "$(uname)" != Linux ]; then echo "  skipped: Linux only"; return; fi
+  local list='sed -n "s/^Cpus_allowed_list:[[:space:]]*//p" /proc/self/status'
+  local mine; mine=$(eval "$list")
+  "$CPUQ" run -n 1 --label p:watch -- sh -c "while [ ! -e $T/stop ]; do $list >$T/cpu.new; mv $T/cpu.new $T/cpu; sleep 0.05; done" 2>/dev/null & local w=$!
+  wait_file "$T/cpu"
+  local before; before=$(cat "$T/cpu")
+  "$CPUQ" drain -c 1 --max 20s --label p:drain -- sh -c "echo \$CPUQ_CPUS >$T/drain; $list >$T/drain.own; sleep 1; cat $T/cpu >$T/during"
+  local after=""; poll 5 '[ "$(cat "$T/cpu")" = "$before" ]' && after=$(cat "$T/cpu")
+  touch "$T/stop"; reap $w
+  local cpu own during; cpu=$(cat "$T/drain"); own=$(cat "$T/drain.own"); during=$(cat "$T/during")
+  local off; off=$(python3 -c "
+def cpus(t):
+    s = set()
+    for p in t.split(','):
+        a, _, b = p.partition('-'); s.update(range(int(a), int(b or a) + 1))
+    return s
+print('yes' if $cpu not in cpus('$during') and cpus('$during') else 'no')")
+  check "a task runs on its cpuq's CPUs ($before; this shell $mine); a drain of 1 pins its command to CPU $cpu ($own), moves the other task off it (during: $during, off: $off) and gives it back ($after)" \
+    "[ '$before' = '$mine' ] && [ '$own' = '$cpu' ] && [ $off = yes ] && [ '$after' = '$before' ]"
 }
 
 t_limit() {
-  # cpuq limit OP -c C: a running run's -c changes. Raised, it takes free CPUs at once; lowered,
-  # it gives CPUs back as its tasks end, killing none. Status flags a run held back by its -c.
+  # cpuq limit RUN -c C: a running run's -c changes. Raised, it starts more at once (here under
+  # its share); lowered, it starts none until fewer run, killing none. Status flags a run held back
+  # by its -c while the machine has room.
   setup limit "budget = 4"
-  "$CPUQ" run -n 12 -c 1 -t 1h --label l:many -- sh -c 'sleep 1' 2>/dev/null & local r=$!
-  wait_held 1
-  local flag; flag=$("$CPUQ" status --json --no-usage | python3 -c 'import json,sys; s=json.load(sys.stdin); print(",".join(f for h in s["holders"] for f in h["flags"]))')
+  "$CPUQ" run -n 12 -c 1 -t 1h --label l:many -- sleep 1 2>/dev/null & local r=$!
+  wait_running 1
+  local flag; flag=$("$CPUQ" status --json --no-usage | python3 -c 'import json,sys; s=json.load(sys.stdin); print(",".join(f for h in s["runs"] for f in h["flags"]))')
   local out; out=$("$CPUQ" limit l:many -c 3); local rc=$?
-  local up=no; wait_held 3 5 && up=yes
+  local up=no; wait_running 3 5 && up=yes
   "$CPUQ" limit l:many -c 25% >/dev/null
-  local down=no; wait_held 1 5 && down=yes
+  local down=no; wait_running 1 5 && down=yes
   wait $r; local rr=$?
   check "cpuq limit raises a run's -c at once and lowers it as tasks end, killing none (flag: $flag; $out; up: $up, down: $down, rc $rr)" \
     "[ $rc = 0 ] && [ $up = yes ] && [ $down = yes ] && [ $rr = 0 ] && [ '$flag' = capped ]"
   local miss; miss=$("$CPUQ" limit l:nothing -c 2 2>&1; echo "rc $?")
   local bad; bad=$("$CPUQ" limit l:many 2>&1 >/dev/null; echo "rc $?")
-  check "cpuq limit names no operation: 1; no -c: 2 (${miss##*rc } ${bad##*rc })" "[ '${miss##*rc }' = 1 ] && [ '${bad##*rc }' = 2 ]"
-}
-
-t_backfill() {
-  # While a drain waits for a long task, the CPUs it gathered don't sit idle: a task whose time
-  # limit ends before the drain could start anyway runs on them (one task or many). A task that
-  # could run past that waits for the drain, and the drain still starts once the long task ends.
-  setup backfill
-  local f=$T/log
-  "$CPUQ" run -t 1h --label b:build -- sh -c "echo build-start >>$f; sleep 4; echo build-end >>$f" & local b=$!
-  wait_held 1
-  "$CPUQ" drain --all --max 30s --label b:drain -- sh -c "echo drain-start >>$f" & local d=$!
-  wait_held 2
-  local t0; t0=$(now)
-  "$CPUQ" run -t 5s --label b:short -- sh -c "echo short >>$f"; local rs=$?
-  "$CPUQ" run -n 3 -t 5s --label b:many -- sh -c "sleep 0.2; echo many\$CPUQ_TASK >>$f" 2>/dev/null; local rm=$?
-  local dt; dt=$(since "$t0")
-  "$CPUQ" run --label b:long -- sh -c "echo long >>$f" & local l=$!
-  wait $b $d $l
-  local got; got=$(tr '\n' ' ' <"$f")
-  echo "  $got"
-  local verdict; verdict=$(python3 - "$f" <<'EOF2'
-import sys
-lines = [l.strip() for l in open(sys.argv[1])]
-at = {l: i for i, l in enumerate(lines)}
-early = all(at[k] < at["build-end"] for k in ("short", "many1", "many2", "many3"))
-order = at["build-end"] < at["drain-start"] < at["long"]
-print("ok" if early and order else "wrong")
-EOF2
-)
-  check "short tasks run on a waiting drain's CPUs (rc $rs $rm in ${dt}s); a long one waits; the drain starts when the build ends" \
-    "[ '$verdict' = ok ] && [ $rs = 0 ] && [ $rm = 0 ] && fl '$dt < 3.5'"
+  check "cpuq limit names no run: 1; no -c: 2 (${miss##*rc } ${bad##*rc })" "[ '${miss##*rc }' = 1 ] && [ '${bad##*rc }' = 2 ]"
 }
 
 t_lock_stuck() {
@@ -523,7 +630,7 @@ f = open(sys.argv[1], "r+")
 fcntl.flock(f, fcntl.LOCK_EX)
 os.pwrite(f.fileno(), ("%12d %16d\n" % (os.getpid(), int(time.time() * 1000) - 60000)).encode(), 0)
 open(sys.argv[2], "w").write("%d" % os.getpid())
-time.sleep(30)' "$CPUQ_DIR/v2/lock" "$T/holder" & local h=$!
+time.sleep(30)' "$CPUQ_DIR/v3/lock" "$T/holder" & local h=$!
   wait_file "$T/holder"
   local t0 out rc dt; t0=$(now)
   out=$(tmo 20 "$CPUQ" status 2>&1); rc=$?; dt=$(since "$t0")
@@ -537,19 +644,19 @@ time.sleep(30)' "$CPUQ_DIR/v2/lock" "$T/holder" & local h=$!
 
 t_storm() {
   # Everything at once on a pool of 2, for about 10 s: runs of tasks, single and urgent runs,
-  # drains (two at a time), kills, Ctrl-Z and continue, and status every 0.3 s. Nothing may hang
-  # (each command has 60 s; a hang ends in 124, or 137 when it ignores the TERM), status always answers, and the pool ends empty.
+  # drains (two of 1 CPU, taking turns), kills, Ctrl-Z and continue, and status every 0.3 s.
+  # Nothing may hang (each command has 60 s; a hang ends in 124, or 137 when it ignores the TERM),
+  # status always answers, and the pool ends empty.
   setup storm
   local L=$T/rc; : >"$L"
   # t CMD...: run CMD with a 60 s limit, noting a hang.
   t() { tmo 60 "$@" >/dev/null 2>&1; local rc=$?; case $rc in 124|137) echo "hang: $*" >>"$L" ;; esac; return 0; }
   local end=$(( $(date +%s) + 10 )) pids=""
   ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" run -n 3 -t 20s --label s:many -- sh -c 'sleep 0.$((CPUQ_TASK * 2))'; done ) & pids="$pids $!"
-  ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" run --label s:one -- sleep 0.1; done ) & pids="$pids $!"
+  ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" run --label s:one -- "$BURN" 0.1; done ) & pids="$pids $!"
   ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" run --urgent --label s:urgent -- sleep 0.2; sleep 0.5; done ) & pids="$pids $!"
-  for d in 1 2; do
-    ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" drain --all --max 30s --label s:drain$d -- sleep 0.3; sleep 0.7; done ) & pids="$pids $!"
-  done
+  ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" drain -c 1 --max 30s --label s:drain1 -- sleep 0.3; sleep 0.7; done ) & pids="$pids $!"
+  ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" drain -c 1 --max 30s --label s:drain2 -- sleep 0.3; sleep 0.7; done ) & pids="$pids $!"
   ( while [ "$(date +%s)" -lt $end ]; do
       "$CPUQ" run --label s:victim -- sleep 5 >/dev/null 2>&1 & local v=$!
       sleep 0.4; t "$CPUQ" kill s:victim; wait $v 2>/dev/null
@@ -567,15 +674,15 @@ t_storm() {
   local t0; t0=$(now)
   wait $pids
   local tail; tail=$(since "$t0")
-  local h w; h=$(held); w=$(waiting)
+  local h w; h=$(running); w=$(waiting)
   local hangs; hangs=$(wc -l <"$L" | tr -d ' ')
   [ "$hangs" = 0 ] || head -5 "$L"
-  check "everything at once: no command hung ($hangs), status answered $((polls - stuck)) of $polls, all done ${tail}s after the end, pool empty (held $h, waiting $w)" \
+  check "everything at once: no command hung ($hangs), status answered $((polls - stuck)) of $polls, all done ${tail}s after the end, pool empty (running $h, waiting $w)" \
     "[ $hangs = 0 ] && [ $stuck = 0 ] && fl '$tail < 30' && [ '$h' = 0 ] && [ '$w' = 0 ]"
 }
 
 t_kill() {
-  # cpuq kill OP, by label or ticket: SIGTERM to the run's cpuq, which ends its tasks; the run
+  # cpuq kill RUN, by label or ticket: SIGTERM to the run's cpuq, which ends its tasks; the run
   # exits by the signal. A label of two runs, or of none, is refused.
   setup kill
   "$CPUQ" run --label k:one -- sh -c 'echo $$ >"$1"; exec sleep 30' sh "$T/one" & local p=$!
@@ -585,9 +692,9 @@ t_kill() {
   sleep 0.2
   local left=no; alive "$T/one" && left=yes
   check "kill by label ends a single run (kill $rk: '$said'; run $rp; task left: $left)" "[ $rk = 0 ] && [ $rp = 143 ] && [ $left = no ] && [[ '$said' == 'stopping '*'k:one'* ]]"
-  "$CPUQ" run -n 4 --label k:many -- sh -c 'echo $$ >"$1.$CPUQ_TASK"; sleep 30' sh "$T/many" 2>"$T/err" & p=$!
-  wait_held 2; wait_file "$T/many.1"; wait_file "$T/many.2"
-  local ticket; ticket=$(sj '[h["ticket"] for h in s["holders"] if h["label"] == "k:many"][0]')
+  "$CPUQ" run -n 4 -c 2 --label k:many -- sh -c 'echo $$ >"$1.$CPUQ_TASK"; sleep 30' sh "$T/many" 2>"$T/err" & p=$!
+  wait_running 2; wait_file "$T/many.1"; wait_file "$T/many.2"
+  local ticket; ticket=$(sj '[h["ticket"] for h in s["runs"] if h["label"] == "k:many"][0]')
   "$CPUQ" kill "$ticket" >/dev/null; rk=$?
   wait $p 2>/dev/null; rp=$?
   sleep 0.2
@@ -595,49 +702,49 @@ t_kill() {
   check "kill by ticket ends a run of tasks, tasks stopped, not failed (kill $rk; run $rp; left: $left)" "[ $rk = 0 ] && [ $rp = 143 ] && [ $left = no ] && grep -q '2 stopped, 2 not run' '$T/err'"
   "$CPUQ" run --label k:two -- sleep 3 & local a=$!
   "$CPUQ" run --label k:two -- sleep 3 & local b=$!
-  wait_held 2
+  wait_running 2
   local two; two=$("$CPUQ" kill k:two 2>&1); local r2=$?
   local none; none=$("$CPUQ" kill k:none 2>&1); local rn=$?
   kill $a $b 2>/dev/null; wait $a $b 2>/dev/null
-  check "a label of two runs is refused with both listed (rc $r2), one of none too (rc $rn: '$none')" "[ $r2 = 1 ] && [[ '$two' == *'2 operations are k:two'* ]] && [ $rn = 1 ] && [[ '$none' == *'no operation here is k:none'* ]]"
+  check "a label of two runs is refused with both listed (rc $r2), one of none too (rc $rn: '$none')" "[ $r2 = 1 ] && [[ '$two' == *'2 runs are k:two'* ]] && [ $rn = 1 ] && [[ '$none' == *'no run here is k:none'* ]]"
 }
 
 t_ctrl_z() {
-  # Ctrl-Z (SIGTSTP to cpuq): its tasks stop and its CPUs go back to the pool, for a newcomer;
-  # continued, it takes CPUs again and its tasks finish. For a run of tasks and for one task.
+  # Ctrl-Z (SIGTSTP to cpuq): its tasks stop and count in no share, so a newcomer of its project
+  # starts at once; continued, its tasks go on and finish. For a run of tasks and for one task.
   setup ctrl-z
-  dfl "$CPUQ" run -n 2 --label z:a -- sh -c 'echo $$ >"$1.$CPUQ_TASK"; sleep 1.5' sh "$T/pid" 2>/dev/null & local a=$!
-  wait_held 2; wait_file "$T/pid.1"; wait_file "$T/pid.2"
+  dfl "$CPUQ" run -n 2 --label z:a -- sh -c 'echo $$ >"$1.$CPUQ_TASK"; "$2" 1.5' sh "$T/pid" "$BURN" 2>/dev/null & local a=$!
+  wait_running 2; wait_file "$T/pid.1"; wait_file "$T/pid.2"
   kill -TSTP $a
-  local freed=no; poll 5 '[ "$(held)" = 0 ]' && freed=yes
+  local freed=no; poll 5 '[ "$(running)" = 0 ]' && freed=yes
   local st; st=$(ps -o stat= -p "$(cat "$T/pid.1")" | tr -d ' ')
   local t0 rb dt; t0=$(now)
   "$CPUQ" run --wait-max 5 --label z:b -- true; rb=$?; dt=$(since "$t0")
   kill -CONT $a
   reap $a; local ra=$?
-  check "a run of tasks stopped gives its CPUs back (freed: $freed), its tasks stopped ($st); a newcomer runs (rc $rb after ${dt}s); continued, it finishes (rc $ra)" \
+  check "a run of tasks stopped counts no more (freed: $freed), its tasks stopped ($st); a newcomer runs (rc $rb after ${dt}s); continued, it finishes (rc $ra)" \
     "[ $freed = yes ] && [[ '$st' == T* ]] && [ $rb = 0 ] && fl '$dt < 2' && [ $ra = 0 ]"
   setup ctrl-z-single "budget = 1"
-  dfl "$CPUQ" run --label z:one -- sh -c 'sleep 1; echo finished >"$1"' sh "$T/done" & a=$!
-  wait_held 1
+  dfl "$CPUQ" run --label z:one -- sh -c '"$2" 1; echo finished >"$1"' sh "$T/done" "$BURN" & a=$!
+  wait_running 1
   kill -TSTP $a
-  freed=no; poll 5 '[ "$(held)" = 0 ]' && freed=yes
+  freed=no; poll 5 '[ "$(running)" = 0 ]' && freed=yes
   "$CPUQ" run --wait-max 5 --label z:b -- true; rb=$?
   kill -CONT $a
   reap $a; ra=$?
-  check "one task stopped gives its CPU back (freed: $freed), a newcomer runs (rc $rb), and continued it finishes (rc $ra, $(cat "$T/done" 2>/dev/null))" \
+  check "one task stopped counts no more (freed: $freed), a newcomer runs (rc $rb), and continued it finishes (rc $ra, $(cat "$T/done" 2>/dev/null))" \
     "[ $freed = yes ] && [ $rb = 0 ] && [ $ra = 0 ] && [ \"\$(cat '$T/done' 2>/dev/null)\" = finished ]"
   # A stop and a continue that both land while cpuq is busy (here: blocked on the pool's lock,
   # held from outside), as from Ctrl-Z then a quick fg: the continue cancels the stop, and the
-  # run goes on to finish once the lock and its CPU come.
-  "$CPUQ" run --label z:hold -- sleep 4 & local h=$!
-  wait_held 1
+  # run goes on to finish once the lock and room come.
+  "$CPUQ" run --label z:hold -- "$BURN" -2 4 & local h=$!
+  wait_running 1
   dfl "$CPUQ" run -n 2 --label z:race -- true 2>/dev/null & a=$!
   wait_waiters 1
   python3 -c 'import fcntl, sys, time
-f = open(sys.argv[1], "r+"); fcntl.flock(f, fcntl.LOCK_EX); open(sys.argv[2], "w").write("1"); time.sleep(2.5)' "$CPUQ_DIR/v2/lock" "$T/locked" & local p=$!
+f = open(sys.argv[1], "r+"); fcntl.flock(f, fcntl.LOCK_EX); open(sys.argv[2], "w").write("1"); time.sleep(2.5)' "$CPUQ_DIR/v3/lock" "$T/locked" & local p=$!
   wait_file "$T/locked"
-  sleep 1.5  # the waiter's 1 s settle blocks on the lock
+  sleep 1.5  # the waiter's 1 s look blocks on the lock
   # Apart, so cpuq's handler takes the stop first (a continue discards a stop still pending).
   kill -TSTP $a; sleep 0.2; kill -CONT $a
   wait $p
@@ -645,88 +752,86 @@ f = open(sys.argv[1], "r+"); fcntl.flock(f, fcntl.LOCK_EX); open(sys.argv[2], "w
   if poll 8 "! kill -0 $a 2>/dev/null"; then ended=yes; else st2=$(ps -o stat= -p $a | tr -d ' '); kill -CONT $a; fi
   reap $a; wait $h
   check "a stop then a continue while cpuq is busy leave the run running: it finishes (ended: $ended $st2)" "[ $ended = yes ]"
-  # A continue that lands after cpuq has taken the stop, while it gives its CPUs back (here:
+  # A continue that lands after cpuq has taken the stop, while it leaves the line's count (here:
   # blocked on the pool's lock, held from outside), as from an agent's `kill -TSTP; kill -CONT`:
   # cpuq doesn't stop itself after it, and the run finishes.
   dfl "$CPUQ" run --label z:lost -- sh -c 'sleep 1; echo finished >"$1"' sh "$T/lost" 2>/dev/null & a=$!
-  wait_held 1
+  wait_running 1
   python3 -c 'import fcntl, sys, time
-f = open(sys.argv[1], "r+"); fcntl.flock(f, fcntl.LOCK_EX); open(sys.argv[2], "w").write("1"); time.sleep(1.5)' "$CPUQ_DIR/v2/lock" "$T/locked2" & p=$!
+f = open(sys.argv[1], "r+"); fcntl.flock(f, fcntl.LOCK_EX); open(sys.argv[2], "w").write("1"); time.sleep(1.5)' "$CPUQ_DIR/v3/lock" "$T/locked2" & p=$!
   wait_file "$T/locked2"
   kill -TSTP $a; sleep 0.4; kill -CONT $a
   wait $p
   ended=no; st2=""
   if poll 8 "! kill -0 $a 2>/dev/null"; then ended=yes; else st2=$(ps -o stat= -p $a | tr -d ' '); kill -CONT $a; fi
   reap $a
-  check "a continue while cpuq gives its CPUs back for a stop leaves the run running: it finishes (ended: $ended $st2, $(cat "$T/lost" 2>/dev/null))" \
+  check "a continue while cpuq leaves the line's count for a stop leaves the run running: it finishes (ended: $ended $st2, $(cat "$T/lost" 2>/dev/null))" \
     "[ $ended = yes ] && [ \"\$(cat '$T/lost' 2>/dev/null)\" = finished ]"
-  # A drain stopped by Ctrl-Z lets the pool go: the CPUs it waited for go back to work, not idle
-  # until it continues. Continued, it takes the pool again and its command runs.
+  # A drain stopped by Ctrl-Z ends its isolation: the capacity comes back. Continued, it takes its
+  # turn again, isolates again, and its command runs.
   setup ctrl-z-drain "budget = 2"
-  "$CPUQ" run -n 8 --label z:work -- sleep 1.5 2>/dev/null & local w=$!
-  wait_held 2
-  dfl "$CPUQ" drain --all --max 30s --label z:drain -- touch "$T/drained" 2>/dev/null & a=$!
-  wait_waiters 1; sleep 0.2
+  dfl "$CPUQ" drain -c 1 --max 30s --label z:drain -- sh -c 'sleep 1; touch "$1"' sh "$T/drained" 2>/dev/null & a=$!
+  local on=no; poll 5 '[ "$(sj "s[\"capacity\"]")" = 1 ]' && on=yes
   kill -TSTP $a
-  sleep 2  # past the end of the tasks running when the drain came
-  local busy=no; poll 4 '[ "$(held)" = 2 ]' && busy=yes
+  local back=no; poll 5 '[ "$(sj "s[\"capacity\"]")" = 2 ]' && back=yes
   kill -CONT $a
+  local again=no; poll 5 '[ "$(sj "s[\"capacity\"]")" = 1 ]' && again=yes
   local rd; reap $a; rd=$?
-  wait $w; local rw=$?
-  check "a stopped drain lets its CPUs go to work (busy: $busy); continued, it runs (rc $rd, ran: $([ -e "$T/drained" ] && echo yes || echo no)); the work ends (rc $rw)" \
-    "[ $busy = yes ] && [ $rd = 0 ] && [ -e '$T/drained' ] && [ $rw = 0 ]"
-  # Two drains, one stopped and continued while the other took part of the pool: the free CPUs
-  # go to the drain holding the most, so it runs, then the other; they never wait on each other.
-  setup ctrl-z-drains "budget = 2"
-  "$CPUQ" run -n 4 --label z:work -- sh -c 'sleep $((CPUQ_TASK % 2 ? 1 : 3))' 2>/dev/null & w=$!
-  wait_held 2
-  dfl "$CPUQ" drain --all --max 15s --label z:b -- true 2>/dev/null & local b=$!
-  wait_waiters 1; sleep 0.1
-  kill -TSTP $b; sleep 0.2
-  "$CPUQ" drain --all --max 15s --label z:c -- true 2>/dev/null & local cc=$!
-  sleep 1.3  # the first CPU frees (at 1 s) and goes to c
-  kill -CONT $b
-  local t0 rb rc2 dt; t0=$(now)
-  reap $b; rb=$?; reap $cc; rc2=$?; dt=$(since "$t0")
-  wait $w
-  check "two drains, one stopped and continued, don't wait on each other: both run (rc $rb $rc2 in ${dt}s)" "[ $rb = 0 ] && [ $rc2 = 0 ] && fl '$dt < 8'"
+  check "a drain isolates (capacity 1: $on); stopped, it gives it back (2: $back); continued, it isolates again ($again) and runs (rc $rd, ran: $([ -e "$T/drained" ] && echo yes || echo no))" \
+    "[ $on = yes ] && [ $back = yes ] && [ $again = yes ] && [ $rd = 0 ] && [ -e '$T/drained' ]"
 }
 
 t_nested() {
-  # A run inside a task runs on that task's CPU at once, with no line, even with the pool full:
-  # found by CPUQ_CPU and CPUQ_OP, or, with them cleared (env -i), by its ancestor's operation.
-  # A CPUQ_OP naming no live operation is ignored. The hook stands down inside a task.
+  # A run inside a task runs within that task at once, with no line, even with the pool busy:
+  # found by CPUQ_OP, or, with it cleared (env -i), by its ancestor's run. A CPUQ_OP naming no
+  # live run is ignored. The hook stands down inside a task.
   setup nested "budget = 1"
   local t0 out dt
   t0=$(now)
-  out=$("$CPUQ" run -- sh -c '"$1" run --wait-max 0 -- sh -c "echo inner \$CPUQ_CPU \$CPUQ_OP"; echo "outer $CPUQ_CPU $CPUQ_OP"' sh "$CPUQ")
+  out=$("$CPUQ" run -- sh -c '"$1" run --wait-max 0 -- sh -c "echo inner \$CPUQ_OP"; echo "outer $CPUQ_OP"' sh "$CPUQ")
   dt=$(since "$t0")
-  local same=no; set -- $out; [ $# = 6 ] && [ "$2" = "$5" ] && [ "$3" = "$6" ] && same=yes
-  check "a run inside a task starts at once in a full pool, on its CPU and operation (${dt}s: $(echo $out))" "[ $same = yes ] && fl '$dt < 1'"
-  out=$("$CPUQ" run -- sh -c '"$1" run -n 3 --wait-max 0 -- sh -c "echo t\$CPUQ_TASK"' sh "$CPUQ" 2>/dev/null | sort | tr '\n' ' ')
-  check "a run of 3 tasks inside a task runs them there (got $out)" "[ '$out' = 't1 t2 t3 ' ]"
+  local same=no; set -- $out; [ $# = 4 ] && [ "$2" = "$4" ] && same=yes
+  check "a run inside a task starts at once in a busy pool, within its run (${dt}s: $(echo $out))" "[ $same = yes ] && fl '$dt < 1'"
+  out=$("$CPUQ" run -- sh -c '"$1" run -n 3 --wait-max 0 -- sh -c "echo t\$CPUQ_TASK"' sh "$CPUQ" 2>/dev/null | tr '\n' ' ')
+  check "a run of 3 tasks inside a task runs them there, one at a time (got $out)" "[ '$out' = 't1 t2 t3 ' ]"
   out=$("$CPUQ" run -- env -i PATH="$PATH" HOME="$HOME" CPUQ_DIR="$CPUQ_DIR" CPUQ_CONFIG="$CPUQ_CONFIG" "$CPUQ" run --wait-max 0 -- sh -c 'echo "env-i ${CPUQ_OP:-none}"'); local rc=$?
-  check "under env -i, the ancestor's operation is found: it runs at once (rc $rc, '$out')" "[ $rc = 0 ] && [ '$out' = 'env-i none' ]"
-  "$CPUQ" run --label n:hold -- sleep 2 & local h=$!
-  wait_held 1
-  CPUQ_CPU=0 CPUQ_OP=99999 "$CPUQ" run --wait-max 0 -- true 2>/dev/null; rc=$?
+  check "under env -i, the ancestor's run is found: it runs at once (rc $rc, '$out')" "[ $rc = 0 ] && [ '$out' = 'env-i none' ]"
+  "$CPUQ" run --label n:hold -- "$BURN" -2 3 & local h=$!
+  wait_running 1
+  CPUQ_OP=99999 "$CPUQ" run --wait-max 0 --label n:x -- true 2>/dev/null; rc=$?
   wait $h
-  check "a CPUQ_OP of no live operation is ignored: the run waits its turn (rc $rc)" "[ $rc = 75 ]"
+  check "a CPUQ_OP of no live run is ignored: the run waits its turn (rc $rc)" "[ $rc = 75 ]"
   local call='printf "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"make -j8\"}}" | "$1" hook 2>/dev/null; echo $?'
   local inside outside; inside=$("$CPUQ" run -- sh -c "$call" sh "$CPUQ"); outside=$(sh -c "$call" sh "$CPUQ")
   check "the hook stands down inside a task (rc $inside), not outside (rc $outside)" "[ '$inside' = 0 ] && [ '$outside' = 2 ]"
 }
 
 t_driver() {
-  # --driver: a runner holding no CPU, with the terminal; each `cpuq run` it starts takes a CPU
-  # of its own; an enclosing task's CPUQ_CPU and CPUQ_OP don't reach it; its exit is its own.
+  # --driver: a runner that is no task, with the terminal; each `cpuq run` it starts is admitted
+  # on its own; an enclosing task's CPUQ_OP doesn't reach it; its exit is its own.
   setup driver "budget = 1"
   local out rc
-  "$CPUQ" run --driver --label d:runner -- sh -c 'echo "cpu=${CPUQ_CPU:-none}"; "$1" status --json --no-usage | python3 -c "import json, sys; print(\"held\", json.load(sys.stdin)[\"held\"])"; "$1" run --label d:case -- sh -c "echo case \${CPUQ_OP:+op}"; exit 3' sh "$CPUQ" >"$T/out"; rc=$?
+  "$CPUQ" run --driver --label d:runner -- sh -c '"$1" status --json --no-usage | python3 -c "import json, sys; print(\"running\", json.load(sys.stdin)[\"running\"])"; "$1" run --label d:case -- sh -c "echo case \${CPUQ_OP:+op}"; exit 3' sh "$CPUQ" >"$T/out"; rc=$?
   out=$(tr '\n' ' ' <"$T/out")
-  local inner; inner=$(CPUQ_CPU=0 CPUQ_OP=1 "$CPUQ" run --driver -- sh -c 'echo "${CPUQ_CPU:-none} ${CPUQ_OP:-none}"')
-  check "a driver holds no CPU, its runs take their own, its exit is its command's (got '$out', rc $rc); CPUQ_CPU/CPUQ_OP stay out ($inner)" \
-    "[ '$out' = 'cpu=none held 0 case op ' ] && [ $rc = 3 ] && [ '$inner' = 'none none' ]"
+  local inner; inner=$(CPUQ_OP=1 "$CPUQ" run --driver -- sh -c 'echo "${CPUQ_OP:-none}"')
+  check "a driver is no task, its runs are their own, its exit is its command's (got '$out', rc $rc); CPUQ_OP stays out ($inner)" \
+    "[ '$out' = 'running 0 case op ' ] && [ $rc = 3 ] && [ '$inner' = 'none' ]"
+  # A driver that computes itself counts against its project's share: on a pool of 1 kept busy by
+  # q (weight 3), a runner keeping CPUs busy itself is flagged, and its project's run, over its
+  # share of a quarter, waits, where another project's, under its share, starts. (Small shares, so
+  # a machine of 2 CPUs, with the burners sharing them, holds it too.)
+  setup driver-cpu "budget = 1" "weights = q:3"
+  "$CPUQ" run --label q:hold -- "$BURN" -2 --until "$T/stop" 40 & local q=$!
+  wait_run q:hold
+  "$CPUQ" run --driver --label dr:runner -- "$BURN" -2 --until "$T/stop" 40 & local d=$!
+  poll 20 '[ "$(sj "[h[\"driver_busy\"] for h in s[\"runs\"] if h[\"driver\"]][0] >= 0.6" 2>/dev/null)" = True ]'
+  local db; db=$(sj '"%.2f" % ([h["driver_busy"] for h in s["runs"] if h["driver"]] or [-1])[0]')
+  local flags; flags=$(sj '" ".join(f for h in s["runs"] for f in h["flags"])')
+  "$CPUQ" run --wait-max 2 --label dr:task -- touch "$T/ran" 2>/dev/null; local rw=$?
+  "$CPUQ" run --wait-max 2 --label other:task -- touch "$T/other"; local ro=$?
+  touch "$T/stop"; wait $d $q
+  check "a driver computing CPUs itself ($db) is flagged ($flags); its project's run waits (rc $rw), another project's starts under its share (rc $ro)" \
+    "[[ '$flags' == *driver_cpu* ]] && [ $rw = 75 ] && [ ! -e '$T/ran' ] && [ $ro = 0 ]"
 }
 
 t_removed() {
@@ -734,7 +839,7 @@ t_removed() {
   # work, and runs nothing.
   setup removed
   local wrong="" out rc f
-  for f in "--cores 2" "--cores 2-6" "--priority high" "--max-wait 5" "--exclusive" "--qos none" "--opaque" "--no-load-check"; do
+  for f in "--cores 2" "--cores 2-6" "--priority high" "--max-wait 5" "--exclusive" "--qos none" "--opaque" "--no-load-check" "-x 2"; do
     out=$("$CPUQ" run $f -- touch "$T/ran" 2>&1); rc=$?
     { [ $rc = 2 ] && [ "$(echo "$out" | wc -l | tr -d ' ')" = 1 ] && [[ "$out" == *' is gone'* || "$out" == *'--wait-max'* ]]; } || wrong="$wrong [run $f: $rc $out]"
   done
@@ -759,27 +864,26 @@ t_removed() {
   check "each removed flag, command and key fails with its pointer, running nothing (ran: $ran; wrong:${wrong:- none})" "[ -z '$wrong' ] && [ $ran = no ]"
 }
 
-# --- Holding and losing CPUs -----------------------------------------------------------------
+# --- Losing runs and waiters -----------------------------------------------------------------
 
 t_kill_holder() {
-  # SIGKILL of an operation's cpuq gives its CPUs back at once: a waiter runs.
+  # SIGKILL of a run's cpuq takes its task with it and frees its share at once: a waiter runs.
   setup kill-holder "budget = 1"
-  "$CPUQ" run -n 1 --label k:holder -- sh -c 'echo $$ >"$1"; exec sleep 30' sh "$T/task" 2>/dev/null & local holder=$!
-  wait_held 1; wait_file "$T/task"
+  "$CPUQ" run -n 1 --label k:holder -- sh -c 'echo $$ >"$1"; exec "$2" -2 30' sh "$T/task" "$BURN" 2>/dev/null & local holder=$!
+  wait_running 1; wait_file "$T/task"
   "$CPUQ" run --label k:waiter -- true & local waiter=$!
   wait_waiters 1
   local t0; t0=$(now)
   kill -9 $holder
   wait $waiter; local rc=$?
   local dt; dt=$(since "$t0")
-  alive "$T/task" && kill -9 "$(cat "$T/task")" 2>/dev/null
-  check "a SIGKILLed operation's CPU comes back at once: the waiter ran ${dt}s after (rc $rc)" "[ $rc = 0 ] && fl '$dt < 1.5'"
+  local left=no; alive "$T/task" && { left=yes; kill -9 "$(cat "$T/task")" 2>/dev/null; }
+  check "a SIGKILLed run's task is ended and its share frees at once: the waiter ran ${dt}s after (rc $rc, task left: $left)" "[ $rc = 0 ] && fl '$dt < 2' && [ $left = no ]"
 }
 
 t_leftovers() {
-  # A SIGKILLed operation's tasks don't run on beside the next holder of their CPU: on Linux they
-  # die with their cpuq (PR_SET_PDEATHSIG); on macOS whoever takes the CPU next ends the task
-  # groups its token names.
+  # A SIGKILLed run's tasks don't run on: on Linux they die with their cpuq (PR_SET_PDEATHSIG);
+  # on macOS whoever next looks at the pool ends the tasks its record names.
   setup leftovers "budget = 1"
   local mode got="" p
   for mode in single tasks; do
@@ -789,17 +893,11 @@ t_leftovers() {
     wait_file "$T/task"
     kill -9 $p; wait $p 2>/dev/null
     sleep 0.3
-    [ "$(uname)" = Linux ] || "$CPUQ" run --label l:next -- true
+    [ "$(uname)" = Linux ] || "$CPUQ" status --no-usage >/dev/null
     sleep 0.2
     if alive "$T/task"; then got="$got$mode:left "; kill -9 "$(cat "$T/task")"; else got="$got$mode:gone "; fi
   done
-  if [ "$(uname)" = Linux ]; then
-    check "Linux: a SIGKILLed operation's tasks die with it, one task or many (got $got)" "[ '$got' = 'single:gone tasks:gone ' ]"
-  else
-    # Pool.take opens a CPU's token write-only (createShared), so it never reads the groups noted
-    # there; and a single task shares cpuq's group, so its pid names no group to kill.
-    check "the next holder of a SIGKILLed operation's CPU ends its leftover tasks (got $got)" "[ '$got' = 'single:gone tasks:gone ' ]"
-  fi
+  check "a SIGKILLed run's tasks end, one task or many (got $got)" "[ '$got' = 'single:gone tasks:gone ' ]"
 }
 
 t_leaked_descendant() {
@@ -821,8 +919,8 @@ t_leaked_descendant() {
 t_kill_waiter() {
   # A SIGKILLed waiter doesn't hold up the line.
   setup kill-waiter "budget = 1"
-  "$CPUQ" run -- sleep 1.5 & local holder=$!
-  wait_held 1
+  "$CPUQ" run --label w:hold -- "$BURN" -2 1.5 & local holder=$!
+  wait_running 1
   "$CPUQ" run --label w:one -- true & local w1=$!
   wait_waiters 1
   "$CPUQ" run --label w:two -- true & local w2=$!
@@ -832,15 +930,15 @@ t_kill_waiter() {
   wait $w2; local rc=$?
   local dt; dt=$(since "$t0")
   wait $holder
-  check "the second waiter ran ${dt}s after the first was SIGKILLed (the holder had under 1.5 s left; rc $rc)" "[ $rc = 0 ] && fl '$dt < 3'"
+  check "the second waiter ran ${dt}s after the first was SIGKILLed (the holder had about 1.5 s left; rc $rc)" "[ $rc = 0 ] && fl '$dt < 3.5'"
 }
 
 t_term_waiting() {
   # A run killed while it waits in the line gives up at once by the signal (143) and never starts
   # its command.
   setup term-waiting "budget = 1"
-  "$CPUQ" run --label w:hold -- sleep 3 & local h=$!
-  wait_held 1
+  "$CPUQ" run --label w:hold -- "$BURN" -2 3 & local h=$!
+  wait_running 1
   "$CPUQ" run -n 2 --label w:many -- touch "$T/many-ran" 2>/dev/null & local m=$!
   wait_waiters 1
   local t0; t0=$(now)
@@ -854,20 +952,18 @@ t_term_waiting() {
   wait $h
   local many=no single=no; [ -e "$T/many-ran" ] && many=yes; [ -e "$T/single-ran" ] && single=yes
   check "a waiting run of tasks killed by SIGTERM ends at once by it (rc $rm after ${dm}s), running nothing ($many)" "[ $rm = 143 ] && fl '$dm < 1' && [ $many = no ]"
-  # sys.installForwarding keeps the signal for a child not yet started: the run waits on for its
-  # CPU, then starts the command and signals it, which may already have run (cpuq kill too).
   check "a waiting single run killed by SIGTERM ends at once by it (rc $rs after ${ds}s), running nothing ($single)" "[ $rs = 143 ] && fl '$ds < 1' && [ $single = no ]"
 }
 
 t_lost_seq() {
   # A lost ticket counter never hands out a live ticket.
   setup lost-seq
-  "$CPUQ" run --label a:x -- sleep 2 & "$CPUQ" run --label b:x -- sleep 2 &
-  wait_held 2
-  "$CPUQ" run --label c:x -- true & wait_waiters 1
-  rm -f "$CPUQ_DIR/v2/seq"
-  "$CPUQ" run --label d:x -- true & wait_waiters 2
-  local tickets; tickets=$(sj '" ".join(str(t) for t in sorted({h["ticket"] for h in s["holders"]} | {w["ticket"] for w in s["waiters"]}))')
+  "$CPUQ" run --label p:a -- "$BURN" -2 2 & "$CPUQ" run --label p:b -- "$BURN" -2 2 &
+  wait_running 2
+  "$CPUQ" run --label p:c -- true & wait_waiters 1
+  rm -f "$CPUQ_DIR/v3/seq"
+  "$CPUQ" run --label p:d -- true & wait_waiters 2
+  local tickets; tickets=$(sj '" ".join(str(t) for t in sorted({h["ticket"] for h in s["runs"]} | {w["ticket"] for w in s["waiters"]}))')
   local rc=0 p; for p in $(jobs -p); do wait "$p" || rc=1; done
   check "with seq deleted the tickets stay distinct ($tickets) and every run completes (rc $rc)" "[ \$(echo $tickets | wc -w) = 4 ] && [ $rc = 0 ]"
 }
@@ -877,8 +973,8 @@ t_long_command() {
   setup long-command
   local pad; pad=$(printf 'x%.0s' $(seq 2000))
   "$CPUQ" run --label l:mid -- sh -c "sleep 1 # $pad" & local p=$!
-  wait_held 1
-  local shown; shown=$(sj '[len(h["command"]) for h in s["holders"]][0]')
+  wait_running 1
+  local shown; shown=$(sj '[len(h["command"]) for h in s["runs"]][0]')
   wait $p; local rc=$?
   check "a 2000-byte command runs and status shows its first 1000 bytes (rc $rc, $shown bytes)" "[ $rc = 0 ] && [ '$shown' = 1000 ]"
   pad=$(printf 'x%.0s' $(seq 5000))
@@ -889,10 +985,10 @@ t_long_command() {
 t_waiters_cpu() {
   # A hundred runs waiting in the line use almost no CPU.
   setup waiters-cpu "budget = 1"
-  "$CPUQ" run -- sleep 12 & local h=$!
-  wait_held 1
+  "$CPUQ" run --label w:hold -- "$BURN" -2 --until "$T/go" 30 & local h=$!
+  wait_running 1
   local pids=() i
-  for i in $(seq 100); do "$CPUQ" run -- true & pids+=($!); done
+  for i in $(seq 100); do "$CPUQ" run --label w:x -- true & pids+=($!); done
   local queued=no
   wait_waiters 100 30 && queued=yes
   sleep 1
@@ -923,12 +1019,11 @@ EOF
   local c1; c1=$(cpu)
   local used; used=$(python3 -c "print('%.2f' % ($c1 - $c0))")
   echo "  100 waiters: ${used}s of CPU in 4s ($(python3 -c "print('%.1f' % ($used / 4 * 100))")% of one CPU)"
-  kill $h 2>/dev/null
+  touch "$T/go"
   local rc=0 p
   for p in "${pids[@]}"; do wait "$p" || rc=1; done
+  wait $h
   check "100 waiters were in the line while measured ($queued)" "[ $queued = yes ]"
-  # Each waiting run wakes every second (op.zig sleep: a 1000 ms poll) and rescans the whole pool
-  # under its lock, so the line's cost grows with the square of its length (0.29: under 0.1 CPU).
   check "100 waiters use almost no CPU (${used}s in 4s)" "fl '$used < 0.5'"
   check "all 100 ran (rc $rc)" "[ $rc = 0 ]"
 }
@@ -1056,74 +1151,24 @@ t_stack_limit() {
   check "a task keeps its caller's stack limit (4096, got $got)" "[ '$got' = 4096 ]"
 }
 
-# --- Linux: pinning --------------------------------------------------------------------------
-
-t_pin() {
-  # Linux: each task is pinned to its CPU (CPUQ_CPU), one task or many; a drain's command has
-  # every CPU this shell may use.
-  setup pin
-  if [ "$(uname)" != Linux ]; then echo "  skipped: Linux only"; return; fi
-  local list='sed -n "s/^Cpus_allowed_list:[[:space:]]*//p" /proc/self/status'
-  "$CPUQ" run -n 4 --label p:x -- sh -c "echo \$CPUQ_CPU=\$($list) >>$T/pins; sleep 0.2" 2>/dev/null
-  local single; single=$("$CPUQ" run -- sh -c "echo \$CPUQ_CPU=\$($list)")
-  local mine; mine=$(eval "$list")
-  local drain; drain=$("$CPUQ" drain --all --max 20s -- sh -c "$list")
-  local pinned; pinned=$(awk -F= '$1 == $2' "$T/pins" | wc -l | tr -d ' ')
-  check "tasks pinned to their CPU ($(tr '\n' ' ' <"$T/pins"); $pinned of 4), one task too ($single); a drain's command unpinned ($drain, this shell: $mine)" \
-    "[ $pinned = 4 ] && [ \"\${single%%=*}\" = \"\${single#*=}\" ] && [ '$drain' = '$mine' ]"
-}
-
-t_repin() {
-  # Linux: a run stopped (Ctrl-Z) and continued on another CPU moves its task there.
-  setup repin
-  if [ "$(uname)" != Linux ]; then echo "  skipped: Linux only"; return; fi
-  dfl "$CPUQ" run -n 1 --label r:a -- sh -c 'while [ ! -e "$1.stop" ]; do sed -n "s/^Cpus_allowed_list:[[:space:]]*//p" /proc/self/status >"$1.new"; mv "$1.new" "$1"; sleep 0.05; done' sh "$T/cpu" 2>/dev/null & local a=$!
-  wait_file "$T/cpu"
-  local before; before=$(cat "$T/cpu")
-  kill -TSTP $a
-  poll 5 '[ "$(held)" = 0 ]'
-  "$CPUQ" run --label r:b -- sh -c 'echo $CPUQ_CPU >"$1"; sleep 3' sh "$T/b" & local b=$!
-  wait_file "$T/b"
-  kill -CONT $a
-  local after; poll 5 '[ "$(cat "$T/cpu")" != "$before" ]'; after=$(cat "$T/cpu")
-  touch "$T/cpu.stop"
-  reap $a; local ra=$?
-  wait $b
-  check "stopped on CPU $before, which a newcomer took ($(cat "$T/b")), the task goes on pinned to CPU $after (rc $ra)" "[ '$before' = \"\$(cat '$T/b')\" ] && [ '$after' != '$before' ] && [ -n '$after' ] && [ $ra = 0 ]"
-}
-
-t_narrow() {
-  # Linux: a run started inside a narrower CPU set (taskset, an outer cpuq's pin) still uses its
-  # whole pool: 4 tasks of 0.5 s at -c 2 on a pool of 2 take about 1 s, and a drain gets the pool.
-  setup narrow "outside_check = on"
-  if [ "$(uname)" != Linux ] || ! command -v taskset >/dev/null; then echo "  skipped: Linux with taskset only"; return; fi
-  local first; first=$(poolcpus); first=${first%% *}
-  local t0 rc dt; t0=$(now)
-  taskset -c "$first" "$CPUQ" run -n 4 --label n:x -- sleep 0.5 2>/dev/null; rc=$?
-  dt=$(since "$t0")
-  taskset -c "$first" "$CPUQ" drain --all --max 3s -- true 2>/dev/null; local rd=$?
-  # The outside-load room counts the machine's CPUs, not the caller's CPU set.
-  check "under taskset -c $first, a run of 4 uses the pool of 2 (rc $rc, ${dt}s) and a drain gets it (rc $rd)" "[ $rc = 0 ] && fl '$dt < 1.8' && [ $rd = 0 ]"
-}
-
 # --- status, history, wait -------------------------------------------------------------------
 
 t_status() {
   setup status
-  "$CPUQ" run -n 4 --label s:build -- sleep 1.5 2>/dev/null & wait_held 2
-  "$CPUQ" run --label t:big -- true & wait_waiters 1
+  "$CPUQ" run -n 4 -c 2 --label s:build -- "$BURN" -2 5 2>/dev/null & local sb=$!; wait_running 2
+  "$CPUQ" run --label s:big -- true & wait_waiters 1
   local s; s=$("$CPUQ" status --no-usage)
   local j; j=$("$CPUQ" status --json | python3 -c 'import json, sys
 s = json.load(sys.stdin)
 m = s["memory"]
-h = s["holders"][0]; w = s["waiters"][0]
-print(s["schema"], s["version"] == sys.argv[1].split()[1], s["admit"], s["budget"], len(s["pool"]), s["held"], s["free"], s["gate"]["state"], s["memory_pressure"],
-      0 < m["used"] <= m["total"], h["label"], h["tasks"], h["cores"], len(h["cpus"]), w["label"], w["order"], w["why"].startswith("1st in line"),
-      " ".join(sorted(p["name"] for p in s["projects"])))' "$("$CPUQ" --version)")
-  wait
+h = s["runs"][0]; w = s["waiters"][0]
+print(s["schema"], s["version"] == sys.argv[1].split()[1], s["admit"], s["budget"], len(s["pool"]), s["capacity"], s["running"], s["gate"]["state"], s["memory_pressure"],
+      0 < m["used"] <= m["total"], h["label"], h["tasks"], h["running"], w["label"], w["order"], w["why"].startswith("1st in line"),
+      " ".join(sorted("%s:%.1f" % (p["name"], p["fair"]) for p in s["projects"])))' "$("$CPUQ" --version)")
+  kill -TERM $sb 2>/dev/null; wait
   echo "$s" | sed 's/^/  | /'
-  check "status shows the pool, the holder and the waiter with why it waits" "[[ '$s' == *\"dir     $CPUQ_DIR/v2\"* && '$s' == *'pool    2 CPUs'* && '$s' == *s:build* && '$s' == *t:big* && '$s' == *'1st in line'* && '$s' == *'memory  '*' GB used'* ]]"
-  check "status --json: schema 2, the pool, holders, waiters and projects (got '$j')" "[ '$j' = '2 True pool 2 2 2 0 open off True s:build 4 2 2 t:big 1 True s t' ]"
+  check "status shows the pool, the run and the waiter with why it waits" "[[ '$s' == *\"dir     $CPUQ_DIR/v3\"* && '$s' == *'pool    2 CPUs'* && '$s' == *s:build* && '$s' == *s:big* && '$s' == *'1st in line'* && '$s' == *'memory  '*' GB used'* ]]"
+  check "status --json: schema 3, the pool, runs, waiters and projects with their share (got '$j')" "[ '$j' = '3 True contested 2 2 2 2 open off True s:build 4 2 s:big 1 True s:2.0' ]"
 }
 
 t_progress() {
@@ -1132,41 +1177,52 @@ t_progress() {
   setup progress
   "$CPUQ" run -n 8 -c 1 --label p:count -- sh -c 'sleep 0.3; [ "$CPUQ_TASK" != 1 ]' 2>/dev/null & local p=$!
   sleep 1.4
-  local got; got=$(sj '[(h["progress"]["done"] >= 2, h["progress"]["total"], h["progress"]["failing"], h["left"] is not None and h["left"] > 0, h["left_from"]) for h in s["holders"]][0]')
+  local got; got=$(sj '[(h["progress"]["done"] >= 2, h["progress"]["total"], h["progress"]["failing"], h["left"] is not None and h["left"] > 0, h["left_from"]) for h in s["runs"]][0]')
   local text; text=$("$CPUQ" status --no-usage | grep 'p:count')
   wait $p
   check "status shows a run's progress and time left (got $got; '$(echo $text)')" "[ \"$got\" = \"(True, 8, 1, True, 'progress')\" ] && [[ '$text' == *'/8'* ]]"
+  # With only its running tasks left, status shows the tail: how long the oldest has run.
+  "$CPUQ" run -n 2 --label p:tail -- sleep 3 2>/dev/null & p=$!
+  wait_running 2; sleep 1.1
+  local tail; tail=$("$CPUQ" status --no-usage | grep 'p:tail')
+  local tj; tj=$(sj '[(h["tail"], h["oldest"] > 0) for h in s["runs"] if h["label"] == "p:tail"][0]')
+  wait $p
+  check "status shows a run's tail: 'last 2 tasks, oldest running ...' ($(echo $tail); $tj)" "[[ '$tail' == *'last 2 tasks, oldest running '* ]] && [ \"$tj\" = '(True, True)' ]"
 }
 
 t_usage() {
-  # status measures what each run's tasks use: a 1-CPU spinner about 1, a sleeper about 0; after
-  # 5 s it flags a run whose CPUs sit mostly idle.
+  # status measures what each run's tasks use: a 1-CPU spinner about 1, three spinners in one task
+  # about 3; after 5 s it flags the run whose tasks keep more than one CPU busy each. (A loaded
+  # machine gives each spinner less: the measure is judged against the other's.)
   setup usage
   "$CPUQ" run --label u:spin -- python3 -c 'import time
 e = time.time() + 9
 while time.time() < e: pass' &
-  "$CPUQ" run --label u:idle -- sleep 9 &
-  wait_held 2
+  "$CPUQ" run --label u:triple -- sh -c 'spin() { python3 -c "import time
+e = time.time() + 9
+while time.time() < e: pass"; }; spin & spin & spin; wait' &
+  wait_running 2
   sleep 1
-  # Three looks, each run's busiest: a shared CI runner can starve the spinner for one half-second
-  # sample (seen: 0.48 on macOS), never for three.
+  # Three looks, each run's busiest: a shared CI runner can starve a spinner for one half-second
+  # sample, never for three.
   local u; u=$(for k in 1 2 3; do "$CPUQ" status --json; done | python3 -c 'import json, sys
 best = {}
 for line in sys.stdin.read().replace("}\n{", "}\0{").split("\0"):
-    for h in json.loads(line)["holders"]:
+    for h in json.loads(line)["runs"]:
         best[h["label"]] = max(best.get(h["label"], 0), h["using"] or 0)
 print(" ".join("%s=%.2f" % (k, v) for k, v in sorted(best.items())))')
   sleep 2.8
   local flags; flags=$("$CPUQ" status --json | python3 -c 'import json, sys
 s = json.load(sys.stdin)
-print(" ".join("%s:%s" % (h["label"], ",".join(h["flags"]) or "-") for h in sorted(s["holders"], key=lambda h: h["label"])))')
+print(" ".join("%s:%s" % (h["label"], ",".join(h["flags"]) or "-") for h in sorted(s["runs"], key=lambda h: h["label"])))')
   wait
   echo "  measured use: $u; flags: $flags"
-  check "status measures use: a spinner about 1, a sleeper about 0 ($u)" "python3 -c '
+  check "status measures use: a spinner about 1, three in one task well over it, as CPUs allow ($u)" "python3 -c '
 import sys
 u = dict(p.split(\"=\") for p in \"$u\".split())
-sys.exit(0 if 0.6 < float(u[\"u:spin\"]) < 1.3 and float(u[\"u:idle\"]) < 0.2 else 1)'"
-  check "status flags the idle run, not the busy one ($flags)" "[[ '$flags' == *'u:idle:low_use'* && '$flags' != *'u:spin:low_use'* ]]"
+s, t = float(u[\"u:spin\"]), float(u[\"u:triple\"])
+sys.exit(0 if 0.3 < s < 1.3 and 1.5 * s < t < 3.6 else 1)'"
+  check "status flags the run whose task keeps three CPUs busy, not the other ($flags)" "[ '$flags' = 'u:spin:- u:triple:over_cpu' ]"
 }
 
 t_zombie() {
@@ -1183,10 +1239,10 @@ for _ in range(3):
         os._exit(0)
     time.sleep(1.6)
     os.waitpid(pid, 0)' & local job=$!
-  wait_held 1
+  wait_running 1
   local top=0 u
   while kill -0 $job 2>/dev/null; do
-    u=$("$CPUQ" status --json | python3 -c 'import json, sys; print(max([h.get("using") or 0 for h in json.load(sys.stdin)["holders"]] or [0]))')
+    u=$("$CPUQ" status --json | python3 -c 'import json, sys; print(max([h.get("using") or 0 for h in json.load(sys.stdin)["runs"]] or [0]))')
     top=$(python3 -c "print(max($top, $u))")
   done
   echo "  zombie: highest use $top"
@@ -1203,7 +1259,7 @@ while time.time() < e: pass' & local stray=$!
   "$CPUQ" run --label inside -- python3 -c 'import time
 e = time.time() + 3
 while time.time() < e: pass' & local op=$!
-  wait_held 1
+  wait_running 1
   sleep 0.5
   local mine; mine="$op $(descendants $op | tr '\n' ' ')"
   local got; got=$("$CPUQ" status --json | python3 -c 'import json, sys
@@ -1213,7 +1269,7 @@ out = s["outside"]
 pids = [o["pid"] for o in out]
 named = stray in pids or len(out) >= 5
 own_out = not (mine & set(pids))
-used = sum(h["using"] or 0 for h in s["holders"])
+used = sum(h["using"] or 0 for h in s["runs"])
 print("named" if named else "missed", "own-out" if own_out else "own-listed", "%.1f" % used)' "$stray" "$mine")
   wait
   echo "  $got (stray pid $stray)"
@@ -1235,13 +1291,13 @@ print("found %d %.1f %s" % (w[0]["procs"], w[0]["using"], w[0]["via"] or "-") if
 t_status_host() {
   setup status-host
   fake_ssh
-  "$CPUQ" run -n 2 --label far:job -- sleep 2 2>/dev/null & wait_held 2
+  "$CPUQ" run -n 2 --label far:job -- sleep 2 2>/dev/null & wait_running 2
   local got; got=$(PATH="$T/bin:$PATH" "$CPUQ" status --json --no-usage --host local --host far | python3 -c 'import json, sys
 d = json.load(sys.stdin)
-print(" ".join("%s:%d" % (h, d[h]["held"]) for h in sorted(d)))')
+print(" ".join("%s:%d" % (h, d[h]["running"]) for h in sorted(d)))')
   check "status --host gives one JSON object keyed by host (got $got)" "[ '$got' = 'far:2 local:2' ]"
   local text; text=$(PATH="$T/bin:$PATH" "$CPUQ" status --no-usage --host far)
-  check "status --host passes the host's own text through when piped" "[[ '$text' == *'held 2'* ]]"
+  check "status --host passes the host's own text through when piped" "[[ '$text' == *'running 2'* ]]"
   "$CPUQ" status --watch >/dev/null 2>&1; local rc=$?
   check "status --watch refuses when not on a terminal (got $rc)" "[ $rc = 2 ]"
   wait
@@ -1258,11 +1314,11 @@ if os.fork() == 0: spin(); os._exit(0)
 spin(); os.wait()'
   "$CPUQ" run --label h:fail -- sh -c 'exit 3'
   "$CPUQ" run -n 4 --label h:tasks -- sh -c '[ "$CPUQ_TASK" != 2 ]' 2>/dev/null
-  "$CPUQ" run -n 2 --label h:hog -- sleep 1.5 2>/dev/null & wait_held 2
+  "$CPUQ" run -n 2 --label h:hog -- sleep 1.5 2>/dev/null & wait_running 2
   "$CPUQ" run --label h:impatient --wait-max 0 -- true 2>/dev/null
   wait
   "$CPUQ" run --label h:crash -- sleep 30.583 & local p=$!
-  wait_held 1
+  wait_running 1
   local kids; kids=$(descendants $p)
   kill -9 $p; kill $kids 2>/dev/null; sleep 0.2
   local got; got=$("$CPUQ" history --json | python3 -c 'import json, sys
@@ -1294,12 +1350,12 @@ t_wait() {
   setup wait
   "$CPUQ" run --label job:a -- sleep 2 &
   "$CPUQ" run -n 2 --label job:b -- sleep 0.5 2>/dev/null &
-  wait_holder job:a
+  wait_run job:a
   local t0; t0=$(now)
   "$CPUQ" wait --label 'job:*'; local rc=$?
   local dt; dt=$(since "$t0")
   check "cpuq wait --label 'job:*' returns when the last matching run ends (exit $rc after ${dt}s)" "[ $rc = 0 ] && fl '1 < $dt < 5'"
-  "$CPUQ" run --label long -- sleep 3 & wait_holder long
+  "$CPUQ" run --label long -- sleep 3 & wait_run long
   "$CPUQ" wait --label long --max-wait 1; rc=$?
   check "cpuq wait --max-wait gives up with 75 (got $rc)" "[ $rc = 75 ]"
   wait
@@ -1310,7 +1366,7 @@ t_record() {
   # status says whether one does, and cpuq samples gives its lines from a time on.
   setup record
   export CPUQ_HISTORY=$T/history.jsonl
-  "$CPUQ" run -n 2 --label held -- sleep 2 2>/dev/null & wait_held 2
+  "$CPUQ" run -n 2 --label held -- sleep 2 2>/dev/null & wait_running 2
   "$CPUQ" record --interval 0.2 2>/dev/null & local r=$!
   sleep 1.2
   "$CPUQ" record --interval 0.2 2>/dev/null; local second=$?
@@ -1318,10 +1374,10 @@ t_record() {
   kill $r; wait $r 2>/dev/null; wait
   local got; got=$("$CPUQ" samples --since 0 | python3 -c 'import json, sys
 s = [json.loads(l) for l in sys.stdin]
-print(len(s), all(x["gate"] == "open" for x in s), max(x["held"] for x in s), len(s[-1]["cpu"]) > 0)')
+print(len(s), all(x["gate"] == "open" for x in s), max(x["running"] for x in s), len(s[-1]["cpu"]) > 0)')
   local future; future=$("$CPUQ" samples --since 9999999999 | wc -l | tr -d ' ')
   unset CPUQ_HISTORY
-  check "record samples while another refuses to start (rc $second), status sees it ($on), and samples gives them from a time on (count, gate open, held, cpus: $got; none from the future: $future)" \
+  check "record samples while another refuses to start (rc $second), status sees it ($on), and samples gives them from a time on (count, gate open, running, cpus: $got; none from the future: $future)" \
     "[[ $second = 0 && $on = True && '$got' == *' True 2 True' && $future = 0 ]] && [ \$(echo '$got' | cut -d' ' -f1) -ge 3 ]"
 }
 
@@ -1369,13 +1425,13 @@ t_hook() {
   driver=$(call driver Bash 'cpuq run --driver --label app:test -- test/run.sh')
   drvbuild=$(call drvbuild Bash 'cpuq run --driver --label app:build -- zig build -j1')
   drvother=$(call drvother Bash 'cpuq run --driver --label app:x -- ./foo')
-  check "--driver passes for a test runner (rc $driver), not for a build (rc $drvbuild) or anything else (rc $drvother)" \
-    "[ $driver = 0 ] && [ $drvbuild = 2 ] && grep -q 'under --driver' '$T/drvbuild' && [ $drvother = 2 ] && grep -q 'one task, on one CPU' '$T/drvother'"
+  check "--driver passes for a test runner (rc $driver) and any other command (rc $drvother), not around a bare build (rc $drvbuild)" \
+    "[ $driver = 0 ] && [ $drvbuild = 2 ] && grep -q 'directly under --driver' '$T/drvbuild' && [ $drvother = 0 ]"
   local rigl rigbare
   rigl=$(call rigl Bash "cpuq run --driver --label rig:build -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build --units=8 a.rig")
   rigbare=$(call rigbare Bash 'cpuq run --driver --label rig:build -- rig build --units=8 a.rig')
-  check "--driver passes rig build whose units are cpuq runs (rc $rigl), not without the launcher (rc $rigbare)" \
-    "[ $rigl = 0 ] && [ $rigbare = 2 ] && grep -q 'RIG_UNIT_LAUNCHER' '$T/rigbare'"
+  check "--driver passes rig build, its units cpuq runs or not (what it computes counts against rig's share): rc $rigl $rigbare" \
+    "[ $rigl = 0 ] && [ $rigbare = 0 ]"
 }
 
 # --- Leases ----------------------------------------------------------------------------------
@@ -1401,8 +1457,8 @@ t_lease() {
   "$CPUQ" lease bench --cores 2 -- true 2>/dev/null; local rcores=$?
   "$CPUQ" lease bench --priority high -- true 2>/dev/null; local rprio=$?
   check "run's removed options are refused for a lease (--cores $rcores, --priority $rprio)" "[ $rcores = 2 ] && [ $rprio = 2 ]"
-  local h; h=$(held)
-  check "a lease holds no CPU of the pool (held $h)" "[ '$h' = 0 ]"
+  local h; h=$(running)
+  check "a lease runs no task of the pool (running $h)" "[ '$h' = 0 ]"
   wait
   local g=$T/slots
   "$CPUQ" lease db --slots 2 -- sh -c "echo a >>$g; sleep 1" &
@@ -1740,22 +1796,32 @@ PY
 t_cgroups() {
   # (CPUQ_CGROUP is cleared where a check needs no scope around it: the suite may itself run inside
   # a cpuq job, whose scope a nested run rightly inherits.)
-  # Linux with a user systemd: a --driver runs in a delegated scope, its command in job/, with
-  # CPUQ_CGROUP naming the scope, and a cap inside it gets a cgroup of its own the kernel stops
-  # at the limit (far sooner than the once-a-second read elsewhere). A plain run has no scope.
-  setup cgroups
-  local plain; plain=$(env -u CPUQ_CGROUP "$CPUQ" run --label plain -- sh -c 'echo "cg=${CPUQ_CGROUP:-none}"')
-  check "a run of tasks has no scope of its own (got $plain)" "[ '$plain' = 'cg=none' ]"
+  # Linux with a user systemd: a run moves into a delegated scope of its own in its project's
+  # slice (cpuq-PROJECT.slice, the name escaped, CPUWeight 100 × the project's weight), its tasks
+  # in the scope's job/, with CPUQ_CGROUP naming the scope; a run inside a task stays in the
+  # task's. A --driver's runner runs in a delegated scope in its project's slice, and a cap inside
+  # it gets a cgroup of its own the kernel stops at the limit; the runs it starts stay in its scope.
+  setup cgroups "weights = wt:3"
+  local plain; plain=$(env -u CPUQ_CGROUP "$CPUQ" run --label plain:x -- sh -c 'echo "cg=${CPUQ_CGROUP:-none}"')
   if [ "$(uname)" != Linux ] || ! systemd-run --user --scope --quiet true 2>/dev/null; then
+    check "without a user systemd a run has no scope (got $plain)" "[ '$plain' = 'cg=none' ]"
     local got; got=$(env -u CPUQ_CGROUP "$CPUQ" run --driver --label plain -- sh -c 'echo "cg=${CPUQ_CGROUP:-none}"')
     check "without a user systemd a driver runs as it is (got $got)" "[ '$got' = 'cg=none' ]"
     return
   fi
+  local own; own=$(env -u CPUQ_CGROUP "$CPUQ" run --label plain:x -- sh -c 'cut -d: -f3 /proc/self/cgroup')
+  local weight; weight=$(env -u CPUQ_CGROUP "$CPUQ" run --label wt:x -- sh -c 'cat "$(dirname "$CPUQ_CGROUP")/cpu.weight" 2>/dev/null || echo none')
+  local esc; esc=$(env -u CPUQ_CGROUP "$CPUQ" run --label my-proj:x -- sh -c 'basename "$(dirname "$CPUQ_CGROUP")"')
+  local nest; nest=$(env -u CPUQ_CGROUP "$CPUQ" run --label plain:x -- sh -c '"$1" run -- sh -c "echo \$CPUQ_CGROUP"; echo "$CPUQ_CGROUP"' sh "$CPUQ" | sort -u | wc -l | tr -d ' ')
+  check "a run has a delegated scope of its own in its project's slice ($plain; its task in $own); weight 3 is CPUWeight $weight; a dash is escaped ($esc); a run inside a task stays in the task's scope ($nest)" \
+    "[[ '$plain' == 'cg=/sys/fs/cgroup/'*'/cpuq.slice/cpuq-plain.slice/cpuq-run-'*'.scope' && '$own' == *'/cpuq-plain.slice/cpuq-run-'*'.scope/job' ]] && [ '$weight' = 300 ] && [ '$esc' = 'cpuq-my\\x2dproj.slice' ] && [ '$nest' = 1 ]"
   local got; got=$("$CPUQ" run --driver --label delegated -- sh -c 'echo "$(cut -d: -f3 /proc/self/cgroup) $CPUQ_CGROUP $(cat "$CPUQ_CGROUP/cgroup.subtree_control")"')
   local t0; t0=$(now)
   "$CPUQ" run --driver --label capped -- "$CPUQ" cap --mem 64M -- python3 -c 'import time; x = bytearray(256 << 20); time.sleep(10)' 2>/dev/null; local rc=$?
   local dt; dt=$(since "$t0")
-  check "a driver runs in its scope's job/ with CPUQ_CGROUP and memory for its children (got $got); a cap there is stopped by the kernel ($rc after ${dt}s)" "[[ '$got' == *'.scope/job /sys/fs/cgroup/'*'.scope '*memory* ]] && [ $rc = 122 ] && fl '$dt < 0.9'"
+  check "a driver runs in its scope's job/ in its project's slice, with CPUQ_CGROUP and memory for its children (got $got); a cap there is stopped by the kernel ($rc after ${dt}s)" "[[ '$got' == *'/cpuq-delegated.slice/cpuq-driver-'*'.scope/job /sys/fs/cgroup/'*'.scope '*memory* ]] && [ $rc = 122 ] && fl '$dt < 0.9'"
+  local drv; drv=$("$CPUQ" run --driver --label drv:x -- sh -c '"$1" run --label drv:case -- sh -c "cut -d: -f3 /proc/self/cgroup"' sh "$CPUQ")
+  check "a run a driver starts stays in the driver's scope (got $drv)" "[[ '$drv' == *'/cpuq-driver-'*'.scope/job' ]]"
   # --pids holds the program's tree to N tasks: python and 4 children of 20 asked for.
   local forks; forks=$("$CPUQ" run --driver --label pids -- "$CPUQ" cap --pids 5 -- python3 -c 'import os, time
 n = 0
@@ -1786,9 +1852,11 @@ EOF2
   check "what a driver leaves running in its scope is stopped when it ends (left: $left)" "[ $left = 0 ]"
   # A command's own ${...} reaches its shell untouched: systemd-run (254 and later) would expand it.
   local lit; lit=$("$CPUQ" run --driver --label literal -- sh -c 'x=abc/job; echo "${x%/job}"' 2>&1)
-  check "a driver's \${x%/job} reaches its shell (got '$lit')" "[ '$lit' = abc ]"
+  local lit2; lit2=$(env -u CPUQ_CGROUP "$CPUQ" run --label literal:x -- sh -c 'x=abc/job; echo "${x%/job}"' 2>&1)
+  check "a command's \${x%/job} reaches its shell, under a driver (got '$lit') and a run (got '$lit2')" "[ '$lit' = abc ] && [ '$lit2' = abc ]"
   local off; off=$(echo "cgroups = off" >>"$CPUQ_CONFIG" && env -u CPUQ_CGROUP "$CPUQ" run --driver --label plain -- sh -c 'echo "cg=${CPUQ_CGROUP:-none}"')
-  check "cgroups = off leaves a driver as it is (got $off)" "[ '$off' = 'cg=none' ]"
+  local off2; off2=$(env -u CPUQ_CGROUP "$CPUQ" run --label plain:x -- sh -c 'echo "cg=${CPUQ_CGROUP:-none}"')
+  check "cgroups = off leaves a driver and a run as they are (got $off $off2)" "[ '$off' = 'cg=none' ] && [ '$off2' = 'cg=none' ]"
 }
 
 # --- Submitted jobs --------------------------------------------------------------------------
@@ -1885,7 +1953,7 @@ EOF
 count() { ls "$1" 2>/dev/null | wc -l | tr -d ' '; }
 
 t_test_pool() {
-  # A test's tasks share the pool, one per CPU: 4 tasks of 1 s on a pool of 2 take about 2 s.
+  # A test's tasks share the pool: 4 tasks of 1 s on a pool of 2 take about 2 s or less.
   setup test-pool
   export XDG_STATE_HOME=$T/xdg
   mkdir -p "$T/roots/repo/cpuq"
@@ -1893,7 +1961,7 @@ t_test_pool() {
   (
     cd "$T/roots/repo" || exit 1
     git init -q && git config user.email t@t && git config user.name t
-    printf '%s\n' 'for i in 1 2 3 4; do echo "echo cpu \$CPUQ_CPU; sleep 1" > "$CPUQ_TODO/t$i"; done' > mk.sh
+    printf '%s\n' 'for i in 1 2 3 4; do echo "sleep 1" > "$CPUQ_TODO/t$i"; done' > mk.sh
     printf '%s\n' '{ "label": "t:pool", "tasks": "sh mk.sh" }' > cpuq/pool.json
     git add -A && git commit -qm init
     local t0; t0=$(now)
@@ -1901,10 +1969,9 @@ t_test_pool() {
   ) >"$T/out" 2>&1
   local got; got=$(cat "$T/out")
   local done_dir; done_dir=$(ls -d "$T"/xdg/cpuq/jobs/*/*/done "$HOME"/.local/state/cpuq/jobs/*/*/done 2>/dev/null | head -1)
-  local cpus; cpus=$(cat "$done_dir"/* 2>/dev/null | grep -o '^cpu [0-9]*' | sort -u | wc -l | tr -d ' ')
   local secs; secs=$(grep -o 'PASS .* \([0-9]*\)s ' "$T/pool" | grep -o ' [0-9]*s ' | tail -1 | tr -d ' s')
-  check "test: 4 tasks of 1 s on a pool of 2 run on both CPUs and the job takes about 2 s ($got; $(count "$done_dir") done on $cpus CPUs; the job ${secs}s)" \
-    "[[ '$got' == rc=0* ]] && [ \"\$(count '$done_dir')\" = 4 ] && [ '$cpus' = 2 ] && [ '${secs:-99}' -le 4 ]"
+  check "test: 4 tasks of 1 s on a pool of 2 take about 2 s or less ($got; $(count "$done_dir") done; the job ${secs}s)" \
+    "[[ '$got' == rc=0* ]] && [ \"\$(count '$done_dir')\" = 4 ] && [ '${secs:-99}' -le 4 ]"
 }
 
 t_submit_moved() {
@@ -2208,9 +2275,9 @@ f = open(sys.argv[1]); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$sp/p/held
 
 # --- cpuq jobs and the agent (until they go) -------------------------------------------------
 
-TESTS=${*:-budget tasks pack cpus_limit timeout retry wait_max share fair order drain backfill drain_turn drain_part limit lock_stuck storm kill ctrl_z nested driver removed \
+TESTS=${*:-budget tasks io cpus_limit timeout retry wait_max share fair order drain drain_cpus drain_turn drain_part limit lock_stuck storm kill ctrl_z nested driver removed \
   kill_holder leftovers leaked_descendant kill_waiter term_waiting lost_seq long_command waiters_cpu \
-  exit_status direct_sigint terminal_sigint tasks_sigint ignored_signals stack_limit pin repin narrow \
+  exit_status direct_sigint terminal_sigint tasks_sigint ignored_signals stack_limit \
   status progress usage zombie outside status_host history note wait record min_available min_disk hook \
   lease lease_host lease_host_hold hold_gone last_words on include_git on_check on_gitignore tethered \
   cap cap_quiet_crash cap_link cgroups submit test test_pool submit_moved submit_abandon submit_slots submit_on \

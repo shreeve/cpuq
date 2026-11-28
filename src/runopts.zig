@@ -29,29 +29,27 @@ pub const RunOptions = struct {
     /// `--repo NAME` (internal, what --on passes on): the repository the run's copy came
     /// from, for its history.
     repo: ?[]const u8 = null,
-    /// `-n M`: an operation of M tasks (0: one task, with the terminal).
+    /// `-n M`: a run of M tasks (0: one task, with the terminal).
     tasks: u32 = 0,
-    /// `-c C` or `-c P%`: the most CPUs the operation may hold.
-    cpus: u32 = 100,
-    cpus_percent: bool = true,
-    /// `-x K`: processes per CPU.
-    overload: u32 = 1,
+    /// `-c C` or `-c P%`: the most tasks the run runs at once; 0: no limit of its own.
+    cpus: u32 = 0,
+    cpus_percent: bool = false,
     /// `-t T`: each task's time limit, in seconds.
     timeout_s: ?u32 = null,
     /// `-r N`: tries again for a task that failed.
     retries: u32 = 0,
-    /// `--urgent`: its first CPU goes ahead of the line ("rebuild first").
+    /// `--urgent`: its first task goes ahead of the line ("rebuild first").
     urgent: bool = false,
-    /// `--driver`: a runner that only starts other `cpuq run`s: it holds no CPU itself.
+    /// `--driver`: a runner that only starts other `cpuq run`s: it is no task itself.
     driver: bool = false,
-    /// `--wait-max S`: give up (exit 75) when no CPU comes within S seconds; 0: start now or not.
+    /// `--wait-max S`: give up (exit 75) when no task starts within S seconds; 0: start now or not.
     wait_max: ?u32 = null,
 };
 
 const max_returns = 8;
 
 /// The options `cpuq run` takes a value for.
-const value_options = [_][]const u8{ "--label", "--note", "--return", "--on", "--include", "--repo", "-n", "-c", "-x", "-t", "-r", "--wait-max" };
+const value_options = [_][]const u8{ "--label", "--note", "--return", "--on", "--include", "--repo", "-n", "-c", "-t", "-r", "--wait-max" };
 
 /// Parses `cpuq run`'s command line; null after saying what is wrong.
 pub fn parseRun(args: []const [:0]const u8) ?RunOptions {
@@ -93,7 +91,7 @@ pub fn parseRun(args: []const [:0]const u8) ?RunOptions {
         } else if (std.mem.eql(u8, name, "-c")) {
             const pct = std.mem.endsWith(u8, value, "%");
             const n = policy.parseCount(if (pct) value[0 .. value.len - 1] else value) orelse {
-                _ = usageError("-c needs a whole number of CPUs or a percentage (50%), not '{s}'", .{value});
+                _ = usageError("-c needs a whole number of tasks or a percentage of the pool (50%), not '{s}'", .{value});
                 return null;
             };
             if (pct and n > 100) {
@@ -102,11 +100,6 @@ pub fn parseRun(args: []const [:0]const u8) ?RunOptions {
             }
             o.cpus = n;
             o.cpus_percent = pct;
-        } else if (std.mem.eql(u8, name, "-x")) {
-            o.overload = policy.parseCount(value) orelse {
-                _ = usageError("-x needs a whole number of processes per CPU, at least 1, not '{s}'", .{value});
-                return null;
-            };
         } else if (std.mem.eql(u8, name, "-t")) {
             o.timeout_s = policy.parseAge(value) orelse {
                 _ = usageError("-t needs a time limit such as 30s, 10m or 2h (off: none), not '{s}'", .{value});

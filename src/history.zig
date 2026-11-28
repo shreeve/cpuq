@@ -50,7 +50,13 @@ pub const Event = struct {
     /// Its tasks that passed and failed (ended).
     done: ?u32 = null,
     failed: ?u32 = null,
+    /// A drain whose CPUs saw work from outside it while its command ran (ended).
+    noisy: ?Noisy = null,
 };
+
+/// Work from outside a drain on its CPUs while its command ran: the busy CPUs it averaged and
+/// at most, and the busiest such process ("name (pid)").
+pub const Noisy = struct { cpus: f64 = 0, max: f64 = 0, top: []const u8 = "" };
 
 /// The longest command kept in a line, so a line stays well under 4 KB.
 pub const max_cmd = 1024;
@@ -152,6 +158,7 @@ pub const Job = struct {
     cpu: ?f64 = null,
     done: ?u32 = null,
     failed: ?u32 = null,
+    noisy: ?Noisy = null,
     state: State = .active,
 
     /// Seconds spent waiting: until admitted, or until it gave up.
@@ -226,6 +233,7 @@ pub fn load(io: Io, a: std.mem.Allocator, path: []const u8, boot: f64, alive: *c
                 j.cpu = ev.cpu;
                 j.done = ev.done;
                 j.failed = ev.failed;
+                j.noisy = ev.noisy;
                 if (ev.cores) |k| j.cores = k;
                 j.state = .done;
             } else if (std.mem.eql(u8, ev.event, "gave_up")) {

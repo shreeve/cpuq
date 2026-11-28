@@ -30,14 +30,12 @@ struct Machine: Hashable, Identifiable {
 /// ran and waited for, and the jobs its `cpuq history` remembers.
 @Observable
 final class GraphModel {
-    /// A job's hold on its cores.
+    /// A run, from its start to its end.
     struct Block: Identifiable {
         /// Its cpuq pid and the second it started.
         let id: String
         let project: String
         let label: String
-        /// Which of the budget's cores it holds, from 0.
-        var lanes: [Int]
         var from: Date
         /// Nil while it runs.
         var to: Date?
@@ -45,8 +43,10 @@ final class GraphModel {
         var active: [Reading] = []
         /// Its average active cores from history, for the stretch the app did not watch.
         var average: Double?
-        /// A drain (`cpuq drain`): it held the Mac alone.
-        var exclusive = false
+        /// A drain (`cpuq drain`): the CPUs its command runs on, and those it isolates.
+        var drain = false
+        var pin: [Int] = []
+        var isolated: [Int] = []
     }
 
     struct Reading {
@@ -59,13 +59,12 @@ final class GraphModel {
         let id: String
         let project: String
         let label: String
-        let cores: String
-        /// The fewest cores it asked for.
-        var need = 1
+        /// What it waits to start: "7 tasks", "a drain on 2 CPUs".
+        let asks: String
         var from: Date
         var to: Date?
-        /// A drain waiting for the Mac to empty.
-        var exclusive = false
+        /// A drain waiting for its turn: the line waits behind it on purpose.
+        var drain = false
     }
 
     /// The machine at one poll, for the top line when pointing at that moment.
@@ -74,8 +73,8 @@ final class GraphModel {
         /// CPU used by the busiest processes outside cpuq, in cores.
         let outside: Double
         let load: Double
-        /// cpuq's gate then: open, or shut by memory pressure, the load valve or spacing (one
-        /// admission per 10 s over the budget); jobs wait even beside free cores while it is shut.
+        /// cpuq's gate then: open, or shut by memory pressure or a full disk; jobs wait even
+        /// beside room while it is shut.
         var gate = "open"
         var gateText = "open"
         var gateOpen: Bool { gate == "open" }
@@ -83,9 +82,9 @@ final class GraphModel {
         var busy: Double? = nil
         /// The same for each CPU, in the kernel's order.
         var perCPU: [Double]? = nil
-        /// The pool's CPUs no one held or was promised (cpuq's `free`); nil when unknown (the
-        /// recorder's samples from before the app watched).
-        var poolFree: Int? = nil
+        /// Room for more of cpuq's tasks (cpuq's `room`): positive, the first waiter starts a task
+        /// at its next look. Nil when unknown (the recorder's samples from before the app watched).
+        var room: Double? = nil
     }
 
     /// A project's finished jobs, summed.
@@ -93,10 +92,10 @@ final class GraphModel {
         var id: String { project }
         let project: String
         let jobs: Int
-        /// CPU-hours held and busy.
-        let held: Double
+        /// Task-hours (each run's most tasks at once, for its time) and CPU-hours busy.
+        let taskHours: Double
         let used: Double
-        var efficiency: Double { held > 0 ? used / held : 0 }
+        var efficiency: Double { taskHours > 0 ? used / taskHours : 0 }
         let medianWait: Double
         let longestWait: Double
     }
@@ -197,24 +196,24 @@ final class GraphModel {
     /// so a project's color never changes as others come and go.
     private var slots = (UserDefaults.standard.dictionary(forKey: "projectPalette") as? [String: Int]) ?? [:]
 
-    var budget: Int { max(status?.capacity ?? 8, 1) }
-
     func add(_ s: Status, at now: Date = Date()) {
         status = s
         problem = nil
         if upSince == nil { upSince = now }
         var running: Set<String> = []
-        for h in s.holders {
-            let id = "\(h.pid)-\(h.since)"
+        for r in s.runs {
+            let id = "\(r.pid)-\(r.since)"
             running.insert(id)
+            let use = Self.busy(r)
             if let i = blocks.firstIndex(where: { $0.id == id }) {
-                if let u = h.using { blocks[i].active.append(Reading(at: now, cores: u)) }
+                if let u = use { blocks[i].active.append(Reading(at: now, cores: u)) }
+                blocks[i].pin = r.pin
+                blocks[i].isolated = r.cpus
             } else {
-                let from = Date(timeIntervalSince1970: Double(h.since))
-                blocks.append(Block(id: id, project: Self.group(h.label, h.note), label: Self.label(h.label, h.command),
-                                    lanes: h.slots.isEmpty ? fit(h.cores, from: from) : h.slots, from: from,
-                                    active: h.using.map { [Reading(at: now, cores: $0)] } ?? [], exclusive: h.exclusive))
-                remember(Self.group(h.label, h.note))
+                blocks.append(Block(id: id, project: Self.group(r.label, r.note), label: Self.label(r.label, r.command),
+                                    from: Date(timeIntervalSince1970: Double(r.since)), active: use.map { [Reading(at: now, cores: $0)] } ?? [],
+                                    drain: r.drain, pin: r.pin, isolated: r.cpus))
+                remember(Self.group(r.label, r.note))
             }
         }
         for i in blocks.indices where blocks[i].to == nil && !running.contains(blocks[i].id) { blocks[i].to = now }
@@ -224,8 +223,8 @@ final class GraphModel {
             let id = "\(w.since)-\(w.label)-\(w.command)"
             queued.insert(id)
             if !waits.contains(where: { $0.id == id }) {
-                waits.append(Wait(id: id, project: Self.group(w.label, w.note), label: Self.label(w.label, w.command), cores: Self.wants(w),
-                                  need: w.exclusive ? budget : max(w.cores, 1), from: Date(timeIntervalSince1970: Double(w.since)), exclusive: w.exclusive))
+                waits.append(Wait(id: id, project: Self.group(w.label, w.note), label: Self.label(w.label, w.command), asks: Self.wants(w),
+                                  from: Date(timeIntervalSince1970: Double(w.since)), drain: w.drain))
                 remember(Self.group(w.label, w.note))
             }
         }
@@ -243,7 +242,7 @@ final class GraphModel {
         }
         cpuTicks = each
         samples.append(Sample(at: now, outside: s.outside.reduce(0) { $0 + $1.using }, load: s.load.first ?? 0,
-                              gate: s.gate.state, gateText: s.gate.text, busy: busy, perCPU: perCPU, poolFree: s.free))
+                              gate: s.gate.state, gateText: s.gate.text, busy: busy, perCPU: perCPU, room: s.room))
         let cutoff = now.addingTimeInterval(-Self.keep)
         samples.removeAll { $0.at < cutoff }
         blocks.removeAll { ($0.to ?? now) < cutoff }
@@ -260,26 +259,25 @@ final class GraphModel {
                 blocks[i].average = j.used
             }
         }
-        var by: [String: (jobs: Int, held: Double, used: Double, waits: [Double])] = [:]
+        var by: [String: (jobs: Int, taskHours: Double, used: Double, waits: [Double])] = [:]
         for j in jobs where j.state == "done" && j.pool == "cpus" {
             guard let cores = j.cores, let ran = j.ran else { continue }
             var e = by[Self.project(j.label)] ?? (0, 0, 0, [])
             e.jobs += 1
-            e.held += Double(cores) * ran / 3600
+            e.taskHours += Double(cores) * ran / 3600
             e.used += (j.used ?? 0) * ran / 3600
             if let w = j.waited { e.waits.append(w) }
             by[Self.project(j.label)] = e
         }
         totals = by.map { k, v in
             let waits = v.waits.sorted()
-            return Totals(project: k, jobs: v.jobs, held: v.held, used: v.used,
+            return Totals(project: k, jobs: v.jobs, taskHours: v.taskHours, used: v.used,
                           medianWait: waits.isEmpty ? 0 : waits[waits.count / 2], longestWait: waits.last ?? 0)
-        }.sorted { $0.held > $1.held }
+        }.sorted { $0.taskHours > $1.taskHours }
     }
 
-    /// The hour before the app started watching, from `cpuq history`: each finished job on the
-    /// cores it took (or the lowest that were free, when it names none), with its
-    /// average active cores, and each wait from queueing to starting.
+    /// The hour before the app started watching, from `cpuq history`: each finished job with its
+    /// average busy CPUs, and each wait from queueing to starting.
     private func seed(_ jobs: [Job], now: Date = Date()) {
         seeded = true
         let since = max(now.addingTimeInterval(-Self.keep), cleared ?? .distantPast).timeIntervalSince1970
@@ -290,24 +288,14 @@ final class GraphModel {
             let from = Date(timeIntervalSince1970: max(start, since))
             let to = Date(timeIntervalSince1970: j.ended ?? start)
             blocks.append(Block(id: "\(j.pid ?? 0)-\(Int(start))", project: Self.group(j.label, j.note), label: j.label.isEmpty ? "-" : j.label,
-                                lanes: j.slots ?? fit(cores, from: from, to: to), from: from, to: to, average: j.used, exclusive: j.exclusive))
+                                from: from, to: to, average: j.used))
             if let w = j.waited, w >= 1, start > since {
-                waits.append(Wait(id: "h\(j.id)", project: Self.group(j.label, j.note), label: j.label, cores: cores == 1 ? "1 CPU" : "\(cores) CPUs",
-                                  need: cores, from: Date(timeIntervalSince1970: start - w), to: from, exclusive: j.exclusive))
+                waits.append(Wait(id: "h\(j.id)", project: Self.group(j.label, j.note), label: j.label, asks: Self.tasks(cores),
+                                  from: Date(timeIntervalSince1970: start - w), to: from))
             }
             remember(Self.group(j.label, j.note))
         }
         blocks.sort { $0.from < $1.from }
-    }
-
-    /// The lowest `n` adjacent cores free from `from` to `to` (or on), else the lowest free ones.
-    private func fit(_ n: Int, from: Date, to: Date? = nil) -> [Int] {
-        var busy = Set<Int>()
-        for b in blocks where b.from < (to ?? .distantFuture) && (b.to ?? .distantFuture) > from { busy.formUnion(b.lanes) }
-        let width = max(budget, n)
-        for start in 0...(width - n) where (start..<start + n).allSatisfy({ !busy.contains($0) }) { return Array(start..<start + n) }
-        let free = (0..<width).filter { !busy.contains($0) }
-        return free.count >= n ? Array(free.prefix(n)) : Array(0..<n)
     }
 
     private func remember(_ project: String) {
@@ -361,8 +349,18 @@ final class GraphModel {
         label.isEmpty ? String(command.prefix(40)) : label
     }
 
+    /// What a waiter waits to start: "7 tasks", or a drain's "a drain on 2 CPUs".
     static func wants(_ w: Status.Waiter) -> String {
-        w.exclusive ? "every CPU" : (w.max > w.cores ? "\(w.cores)–\(w.max) CPUs" : w.cores == 1 ? "1 CPU" : "\(w.cores) CPUs")
+        w.drain ? "a drain on \(w.max) CPU\(w.max == 1 ? "" : "s")" : tasks(w.waiting)
+    }
+
+    /// "1 task", "7 tasks".
+    static func tasks(_ n: Int) -> String { n == 1 ? "1 task" : "\(n) tasks" }
+
+    /// The CPUs a run keeps busy: its tasks', and a driver's own process tree's; nil while
+    /// unmeasured.
+    static func busy(_ r: Status.Run) -> Double? {
+        r.driver ? (r.using ?? 0) + r.driverBusy : r.using
     }
 
     /// What the charts split CPU by: the project, and with a note ("#881 markers") the project
@@ -536,11 +534,11 @@ struct HistoryCard: View {
                         HStack(spacing: 6) { Circle().fill(model.color(t.project)).frame(width: 8, height: 8); Text(t.project) }
                     }
                     TableColumn("Jobs") { t in Text("\(t.jobs)").monospacedDigit() }.width(50)
-                    TableColumn("CPU-hours held") { t in Text(String(format: "%.2f", t.held)).monospacedDigit() }
+                    TableColumn("Task-hours") { t in Text(String(format: "%.2f", t.taskHours)).monospacedDigit() }
                     TableColumn("CPU-hours busy") { t in Text(String(format: "%.2f", t.used)).monospacedDigit() }
                     TableColumn("Share") { t in
-                        // Used of held: noise for a project with next to nothing held.
-                        if t.held < 0.01 {
+                        // Busy of task-hours: noise for a project with next to nothing run.
+                        if t.taskHours < 0.01 {
                             Text("–").foregroundStyle(.secondary)
                         } else {
                             Text("\(Int((t.efficiency * 100).rounded()))%").monospacedDigit()

@@ -71,10 +71,10 @@ never write them.
 |---|---|---|
 | `label` | `project:task` | required |
 | `run` | `sh -c RUN cpuq ARGS...` at the copy's top, as one task; `-- ARGS` become `"$@"` (`cpuq submit`) | `run` or `tasks` |
-| `tasks` | `sh -c TASKS cpuq ARGS...` after `setup`, writing one task file per task into `$CPUQ_TODO` (its work up to the first blank line, run with `sh`); they then run on the host one per CPU of its pool (`cpuq run -n COUNT -- cpuq _task FOLDER`, README "A test's tasks"), each with `$CPUQ_CODE`, the copy's path (`cpuq test`) | `run` or `tasks` |
+| `tasks` | `sh -c TASKS cpuq ARGS...` after `setup`, writing one task file per task into `$CPUQ_TODO` (its work up to the first blank line, run with `sh`); they then run on the host as tasks of one run, as many at once as the line allows (`cpuq run -n COUNT -- cpuq _task FOLDER`, README "A test's tasks"), each with `$CPUQ_CODE`, the copy's path (`cpuq test`) | `run` or `tasks` |
 | `setup` | run first, in the same job | none |
-| `driver` | `true`: the job is a runner (`cpuq run --driver`): it holds no CPU, and each `cpuq run` it starts takes its own, so `run` may fan out with `cpuq run -n M` | `false`: one task on one CPU |
-| `time` | wall time from the job's start on its CPU, enforced by `cpuq cap --time` around setup and run; required on a host with `remote_start` | 2h there, none here |
+| `driver` | `true`: the job is a runner (`cpuq run --driver`): it is no task of its own, and each `cpuq run` it starts is admitted on its own, so `run` may fan out with `cpuq run -n M` | `false`: one task |
+| `time` | wall time from the job's start, enforced by `cpuq cap --time` around setup and run; required on a host with `remote_start` | 2h there, none here |
 | `mem` | memory of the whole job, by `cpuq cap --mem` (the kernel's memory.max inside a Linux job) | none |
 | `tools` | `{"zig": "0.17.0"}`: `zig version` etc. checked on the host before the run; a mismatch is NOT RUN | none |
 | `env` | variables for setup and run, written to the job's own files on the host, never on a command line | none |
@@ -91,7 +91,7 @@ never write them.
   `submit_roots` (default `~/Data/Code`).
 - **Spec errors:** one line naming the field, exit 2. A spec with `cores` is refused: its job runs
   as one task, or as a runner with `driver`.
-- **One CPU:** without `driver`, `setup` and `run` share the job's one CPU, so they run at one job
+- **One task:** without `driver`, `setup` and `run` are one task, so they run at one job
   (`zig build -j1`), and a `cpuq run -n M` inside them is nested and runs on that same CPU. A
   runner sets `driver`, so its `cpuq run -n M` takes M CPUs from the pool; a suite of task files
   is a spec with `tasks`, run by `cpuq test`.
@@ -179,7 +179,7 @@ never write them.
      writes the generation. `_job` checks it.
 4. **Run.**
    - `cpuq run --label L [--note N] -- cpuq cap --time T --mem M -- sh -c 'SETUP && RUN' cpuq ARGS`,
-     in the copy: one task, on one CPU of the host's pool.
+     in the copy: one task on the host.
    - The environment: `env`, `caches` and a `TMPDIR` of the job's own.
    - Output goes to the job's `output.log`, and the report is truncated first.
    - `tools` are checked before anything runs.

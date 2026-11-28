@@ -1,11 +1,12 @@
-//! The pool's CPUs: which of this machine's CPUs cpuq hands out, and in what order. Every cpuq
-//! on the machine works the list out the same way, so they agree on it.
+//! The pool's CPUs: how many CPUs the line shares (its capacity), and which ones, in what order
+//! (a drain isolates CPUs from the end of it). Every cpuq on the machine works the list out the
+//! same way, so they agree on it.
 //!
 //! - `cpus = LIST` in the config (a Linux CPU list, "12-19,2") is the pool, in that order.
 //! - Otherwise, Linux: the CPUs online, less those isolated from the scheduler, within the CPUs
 //!   the machine's init may use (a container's CPU set), one hyperthread of each physical core
 //!   first, then their siblings. macOS: 0 to the active CPU count less one (it cannot pin, so
-//!   the numbers only name slots).
+//!   the numbers only count).
 //! - `budget = N` (or CPUQ_BUDGET) keeps the first N.
 const std = @import("std");
 const Io = std.Io;
@@ -66,4 +67,59 @@ fn allowedCpus(io: Io, a: std.mem.Allocator) []const u32 {
         }
     }
     return &.{};
+}
+
+/// A CPU and its SMT siblings (the other hardware threads of its core), itself left out.
+pub const Core = struct { cpu: u32, siblings: []const u32 };
+
+/// Linux: each of `cpus` with its siblings (`topology/thread_siblings_list`). Elsewhere, and for
+/// a CPU whose list can't be read, none: macOS has no SMT on Apple silicon, and names no CPU.
+pub fn cores(io: Io, a: std.mem.Allocator, cpus: []const u32) []const Core {
+    var out: std.ArrayList(Core) = .empty;
+    for (cpus) |c| {
+        var sibs: std.ArrayList(u32) = .empty;
+        if (builtin.os.tag == .linux) {
+            const path = std.fmt.allocPrint(a, "/sys/devices/system/cpu/cpu{d}/topology/thread_siblings_list", .{c}) catch "";
+            const all = policy.cpuList(a, std.mem.trim(u8, readSmall(io, a, path), " \n")) catch &.{};
+            for (all) |s| if (s != c) sibs.append(a, s) catch {};
+        }
+        out.append(a, .{ .cpu = c, .siblings = sibs.items }) catch break;
+    }
+    return out.items;
+}
+
+/// `cpus` fastest first (Linux): a hybrid CPU's performance cores (`/sys/devices/cpu_core/cpus`)
+/// before its efficiency cores, then by `cpu_capacity`, then by top clock (`cpuinfo_max_freq`),
+/// else in their order. Elsewhere as they are.
+pub fn fastFirst(io: Io, a: std.mem.Allocator, cpus: []const u32) []const u32 {
+    const out = a.dupe(u32, cpus) catch return cpus;
+    if (builtin.os.tag != .linux) return out;
+    const p_cores = policy.cpuList(a, std.mem.trim(u8, readSmall(io, a, "/sys/devices/cpu_core/cpus"), " \n")) catch &.{};
+    const Key = struct { cpu: u32, p: bool, cap: u64, freq: u64, at: usize };
+    const keys = a.alloc(Key, out.len) catch return out;
+    for (out, keys, 0..) |c, *k, i| {
+        const num = struct {
+            fn of(io2: Io, a2: std.mem.Allocator, cpu: u32, file: []const u8) u64 {
+                const path = std.fmt.allocPrint(a2, "/sys/devices/system/cpu/cpu{d}/{s}", .{ cpu, file }) catch return 0;
+                return std.fmt.parseInt(u64, std.mem.trim(u8, readSmall(io2, a2, path), " \n"), 10) catch 0;
+            }
+        };
+        k.* = .{
+            .cpu = c,
+            .p = std.mem.findScalar(u32, p_cores, c) != null,
+            .cap = num.of(io, a, c, "cpu_capacity"),
+            .freq = num.of(io, a, c, "cpufreq/cpuinfo_max_freq"),
+            .at = i,
+        };
+    }
+    std.mem.sort(Key, keys, {}, struct {
+        fn faster(_: void, x: Key, y: Key) bool {
+            if (x.p != y.p) return x.p;
+            if (x.cap != y.cap) return x.cap > y.cap;
+            if (x.freq != y.freq) return x.freq > y.freq;
+            return x.at < y.at;
+        }
+    }.faster);
+    for (out, keys) |*c, k| c.* = k.cpu;
+    return out;
 }

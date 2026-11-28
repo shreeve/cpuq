@@ -217,6 +217,34 @@ pub fn perCpuTicks(io: Io, a: std.mem.Allocator) ?[]Ticks {
     return if (list.items.len == 0) null else list.items;
 }
 
+/// Linux: each online CPU's time so far, by its number (the cpuN lines of /proc/stat). Null
+/// elsewhere, where a CPU's number names no CPU anything is kept on.
+pub fn numberedTicks(io: Io, a: std.mem.Allocator) ?[]NumberedTicks {
+    if (is_darwin) return null;
+    const buf = a.alloc(u8, 64 << 10) catch return null;
+    const text = Io.Dir.cwd().readFile(io, "/proc/stat", buf) catch return null;
+    var list: std.ArrayList(NumberedTicks) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len < 4 or !std.mem.startsWith(u8, line, "cpu") or !std.ascii.isDigit(line[3])) continue;
+        var f = std.mem.tokenizeScalar(u8, line, ' ');
+        const cpu = std.fmt.parseInt(u32, (f.next() orelse continue)[3..], 10) catch continue;
+        var total: u64 = 0;
+        var idle: u64 = 0;
+        var i: usize = 0;
+        while (f.next()) |v| : (i += 1) {
+            if (i >= 8) break;
+            const n = std.fmt.parseInt(u64, v, 10) catch 0;
+            total += n;
+            if (i == 3 or i == 4) idle += n;
+        }
+        list.append(a, .{ .cpu = cpu, .busy = total - idle, .total = total }) catch return null;
+    }
+    return if (list.items.len == 0) null else list.items;
+}
+
+pub const NumberedTicks = struct { cpu: u32, busy: u64, total: u64 };
+
 /// The share of all CPUs busy between two readings, 0 to 1.
 pub fn busyBetween(a: Ticks, b: Ticks) ?f64 {
     if (b.total <= a.total) return null;
@@ -826,6 +854,8 @@ pub const Proc = struct {
     /// Waiting on a disk or other device (Linux state D): busy, though using
     /// no CPU. Always false on macOS.
     blocked: bool = false,
+    /// Linux: the CPU it last ran on (/proc/PID/stat's 39th field); null elsewhere.
+    last_cpu: ?u32 = null,
 };
 
 /// Every process the caller can see, with its parent and its CPU time so
@@ -943,6 +973,7 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
         var running: u32 = 0;
         var stopped = false;
         var blocked = false;
+        var last_cpu: ?u32 = null;
         var i: usize = 0;
         while (fields.next()) |f| : (i += 1) {
             switch (i) {
@@ -961,9 +992,11 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
                 13, 14 => ticks += std.fmt.parseInt(u64, f, 10) catch 0,
                 // rss, in pages (the 24th field).
                 21 => rss = std.fmt.parseInt(u64, f, 10) catch 0,
+                // processor, the CPU it last ran on (the 39th field).
+                36 => last_cpu = std.fmt.parseInt(u32, f, 10) catch null,
                 else => {},
             }
-            if (i == 21) break;
+            if (i == 36) break;
         }
         // The owner: /proc/PID belongs to the process's user.
         var uid: u32 = 0;
@@ -974,7 +1007,7 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
             var stx: linux.Statx = undefined;
             if (linux.statx(dir.handle, &name_z, 0, .{ .UID = true }, &stx) == 0) uid = stx.uid;
         }
-        list.append(arena, .{ .pid = pid, .ppid = ppid, .name = arena.dupe(u8, text[open + 1 .. close]) catch "", .cpu_ns = ticks * std.time.ns_per_s / tick_hz, .own_ns = own * std.time.ns_per_s / tick_hz, .mem = rss * page, .running = running, .stopped = stopped, .uid = uid, .blocked = blocked }) catch break;
+        list.append(arena, .{ .pid = pid, .ppid = ppid, .name = arena.dupe(u8, text[open + 1 .. close]) catch "", .cpu_ns = ticks * std.time.ns_per_s / tick_hz, .own_ns = own * std.time.ns_per_s / tick_hz, .mem = rss * page, .running = running, .stopped = stopped, .uid = uid, .blocked = blocked, .last_cpu = last_cpu }) catch break;
     }
     return list.items;
 }
@@ -1107,22 +1140,83 @@ test "statStart" {
     try std.testing.expectEqual(@as(?u64, null), statStart("17 (a) Z 1 17 17 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 4242 1000 10"));
 }
 
-/// Linux: pins every thread of process `pid` to `cpu` (sched_setaffinity works per thread,
-/// so each in /proc/PID/task). Elsewhere it does nothing.
-pub fn pinThreads(io: Io, a: std.mem.Allocator, pid: c.pid_t, cpu: u32) void {
-    if (is_darwin) return;
+/// macOS: runs process `pid` in the background (PRIO_DARWIN_BG: efficiency cores, throttled
+/// disk), or back in the foreground; a process's own user may do both, where a nice value once
+/// raised can't be lowered again. Elsewhere it does nothing.
+pub fn setBackground(pid: c.pid_t, on: bool) void {
+    if (!is_darwin) return;
+    _ = setpriority(4, @intCast(pid), if (on) 0x1000 else 0); // PRIO_DARWIN_PROCESS, PRIO_DARWIN_BG
+}
+
+/// Linux: this process's CPU affinity, as CPU numbers; empty elsewhere or when unreadable.
+pub fn ownAffinity(a: std.mem.Allocator) []const u32 {
+    if (is_darwin) return &.{};
     var set: std.os.linux.cpu_set_t = @splat(0);
-    const bits = @bitSizeOf(usize);
-    if (cpu >= set.len * bits) return;
-    set[cpu / bits] |= @as(usize, 1) << @intCast(cpu % bits);
-    const path = std.fmt.allocPrint(a, "/proc/{d}/task", .{pid}) catch return;
-    var dir = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return;
+    if (std.os.linux.syscall3(.sched_getaffinity, 0, @sizeOf(std.os.linux.cpu_set_t), @intFromPtr(&set)) > std.math.maxInt(isize)) return &.{};
+    return setList(a, set);
+}
+
+/// Linux: the threads of process `pid`, from /proc/PID/task; empty elsewhere.
+fn threadsOf(io: Io, a: std.mem.Allocator, pid: c.pid_t) []const i32 {
+    if (is_darwin) return &.{};
+    var out: std.ArrayList(i32) = .empty;
+    const path = std.fmt.allocPrint(a, "/proc/{d}/task", .{pid}) catch return &.{};
+    var dir = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return &.{};
     defer dir.close(io);
     var it = dir.iterate();
-    while (it.next(io) catch null) |e| {
-        const tid = std.fmt.parseInt(i32, e.name, 10) catch continue;
+    while (it.next(io) catch null) |e| out.append(a, std.fmt.parseInt(i32, e.name, 10) catch continue) catch break;
+    return out.items;
+}
+
+/// Linux: sets every thread of process `pid` to run on `cpus` only (sched_setaffinity works per
+/// thread, so each in /proc/PID/task). Elsewhere, or with no CPUs, it does nothing.
+pub fn setThreads(io: Io, a: std.mem.Allocator, pid: c.pid_t, cpus: []const u32) void {
+    if (is_darwin or cpus.len == 0) return;
+    const set = listSet(cpus);
+    for (threadsOf(io, a, pid)) |tid| {
         _ = std.os.linux.syscall3(.sched_setaffinity, @as(usize, @bitCast(@as(isize, tid))), @sizeOf(std.os.linux.cpu_set_t), @intFromPtr(&set));
     }
+}
+
+/// Linux: takes `cpus` out of the affinity of every thread of process `pid`, leaving alone a
+/// thread that would have no CPU left. Elsewhere it does nothing.
+pub fn excludeThreads(io: Io, a: std.mem.Allocator, pid: c.pid_t, cpus: []const u32) void {
+    if (is_darwin or cpus.len == 0) return;
+    const out = listSet(cpus);
+    for (threadsOf(io, a, pid)) |tid| {
+        const t: usize = @bitCast(@as(isize, tid));
+        var set: std.os.linux.cpu_set_t = @splat(0);
+        if (std.os.linux.syscall3(.sched_getaffinity, t, @sizeOf(std.os.linux.cpu_set_t), @intFromPtr(&set)) > std.math.maxInt(isize)) continue;
+        var left = false;
+        for (&set, out) |*w, x| {
+            w.* &= ~x;
+            if (w.* != 0) left = true;
+        }
+        if (left) _ = std.os.linux.syscall3(.sched_setaffinity, t, @sizeOf(std.os.linux.cpu_set_t), @intFromPtr(&set));
+    }
+}
+
+fn listSet(cpus: []const u32) std.os.linux.cpu_set_t {
+    var set: std.os.linux.cpu_set_t = @splat(0);
+    const bits = @bitSizeOf(usize);
+    for (cpus) |cpu| if (cpu < set.len * bits) {
+        set[cpu / bits] |= @as(usize, 1) << @intCast(cpu % bits);
+    };
+    return set;
+}
+
+fn setList(a: std.mem.Allocator, set: std.os.linux.cpu_set_t) []const u32 {
+    var out: std.ArrayList(u32) = .empty;
+    const bits = @bitSizeOf(usize);
+    for (set, 0..) |w, i| {
+        var x = w;
+        while (x != 0) {
+            const b = @ctz(x);
+            out.append(a, @intCast(i * bits + b)) catch break;
+            x &= x - 1;
+        }
+    }
+    return out.items;
 }
 
 /// A process's parent, or null when it is gone or can't be read: macOS proc_bsdinfo's
