@@ -668,6 +668,18 @@ print('yes' if $cpu not in cpus('$during') and cpus('$during') else 'no')")
     "[ '$before' = '$mine' ] && [ '$own' = '$cpu' ] && [ $off = yes ] && [ '$after' = '$before' ]"
 }
 
+t_drain_long() {
+  # A drain holds its cores at most drain_timeout while anyone waits, whatever its own -t.
+  setup drain_long "drain_timeout = 3s"
+  local t0 rc dt; t0=$(now)
+  "$CPUQ" drain -c 1 -t 1h --label d:long -- sh -c 'end=$(($(date +%s)+30)); while [ $(date +%s) -lt $end ]; do :; done' 2>"$T/err" & local d=$!
+  wait_line_any() { :; }
+  sleep 1
+  "$CPUQ" drain -c 1 --max 60s -t 10s --label d:next -- true & local n=$!
+  wait $d; rc=$?; dt=$(since "$t0"); wait $n; local rn=$?
+  check "a drain past drain_timeout is stopped while another waits (rc $rc after ${dt}s; next rc $rn)" "[ $rc = 124 ] && fl '$dt < 15' && [ $rn = 0 ] && grep -q 'drain_timeout' '$T/err'"
+}
+
 t_limit() {
   # cpuq limit RUN -c C: a running run's -c changes. Raised, it starts more at once (here under
   # its share); lowered, it starts none until fewer run, killing none. Status flags a run held back
@@ -2344,7 +2356,7 @@ f = open(sys.argv[1]); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$sp/p/held
 
 # --- cpuq jobs and the agent (until they go) -------------------------------------------------
 
-TESTS=${*:-budget tasks io cpus_limit timeout retry wait_max share fair order stream backstop drain drain_cpus drain_turn drain_cap drain_part limit lock_stuck storm kill ctrl_z nested driver removed \
+TESTS=${*:-budget tasks io cpus_limit timeout retry wait_max share fair order stream backstop drain drain_cpus drain_turn drain_cap drain_part drain_long limit lock_stuck storm kill ctrl_z nested driver removed \
   kill_holder leftovers leaked_descendant kill_waiter term_waiting lost_seq long_command waiters_cpu \
   exit_status direct_sigint terminal_sigint tasks_sigint ignored_signals stack_limit \
   status progress usage zombie outside status_host history note wait record min_available min_disk hook \

@@ -211,6 +211,9 @@ const Run = struct {
     idle_since_ms: i64 = 0,
     idle_warned: bool = false,
     idle_stopped: bool = false,
+    /// Ended at config `drain_timeout` because others waited (its own -t was longer).
+    long_stopped: bool = false,
+    long_at_ms: i64 = 0,
     /// Why it waits, as the record says it: kept here, so it outlives each look.
     why_buf: [256]u8 = undefined,
     /// A drain: its candidate CPUs in the order it takes them, with their SMT siblings.
@@ -432,7 +435,7 @@ fn logEnd(r: *Run) void {
             extra.exit = 125;
         } else if (last.?.timed_out) {
             extra.exit = 124;
-            extra.stopped = if (r.idle_stopped) "idle" else "time limit";
+            extra.stopped = if (r.long_stopped) "drain_timeout, others waiting" else if (r.idle_stopped) "idle" else "time limit";
         } else if (r.last_wait) |w| switch (w.exit) {
             .code => |code| extra.exit = code,
             .signal => |sig| extra.signal = @intCast(@backingInt(sig)),
@@ -548,6 +551,7 @@ fn timeouts(r: *Run) void {
 /// task tree's CPU time. Kept under `drain_idle_busy` CPUs for `drain_idle` while another run
 /// waits, it is warned halfway, then stopped as at its time limit.
 fn idleDrain(r: *Run) void {
+    longDrain(r);
     const window: i64 = @as(i64, r.ctx.cfg.drain_idle_s) * 1000;
     if (window == 0 or r.running.items.len == 0 or r.idle_stopped or r.rec.dstart == 0) return;
     const now = sys.monoMs();
@@ -603,6 +607,34 @@ fn setLimit(r: *Run, n_in: u32) void {
     if (!r.single) std.debug.print("cpuq: now up to {d} at once (was {d}), by cpuq limit\n", .{ n, r.limit });
     r.limit = n;
     r.event = true;
+}
+
+/// A drain holds its cores at most config `drain_timeout` while anyone waits, whatever its own
+/// -t: a longer -t runs on only on an otherwise idle machine. Looked at every 2 s.
+fn longDrain(r: *Run) void {
+    if (r.running.items.len == 0 or r.idle_stopped or r.rec.dstart == 0) return;
+    const now = sys.monoMs();
+    if (now - r.rec.dstart < @as(i64, r.ctx.cfg.drain_timeout_s) * 1000) return;
+    if (r.long_at_ms != 0 and now - r.long_at_ms < 2000) return;
+    r.long_at_ms = now;
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    r.pool.lock();
+    const ops = r.pool.scan(arena.allocator());
+    r.pool.unlock();
+    var others = false;
+    for (ops) |o| {
+        if (o.ticket != r.rec.ticket and o.waiting > 0) others = true;
+    }
+    if (!others) return;
+    r.long_stopped = true;
+    r.idle_stopped = true;
+    std.debug.print("cpuq: drain stopped: it held its CPUs past drain_timeout ({d}s) while others waited\n", .{r.ctx.cfg.drain_timeout_s});
+    for (r.running.items) |*t| if (t.term_ms == 0) {
+        t.term_ms = now;
+        t.timed_out = true;
+        signalTask(r, t.*, .TERM);
+    };
 }
 
 fn signalTask(r: *Run, t: Task, sig: c.SIG) void {
@@ -1210,7 +1242,9 @@ fn finish(r: *Run) u8 {
         }
         const out = r.outcomes.items[r.outcomes.items.len - 1];
         if (out.timed_out) {
-            if (r.idle_stopped)
+            if (r.long_stopped)
+                std.debug.print("cpuq: drain stopped at drain_timeout ({d}s): others waited for its CPUs\n", .{r.ctx.cfg.drain_timeout_s})
+            else if (r.idle_stopped)
                 std.debug.print("cpuq: drain stopped: its command kept under {d:.2} CPUs busy for {d}s while others waited\n", .{ drain_idle_busy, r.ctx.cfg.drain_idle_s })
             else
                 std.debug.print("cpuq: stopped at its time limit\n", .{});
@@ -1289,10 +1323,13 @@ fn outDir(ctx: *Ctx, project: []const u8) ![]const u8 {
 
 /// The project a run counts for: the repo it runs in (each worktree counts as its repo), else
 /// its label's project, else "-".
+/// A run's project: its label's (`project:task`), else the repository it runs in, else "-". The
+/// label comes first: on burst every run sits inside the home folder, itself a repository, which
+/// made every project one.
 pub fn projectOf(ctx: *Ctx, o: Opts) []const u8 {
+    if (o.label.len != 0) return std.mem.sliceTo(o.label, ':');
     const cwd = std.process.currentPathAlloc(ctx.io, ctx.arena) catch "";
     if (repos.repoAt(ctx, cwd)) |name| return name;
-    if (o.label.len != 0) return std.mem.sliceTo(o.label, ':');
     return "-";
 }
 
