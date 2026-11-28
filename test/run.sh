@@ -771,16 +771,18 @@ t_driver() {
   local inner; inner=$(CPUQ_OP=1 "$CPUQ" run --driver -- sh -c 'echo "${CPUQ_OP:-none}"')
   check "a driver is no task, its runs are their own, its exit is its command's (got '$out', rc $rc); CPUQ_OP stays out ($inner)" \
     "[ '$out' = 'running 0 case op ' ] && [ $rc = 3 ] && [ '$inner' = 'none' ]"
-  # A driver that computes itself counts against its project's share: on a pool of 2, a runner
-  # keeping 2 CPUs busy is flagged, its project's run waits while the machine is busy, and another
-  # project's starts under its share.
+  # A driver that computes itself counts against its project's share: on a pool of 2 kept busy by
+  # q, a runner keeping 2 CPUs busy is flagged, and its project's run is over its share of 1 and
+  # waits, where another project's, under its share, starts.
   setup driver-cpu "budget = 2"
+  "$CPUQ" run --label q:hold -- "$BURN" -4 --until "$T/stop" 30 & local q=$!
+  wait_run q:hold
   "$CPUQ" run --driver --label dr:runner -- "$BURN" -2 --until "$T/stop" 30 & local d=$!
   poll 10 '[ "$(sj "[h[\"driver_busy\"] for h in s[\"runs\"] if h[\"driver\"]][0] > 1.2" 2>/dev/null)" = True ]'
   local flags; flags=$(sj '" ".join(f for h in s["runs"] for f in h["flags"])')
   "$CPUQ" run --wait-max 2 --label dr:task -- touch "$T/ran" 2>/dev/null; local rw=$?
   "$CPUQ" run --wait-max 2 --label other:task -- touch "$T/other"; local ro=$?
-  touch "$T/stop"; wait $d
+  touch "$T/stop"; wait $d $q
   check "a driver computing 2 CPUs itself is flagged ($flags); its project's run waits (rc $rw), another project's starts under its share (rc $ro)" \
     "[[ '$flags' == *driver_cpu* ]] && [ $rw = 75 ] && [ ! -e '$T/ran' ] && [ $ro = 0 ]"
 }

@@ -329,8 +329,8 @@ it starts aren't nested, and its exit status or signal is cpuq's. It has a recor
 (`driver`, no task, never waiting; `nested` passes over it), where its cpuq notes once a second
 `dbusy`: the CPU time of the runner's process tree (each process's own), the trees of the runs in
 it left out (`driverCpu`). From `driver_min` (0.5 CPUs) the line counts `dbusy` as its project's
-load beside its running tasks (`under`, `ahead`, the macOS plan) and as busy (`busyNow`); status
-flags it `driver_cpu`. A process that ends between two looks counts until it ends. On Linux with `cgroups` it runs as
+load beside its running tasks (`under`, `ahead`, the macOS plan); as busy it is already in the
+machine's ticks. Status flags it `driver_cpu`. A process that ends between two looks counts until it ends. On Linux with `cgroups` it runs as
 
     systemd-run --user --scope --quiet --collect --expand-environment=no
         --property=Delegate=yes --property=OOMPolicy=continue

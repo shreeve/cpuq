@@ -42,8 +42,8 @@ and a drain no longer gathers any.
 - **`cpuq limit RUN -c C`** changes the running-task cap: raised, it starts more as the line
   allows; lowered, it starts none until fewer run. Up to 4 × the pool.
 - **A `--driver` that computes counts.** Its record notes what its runner's own process tree
-  keeps busy, the runs it starts left out; from 0.5 CPUs that counts against its project's share
-  and as busy, and status flags it `driver_cpu`. On the Mac, `rig/tools/light` under `--driver`
+  keeps busy, the runs it starts left out; from 0.5 CPUs that counts against its project's share,
+  and status flags it `driver_cpu`. On the Mac, `rig/tools/light` under `--driver`
   kept 2.5 CPUs busy unseen.
 - **A run whose cpuq dies** has its tasks killed by whoever next scans the pool.
 - **`cpuq status`** shows capacity, tasks running and waiting, machine busy and room; tables of

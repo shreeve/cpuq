@@ -480,7 +480,7 @@ pub const Op = struct {
     single: bool = false,
     /// `cpuq run --driver`: a test runner, no task of its own; `dbusy` is the CPUs its own process
     /// tree keeps busy, the runs it starts left out (measured by its cpuq once a second). It
-    /// counts against its project's share and as busy.
+    /// counts against its project's share.
     driver: bool = false,
     dbusy: f64 = 0,
     /// Its cpuq is stopped (Ctrl-Z): its tasks are stopped, and it starts none.
@@ -885,14 +885,11 @@ pub fn mayStart(a: std.mem.Allocator, ops: []const Op, me: u64, cx: Cx) Wait {
 /// outside check on, the load outside cpuq beyond the CPUs the pool leaves to it (`ncpu` −
 /// `pool_n`). What drains isolate is left out: their commands, and on Linux every tick of their
 /// CPUs (other tasks are kept off them), as those CPUs are out of the capacity. A driver's own
-/// busy CPUs (its record's) count as cpuq's.
+/// busy CPUs are the machine's like any work outside a task: they count against its project's
+/// share, not again here.
 pub fn busyNow(a: std.mem.Allocator, ops: []const Op, s: ?Sample, outside_check: bool, ncpu: u32, pool_n: u32, now_ms: i64) f64 {
-    var drivers: f64 = 0;
-    for (ops) |o| if (o.driver and !o.stopped) {
-        drivers += o.dbusy;
-    };
-    const sample = s orelse return drivers;
-    var tasks: f64 = drivers;
+    const sample = s orelse return 0;
+    var tasks: f64 = 0;
     for (ops) |o| if (o.counts()) for (o.tasks_now) |t| {
         if (t.paused) continue;
         if (sample.find(t.pid, t.start)) |b| tasks += b.busy;
@@ -906,11 +903,11 @@ pub fn busyNow(a: std.mem.Allocator, ops: []const Op, s: ?Sample, outside_check:
         for (sample.cpus) |c| if (std.mem.findScalar(u32, iso, c.cpu) == null) {
             machine += c.frac;
         };
-        outside = @max(0, machine - (sample.tasks - sample.drains) - drivers);
+        outside = @max(0, machine - (sample.tasks - sample.drains));
     } else {
         // macOS: the whole machine, less every task (drains' commands included).
         const machine = sample.machine orelse return tasks;
-        outside = @max(0, machine - sample.tasks - drivers);
+        outside = @max(0, machine - sample.tasks);
     }
     const spill = @max(0, outside - @as(f64, @floatFromInt(ncpu -| pool_n)));
     return tasks + spill;
@@ -1140,8 +1137,6 @@ test "admission: a driver that computes counts against its project's share" {
     var idle = ops;
     idle[0].dbusy = 0.2;
     try std.testing.expectEqual(Wait.go, mayStart(a, &idle, 2, cx));
-    // Its busy counts as busy: with outside load off, only cpuq's work counts.
-    try std.testing.expectApproxEqAbs(2.5, busyNow(a, &ops, null, false, 4, 4, 0), 1e-9);
 }
 
 test "admission: within a project, the run running the fewest goes first" {

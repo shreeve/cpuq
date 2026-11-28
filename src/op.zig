@@ -1249,7 +1249,7 @@ fn envBudget(ctx: *Ctx) ?u32 {
 /// A `--driver`'s cpuq while its runner runs: in the pool as a record of its own (no task), it
 /// measures once a second what the runner's process tree keeps busy itself, the trees of the runs
 /// it starts left out, and notes it (`dbusy`) for the line, which counts it against the project's
-/// share and as busy, and for status. Returns how the runner ended.
+/// share, and for status. Returns how the runner ended.
 pub fn watchDriver(ctx: *Ctx, label: []const u8, cmd: []const u8, child: c.pid_t) sys.Waited {
     const a = ctx.arena;
     var pool = Pool.open(ctx.io, a, main.stateDir(ctx)) catch return sys.waitChild(child);

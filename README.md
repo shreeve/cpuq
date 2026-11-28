@@ -194,7 +194,7 @@ watches the slow way.
 
 A driver is in the pool as a run with no task, so status lists it. Once a second it measures what
 its runner's own process tree keeps busy, the runs it starts left out. From 0.5 CPUs that counts
-against its project's share and as busy, and status flags it (`driver_cpu`: the driver computes
+against its project's share, and status flags it (`driver_cpu`: the driver computes
 N CPUs itself; run its work as tasks).
 
 `cpuq hook` accepts `--driver` only for a test runner (swarm, rip, a script named `run`, `run.sh`
