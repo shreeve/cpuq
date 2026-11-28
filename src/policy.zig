@@ -228,6 +228,9 @@ pub const removed_keys = [_][2][]const u8{
 /// tab, so a value may hold one (`a#b`). Each key appears at most once; `remote_start.HOST` and
 /// `remote_env.HOST` once per HOST, and HOST must be one of the remotes.
 pub fn parseConfig(text: []const u8, cfg: *Config, diag: *Diagnostic) error{ConfigInvalid}!void {
+    // The remote lines are this text's alone: a Config read before keeps none of its own.
+    cfg.remote_start_count = 0;
+    cfg.remote_env_count = 0;
     var seen: std.StaticBitSet(keys.len) = .empty;
     var lines = std.mem.splitScalar(u8, text, '\n');
     var n: usize = 0;
@@ -679,6 +682,17 @@ test "config file" {
     try testing.expectError(error.ConfigInvalid, parseConfig("reserve = 4\n# two\nreserve = 5\n", &cfg3, &diag));
     try testing.expectEqualStrings("set twice", diag.message);
     try testing.expectEqual(3, diag.line);
+}
+
+test "a config read twice into one Config reads its remote lines once" {
+    var cfg: Config = .{};
+    var diag: Diagnostic = .{};
+    const text = "remotes = burst\nremote_start.burst = start-it\nremote_env.burst = A=1\n";
+    try parseConfig(text, &cfg, &diag);
+    try parseConfig(text, &cfg, &diag);
+    try testing.expectEqual(1, cfg.remote_start_count);
+    try testing.expectEqual(1, cfg.remote_env_count);
+    try testing.expectEqualStrings("start-it", cfg.remoteStart("burst").?);
 }
 
 test "a removed key says what replaces it" {
