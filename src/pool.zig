@@ -798,7 +798,8 @@ fn under(m: std.StringArrayHashMapUnmanaged(Proj), project: []const u8, t: u32) 
     return loadOf(p) * @as(f64, @floatFromInt(weights(m))) < @as(f64, @floatFromInt(@as(u64, t) * p.weight));
 }
 
-/// Tasks started or continued in the last `fresh_ms`, which the sample can't have measured yet.
+/// Tasks started (or continued after a stop) in the last `fresh_ms`, which the sample can't
+/// have measured yet.
 pub fn starting(ops: []const Op, now_ms: i64) u32 {
     var n: u32 = 0;
     for (ops) |o| if (o.counts()) for (o.tasks_now) |t| {
@@ -908,6 +909,18 @@ pub fn busyNow(a: std.mem.Allocator, ops: []const Op, s: ?Sample, outside_check:
 
 // --- macOS: sharing time by stopping and continuing tasks -----------------------------------
 
+/// Whether run `o`'s tasks may be demoted at all: never the only task of a run (`cpuq run --
+/// CMD`, or -n 1), nor its project's only task running: a lone build holding a lock is the worst
+/// case for the background's throttled disk.
+pub fn demotable(ops: []const Op, o: Op) bool {
+    if (o.single or o.tasks <= 1) return false;
+    var n: u32 = 0;
+    for (ops) |x| if (x.counts() and std.mem.eql(u8, x.project, o.project)) {
+        n += x.running;
+    };
+    return n > 1;
+}
+
 /// One step of the plan: demote or restore one task.
 pub const Step = struct { ticket: u64, pid: i32, demote: bool };
 
@@ -927,8 +940,8 @@ const Live = struct { ticket: u64, task: TaskNow, project: []const u8, load: f64
 /// project furthest over its share (by its tasks running and its drivers' own CPUs) until they
 /// keep no more than that. A demoted task is restored once all cpuq's tasks keep no more than T
 /// CPUs busy, or once its project is no longer over its share. A project at or under its share is
-/// never demoted. Every cpuq computes the same plan from the records and carries out the steps for
-/// its own tasks.
+/// never demoted, nor a task `demotable` spares. Every cpuq computes the same plan from the records
+/// and carries out the steps for its own tasks.
 pub fn demotePlan(a: std.mem.Allocator, ops: []const Op, s: ?Sample, cx: Cx) []const Step {
     var out: std.ArrayList(Step) = .empty;
     const t = capacity(ops, cx.pool_n, cx.now_ms);
@@ -946,7 +959,7 @@ pub fn demotePlan(a: std.mem.Allocator, ops: []const Op, s: ?Sample, cx: Cx) []c
         if (task.demoted) {
             demoted.append(a, l) catch {};
         } else {
-            normal.append(a, l) catch {};
+            if (demotable(ops, o)) normal.append(a, l) catch {};
             kept += l.load;
         }
     };
@@ -961,9 +974,12 @@ pub fn demotePlan(a: std.mem.Allocator, ops: []const Op, s: ?Sample, cx: Cx) []c
             return loadOf(pr) - tt * @as(f64, @floatFromInt(pr.weight)) / ww;
         }
     };
-    // Restore: room for everyone, or a project no longer over its share.
+    // Restore: room for everyone, a project no longer over its share, or a task it now spares.
     for (demoted.items) |l| {
-        if (all <= tf or over.by(m, l.project, tf, w) <= 0) {
+        const run = for (ops) |o| {
+            if (o.ticket == l.ticket) break o;
+        } else continue;
+        if (all <= tf or over.by(m, l.project, tf, w) <= 0 or !demotable(ops, run)) {
             out.append(a, .{ .ticket = l.ticket, .pid = l.task.pid, .demote = false }) catch break;
             kept += l.load;
         }
@@ -1256,8 +1272,8 @@ test "demote plan: the newest of the project furthest over its share, restored w
     const now: i64 = 100_000;
     // Pool of 2: rig runs 3 busy tasks, trig 1: rig is over its share of 1 by 2.
     const busy = [_]Op{
-        .{ .ticket = 1, .project = "rig", .running = 3, .tasks_now = &.{ tk(1, 10_000), tk(2, 20_000), tk(3, 30_000) } },
-        .{ .ticket = 2, .project = "trig", .running = 1, .tasks_now = &.{tk(4, 10_000)} },
+        .{ .ticket = 1, .project = "rig", .running = 3, .tasks = 9, .tasks_now = &.{ tk(1, 10_000), tk(2, 20_000), tk(3, 30_000) } },
+        .{ .ticket = 2, .project = "trig", .running = 1, .tasks = 1, .tasks_now = &.{tk(4, 10_000)} },
     };
     const plan = demotePlan(a, &busy, null, .{ .pool_n = 2, .now_ms = now });
     try std.testing.expectEqual(2, plan.len);
@@ -1271,13 +1287,22 @@ test "demote plan: the newest of the project furthest over its share, restored w
     var d = [_]TaskNow{ tk(1, 10_000), tk(2, 20_000), tk(3, 30_000) };
     d[1].demoted = true;
     d[2].demoted = true;
-    const still = [_]Op{ .{ .ticket = 1, .project = "rig", .running = 3, .tasks_now = &d }, busy[1] };
+    const still = [_]Op{ .{ .ticket = 1, .project = "rig", .running = 3, .tasks = 9, .tasks_now = &d }, busy[1] };
     try std.testing.expectEqual(0, demotePlan(a, &still, null, .{ .pool_n = 2, .now_ms = now }).len);
     // trig gone: rig alone is at its share... over by 1 of 2, and all tasks keep 3 > 2 busy: they
     // stay. Then one ends: 2 tasks keep 2 busy, room for all: restored.
-    const two = [_]Op{.{ .ticket = 1, .project = "rig", .running = 2, .tasks_now = d[0..2] }};
+    const two = [_]Op{.{ .ticket = 1, .project = "rig", .running = 2, .tasks = 5, .tasks_now = d[0..2] }};
     const back = demotePlan(a, &two, null, .{ .pool_n = 2, .now_ms = now });
     try std.testing.expectEqual(1, back.len);
     try std.testing.expectEqual(2, back[0].pid);
     try std.testing.expect(!back[0].demote);
+    // Never a run's only task, nor a project's only task running: three single runs of rig and
+    // one of trig crowd a pool of 1, and none is demoted.
+    const lone = [_]Op{
+        .{ .ticket = 1, .project = "rig", .running = 1, .single = true, .tasks_now = &.{tk(1, 10_000)} },
+        .{ .ticket = 2, .project = "rig", .running = 1, .tasks = 1, .tasks_now = &.{tk(2, 20_000)} },
+        .{ .ticket = 3, .project = "trig", .running = 1, .tasks = 4, .tasks_now = &.{tk(3, 30_000)} },
+    };
+    try std.testing.expectEqual(0, demotePlan(a, &lone, null, .{ .pool_n = 1, .now_ms = now }).len);
+    try std.testing.expect(!demotable(&lone, lone[2]));
 }

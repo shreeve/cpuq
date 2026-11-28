@@ -454,6 +454,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
             .waiting = if (o.drain) 0 else o.waiting,
             .running_tasks = tasksJson(a, o.tasks_now),
             .demoted = demotedOf(o),
+            .demoted_for = if (demotedOf(o) == 0) "" else if (pool_mod.isolated(a, ops, now_ms).len != 0) "drain" else "over share",
             .io_wait = io_n,
             .tail = !o.drain and !o.driver and o.running != 0 and o.done + o.failed + o.running >= o.tasks,
             .oldest = oldestOf(o),
@@ -622,7 +623,7 @@ fn runText(a: std.mem.Allocator, h: JsonRun) []const u8 {
         const iso = if (h.cpus.len > h.pin.len) a.print(" (isolates {s})", .{cpuText(a, h.cpus)}) catch "" else "";
         return a.print("drain {s}{s}", .{ cpuText(a, h.pin), iso }) catch "drain";
     }
-    const d = if (h.demoted != 0) a.print(" · {d} in background", .{h.demoted}) catch "" else "";
+    const d = if (h.demoted != 0) a.print(" · {d} background: {s}", .{ h.demoted, h.demoted_for }) catch "" else "";
     const io = if (h.io_wait) |n| (if (n != 0) a.print(" · {d} on I/O", .{n}) catch "" else "") else "";
     const c = if (h.running >= h.limit and h.tasks > 1) a.print(" of -c {d}", .{h.limit}) catch "" else "";
     return a.print("{d}{s}{s}{s}", .{ h.running, c, d, io }) catch "?";

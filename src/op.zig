@@ -2,12 +2,12 @@
 //! run's one loop. It starts a task whenever the line lets it (pool.zig: under its project's
 //! share at once; over it, in spare room), up to C at once, and never decides which CPU a task
 //! runs on: the kernel shares the CPUs. On macOS, which has nothing to share time by project, it
-//! also stops and continues its own tasks as the pool's plan says. It never sleeps while the line
-//! would let it start a task.
+//! also demotes and restores its own tasks (runs them in the background) as the pool's plan says,
+//! never stopping one. It never sleeps while the line would let it start a task.
 //!
-//!   reap ended tasks -> retry or record them -> under the pool's lock: follow drains (stop
-//!   tasks for a drain of the whole machine; keep them off a drain's CPUs on Linux), follow the
-//!   pause plan (macOS), start what the line allows, wake the runs that may start now ->
+//!   reap ended tasks -> retry or record them -> under the pool's lock: follow drains (keep
+//!   tasks off a drain's CPUs on Linux; demote them beside one on macOS), follow the demote plan
+//!   (macOS), start what the line allows, wake the runs that may start now (or restore) ->
 //!   sleep until a task ends, a wake comes, or a look is due
 const std = @import("std");
 const Io = std.Io;
@@ -46,8 +46,8 @@ pub const Opts = struct {
     wait_max_s: ?u32 = null,
     /// `cpuq drain`: once its turn comes, isolate `cpus` CPUs (with their SMT siblings) for the
     /// command: those named (`drain_cpus`, --cpus), else from the pool's end or fastest first
-    /// (`prefer_fast`, --prefer fast). With `quiet_max` (--quiet-max, Linux), the command starts
-    /// once work from outside keeps no more than that many CPUs busy on them.
+    /// (`prefer_fast`, --prefer fast). With `quiet_max` (--quiet-max), the command starts once
+    /// work from outside keeps no more than that many CPUs busy on them.
     drain: bool = false,
     drain_cpus: []const u32 = &.{},
     prefer_fast: bool = false,
@@ -847,9 +847,10 @@ fn look(r: *Run) void {
         if (!is_linux and r.running.items.len != 0) {
             const procs = sys.processes(r.ctx.io, a);
             const beside_drain = pool_mod.isolated(a, ops, now).len != 0;
+            const spared = !pool_mod.demotable(ops, ops[me]);
             const want = a.alloc(bool, r.running.items.len) catch a.alloc(bool, 0) catch unreachable;
             for (r.running.items, 0..) |t, i| {
-                if (i < want.len) want[i] = beside_drain or t.demoted;
+                if (i < want.len) want[i] = !spared and (beside_drain or t.demoted);
             }
             if (!beside_drain) for (pool_mod.demotePlan(a, ops, sample, cx)) |step| {
                 if (step.ticket != r.rec.ticket) continue;
@@ -928,6 +929,12 @@ fn wakeReady(r: *Run, a: std.mem.Allocator, ops: []const Op, sample: ?pool_mod.S
     const pool_n: u32 = @intCast(r.pool_cpus.len);
     const cx: pool_mod.Cx = .{ .pool_n = pool_n, .busy = pool_mod.busyNow(a, ops, sample, r.ctx.cfg.outside_check, r.ncpu, pool_n, now), .now_ms = now };
     for (ops) |o| {
+        // A run with tasks in the background looks at once: room may let it restore them, and
+        // the sooner a demoted lock holder's disk is no longer throttled, the better.
+        if (o.ticket != r.rec.ticket and !is_linux) for (o.tasks_now) |t| if (t.demoted) {
+            r.pool.wakeOp(o.ticket);
+            break;
+        };
         if (o.ticket == r.rec.ticket or o.waiting == 0 or o.stopped) continue;
         // A drain is woken when its turn may have come (it works out its CPUs itself).
         const ready = if (o.drain) pool_mod.drainMayStart(ops, o.ticket, policy.drainMax(r.ctx.cfg, pool_n), now, 0) == .go else pool_mod.mayStart(a, ops, o.ticket, cx) == .go;

@@ -98,7 +98,7 @@ borrows, and what is new here.
 |---|---|
 | `-n M` | M tasks of CMD; each gets `CPUQ_TASK` (1 to M) and `CPUQ_TASKS`, and its output goes to a file of its own. Without `-n`, one task, with the terminal |
 | `-c C`, `-c P%` | run at most C tasks at once, or P% of the pool (at least 1); default: none of its own (the machine-wide backstop applies) |
-| `-t T` | each task's time limit, counting only the time it runs: `30s`, `10m`, `2h`, or `off`; default the config's `timeout` (1h) |
+| `-t T` | each task's time limit, wall time (not the time you stop it with Ctrl-Z): `30s`, `10m`, `2h`, or `off`; default the config's `timeout` (1h) |
 | `-r N` | try a failed task up to N more times; `CPUQ_ATTEMPT` says which try it is |
 | `--label PROJECT:TASK` | the run's name in status and history |
 | `--note TEXT` | what the run is for, kept beside its label in history |
@@ -156,8 +156,8 @@ at once, until all M have run:
 - **Work that waits** (network, a server, sleeps) needs no option: a task that waits keeps almost
   no CPU busy, so the machine has room and cpuq starts more tasks.
 - **`-t T`** limits each task: at T it gets SIGTERM, then SIGKILL 5 seconds later; it counts as
-  failed (124), and the next task starts. Only time the task runs counts: time cpuq has stopped it
-  for sharing, or a Ctrl-Z, does not. A sensible T is about ten times the task's usual time. With
+  failed (124), and the next task starts. It counts wall time, less any time you stop the run
+  with Ctrl-Z. A sensible T is about ten times the task's usual time. With
   no `-t`, the config's `timeout` (1 hour) applies, so no task runs forever.
 - **`-r N`** tries a task that failed (non-zero exit or its time limit) up to N more times, after
   the tasks not yet started. Tasks stopped by a signal are not tried again.
@@ -266,12 +266,10 @@ A run starts its next task when the line lets it:
     the sample can't have seen it yet.
 - **Hard limits** hold whatever the share: a run's `-c`, the gates, and 4 × T tasks running
   machine-wide, a backstop for when every waiting task wakes at once.
-- **While tasks are stopped for sharing** (macOS), no task starts in spare room: the stopped ones
-  continue first.
 
 So ten runs of one task each on a ten-CPU Mac start at once, an eleventh waits for room (or its
 project's share), and a 5,000-task run that fills the machine makes room for a second project's
-share by the kernel's weights (Linux) or by the pause plan (macOS), not by waiting for its tasks
+share by the kernel's weights (Linux) or by demoting tasks (macOS), not by waiting for its tasks
 to end.
 
 ### Sharing the time
@@ -285,15 +283,21 @@ shares CPU time among projects by weight, and among a project's tasks equally. T
 unpinned. It needs config `cgroups` on and user scopes working (probed once and remembered);
 otherwise the run runs as it is, and the kernel shares CPUs among tasks alike.
 
-**macOS** has no cgroups. Once a second, every run with tasks works out the same plan from the
-records, and carries out the steps for its own tasks:
+**macOS** has no cgroups, and cpuq never stops a task to share time: a stopped task can hold a
+lock others wait on (five zig builds once stalled on one cache lock). Tasks are *demoted*
+instead: `setpriority(PRIO_DARWIN_PROCESS, pid, PRIO_DARWIN_BG)` on the task's process tree puts
+it in the background (efficiency cores, throttled disk), and clearing it restores it. Once a
+second, every run with tasks works out the same plan from the records, and carries out the steps
+for its own tasks, re-applying them to new child processes:
 
-- while cpuq's runnable tasks keep more than T + 0.5 CPUs busy, `SIGSTOP` the newest task of the
-  project furthest over its share (never a project at or under its share);
-- while they keep less than T, `SIGCONT` the oldest stopped task of the project furthest under
-  its share, while one more fits within T.
-
-A stopped task's time doesn't count against its `-t`.
+- while cpuq's tasks not demoted keep more than T + 0.5 CPUs busy, demote the newest task of the
+  project furthest over its share (by its tasks running and its drivers' own CPUs); a project at
+  or under its share is never demoted;
+- restore a demoted task once all cpuq's tasks keep no more than T CPUs busy, or once its project
+  is no longer over its share: checked at every look, and a run that frees room wakes the runs
+  with demoted tasks, so a demoted lock holder's disk is throttled as briefly as can be;
+- never demote the only task of a run (`cpuq run -- CMD`, `-n 1`), nor a project's only task
+  running, beside a drain too: a lone build holding a lock is the worst case for the throttle.
 
 ### Outside load and the gates
 
@@ -317,8 +321,7 @@ a minute. `outside_check = off` leaves the pool alone to limit CPU work.
 - **Ctrl-Z** on a run stops every task and then stops cpuq. While stopped it counts in no share
   and starts nothing, so the line passes it by (a stopped `cpuq drain` ends its isolation). A
   continue sent at once after the stop leaves it running, as `kill -TSTP; kill -CONT` from a
-  script expects. Continued (`fg`), its tasks continue, except those cpuq had stopped for sharing,
-  which stay stopped. Time stopped doesn't count against a task's limit.
+  script expects. Continued (`fg`), its tasks continue. Time stopped doesn't count against a task's limit.
 - **`cpuq kill TICKET|PID|LABEL`** ends a run on this machine, waiting or running: its cpuq gets
   SIGTERM, passes it to every task, and kills what is left 5 seconds later. A label that names
   several runs lists them, to be named by ticket. It acts on anyone's runs, not only the caller's.
@@ -358,7 +361,7 @@ waits.
 - **Linux:** CMD is pinned to its CPUs, and every other cpuq task's threads get an affinity
   without the isolated ones (the drain sets it at once, each run follows for its own tasks, and
   new tasks start with that mask). **macOS:** the capacity drops by the isolated CPUs and the
-  pause plan stops others' tasks as needed. All drains together isolate at most `drain_max` of the pool (config; half by default).
+  every other cpuq task is demoted while any drain isolates (cores can't be isolated there). All drains together isolate at most `drain_max` of the pool (config; half by default).
 
 A drain's turn comes after the older runs that wait with no task running yet, and after older
 drains; it also waits for the `drain_max` bound, and (with `--cpus`, or when too few whole cores
@@ -380,14 +383,14 @@ A drain must end on time and use what it isolates:
 - History says which stopped it (`124 time limit`, `124 idle`), and `cpuq status` flags a drain
   past `drain_timeout` or idling.
 
-**Noise (Linux).** Once a second while a drain isolates, the busy share of its CPUs (kernel ticks)
-less its own command's CPU time is work from outside it there: kernel threads, interrupts,
-processes cpuq doesn't run. `cpuq status` flags a drain `noisy` at 0.1 CPUs or more and names the
+**Noise.** Once a second while a drain isolates, the busy share of its CPUs (kernel ticks; on
+macOS the machine's busy CPUs, beyond the CPUs it leaves to others) less its own command's CPU
+time is work from outside it: kernel threads, interrupts, processes cpuq doesn't run. `cpuq status` flags a drain `noisy` at 0.1 CPUs or more and names the
 busiest such process (by the CPU it last ran on), and history's ended line carries
 `noisy: {cpus, max, top}` (the mean while CMD ran, the most, the busiest process) when the most
 reached 0.1.
 
-`--quiet-max X` (Linux only; elsewhere a usage error) waits for quiet: after isolating, CMD starts
+`--quiet-max X` waits for quiet: after isolating, CMD starts
 once a one-second look finds the work from outside at X CPUs or less (`--quiet-max 0.05`). It
 gives up with exit 75 ("never quieted") at `--max` or at its `-t`.
 
@@ -417,8 +420,9 @@ runs; `cpuq status` shows it.
   its busy processes and the CPUs they keep busy. So `ssh burst 'make -j'`, or a build an agent
   ran without cpuq, shows as one line naming the command and its folder. Apps and system services
   (detached, running in `/`) count in the load but aren't listed; `--json` keeps them.
-- **Running:** each run's ticket (`OP`), pid, project, label, tasks done of total and failed, its
-  tasks running and stopped, the CPUs they keep busy, how long, an estimate of the time left, and
+- **Running:** each run's ticket (`OP`), pid, project, label, tasks done of total and failed (once only running tasks are left, the tail: `last task,
+  running 32m`, `last 3 tasks, oldest running 32m`; a single task: `running 32m`), its
+  tasks running (with ` · N background: over share` (or `: drain`) for tasks demoted on macOS and ` · N on I/O` for tasks with a process in state D on Linux), the CPUs they keep busy, how long, an estimate of the time left, and
   its command. A note under it flags a run whose tasks keep more than 1.2 CPUs busy each
   (`over_cpu`), one held back by its own `-c` (`capped`), one stopped (Ctrl-Z), and a drain that
   idles (`idle_drain`), runs past `drain_timeout` (`long_drain`) or has work from outside on its
@@ -445,14 +449,14 @@ lines.
 | `schema`, `version`, `dir`, `admit` | 3, cpuq's version, the pool's directory, and `contested` |
 | `budget`, `pool` | the pool's size, and its CPUs |
 | `capacity`, `isolated` | the capacity the line shares (the pool less the isolated CPUs), and the CPUs drains isolate |
-| `running`, `paused`, `waiting` | cpuq's tasks running (stopped ones included), those cpuq has stopped, and those waiting to start |
+| `running`, `paused`, `waiting` | cpuq's tasks running, a drain's command waiting for its turn again after a Ctrl-Z (`paused`), and tasks waiting to start |
 | `busy`, `tasks_busy` | CPUs busy on the machine, and of those, cpuq's tasks |
 | `room` | spare room for a run over its share: capacity − 0.5 − busy − tasks just started; positive: the first such waiter starts at its next look |
 | `cores`, `active_cores` | the machine's CPUs, and those active now |
 | `load`, `memory_pressure` | the 1-, 5- and 15-minute load; `normal`, `high`, `unknown` or `off` |
 | `memory` | bytes: `total`, `used`, `swap_total`, `swap_used`; null when unreadable |
 | `gate` | `state` (`open`, `pressure`, `low_memory` or `low_disk`), `available`, `disk_free`, `disk_path`, `text` |
-| `runs[]` | runs with tasks running (or a drain isolating): `ticket`, `pid` (its cpuq), `project`, `weight`, `label`, `command`, `since`, `limit` (its `-c`), `tasks`, `done`, `failed`, `running`, `paused`, `waiting`, `running_tasks` (each task: `task`, `attempt`, `pid`, `since`, `paused`), `stopped` (Ctrl-Z), `drain`, `pin` (the CPUs a drain's command runs on), `cpus` (those it isolates, siblings included), `noise` and `noisy_top` (work from outside on them, and the busiest process), `urgent`, `using` (CPUs busy), `progress`, `left`, `left_from`, `flags` |
+| `runs[]` | runs with tasks running (or a drain isolating): `ticket`, `pid` (its cpuq), `project`, `weight`, `label`, `command`, `since`, `limit` (its `-c`), `tasks`, `done`, `failed`, `running`, `paused`, `demoted` (macOS: tasks in the background), `io_wait` (Linux: tasks with a process in state D; null with `--no-usage` and on macOS), `tail` and `oldest` (only running tasks are left, and when the oldest started), `waiting`, `running_tasks` (each task: `task`, `attempt`, `pid`, `since`, `paused`, `demoted`), `stopped` (Ctrl-Z), `drain`, `pin` (the CPUs a drain's command runs on), `cpus` (those it isolates, siblings included), `noise` and `noisy_top` (work from outside on them, and the busiest process), `urgent`, `using` (CPUs busy), `progress`, `left`, `left_from`, `flags` |
 | `waiters[]` | in line order: `order` (1 first), `ticket`, `pid`, `project`, `label`, `command`, `since`, `waiting`, `running`, `max` (its limit), `drain`, `urgent`, `why` |
 | `projects[]` | `name`, `weight`, `runs`, `running`, `waiting`, `fair` |
 | `outside[]`, `outside_total` | the busiest processes outside cpuq (`pid`, `name`, `using`), and their total |

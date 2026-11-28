@@ -24,8 +24,9 @@ pub const JsonRun = struct {
     running: u32 = 0,
     /// Its tasks cpuq has stopped: a drain's command waiting for its turn again after a Ctrl-Z.
     paused: u32 = 0,
-    /// macOS: its tasks demoted (run in the background) for sharing, or beside a drain.
+    /// macOS: its tasks demoted (run in the background), and why: "over share" or "drain".
     demoted: u32 = 0,
+    demoted_for: []const u8 = "",
     /// Linux: its tasks waiting on a disk or other device (a process in state D); null when not
     /// measured (--no-usage, macOS).
     io_wait: ?u32 = null,

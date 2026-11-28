@@ -37,7 +37,7 @@ them for CMD, not for your shell: use `sh -c` with SINGLE quotes.
 
 - Each task's output goes to a file of its own. The summary at the end names the failed tasks with
   their last lines, and the folder. Exit 0 when every task passed, else 1.
-- `-t T`: each task's time limit (time it runs), about ten times its usual time (`-t 30s`; default 1h).
+- `-t T`: each task's time limit (wall time), about ten times its usual time (`-t 30s`; default 1h).
   Tasks that wait (network, sleep, a server) need no option: cpuq starts more while they wait.
 - `-r N`: try a failed task up to N more times (`CPUQ_ATTEMPT` says which try). Flaky work only.
 - `-c C`: run at most C tasks at once, or `-c 25%`. Usually leave it out. `cpuq limit LABEL -c C` changes it while

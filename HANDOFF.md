@@ -31,7 +31,7 @@ binary, [AGENTS.md](AGENTS.md) is enough.
   old binary (`~/.local/bin/cpuq.0.29.0`, burst's `.0.28.0`) and config (`config.before-pool`)
   for a rollback. CHANGELOG 0.30.0 lists what each project changed.
 - **The Lean model** of the pool is in `formal/` (its README says what is proved, what is only
-  searched, and every finding). A change to the line (src/pool.zig) or to the loop's pause, drain
+  searched, and every finding). A change to the line (src/pool.zig) or to the loop's demotion, drain
   and isolation (src/op.zig) goes past it before release:
   1. Add the change to `Model.lean` as a rule switch, and make `Rules.released` the code as it
      will ship.
@@ -88,7 +88,7 @@ Run everything heavy under cpuq, even here:
 | Area | Files |
 |---|---|
 | Entry and options | `main.zig` (dispatch, usage, removed commands), `runopts.zig` (`cpuq run`'s options), `texts.zig`, `table.zig`, `layout.zig` |
-| The pool | `pool.zig` (the `v3/` files: records, wake FIFOs, limits, the sample; the pure rules: `mayStart`, `firstWaiter`, `fairShare`, `capacity`, `busyNow`, `drainMayStart`, `pausePlan`), `op.zig` (an operation's loop: `look`, the pause plan's steps, `drainStep` and `isolateOthers`, Ctrl-Z, nesting, `cpuq drain`, `cpuq limit`, `cpuq kill`), `cpus.zig` (the pool's CPUs and their order), `runner.zig` (`cpuq run`: removed options, the Linux slice and scope (`enterSlice`, `sliceWeight`), `--driver`, `--tethered`; `cpuq wait`; `cpuq hook`'s entry) |
+| The pool | `pool.zig` (the `v3/` files: records, wake FIFOs, limits, the sample; the pure rules: `mayStart`, `firstWaiter`, `fairShare`, `capacity`, `busyNow`, `drainMayStart`, `demotePlan`), `op.zig` (an operation's loop: `look`, the demote plan's steps, `drainStep` and `isolateOthers`, Ctrl-Z, nesting, `cpuq drain`, `cpuq limit`, `cpuq kill`), `cpus.zig` (the pool's CPUs and their order), `runner.zig` (`cpuq run`: removed options, the Linux slice and scope (`enterSlice`, `sliceWeight`), `--driver`, `--tethered`; `cpuq wait`; `cpuq hook`'s entry) |
 | Config and gates | `policy.zig` (config keys, removed keys with their pointers, the gates, weights, CPU lists) |
 | Named leases | `leasing.zig`, `state.zig` (a lease's queue) |
 | Machine signals | `sys.zig` (CPU ticks, memory, spawning, affinity, `PR_SET_PDEATHSIG`), `records.zig` (record, samples, history, clean), `history.zig`, `joblog.zig`, `runtimes.zig` |

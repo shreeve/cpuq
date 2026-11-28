@@ -53,11 +53,10 @@ names the holder from the lock file's note and exits 125.
 
 An operation's record is `key=value` lines: `pid`, `urgent`, `served` (it has started a task),
 `drain`, `single`, `stopped` (Ctrl-Z), `project`, `label`, `weight`, `limit` (`-c`, worked
-out; a drain's CPUs), `tasks`, `done`, `failed`, `running` (its tasks running, those cpuq has
-stopped included), `waiting` (tasks it could start now: none while stopped or at its `-c`),
+out; a drain's CPUs), `tasks`, `done`, `failed`, `running` (its tasks running), `waiting` (tasks it could start now: none while stopped or at its `-c`),
 `cpus`, `pin`, `npool` and `dstart` (a drain's isolated CPUs, those its command runs on, how many of the isolated are the pool's, and when isolation began), `noise` and `noisy_top`, `last` (when its last task started), `since`, `tlimit`, `why`
 (what holds it back, for status), `now` (its tasks running: number, try, pid, the process's
-start time, when it started, when it last started or continued, whether cpuq has it stopped) and
+start time, when it started, when it last started or continued, whether cpuq has stopped it (`paused`: only a drain's command, waiting for its turn again after a Ctrl-Z), whether it is demoted (`demoted`)) and
 `cmd`. Records are written in place and read only under the pool's lock, as they are written, so
 no reader sees one half written.
 
@@ -84,7 +83,7 @@ CPU, and it never sleeps while the line would let it start a task. Each turn:
 1. **Reap** every ended task: record its outcome, or queue it for a retry (`-r`). For a run of
    many tasks, kill whatever the task left in its process group.
 2. **Signals and time limits:** pass a TERM, INT, HUP or QUIT to every task group; TERM a task at
-   its limit (time it has run: time stopped doesn't count) and KILL it 5 s later; KILL what is
+   its limit (wall time, less any time stopped by the user's Ctrl-Z) and KILL it 5 s later; KILL what is
    left 5 s after a signal.
 3. **`cpuq limit`:** take a new `-c` from `v3/limits/PID`. A drain instead checks it is not idle.
 4. **Ctrl-Z**, if one came (below).
@@ -93,7 +92,7 @@ CPU, and it never sleeps while the line would let it start a task. Each turn:
    record, scan the operations, and
    - follow the drains (below): keep them off the CPUs a
      `-c` drain isolates;
-   - on macOS, follow the pause plan for its own tasks;
+   - on macOS, follow the demote plan for its own tasks;
    - start tasks while `mayStart` says go (retries behind the tasks not yet started), the gates
      are open and it is under its `-c`; write the record after each start;
    - wake every other operation that may start now (`wakeReady`), and every drain whose turn has
@@ -102,7 +101,7 @@ CPU, and it never sleeps while the line would let it start a task. Each turn:
    and its wake FIFO, until the next look, the next time limit, or a wake. The next look is a
    second away while the operation is first in line for spare room, held back by something that
    can change without a word (the room, a gate, a drain), keeping its tasks off isolated CPUs, or
-   (macOS) has tasks running, which the pause plan watches; else 10 s. A wake comes when room
+   (macOS) has tasks running, which the demote plan watches; else 10 s. A wake comes when room
    frees, so a long line costs little: a waiter wakes for its turn, not to look.
 
 `limit` is `-c` worked out against the pool when the run starts (a percentage of the pool, at
@@ -133,18 +132,16 @@ one more task now. The caller has checked the gates and the operation's `-c`.
   ends a task never takes its project's share back before a newer run of the project starts one.
 - **Under its share** (running × Σw < T × w, compared without division), the project's first
   waiter starts its next task at once, however busy the machine is. The kernel weights give its tasks
-  their share of CPU time; nobody's task is stopped for it.
+  their share of CPU time; nobody's task is demoted for it.
 - **Over its share**, an operation starts a task only while `busy + starting < T − 0.5`, and
   only the first such waiter in line takes it (`firstWaiter`). The line, in order: an urgent
   operation that has not yet started a task, the project running the fewest tasks for its weight,
-  the operation running the fewest, the one whose last task started longest ago, the older ticket. Operations with a task of their own stopped for sharing are not in the line.
+  the operation running the fewest, the one whose last task started longest ago, the older ticket. 
 - **Hard limits:** the operation's `-c`, the gates, and 4T tasks running machine-wide (the
   backstop, for when every waiting task wakes at once).
-- **While any task is stopped for sharing** (macOS), no task starts in spare room: the stopped
-  ones continue first.
 
 Each look starts tasks one at a time, asking `mayStart` again after each start, since a start
-changes the count and the room. `Wait` says why not (a drain, stopped tasks, the backstop, a busy
+changes the count and the room. `Wait` says why not (a drain, the backstop, a busy
 machine, another waiter first); `whyText` turns it into the record's `why`, which status shows.
 
 **Busy.** `busyNow` adds the busy CPUs of the running tasks (from the sample; tasks that ended
@@ -195,19 +192,27 @@ among a project's tasks equally. A run that can't enter a scope (config `cgroups
 alike. A `--driver`'s runner runs in its own scope, `cpuq-driver-PID`, in its project's slice, and
 the runs it starts stay in that scope.
 
-**macOS** has no cgroups, so `pausePlan` shares time by stopping and continuing tasks. Once a
-second every operation with tasks computes the same plan from the records and the sample, and
-carries out the steps for its own tasks (each step names a ticket and a pid):
+**macOS** has no cgroups, and cpuq never stops a task (SIGSTOP) to share time: a stopped task can
+hold a lock others wait on (five zig builds stalled on one cache lock). `demotePlan` demotes
+tasks instead: `setpriority(PRIO_DARWIN_PROCESS, pid, PRIO_DARWIN_BG)` on the task's process tree
+(`setBackground`; background means efficiency cores and throttled disk), cleared with 0. Nice
+can't be used: macOS lets no unprivileged user lower a nice value back. Once a second every
+operation with tasks computes the same plan from the records and the sample, and carries out the
+steps for its own tasks (each step names a ticket and a pid), re-applying them to new child
+processes (`demoteTask`):
 
-- while cpuq's runnable tasks keep more than T + 0.5 CPUs busy, `SIGSTOP` the newest task of the
-  project furthest over its share, until they keep no more; a project at or under its share is
-  never stopped;
-- else while they keep less than T and tasks are stopped, `SIGCONT` the oldest stopped task of
-  the project furthest under its share, while one more fits within T.
+- while cpuq's tasks not demoted keep more than T + 0.5 CPUs busy, demote the newest task of the
+  project furthest over its share (its tasks running and its drivers' own CPUs); a project at or
+  under its share is never demoted;
+- restore a demoted task once all cpuq's tasks keep no more than T CPUs busy, or once its project
+  is no longer over its share: checked at every look, and a run that frees room wakes the runs
+  with demoted tasks, so a demoted lock holder's disk is throttled as briefly as can be;
+- never demote the only task of a run (`cpuq run -- CMD`, `-n 1`), nor a project's only task
+  running, beside a drain too: a lone build holding a lock is the worst case for the throttle.
 
-A task counts one CPU while fresh or unmeasured, else the sample's figure. A stopped task is
-marked in its operation's record (`paused`), so every operation sees the same state, and its time
-doesn't count against its `-t`. Continuing a task renews its `fresh` time, so `starting` counts it.
+A task counts one CPU while fresh or unmeasured, else the sample's figure. A demoted task is
+marked in its operation's record (`demoted`), so every operation sees the same state. Every task
+of another run is demoted while any drain isolates, since cores can't be isolated on macOS.
 
 ## The gates
 
@@ -253,14 +258,13 @@ pid is someone else's and left alone. A dead operation's history reads `lost`.
 
 ## Ctrl-Z
 
-cpuq takes SIGTSTP (unless it was started with it ignored). It SIGSTOPs every task, marks itself
+cpuq takes SIGTSTP (unless it was started with it ignored). It SIGSTOPs every task (the user's own stop), marks itself
 stopped (its record counts in no share and starts nothing), wakes the others that may start in the
 room it left, and then stops itself with SIGSTOP (a TSTP to a process outside job control, an
 agent's shell, would be dropped). A continue that comes before cpuq acts on the stop cancels it;
 one that comes meanwhile moves a count of continues, and cpuq then doesn't stop itself (only a
 continue between that check and the raise is still lost). Continued, cpuq adds the time stopped to
-each task's start so it doesn't count against its limit, and continues its tasks, except those it
-had stopped for sharing (a shell continues the whole job's group, so it stops those again). A
+each task's start so it doesn't count against its limit, and continues its tasks. A
 stopped drain ends its isolation; continued, it takes its turn again before its command continues.
 
 ## cpuq drain
@@ -295,11 +299,12 @@ Whole cores that would take more than `drain_max` of the pool are refused before
   operation follows for its own tasks (`repinOwn`) whenever the isolated set changes, and starts
   new tasks with that mask. When no drain isolates any CPU, an operation's tasks return to cpuq's
   own CPU set.
-- **macOS:** the capacity drop makes the pause plan stop others' tasks as needed.
+- **macOS:** the capacity drop, and every other cpuq task demoted while any drain isolates.
 
-**Noise** (`noiseDrain`, Linux). Once a second while the drain isolates, it reads each CPU's
-kernel ticks; the busy share of `cpus` less its own command's process-tree CPU time is the work
-from outside there. It is written to the record (`noise`; `noisy_top`, at 0.1 CPUs or more: the
+**Noise** (`noiseDrain`). Once a second while the drain isolates, it reads each CPU's kernel
+ticks; the busy share of `cpus` less its own command's process-tree CPU time is the work from
+outside there. On macOS it is the machine's busy CPUs less its command's, beyond the CPUs the
+drain leaves to others. It is written to the record (`noise`; `noisy_top`, at 0.1 CPUs or more: the
 busiest process last seen on those CPUs, by the CPU it last ran on), and summed while the command
 runs for history's ended line (`noisy`: mean, max, top, when the max reached 0.1). Status flags
 `noisy`. With `--quiet-max X` the command starts once a look at least 0.9 s after the isolation
@@ -439,7 +444,7 @@ src/pool.zig and the loop of src/op.zig as its rule sets. The properties it hold
 5. **No idle hold:** no state where a CPU is reserved but unused while a task waits: nothing
    reserves one.
 
-Not modelled: flock itself, the kernel's sharing, macOS signals beyond the pause plan's rule,
+Not modelled: flock itself, the kernel's sharing, macOS demotion beyond the demote plan's rule,
 process groups and leftovers beyond a task's own processes, the gates and outside load as
 measures, `-c` as a percentage, nesting, output files, and time: no timed bound is proved.
 

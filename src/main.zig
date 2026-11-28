@@ -78,8 +78,8 @@ const usage =
     \\                        output goes to a file of its own
     \\  -c C | -c P%          run at most C tasks at once, or P% of the pool (default: as the
     \\                        line allows)
-    \\  -t T                  each task's time limit, counting only time it runs (30s, 10m,
-    \\                        2h; config `timeout`, 1h)
+    \\  -t T                  each task's time limit, wall time (30s, 10m, 2h; config
+    \\                        `timeout`, 1h)
     \\  -r N                  try a failed task up to N more times (CPUQ_ATTEMPT says which)
     \\  --label PROJECT:TASK  the run's name in status and history
     \\  --note TEXT           what the run is for, kept beside its label
@@ -97,10 +97,10 @@ const usage =
     \\  drain                 for timing: after the runs queued before it that run nothing yet,
     \\                        N whole cores (-c N, their SMT siblings too, at most drain_max,
     \\                        half the pool by default) are isolated for CMD at once: pinned on Linux (CPUQ_CPUS
-    \\                        lists them), others' tasks kept off them; macOS stops others'
-    \\                        tasks while they would crowd the rest. --cpus LIST names them,
+    \\                        lists them), others' tasks kept off them; macOS demotes others'
+    \\                        tasks (background priority). --cpus LIST names them,
     \\                        --prefer fast takes performance cores first; --quiet-max X
-    \\                        (Linux) starts CMD once outside work keeps at most X CPUs busy
+    \\                        starts CMD once outside work keeps at most X CPUs busy
     \\                        there; --max T gives up (exit 75); -t T ends CMD (exit 124;
     \\                        default 20m, at most 2h, counted from the isolation)
     \\  kill                  end a run here: SIGTERM to its tasks, SIGKILL 5 s later
