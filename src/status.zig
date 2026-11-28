@@ -333,9 +333,8 @@ fn projectRunning(ops: []const Op, project: []const u8) u32 {
     return n;
 }
 
-/// The gate as status shows it: the machine's memory and disk gates, then a drain of the whole
-/// machine.
-fn gateNow(ctx: *Ctx, a: std.mem.Allocator, all_drain: bool) JsonGate {
+/// The gate as status shows it: the machine's memory and disk gates.
+fn gateNow(ctx: *Ctx, a: std.mem.Allocator) JsonGate {
     const m = main.machine(ctx);
     const g = policy.gate(ctx.cfg, m);
     var buf: [256]u8 = undefined;
@@ -345,7 +344,6 @@ fn gateNow(ctx: *Ctx, a: std.mem.Allocator, all_drain: bool) JsonGate {
         .low_memory => |av| return .{ .state = "low_memory", .available = av, .text = a.dupe(u8, texts.gateText(&buf, g)) catch "closed: memory low" },
         .low_disk => |d| return .{ .state = "low_disk", .disk_free = d.free, .disk_path = d.path, .text = a.dupe(u8, texts.gateText(&buf, g)) catch "closed: disk low" },
     }
-    if (all_drain) return .{ .state = "drain", .text = "closed: a drain has the whole machine" };
     return .{ .state = "open", .text = "open" };
 }
 
@@ -393,8 +391,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
     const m = measureOps(io, a, ops, ncpu, measure);
     const busy = m.busy orelse if (sample) |sm| sm.machine else null;
     const t = pool_mod.capacity(ops, pool_n, now_ms);
-    const all_drain = pool_mod.allDrain(ops, now_ms);
-    const gate = gateNow(ctx, a, all_drain);
+    const gate = gateNow(ctx, a);
     const line_busy = pool_mod.busyNow(a, ops, sample, ctx.cfg.outside_check, ncpu, pool_n, now_ms);
     const room = @as(f64, @floatFromInt(t)) - pool_mod.headroom - line_busy - @as(f64, @floatFromInt(pool_mod.starting(ops, now_ms)));
 
@@ -412,6 +409,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
         if (o.running == 0 and !(o.drain and o.dstart != 0)) continue;
         var flags: std.ArrayList([]const u8) = .empty;
         if (o.drain and o.dstart != 0 and now - o.since >= @as(i64, ctx.cfg.drain_timeout_s)) flags.append(a, "long_drain") catch {};
+        if (o.drain and o.dstart != 0 and o.noise >= op_mod.noisy_min) flags.append(a, "noisy") catch {};
         if (using) |u| if (o.drain and o.running != 0 and now - o.since >= 5) {
             if (u < op_mod.drain_idle_busy) flags.append(a, "idle_drain") catch {};
         } else if (!o.drain and o.running > o.paused() and now - o.since >= 5) {
@@ -437,8 +435,10 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
             .running_tasks = tasksJson(a, o.tasks_now),
             .stopped = stopped or o.stopped,
             .drain = o.drain,
-            .all = o.all,
+            .pin = o.pin,
             .cpus = o.cpus,
+            .noise = o.noise,
+            .noisy_top = o.noisy_top,
             .urgent = o.urgent,
             .using = using,
             .flags = flags.items,
@@ -466,7 +466,6 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
             .running = o.running,
             .max = o.limit,
             .drain = o.drain,
-            .all = o.all,
             .urgent = o.urgent,
             .why = whyText(a, place, o),
             .label = o.label,
@@ -569,7 +568,10 @@ fn tasksText(a: std.mem.Allocator, h: JsonRun) []const u8 {
 /// Its tasks running, with those cpuq has stopped, its -c, or a drain's CPUs: "3 · 1 stopped",
 /// "2 of -c 2", "drain 6-7".
 fn runText(a: std.mem.Allocator, h: JsonRun) []const u8 {
-    if (h.drain) return a.print("drain {s}", .{if (h.all) "all" else cpuText(a, h.cpus)}) catch "drain";
+    if (h.drain) {
+        const iso = if (h.cpus.len > h.pin.len) a.print(" (isolates {s})", .{cpuText(a, h.cpus)}) catch "" else "";
+        return a.print("drain {s}{s}", .{ cpuText(a, h.pin), iso }) catch "drain";
+    }
     const p = if (h.paused != 0) a.print(" · {d} stopped", .{h.paused}) catch "" else "";
     const c = if (h.running >= h.limit and h.tasks > 1) a.print(" of -c {d}", .{h.limit}) catch "" else "";
     return a.print("{d}{s}{s}", .{ h.running, c, p }) catch "?";
@@ -604,6 +606,8 @@ fn flagNotes(a: std.mem.Allocator, runs: []const JsonRun) []const []const u8 {
             a.print("{s}: {d} tasks queued under its -c {d} while the machine has room; raise it with cpuq limit {d} -c N", .{ whoText(a, h), h.tasks -| (h.done + h.failed + h.running), h.limit, h.ticket })
         else if (std.mem.eql(u8, f, "idle_drain"))
             a.print("{s}: a drain whose command keeps {d:.2} CPUs busy; under {d:.2} for `drain_idle` while others wait, it is stopped", .{ whoText(a, h), h.using orelse 0, op_mod.drain_idle_busy })
+        else if (std.mem.eql(u8, f, "noisy"))
+            a.print("{s}: work from outside it keeps {d:.2} CPUs busy on its CPUs{s}{s}: its timing is noisy", .{ whoText(a, h), h.noise, if (h.noisy_top.len != 0) ", most " else "", h.noisy_top })
         else if (std.mem.eql(u8, f, "long_drain"))
             a.print("{s}: a drain past config `drain_timeout`; it ends at its -t (at most 2h)", .{whoText(a, h)})
         else if (std.mem.eql(u8, f, "stopped"))
@@ -772,7 +776,7 @@ fn boxed(ctx: *Ctx, st: JsonStatus, remote: ?[]const u8) void {
                 .{ .text = dash(q.project) },
                 .{ .text = dash(q.label), .tint = .accent },
                 .{ .text = a.print("{d}", .{q.running}) catch "?" },
-                .{ .text = if (q.drain) (if (q.all) "drain all" else a.print("drain {d}", .{q.max}) catch "?") else a.print("{d}", .{q.waiting}) catch "?", .tint = if (q.drain or q.urgent) .warn else null },
+                .{ .text = if (q.drain) a.print("drain {d}", .{q.max}) catch "?" else a.print("{d}", .{q.waiting}) catch "?", .tint = if (q.drain or q.urgent) .warn else null },
                 .{ .text = a.dupe(u8, age(&b, now - q.since)) catch "?" },
                 .{ .text = q.why },
                 .{ .text = q.command },
@@ -904,7 +908,7 @@ fn plain(ctx: *Ctx, st: JsonStatus) void {
     if (st.waiters.len != 0) w.writeAll("  #    RUN    PID      PROJECT      LABEL                RUNNING WAITING WHY\n") catch {};
     for (st.waiters) |q| {
         var cb: [16]u8 = undefined;
-        const wants = if (q.drain) (if (q.all) "all" else std.mem.print(&cb, "d{d}", .{q.max}) catch "?") else std.mem.print(&cb, "{d}", .{q.waiting}) catch "?";
+        const wants = if (q.drain) std.mem.print(&cb, "d{d}", .{q.max}) catch "?" else std.mem.print(&cb, "{d}", .{q.waiting}) catch "?";
         w.print("  {d:<4} {d:<6} {s:<8} {s:<12} {s:<20} {d:<7} {s:<7} {s}\n", .{ q.order, q.ticket, pidText(a, q.pid), dash(q.project), dash(q.label), q.running, wants, q.why }) catch {};
     }
 

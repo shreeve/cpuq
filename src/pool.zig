@@ -473,10 +473,9 @@ pub const Op = struct {
     /// that started longest ago goes first, so a run that ends a task and would start the next
     /// takes its turn behind the others.
     last: i64 = 0,
-    /// `cpuq drain`: isolates `limit` CPUs (or with `all`, stops every other task) for its
-    /// command, once its turn comes.
+    /// `cpuq drain`: isolates `limit` CPUs (with their SMT siblings) for its command, once its
+    /// turn comes.
     drain: bool = false,
-    all: bool = false,
     /// One task, sharing its cpuq's process group (`cpuq run -- CMD`).
     single: bool = false,
     /// Its cpuq is stopped (Ctrl-Z): its tasks are stopped, and it starts none.
@@ -496,6 +495,13 @@ pub const Op = struct {
     waiting: u32 = 0,
     /// A drain: the CPUs it isolates, once it has started.
     cpus: []const u32 = &.{},
+    /// A drain: the CPUs its command runs on (CPUQ_CPUS), and how many of `cpus` are the pool's.
+    pin: []const u32 = &.{},
+    npool: u32 = 0,
+    /// A drain: the busy CPUs work from outside it kept on its CPUs over the last second
+    /// (Linux), and the busiest such process ("name (pid)"); 0 and empty when quiet.
+    noise: f64 = 0,
+    noisy_top: []const u8 = "",
     /// A drain: when its isolation began (monotonic ms); 0 while it waits for its turn.
     dstart: i64 = 0,
     since: i64 = 0,
@@ -508,13 +514,15 @@ pub const Op = struct {
     cmd: []const u8 = "",
 
     pub fn format(r: Op, w: *Io.Writer) Io.Writer.Error!void {
-        try w.print("pid={d}\nurgent={d}\nserved={d}\ndrain={d}\nall={d}\nsingle={d}\nstopped={d}\nproject={s}\nlabel={s}\nweight={d}\nlimit={d}\ntasks={d}\ndone={d}\nfailed={d}\nrunning={d}\nwaiting={d}\ncpus=", .{
-            r.pid,     @intFromBool(r.urgent), @intFromBool(r.served), @intFromBool(r.drain), @intFromBool(r.all), @intFromBool(r.single), @intFromBool(r.stopped),
-            r.project, r.label,                r.weight,               r.limit,               r.tasks,             r.done,                 r.failed,
-            r.running, r.waiting,
+        try w.print("pid={d}\nurgent={d}\nserved={d}\ndrain={d}\nsingle={d}\nstopped={d}\nproject={s}\nlabel={s}\nweight={d}\nlimit={d}\ntasks={d}\ndone={d}\nfailed={d}\nrunning={d}\nwaiting={d}\ncpus=", .{
+            r.pid,     @intFromBool(r.urgent), @intFromBool(r.served), @intFromBool(r.drain), @intFromBool(r.single), @intFromBool(r.stopped),
+            r.project, r.label,                r.weight,               r.limit,               r.tasks,                r.done,
+            r.failed,  r.running,              r.waiting,
         });
         for (r.cpus, 0..) |cpu, i| try w.print("{s}{d}", .{ if (i == 0) "" else ",", cpu });
-        try w.print("\nlast={d}\ndstart={d}\nsince={d}\ntlimit={d}\nwhy={s}\nnow=", .{ r.last, r.dstart, r.since, r.tlimit, r.why });
+        try w.writeAll("\npin=");
+        for (r.pin, 0..) |cpu, i| try w.print("{s}{d}", .{ if (i == 0) "" else ",", cpu });
+        try w.print("\nnpool={d}\nnoise={d:.3}\nnoisy_top={s}\nlast={d}\ndstart={d}\nsince={d}\ntlimit={d}\nwhy={s}\nnow=", .{ r.npool, r.noise, r.noisy_top, r.last, r.dstart, r.since, r.tlimit, r.why });
         for (r.tasks_now, 0..) |t, i| try w.print("{s}{d}:{d}:{d}:{d}:{d}:{d}:{d}", .{ if (i == 0) "" else ",", t.task, t.attempt, t.pid, t.start, t.since, t.fresh, @intFromBool(t.paused) });
         try w.writeAll("\ncmd=");
         // The command is for people reading status: its first 1,000 bytes are plenty.
@@ -532,7 +540,6 @@ pub const Op = struct {
             if (eq(k, "urgent")) r.urgent = eq(v, "1");
             if (eq(k, "served")) r.served = eq(v, "1");
             if (eq(k, "drain")) r.drain = eq(v, "1");
-            if (eq(k, "all")) r.all = eq(v, "1");
             if (eq(k, "single")) r.single = eq(v, "1");
             if (eq(k, "stopped")) r.stopped = eq(v, "1");
             if (eq(k, "project")) r.project = v;
@@ -545,6 +552,10 @@ pub const Op = struct {
             if (eq(k, "running")) r.running = n;
             if (eq(k, "waiting")) r.waiting = n;
             if (eq(k, "cpus")) r.cpus = parseList(a, v);
+            if (eq(k, "pin")) r.pin = parseList(a, v);
+            if (eq(k, "npool")) r.npool = n;
+            if (eq(k, "noise")) r.noise = std.fmt.parseFloat(f64, v) catch 0;
+            if (eq(k, "noisy_top")) r.noisy_top = v;
             if (eq(k, "last")) r.last = std.fmt.parseInt(i64, v, 10) catch 0;
             if (eq(k, "dstart")) r.dstart = std.fmt.parseInt(i64, v, 10) catch 0;
             if (eq(k, "since")) r.since = std.fmt.parseInt(i64, v, 10) catch 0;
@@ -608,33 +619,25 @@ pub fn isolating(o: Op, now_ms: i64) bool {
     return now_ms - o.dstart <= (@as(i64, o.tlimit) + drain_grace_s) * 1000;
 }
 
-/// Whether a drain of the whole machine (--all) runs: every other task is stopped meanwhile.
-pub fn allDrain(ops: []const Op, now_ms: i64) bool {
-    for (ops) |o| if (o.all and isolating(o, now_ms)) return true;
-    return false;
-}
-
-/// The CPUs drains of a few CPUs (-c N) isolate now, in no order.
+/// The CPUs drains isolate now (their commands' CPUs and those CPUs' SMT siblings), in no order.
 pub fn isolated(a: std.mem.Allocator, ops: []const Op, now_ms: i64) []const u32 {
     var out: std.ArrayList(u32) = .empty;
-    for (ops) |o| if (!o.all and isolating(o, now_ms)) for (o.cpus) |c| {
+    for (ops) |o| if (isolating(o, now_ms)) for (o.cpus) |c| {
         if (std.mem.findScalar(u32, out.items, c) == null) out.append(a, c) catch break;
     };
     return out.items;
 }
 
-/// The capacity the line shares: the pool's CPUs less those isolated; none while a drain has the
-/// whole machine.
+/// The capacity the line shares: the pool's CPUs less those drains isolate (those of the pool).
 pub fn capacity(ops: []const Op, pool_n: u32, now_ms: i64) u32 {
-    if (allDrain(ops, now_ms)) return 0;
     var iso: u32 = 0;
-    for (ops) |o| if (!o.all and isolating(o, now_ms)) {
-        iso += @intCast(o.cpus.len);
+    for (ops) |o| if (isolating(o, now_ms)) {
+        iso += o.npool;
     };
     return pool_n -| iso;
 }
 
-/// The most CPUs drains may isolate at once: half the pool, at least one.
+/// The most of the pool's CPUs drains may isolate at once: half the pool, at least one.
 pub fn drainRoom(pool_n: u32) u32 {
     return @max(1, pool_n / 2);
 }
@@ -648,44 +651,70 @@ pub const DrainWait = enum {
     older_drain,
     /// Its CPUs would take the drains' isolation past half the pool.
     half_pool,
-    /// A drain of the whole machine runs, or (for --all) any drain runs.
-    other_drain,
+    /// The CPUs it names, or enough whole cores for it, are another drain's.
+    taken,
 };
 
-/// Whether drain `me` may begin isolating now.
-pub fn drainMayStart(ops: []const Op, me: u64, pool_n: u32, now_ms: i64) DrainWait {
-    const d = for (ops) |o| {
-        if (o.ticket == me) break o;
-    } else return .older_waiter;
+/// Whether drain `me` may begin isolating now, isolating `need` of the pool's CPUs (its own and
+/// their siblings).
+pub fn drainMayStart(ops: []const Op, me: u64, pool_n: u32, now_ms: i64, need: u32) DrainWait {
     var iso: u32 = 0;
-    var any = false;
     for (ops) |o| {
         if (o.ticket == me) continue;
         // 0.34's turn: a run that queued before it and waits holding nothing (no task running)
         // goes first; one already running tasks takes the rest of its turn beside the drain.
         if (o.ticket < me and o.counts() and o.waiting > 0 and o.running == 0) return .older_waiter;
         if (o.ticket < me and o.drain and !o.stopped and o.dstart == 0) return .older_drain;
-        if (isolating(o, now_ms)) {
-            any = true;
-            if (o.all and !d.all) return .other_drain;
-            if (!o.all) iso += @intCast(o.cpus.len);
-        }
+        if (isolating(o, now_ms)) iso += o.npool;
     }
-    if (d.all) return if (any) .other_drain else .go;
-    if (iso + d.limit > drainRoom(pool_n)) return .half_pool;
+    if (iso + need > drainRoom(pool_n)) return .half_pool;
     return .go;
 }
 
-/// The `n` CPUs a drain isolates: from the end of the pool's order, none another drain isolates.
-pub fn pickDrainCpus(a: std.mem.Allocator, pool_cpus: []const u32, taken: []const u32, n: u32) []const u32 {
-    var out: std.ArrayList(u32) = .empty;
-    var i = pool_cpus.len;
-    while (i > 0 and out.items.len < n) {
-        i -= 1;
-        if (std.mem.findScalar(u32, taken, pool_cpus[i]) != null) continue;
-        out.append(a, pool_cpus[i]) catch break;
+/// What a drain isolates: the CPUs its command runs on (`pin`), and those with their SMT
+/// siblings (`cpus`), so no other work shares their cores.
+pub const Pick = struct { pin: []const u32, cpus: []const u32 };
+
+fn siblingsOf(topo: []const @import("cpus.zig").Core, cpu: u32) []const u32 {
+    for (topo) |t| if (t.cpu == cpu) return t.siblings;
+    return &.{};
+}
+
+/// The CPUs a drain isolates: `named` if it names them (null when any of them, or a sibling, is
+/// another drain's), else `n` whole cores' worth from `order` (the pool's order from its end, or
+/// fastest first), skipping any CPU whose core is partly `taken`. Null when there aren't enough.
+pub fn pickDrain(a: std.mem.Allocator, order: []const u32, topo: []const @import("cpus.zig").Core, taken: []const u32, n: u32, named: []const u32) ?Pick {
+    var pin: std.ArrayList(u32) = .empty;
+    var all: std.ArrayList(u32) = .empty;
+    const free = struct {
+        fn core(tp: []const @import("cpus.zig").Core, busy: []const u32, used: []const u32, cpu: u32) bool {
+            if (std.mem.findScalar(u32, busy, cpu) != null or std.mem.findScalar(u32, used, cpu) != null) return false;
+            for (siblingsOf(tp, cpu)) |s| if (std.mem.findScalar(u32, busy, s) != null) return false;
+            return true;
+        }
+    };
+    const want = if (named.len != 0) named else order;
+    for (want) |cpu| {
+        if (named.len == 0 and pin.items.len >= n) break;
+        if (!free.core(topo, taken, all.items, cpu)) {
+            if (named.len != 0) return null;
+            continue;
+        }
+        pin.append(a, cpu) catch return null;
+        if (std.mem.findScalar(u32, all.items, cpu) == null) all.append(a, cpu) catch return null;
+        for (siblingsOf(topo, cpu)) |sib| if (std.mem.findScalar(u32, all.items, sib) == null) {
+            all.append(a, sib) catch return null;
+        };
     }
-    return out.items;
+    if (named.len == 0 and pin.items.len < n) return null;
+    return .{ .pin = pin.items, .cpus = all.items };
+}
+
+/// How many of `cpus` are the pool's.
+pub fn inPool(cpus: []const u32, pool: []const u32) u32 {
+    var n: u32 = 0;
+    for (cpus) |c| n += @intFromBool(std.mem.findScalar(u32, pool, c) != null);
+    return n;
 }
 
 // --- The line: pure decisions over the runs' records ----------------------------------------
@@ -703,8 +732,6 @@ pub const Cx = struct {
 pub const Wait = enum {
     /// It starts a task now.
     go,
-    /// A drain has the whole machine.
-    drain_all,
     /// Tasks cpuq has stopped (its own, or others') continue before a task starts in spare room.
     paused,
     /// Running tasks are at `backstop` × T.
@@ -821,7 +848,6 @@ pub fn mayStart(a: std.mem.Allocator, ops: []const Op, me: u64, cx: Cx) Wait {
         if (o.ticket == me) break o;
     } else return .idle;
     if (!o.counts() or o.waiting == 0) return .idle;
-    if (allDrain(ops, cx.now_ms)) return .drain_all;
     if (o.paused() > 0) return .paused;
     const t = capacity(ops, cx.pool_n, cx.now_ms);
     var total: u32 = 0;
@@ -894,7 +920,6 @@ const Live = struct { ticket: u64, task: TaskNow, project: []const u8, load: f64
 pub fn pausePlan(a: std.mem.Allocator, ops: []const Op, s: ?Sample, cx: Cx) []const Step {
     var out: std.ArrayList(Step) = .empty;
     const t = capacity(ops, cx.pool_n, cx.now_ms);
-    if (allDrain(ops, cx.now_ms)) return out.items;
     const m = projects(a, ops);
     // Each project's share, and its tasks running unstopped.
     var run: std.StringArrayHashMapUnmanaged(f64) = .empty;
@@ -986,11 +1011,15 @@ test "an op record round trip" {
     var buf: [2048]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     const now = [_]TaskNow{.{ .task = 17, .attempt = 2, .pid = 4242, .start = 99, .since = 1700000000, .fresh = 12345, .paused = true }};
-    const r: Op = .{ .tasks_now = &now, .pid = 7, .project = "rig", .label = "rig:test", .weight = 2, .waiting = 3, .cpus = &.{ 4, 9 }, .dstart = 77, .limit = 8, .tasks = 100, .done = 5, .single = true, .cmd = "a\tb\nc" };
+    const r: Op = .{ .tasks_now = &now, .pid = 7, .project = "rig", .label = "rig:test", .weight = 2, .waiting = 3, .cpus = &.{ 4, 9 }, .pin = &.{4}, .npool = 2, .noise = 0.25, .noisy_top = "dd (77)", .dstart = 77, .limit = 8, .tasks = 100, .done = 5, .single = true, .cmd = "a\tb\nc" };
     try r.format(&w);
     const p = Op.parse(arena.allocator(), w.buffered());
     try std.testing.expectEqualStrings("rig", p.project);
     try std.testing.expectEqualSlices(u32, &.{ 4, 9 }, p.cpus);
+    try std.testing.expectEqualSlices(u32, &.{4}, p.pin);
+    try std.testing.expectEqual(2, p.npool);
+    try std.testing.expectEqual(0.25, p.noise);
+    try std.testing.expectEqualStrings("dd (77)", p.noisy_top);
     try std.testing.expectEqual(77, p.dstart);
     try std.testing.expectEqual(3, p.waiting);
     try std.testing.expect(p.single);
@@ -1132,43 +1161,65 @@ test "drains: isolation, the half-pool bound, and the turn" {
     const a = arena.allocator();
     const now: i64 = 1_000_000;
     // A drain of 2 isolating CPUs 6 and 7 of 8: capacity 6.
-    const d1: Op = .{ .ticket = 1, .drain = true, .limit = 2, .cpus = &.{ 6, 7 }, .dstart = now - 1000, .tlimit = 600 };
+    const d1: Op = .{ .ticket = 1, .drain = true, .limit = 2, .cpus = &.{ 6, 7 }, .npool = 2, .dstart = now - 1000, .tlimit = 600 };
     try std.testing.expectEqual(6, capacity(&.{d1}, 8, now));
     try std.testing.expectEqualSlices(u32, &.{ 6, 7 }, isolated(a, &.{d1}, now));
     // Past its limit and grace, it isolates nothing.
     try std.testing.expectEqual(8, capacity(&.{d1}, 8, now + 700_000));
-    // A second drain of 3 would pass half the pool (4): it waits; one of 2 goes.
+    // A second drain needing 3 would pass half the pool (4): it waits; one needing 2 goes.
     const d2: Op = .{ .ticket = 2, .drain = true, .limit = 3, .waiting = 1 };
-    try std.testing.expectEqual(DrainWait.half_pool, drainMayStart(&.{ d1, d2 }, 2, 8, now));
-    var d3 = d2;
-    d3.limit = 2;
-    try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{ d1, d3 }, 2, 8, now));
-    try std.testing.expectEqualSlices(u32, &.{ 5, 4 }, pickDrainCpus(a, &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, &.{ 6, 7 }, 2));
+    try std.testing.expectEqual(DrainWait.half_pool, drainMayStart(&.{ d1, d2 }, 2, 8, now, 3));
+    try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{ d1, d2 }, 2, 8, now, 2));
     // A run older than the drain waiting with no task running goes first; one running tasks
     // already, or a newer one, doesn't hold it.
     const old: Op = .{ .ticket = 1, .project = "rig", .waiting = 1 };
     const young: Op = .{ .ticket = 3, .project = "rig", .waiting = 1 };
-    try std.testing.expectEqual(DrainWait.older_waiter, drainMayStart(&.{ old, d3 }, 2, 8, now));
-    try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{ d3, young }, 2, 8, now));
+    try std.testing.expectEqual(DrainWait.older_waiter, drainMayStart(&.{ old, d2 }, 2, 8, now, 1));
+    try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{ d2, young }, 2, 8, now, 1));
     var busy_old = old;
     busy_old.running = 3;
-    try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{ busy_old, d3 }, 2, 8, now));
-    // An older drain waiting goes first; --all waits for any drain running.
+    try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{ busy_old, d2 }, 2, 8, now, 1));
+    // An older drain waiting goes first.
     const w1: Op = .{ .ticket = 1, .drain = true, .limit = 1, .waiting = 1 };
-    try std.testing.expectEqual(DrainWait.older_drain, drainMayStart(&.{ w1, d3 }, 2, 8, now));
-    const all: Op = .{ .ticket = 2, .drain = true, .all = true, .limit = 8, .waiting = 1 };
-    try std.testing.expectEqual(DrainWait.other_drain, drainMayStart(&.{ d1, all }, 2, 8, now));
-    try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{all}, 2, 8, now));
-    // A drain of the whole machine running: capacity 0, nothing starts.
-    var on = all;
-    on.dstart = now;
-    on.tlimit = 1200;
-    try std.testing.expectEqual(0, capacity(&.{on}, 8, now));
-    try std.testing.expectEqual(Wait.drain_all, mayStart(a, &.{ on, young }, 3, .{ .pool_n = 8, .now_ms = now }));
+    try std.testing.expectEqual(DrainWait.older_drain, drainMayStart(&.{ w1, d2 }, 2, 8, now, 1));
     // A stopped drain isolates nothing.
     var stopped = d1;
     stopped.stopped = true;
     try std.testing.expectEqual(8, capacity(&.{stopped}, 8, now));
+}
+
+test "drains: whole cores, from the pool's end, fastest first, or as named" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Core = @import("cpus.zig").Core;
+    // 4 cores of 2 threads: 0+4, 1+5, 2+6, 3+7; the pool's order puts first threads first.
+    const topo = [_]Core{
+        .{ .cpu = 0, .siblings = &.{4} }, .{ .cpu = 1, .siblings = &.{5} }, .{ .cpu = 2, .siblings = &.{6} }, .{ .cpu = 3, .siblings = &.{7} },
+        .{ .cpu = 4, .siblings = &.{0} }, .{ .cpu = 5, .siblings = &.{1} }, .{ .cpu = 6, .siblings = &.{2} }, .{ .cpu = 7, .siblings = &.{3} },
+    };
+    const from_end = [_]u32{ 7, 6, 5, 4, 3, 2, 1, 0 };
+    const p = pickDrain(a, &from_end, &topo, &.{}, 1, &.{}).?;
+    try std.testing.expectEqualSlices(u32, &.{7}, p.pin);
+    try std.testing.expectEqualSlices(u32, &.{ 7, 3 }, p.cpus);
+    // Two: two whole cores, never both threads of one as two CPUs.
+    const two = pickDrain(a, &from_end, &topo, &.{}, 2, &.{}).?;
+    try std.testing.expectEqualSlices(u32, &.{ 7, 6 }, two.pin);
+    try std.testing.expectEqualSlices(u32, &.{ 7, 3, 6, 2 }, two.cpus);
+    // A core partly another drain's is skipped.
+    const skip = pickDrain(a, &from_end, &topo, &.{3}, 1, &.{}).?;
+    try std.testing.expectEqualSlices(u32, &.{6}, skip.pin);
+    // Named: exactly those, or none while one of them (or a sibling) is taken.
+    const named = pickDrain(a, &from_end, &topo, &.{}, 2, &.{ 0, 1 }).?;
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, named.pin);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 4, 1, 5 }, named.cpus);
+    try std.testing.expectEqual(null, pickDrain(a, &from_end, &topo, &.{5}, 2, &.{ 0, 1 }));
+    // Not enough whole cores free.
+    try std.testing.expectEqual(null, pickDrain(a, &from_end, &topo, &.{ 0, 1, 2 }, 2, &.{}));
+    // No SMT (macOS, or siblings unknown): just the CPUs.
+    const flat = pickDrain(a, &from_end, &.{}, &.{}, 2, &.{}).?;
+    try std.testing.expectEqualSlices(u32, &.{ 7, 6 }, flat.cpus);
+    try std.testing.expectEqual(2, inPool(two.cpus, &.{ 0, 1, 6, 7 }));
 }
 
 test "busy: tasks from the sample, outside load beyond the CPUs left to it, isolated CPUs left out" {
@@ -1183,7 +1234,7 @@ test "busy: tasks from the sample, outside load beyond the CPUs left to it, isol
     try std.testing.expectEqual(0, busyNow(a, &ops, null, true, 10, 8, 0));
     // Linux, 4 CPUs all in the pool: a drain isolates CPU 3 and keeps it busy. Its command's
     // CPU and CPU 3's ticks count for no one: busy is the tasks' 1.5 and nothing outside.
-    const d: Op = .{ .ticket = 2, .drain = true, .limit = 1, .cpus = &.{3}, .dstart = 1, .tlimit = 600, .running = 1, .tasks_now = &.{tk(3, 0)} };
+    const d: Op = .{ .ticket = 2, .drain = true, .limit = 1, .cpus = &.{3}, .npool = 1, .dstart = 1, .tlimit = 600, .running = 1, .tasks_now = &.{tk(3, 0)} };
     const lin: Sample = .{ .ms = 1, .tasks = 2.5, .drains = 1.0, .per = s.per, .cpus = &.{
         .{ .cpu = 0, .busy = 0, .total = 0, .frac = 1.0 }, .{ .cpu = 1, .busy = 0, .total = 0, .frac = 0.5 },
         .{ .cpu = 2, .busy = 0, .total = 0, .frac = 0.0 }, .{ .cpu = 3, .busy = 0, .total = 0, .frac = 1.0 },

@@ -31,17 +31,22 @@ pub const JsonRun = struct {
     running_tasks: []const JsonTask = &.{},
     /// Its cpuq is stopped (Ctrl-Z): its tasks are stopped, and it counts in no share.
     stopped: bool = false,
-    /// `cpuq drain`: the CPUs it isolates (-c N; the pool with `all`).
+    /// `cpuq drain`: the CPUs its command runs on (`pin`), the CPUs it isolates (those with their
+    /// SMT siblings), and the busy CPUs work from outside it keeps on them (Linux), with the
+    /// busiest such process ("name (pid)").
     drain: bool = false,
-    all: bool = false,
+    pin: []const u32 = &.{},
     cpus: []const u32 = &.{},
+    noise: f64 = 0,
+    noisy_top: []const u8 = "",
     urgent: bool = false,
     /// CPUs its tasks kept busy over the sample, its own cpuq left out; null with --no-usage.
     using: ?f64 = null,
     /// What deserves a look: "over_cpu" (its tasks keep more than 1.2 CPUs busy each: a task
     /// runs more than one job), "stopped" (its cpuq is stopped), "capped" (tasks queued under
     /// its own -c while the machine has room: `cpuq limit` raises it); for a drain, "idle_drain"
-    /// (its command keeps under 0.25 CPUs busy) and "long_drain" (past config `drain_timeout`).
+    /// (its command keeps under 0.25 CPUs busy), "long_drain" (past config `drain_timeout`) and
+    /// "noisy" (work from outside it keeps 0.1 CPUs or more busy on its CPUs).
     flags: []const []const u8 = &.{},
     /// Its tasks ended (passed or failed) of all, with those that failed.
     progress: ?JsonProgress = null,
@@ -70,9 +75,8 @@ pub const JsonWaiter = struct {
     waiting: u32 = 0,
     running: u32 = 0,
     max: u32 = 0,
-    /// `cpuq drain` waiting for its turn: the CPUs it will isolate (`all`: every other task stops).
+    /// `cpuq drain` waiting for its turn (`max`: the CPUs it times on).
     drain: bool = false,
-    all: bool = false,
     urgent: bool = false,
     /// Why it waits, for people: "1st in line; over its share (2.0 of 4); the machine is busy".
     why: []const u8 = "",
@@ -94,8 +98,7 @@ pub const JsonProject = struct {
     fair: f64 = 0,
 };
 
-/// What holds every start back: `state` is open, pressure, low_memory, low_disk, or drain (a
-/// drain of the whole machine runs).
+/// What holds every start back: `state` is open, pressure, low_memory or low_disk.
 pub const JsonGate = struct {
     state: []const u8 = "",
     /// With `state` low_memory: the bytes of memory available.
@@ -119,8 +122,8 @@ pub const JsonStatus = struct {
     /// The pool's size, and its CPUs by the machine's numbers.
     budget: u32 = 0,
     pool: []const u32 = &.{},
-    /// The capacity the line shares: the pool less the CPUs drains isolate (`isolated`); 0 while
-    /// a drain of the whole machine runs.
+    /// The capacity the line shares: the pool less the CPUs drains isolate (`isolated`, those of
+    /// the pool).
     capacity: u32 = 0,
     isolated: []const u32 = &.{},
     /// The machine's CPUs, and those online.

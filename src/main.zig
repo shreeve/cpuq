@@ -51,7 +51,7 @@ pub const version = @import("build_options").version;
 
 const usage =
     \\usage: cpuq run [-n M] [-c C] [-t T] [-r N] [run options] [--] CMD [ARGS...]
-    \\       cpuq drain -c N | --all [--max T] [-t T] [--label L] [--] CMD [ARGS...]
+    \\       cpuq drain -c N | --cpus LIST [--prefer fast] [--quiet-max X] [--max T] [-t T] [--label L] [--] CMD [ARGS...]
     \\       cpuq kill TICKET|PID|LABEL
     \\       cpuq limit TICKET|PID|LABEL -c C [--host HOST]
     \\       cpuq lease NAME [--slots N] [--label L] [--wait-max S] [--host HOST] [--] CMD [ARGS...]
@@ -95,11 +95,14 @@ const usage =
     \\
     \\commands:
     \\  drain                 for timing: after the runs queued before it that run nothing yet,
-    \\                        N CPUs (-c N, at most half the pool) are isolated for CMD at
-    \\                        once: pinned on Linux (CPUQ_CPUS lists them), others' tasks kept
-    \\                        off them; macOS stops others' tasks while they would crowd the
-    \\                        rest. --all stops every other task (at most 20m); --max T gives
-    \\                        up (exit 75); -t T ends CMD (exit 124; default 20m, at most 2h)
+    \\                        N whole cores (-c N, their SMT siblings too, at most half the
+    \\                        pool) are isolated for CMD at once: pinned on Linux (CPUQ_CPUS
+    \\                        lists them), others' tasks kept off them; macOS stops others'
+    \\                        tasks while they would crowd the rest. --cpus LIST names them,
+    \\                        --prefer fast takes performance cores first; --quiet-max X
+    \\                        (Linux) starts CMD once outside work keeps at most X CPUs busy
+    \\                        there; --max T gives up (exit 75); -t T ends CMD (exit 124;
+    \\                        default 20m, at most 2h, counted from the isolation)
     \\  kill                  end a run here: SIGTERM to its tasks, SIGKILL 5 s later
     \\  limit                 change a running run's -c (a count or 50%): raised, it starts
     \\                        more as the line allows; lowered, it starts none till fewer run

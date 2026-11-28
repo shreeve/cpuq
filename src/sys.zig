@@ -854,6 +854,8 @@ pub const Proc = struct {
     /// Waiting on a disk or other device (Linux state D): busy, though using
     /// no CPU. Always false on macOS.
     blocked: bool = false,
+    /// Linux: the CPU it last ran on (/proc/PID/stat's 39th field); null elsewhere.
+    last_cpu: ?u32 = null,
 };
 
 /// Every process the caller can see, with its parent and its CPU time so
@@ -971,6 +973,7 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
         var running: u32 = 0;
         var stopped = false;
         var blocked = false;
+        var last_cpu: ?u32 = null;
         var i: usize = 0;
         while (fields.next()) |f| : (i += 1) {
             switch (i) {
@@ -989,9 +992,11 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
                 13, 14 => ticks += std.fmt.parseInt(u64, f, 10) catch 0,
                 // rss, in pages (the 24th field).
                 21 => rss = std.fmt.parseInt(u64, f, 10) catch 0,
+                // processor, the CPU it last ran on (the 39th field).
+                36 => last_cpu = std.fmt.parseInt(u32, f, 10) catch null,
                 else => {},
             }
-            if (i == 21) break;
+            if (i == 36) break;
         }
         // The owner: /proc/PID belongs to the process's user.
         var uid: u32 = 0;
@@ -1002,7 +1007,7 @@ pub fn processes(io: Io, arena: std.mem.Allocator) []Proc {
             var stx: linux.Statx = undefined;
             if (linux.statx(dir.handle, &name_z, 0, .{ .UID = true }, &stx) == 0) uid = stx.uid;
         }
-        list.append(arena, .{ .pid = pid, .ppid = ppid, .name = arena.dupe(u8, text[open + 1 .. close]) catch "", .cpu_ns = ticks * std.time.ns_per_s / tick_hz, .own_ns = own * std.time.ns_per_s / tick_hz, .mem = rss * page, .running = running, .stopped = stopped, .uid = uid, .blocked = blocked }) catch break;
+        list.append(arena, .{ .pid = pid, .ppid = ppid, .name = arena.dupe(u8, text[open + 1 .. close]) catch "", .cpu_ns = ticks * std.time.ns_per_s / tick_hz, .own_ns = own * std.time.ns_per_s / tick_hz, .mem = rss * page, .running = running, .stopped = stopped, .uid = uid, .blocked = blocked, .last_cpu = last_cpu }) catch break;
     }
     return list.items;
 }

@@ -52,6 +52,7 @@ pub const EventExtra = struct {
     cpu: ?f64 = null,
     done: ?u32 = null,
     failed: ?u32 = null,
+    noisy: ?history.Noisy = null,
     /// When the event happened, if not now.
     t: ?f64 = null,
 };
@@ -70,6 +71,7 @@ pub fn logEvent(ctx: *Ctx, job: JobLog, event: []const u8, extra: EventExtra) vo
     ev.cpu = extra.cpu;
     ev.done = extra.done;
     ev.failed = extra.failed;
+    ev.noisy = extra.noisy;
     history.append(ctx.io, path, ev);
 }
 

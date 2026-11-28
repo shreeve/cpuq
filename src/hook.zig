@@ -62,7 +62,7 @@ pub const removed_options = [_][2][]const u8{
     .{ "--cores", "--cores is gone: every task counts as one CPU. Run M tasks with -n M (at most -c C at once); a build is one task, one job" },
     .{ "--priority", "--priority is gone: --urgent puts a run's first CPU ahead of the line; there is no low" },
     .{ "--max-wait", "--max-wait is now --wait-max" },
-    .{ "--exclusive", "--exclusive is gone: `cpuq drain -c N -- CMD` times CMD alone on N CPUs; `--all` empties the machine" },
+    .{ "--exclusive", "--exclusive is gone: `cpuq drain -c N -- CMD` times CMD on N CPUs of its own, isolated at once" },
     .{ "--no-load-check", "--no-load-check is gone: the pool limits CPU work, and outside load is measured" },
     .{ "--qos", "--qos is gone: tasks run as they are" },
     .{ "--opaque", "--opaque is gone: every task counts as one CPU, inside a container or not" },
@@ -70,7 +70,7 @@ pub const removed_options = [_][2][]const u8{
 };
 
 /// `--exclusive`, given to `cpuq lease`.
-pub const lease_exclusive = "--exclusive is gone: `cpuq lease NAME -- cpuq drain --all -- CMD` holds the lease and runs CMD alone on the emptied machine";
+pub const lease_exclusive = "--exclusive is gone: `cpuq lease NAME -- cpuq drain -c N -- CMD` holds the lease and times CMD on N CPUs of its own";
 
 /// The removed options that took a value: skipped with it.
 const removed_value_options = [_][]const u8{ "--cores", "--priority", "--max-wait", "--qos", "-x" };
@@ -105,6 +105,11 @@ const Ctx = struct {
             if (shellScript(w)) |s| return ctx.script(s, host, depth + 1);
             if (cmd.heredoc) |body| return ctx.script(body, host, depth + 1);
         }
+        // A benchmark outside cpuq: other work shares its CPUs, so its numbers are noise.
+        if (benchName(a, w)) |what| return .{
+            .reason = a.print("`{s}` is a benchmark run outside cpuq: other work shares its CPUs and skews its numbers, and it is scheduled around nothing", .{what}) catch "a benchmark runs outside cpuq",
+            .instead = a.print("cpuq drain -c 1 -t 20m --label {s}:bench -- {s} (-c as many CPUs as it times on; -t about ten times its run)", .{ if (ctx.project.len != 0) ctx.project else "proj", joinQuoted(a, w) }) catch "cpuq drain -c N -t T -- CMD",
+        };
         const heavy_prog = heavyName(w) orelse return null;
         // "zig build", "cargo test": the program and its subcommand.
         const heavy = if (std.mem.eql(u8, heavy_prog, prog)) toolLabel(a, w) else heavy_prog;
@@ -526,7 +531,7 @@ fn fixRun(a: std.mem.Allocator, w: []const []const u8, drop_driver: bool) FixedR
     var words: std.ArrayList([]const u8) = .empty;
     if (drain and !lease) {
         // A run held alone: `cpuq drain`, which takes a label and a time to wait.
-        words.appendSlice(a, &.{ "cpuq", "drain", "--all" }) catch {};
+        words.appendSlice(a, &.{ "cpuq", "drain", "-c", "1" }) catch {};
         if (label) |l| words.appendSlice(a, &.{ "--label", l }) catch {};
         if (wait) |s| words.appendSlice(a, &.{ "--max", a.print("{s}s", .{s}) catch s }) catch {};
     } else {
@@ -535,7 +540,7 @@ fn fixRun(a: std.mem.Allocator, w: []const []const u8, drop_driver: bool) FixedR
     }
     if (fixed.words.len != 0) {
         words.append(a, "--") catch {};
-        if (drain and lease) words.appendSlice(a, &.{ "cpuq", "drain", "--all", "--" }) catch {};
+        if (drain and lease) words.appendSlice(a, &.{ "cpuq", "drain", "-c", "1", "--" }) catch {};
         words.appendSlice(a, fixed.words) catch {};
     }
     return .{ .text = joinQuoted(a, words.items), .whole = fixed.whole };
@@ -751,6 +756,34 @@ fn isAssignment(x: []const u8) bool {
     if (eq == 0) return false;
     for (x[0..eq]) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) return false;
     return !std.ascii.isDigit(x[0]);
+}
+
+/// A benchmark, named as the hook refuses it outside cpuq: `hyperfine`, `cargo bench`, `zig build
+/// bench`, or a script with "bench" in its path run by node, bun, deno or python; else null.
+fn benchName(a: std.mem.Allocator, w: []const []const u8) ?[]const u8 {
+    const prog = std.fs.path.basename(w[0]);
+    for (w[1..]) |x| for ([_][]const u8{ "--help", "-h", "--version" }) |q| if (std.mem.eql(u8, x, q)) return null;
+    if (std.mem.eql(u8, prog, "hyperfine")) return "hyperfine";
+    if (std.mem.eql(u8, prog, "cargo")) {
+        const at: usize = if (w.len >= 2 and std.mem.startsWith(u8, w[1], "+")) 2 else 1;
+        if (w.len > at and std.mem.eql(u8, w[at], "bench")) return "cargo bench";
+        return null;
+    }
+    if (std.mem.eql(u8, prog, "zig")) {
+        if (w.len < 2 or !std.mem.eql(u8, w[1], "build")) return null;
+        for (w[2..]) |x| if (std.mem.eql(u8, x, "bench")) return "zig build bench";
+        return null;
+    }
+    const runner = isPython(prog) or std.mem.eql(u8, prog, "node") or std.mem.eql(u8, prog, "bun") or std.mem.eql(u8, prog, "deno");
+    if (!runner) return null;
+    // The script: the first word that is no option (bun's and deno's `run` passed over).
+    for (w[1..]) |x| {
+        if (x.len == 0 or x[0] == '-') continue;
+        if (std.mem.eql(u8, x, "run") and !isPython(prog) and !std.mem.eql(u8, prog, "node")) continue;
+        if (std.mem.indexOf(u8, x, "bench") == null) return null;
+        return a.print("{s} {s}", .{ prog, x }) catch prog;
+    }
+    return null;
 }
 
 fn isPython(prog: []const u8) bool {
@@ -1230,6 +1263,22 @@ test "$CPUQ_CORES is refused, with the run at one job" {
     }
 }
 
+test "a benchmark outside cpuq is refused, with a drain to time it in" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = refusal(a, "hyperfine 'zig-out/bin/app x'");
+    try std.testing.expect(std.mem.startsWith(u8, r.reason, "`hyperfine` is a benchmark run outside cpuq"));
+    try std.testing.expect(std.mem.startsWith(u8, r.instead, "cpuq drain -c 1 -t 20m --label "));
+    try std.testing.expect(std.mem.endsWith(u8, r.instead, ":bench -- hyperfine \"zig-out/bin/app x\" (-c as many CPUs as it times on; -t about ten times its run)"));
+    for ([_][]const u8{ "cargo bench", "cargo +nightly bench --bench x", "zig build bench -Doptimize=fast", "node scripts/bench.mjs", "bun run bench/render.ts", "python3 tools/microbench.py -n 3", "deno run -A bench.ts" }) |cmd|
+        try std.testing.expect(refused(cmd));
+    for ([_][]const u8{ "node scripts/build.mjs", "python3 -m benchmark_lib --help", "hyperfine --version", "cpuq drain -c 1 -t 20m -- hyperfine x", "zig build test" }) |cmd| {
+        const got = refusal(a, cmd);
+        try std.testing.expect(!std.mem.startsWith(u8, got.reason, "`hyperfine`") and std.mem.indexOf(u8, got.reason, "benchmark") == null);
+    }
+}
+
 test "removed options are refused as cpuq refuses them, with the run they become" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1239,7 +1288,7 @@ test "removed options are refused as cpuq refuses them, with the run they become
         .{ "cpuq run --cores=4 -- make", "--cores", "cpuq run -- make" },
         .{ "cpuq run --priority high --label a:b -- ./x", "--priority", "cpuq run --label a:b -- ./x" },
         .{ "cpuq run --max-wait 60 --label a:b -- ./x", "--max-wait", "cpuq run --wait-max 60 --label a:b -- ./x" },
-        .{ "cpuq run --exclusive --label rig:bench --max-wait 90 -- ./bench", "--exclusive", "cpuq drain --all --label rig:bench --max 90s -- ./bench" },
+        .{ "cpuq run --exclusive --label rig:bench --max-wait 90 -- ./bench", "--exclusive", "cpuq drain -c 1 --label rig:bench --max 90s -- ./bench" },
         .{ "cpuq run --no-load-check -- ./x", "--no-load-check", "cpuq run -- ./x" },
         .{ "cpuq run --qos none -- ./x", "--qos", "cpuq run -- ./x" },
         .{ "cpuq run --label e:t --cores 4 --opaque -- incus exec c -- make", "--cores", "cpuq run --label e:t -- incus exec c -- make" },
@@ -1256,7 +1305,7 @@ test "removed options are refused as cpuq refuses them, with the run they become
     // A lease held alone: the lease, then cpuq drain inside it.
     const r = refusal(a, "cpuq lease w --host pup --exclusive -- ./bench");
     try std.testing.expectEqualStrings(lease_exclusive, r.reason);
-    try std.testing.expectEqualStrings("cpuq lease w --host pup -- cpuq drain --all -- ./bench", r.instead);
+    try std.testing.expectEqualStrings("cpuq lease w --host pup -- cpuq drain -c 1 -- ./bench", r.instead);
     try std.testing.expect(refused("cpuq lease w --priority low -- ./bench"));
     // After `--` an option is the command's.
     try std.testing.expect(!refused("cpuq run --label a:b -- ./x --cores 4"));

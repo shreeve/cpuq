@@ -396,13 +396,13 @@ t_drain() {
   local rt; t1=$(now)
   "$CPUQ" drain -c 1 --max 20s -t 1s -- sleep 30 2>/dev/null; rt=$?; dt1=$(since "$t1")
   check "drain -t 1s ends its command with 124 (rc $rt after ${dt1}s)" "[ $rt = 124 ] && fl '$dt1 < 10'"
-  local bad; bad=$("$CPUQ" drain --all -t off -- true 2>&1 >/dev/null; echo "rc $?")
+  local bad; bad=$("$CPUQ" drain -c 1 -t off -- true 2>&1 >/dev/null; echo "rc $?")
   local half; half=$("$CPUQ" drain -c 2 -- true 2>&1 >/dev/null; echo "rc $?")
   check "a drain has no -t off, -t goes no higher than 2h, and -c takes at most half the pool (${bad##*rc } ${half##*rc })" \
     "[ '${bad##*rc }' = 2 ] && [ '${half##*rc }' = 2 ] && \"$CPUQ\" drain -t 3h -c 1 -- true 2>/dev/null; [ \$? = 2 ]"
   local none; none=$("$CPUQ" drain -- true 2>&1 >/dev/null; echo "rc $?")
-  local long; long=$("$CPUQ" drain --all -t 30m -- true 2>&1 >/dev/null; echo "rc $?")
-  check "a drain needs -c N or --all (${none##*rc }); --all stops the rest at most 20m (${long##*rc })" "[ '${none##*rc }' = 2 ] && [ '${long##*rc }' = 2 ]"
+  local all; all=$("$CPUQ" drain --all -- touch "$T/ran-all" 2>&1 >/dev/null; echo "rc $?")
+  check "a drain needs -c N or --cpus (${none##*rc }); --all is gone and says -c N, running nothing (${all})" "[ '${none##*rc }' = 2 ] && [[ '$all' == *'--all is gone: use -c N'*'rc 2' ]] && [ ! -e '$T/ran-all' ]"
   # A drain whose command idles while others wait is stopped (drain_idle); one that computes,
   # even on a single CPU, runs on.
   echo "drain_idle = 3s" >>"$CPUQ_CONFIG"
@@ -429,26 +429,60 @@ open('$u','a').write('busy-end\n')" & local db=$!
     "[ $rb = 0 ] && [ $rw2 = 0 ] && grep -q busy-end $u"
 }
 
-t_drain_all() {
-  # cpuq drain --all stops every other task while its command runs, then continues them; their
-  # time limit counts only time they run (each needs about 2 s of its 3 s while stopped 2.5 s).
-  setup drain-all
-  local f=$T/ticks
-  "$CPUQ" run -n 2 -t 3s --label g:work -- sh -c 'echo $$ >"$1.$CPUQ_TASK"; i=0; while [ $i -lt 20 ]; do echo "$CPUQ_TASK" >>"$1"; sleep 0.1; i=$((i + 1)); done' sh "$f" 2>"$T/err" & local w=$!
-  wait_file "$f.1"; wait_file "$f.2"
-  "$CPUQ" drain --all --max 20s --label g:drain -- sh -c 'sleep 0.3; wc -l <"$1" >"$1.at"; ps -o stat= -p "$(cat "$1.1")" >"$1.st"; sleep 2.2; wc -l <"$1" >"$1.end"' sh "$f"; local rd=$?
-  reap $w; local rw=$?
-  local at end st; at=$(tr -d ' ' <"$f.at"); end=$(tr -d ' ' <"$f.end"); st=$(tr -d ' ' <"$f.st")
-  check "while a drain of the whole machine runs, the others stop (ticks $at then $end, task state $st), and continue after it (rc $rd; the run $rw: $(tail -1 "$T/err" | cut -c1-40))" \
-    "[ $rd = 0 ] && [ $rw = 0 ] && [ '$at' = '$end' ] && [[ '$st' == T* ]] && [ \$(wc -l <'$f') = 40 ]"
-  # Two drains of the whole machine go one at a time, in turn.
+t_drain_cpus() {
+  # A drain names its CPUs (--cpus), or picks whole cores (--prefer fast: performance cores
+  # first); all its drains together isolate at most half the pool, so a second waits for the
+  # first. On Linux a drain isolates its CPUs' SMT siblings too.
+  setup drain-cpus
+  local first last; first=$(poolcpus); last=${first##* }; first=${first%% *}
+  local got; got=$("$CPUQ" drain --cpus "$first" --max 20s -- sh -c 'echo "$CPUQ_CPUS"')
+  local fast; fast=$("$CPUQ" drain -c 1 --prefer fast --max 20s -- sh -c 'echo "$CPUQ_CPUS"')
+  local bad=""
+  "$CPUQ" drain -c 2 --cpus "$first" -- true 2>/dev/null; bad="$bad$? "
+  "$CPUQ" drain --cpus 4095 -- true 2>/dev/null; bad="$bad$? "
+  "$CPUQ" drain -c 1 --prefer slow -- true 2>/dev/null; bad="$bad$? "
+  "$CPUQ" drain --cpus "$first" --prefer fast -- true 2>/dev/null; bad="$bad$? "
+  check "--cpus $first names its CPU ($got); --prefer fast takes one of the pool ($fast: $(poolcpus)); a -c that disagrees, a CPU not in the pool, --prefer other than fast, --prefer with --cpus are usage errors ($bad)" \
+    "[ '$got' = '$first' ] && [[ ' $(poolcpus) ' == *\" $fast \"* ]] && [ '$bad' = '2 2 2 2 ' ]"
+  # Two drains of 1 on a pool of 2: half the pool is 1, so they run one at a time, in turn.
   local g=$T/two
-  "$CPUQ" drain --all --max 20s --label g:one -- sh -c "echo one-start >>$g; sleep 1; echo one-end >>$g" & local d1=$!
+  "$CPUQ" drain -c 1 --max 20s --label g:one -- sh -c "echo one-start >>$g; sleep 1; echo one-end >>$g" & local d1=$!
   wait_line "$g" one-start
-  "$CPUQ" drain --all --max 20s --label g:two -- sh -c "echo two-start >>$g; sleep 1; echo two-end >>$g" & local d2=$!
+  "$CPUQ" drain -c 1 --max 20s --label g:two -- sh -c "echo two-start >>$g; sleep 0.3; echo two-end >>$g" & local d2=$!
   local r1 r2; wait $d1; r1=$?; wait $d2; r2=$?
   local order; order=$(tr '\n' ' ' <"$g")
-  check "two drains of the whole machine run one at a time (rc $r1 $r2: $order)" "[ $r1 = 0 ] && [ $r2 = 0 ] && [ '$order' = 'one-start one-end two-start two-end ' ]"
+  check "two drains of 1 CPU on a pool of 2 run one at a time (rc $r1 $r2: $order)" "[ $r1 = 0 ] && [ $r2 = 0 ] && [ '$order' = 'one-start one-end two-start two-end ' ]"
+  if [ "$(uname)" != Linux ]; then
+    local q; "$CPUQ" drain -c 1 --quiet-max 0.1 -- true 2>/dev/null; q=$?
+    check "--quiet-max needs Linux (rc $q)" "[ $q = 2 ]"
+    return
+  fi
+  # Linux: a drain of 1 isolates its CPU's SMT siblings too.
+  local sib; sib=$("$CPUQ" drain -c 1 --max 20s -- sh -c '"$1" status --json --no-usage | python3 -c "import json, sys; print(\",\".join(map(str, sorted(json.load(sys.stdin)[\"isolated\"]))))"; cat /sys/devices/system/cpu/cpu$CPUQ_CPUS/topology/thread_siblings_list' sh "$CPUQ" | tr '\n' ' ')
+  local want; want=$(python3 -c "
+import sys
+t = '${sib#* }'.strip()
+s = set()
+for p in t.split(','):
+    if p:
+        a, _, b = p.partition('-'); s.update(range(int(a), int(b or a) + 1))
+print(','.join(map(str, sorted(s))))")
+  check "a drain isolates its CPU with its SMT siblings (isolated ${sib%% *}; siblings $want)" "[ '${sib%% *}' = '$want' ]"
+  # Linux: work from outside on a drain's CPU (a burner pinned there, which cpuq doesn't run)
+  # makes it noisy: status flags it live and history records it; --quiet-max holds the command
+  # until the CPU is quiet, and gives up at --max.
+  if ! command -v taskset >/dev/null; then echo "  skipped: noise needs taskset"; return; fi
+  taskset -c "$last" "$BURN" --until "$T/quiet" 30 & local noise=$!
+  sleep 0.5
+  "$CPUQ" drain --cpus "$last" --max 20s --label n:noisy -- sh -c 'sleep 2.5; "$1" status --json --no-usage | python3 -c "import json, sys; print(\" \".join(f for h in json.load(sys.stdin)[\"runs\"] for f in h[\"flags\"]))"' sh "$CPUQ" >"$T/flags"; local rn=$?
+  local t0 rq dq; t0=$(now)
+  "$CPUQ" drain --cpus "$last" --quiet-max 0.2 --max 3s --label n:quiet -- touch "$T/ran-loud" 2>"$T/quiet.err"; rq=$?; dq=$(since "$t0")
+  touch "$T/quiet"; wait $noise
+  local rq2; "$CPUQ" drain --cpus "$last" --quiet-max 0.2 --max 20s --label n:quiet2 -- touch "$T/ran-quiet"; rq2=$?
+  local hist; hist=$("$CPUQ" history --label n:noisy --json | python3 -c 'import json,sys; n = json.load(sys.stdin)[0].get("noisy") or {}; print("%.1f %s" % (n.get("max", 0), n.get("top", "-")))')
+  check "outside work on its CPU: status flags the drain noisy ($(cat "$T/flags"); rc $rn) and history records it ($hist)" "[ $rn = 0 ] && grep -qw noisy '$T/flags' && fl \"${hist%% *} >= 0.5\" && [[ '$hist' == *python* ]]"
+  check "--quiet-max waits for a quiet CPU and gives up at --max (rc $rq after ${dq}s: $(cat "$T/quiet.err"), ran: $([ -e "$T/ran-loud" ] && echo yes || echo no)); once quiet it runs (rc $rq2)" \
+    "[ $rq = 75 ] && [ ! -e '$T/ran-loud' ] && fl '2.5 < $dq < 6' && grep -q 'never quieted' '$T/quiet.err' && [ $rq2 = 0 ] && [ -e '$T/ran-quiet' ]"
 }
 
 t_drain_turn() {
@@ -460,13 +494,13 @@ t_drain_turn() {
   wait_running 1
   "$CPUQ" run --label t:older -- sh -c "echo older-start >>$f; \"$BURN\" 0.5; echo older-end >>$f" & local o=$!
   wait_waiters 1
-  "$CPUQ" drain --all --max 30s --label t:drain -- sh -c "echo drain-start >>$f; sleep 0.5; echo drain-end >>$f" & local d=$!
+  "$CPUQ" drain -c 1 --max 30s --label t:drain -- sh -c "echo drain-start >>$f; sleep 0.5; echo drain-end >>$f" & local d=$!
   wait_waiters 2
   local why; why=$("$CPUQ" status --no-usage | grep 't:drain' | grep -o 'runs queued before it go first' | head -1)
   wait $b $o $d
   local got; got=$(tr '\n' ' ' <"$f")
-  # By history's start times: the drain stops every task as it starts, so the older run's task
-  # may only get to write once the drain has ended.
+  # By history's start times: the drain takes the pool's one CPU as it starts, so the older run's
+  # task may only get to write once the drain has ended.
   local order; order=$("$CPUQ" history --json | python3 -c 'import json, sys
 j = {x["label"]: x for x in json.load(sys.stdin)}
 print("ok" if j["t:older"]["started"] < j["t:drain"]["started"] else "wrong")')
@@ -484,8 +518,8 @@ print("ok" if j["t:older"]["started"] < j["t:drain"]["started"] else "wrong")')
 
 t_drain_part() {
   # Linux: tasks are unpinned (a task's CPUs are its cpuq's); a drain of 1 CPU pins its command
-  # there at once and moves every other task's threads off it, and they get it back when it ends;
-  # a drain of the whole machine runs unpinned.
+  # there at once and moves every other task's threads off it (and its siblings), and they get it
+  # back when it ends.
   setup drain_part
   if [ "$(uname)" != Linux ]; then echo "  skipped: Linux only"; return; fi
   local list='sed -n "s/^Cpus_allowed_list:[[:space:]]*//p" /proc/self/status'
@@ -504,9 +538,8 @@ def cpus(t):
         a, _, b = p.partition('-'); s.update(range(int(a), int(b or a) + 1))
     return s
 print('yes' if $cpu not in cpus('$during') and cpus('$during') else 'no')")
-  local drain_all; drain_all=$("$CPUQ" drain --all --max 20s -- sh -c "$list")
-  check "a task runs on its cpuq's CPUs ($before; this shell $mine); a drain of 1 pins its command to CPU $cpu ($own), moves the other task off it (during: $during, off: $off) and gives it back ($after); --all runs unpinned ($drain_all)" \
-    "[ '$before' = '$mine' ] && [ '$own' = '$cpu' ] && [ $off = yes ] && [ '$after' = '$before' ] && [ '$drain_all' = '$mine' ]"
+  check "a task runs on its cpuq's CPUs ($before; this shell $mine); a drain of 1 pins its command to CPU $cpu ($own), moves the other task off it (during: $during, off: $off) and gives it back ($after)" \
+    "[ '$before' = '$mine' ] && [ '$own' = '$cpu' ] && [ $off = yes ] && [ '$after' = '$before' ]"
 }
 
 t_limit() {
@@ -554,7 +587,7 @@ time.sleep(30)' "$CPUQ_DIR/v3/lock" "$T/holder" & local h=$!
 
 t_storm() {
   # Everything at once on a pool of 2, for about 10 s: runs of tasks, single and urgent runs,
-  # drains (of 1 CPU and of the whole machine), kills, Ctrl-Z and continue, and status every 0.3 s.
+  # drains (two of 1 CPU, taking turns), kills, Ctrl-Z and continue, and status every 0.3 s.
   # Nothing may hang (each command has 60 s; a hang ends in 124, or 137 when it ignores the TERM),
   # status always answers, and the pool ends empty.
   setup storm
@@ -565,7 +598,7 @@ t_storm() {
   ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" run -n 3 -t 20s --label s:many -- sh -c 'sleep 0.$((CPUQ_TASK * 2))'; done ) & pids="$pids $!"
   ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" run --label s:one -- "$BURN" 0.1; done ) & pids="$pids $!"
   ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" run --urgent --label s:urgent -- sleep 0.2; sleep 0.5; done ) & pids="$pids $!"
-  ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" drain --all --max 30s --label s:drain1 -- sleep 0.3; sleep 0.7; done ) & pids="$pids $!"
+  ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" drain -c 1 --max 30s --label s:drain1 -- sleep 0.3; sleep 0.7; done ) & pids="$pids $!"
   ( while [ "$(date +%s)" -lt $end ]; do t "$CPUQ" drain -c 1 --max 30s --label s:drain2 -- sleep 0.3; sleep 0.7; done ) & pids="$pids $!"
   ( while [ "$(date +%s)" -lt $end ]; do
       "$CPUQ" run --label s:victim -- sleep 5 >/dev/null 2>&1 & local v=$!
@@ -677,20 +710,18 @@ f = open(sys.argv[1], "r+"); fcntl.flock(f, fcntl.LOCK_EX); open(sys.argv[2], "w
   reap $a
   check "a continue while cpuq leaves the line's count for a stop leaves the run running: it finishes (ended: $ended $st2, $(cat "$T/lost" 2>/dev/null))" \
     "[ $ended = yes ] && [ \"\$(cat '$T/lost' 2>/dev/null)\" = finished ]"
-  # A drain stopped by Ctrl-Z ends its isolation: the tasks it stopped go on. Continued, it takes
-  # its turn again, stops them again, and its command runs.
+  # A drain stopped by Ctrl-Z ends its isolation: the capacity comes back. Continued, it takes its
+  # turn again, isolates again, and its command runs.
   setup ctrl-z-drain "budget = 2"
-  "$CPUQ" run -n 2 --label z:work -- sh -c 'echo $$ >"$1.$CPUQ_TASK"; sleep 4' sh "$T/w" 2>/dev/null & local w=$!
-  wait_file "$T/w.1"; wait_file "$T/w.2"
-  dfl "$CPUQ" drain --all --max 30s --label z:drain -- sh -c 'sleep 1; touch "$1"' sh "$T/drained" 2>/dev/null & a=$!
-  local stopped=no; poll 5 '[[ "$(ps -o stat= -p "$(cat "$T/w.1")")" == *T* ]]' && stopped=yes
+  dfl "$CPUQ" drain -c 1 --max 30s --label z:drain -- sh -c 'sleep 1; touch "$1"' sh "$T/drained" 2>/dev/null & a=$!
+  local on=no; poll 5 '[ "$(sj "s[\"capacity\"]")" = 1 ]' && on=yes
   kill -TSTP $a
-  local back=no; poll 5 '[[ "$(ps -o stat= -p "$(cat "$T/w.1")")" != *T* ]]' && back=yes
+  local back=no; poll 5 '[ "$(sj "s[\"capacity\"]")" = 2 ]' && back=yes
   kill -CONT $a
+  local again=no; poll 5 '[ "$(sj "s[\"capacity\"]")" = 1 ]' && again=yes
   local rd; reap $a; rd=$?
-  wait $w; local rw=$?
-  check "a drain stops the others (stopped: $stopped); stopped itself, it lets them go on (back: $back); continued, it runs (rc $rd, ran: $([ -e "$T/drained" ] && echo yes || echo no)); the work ends (rc $rw)" \
-    "[ $stopped = yes ] && [ $back = yes ] && [ $rd = 0 ] && [ -e '$T/drained' ] && [ $rw = 0 ]"
+  check "a drain isolates (capacity 1: $on); stopped, it gives it back (2: $back); continued, it isolates again ($again) and runs (rc $rd, ran: $([ -e "$T/drained" ] && echo yes || echo no))" \
+    "[ $on = yes ] && [ $back = yes ] && [ $again = yes ] && [ $rd = 0 ] && [ -e '$T/drained' ]"
 }
 
 t_nested() {
@@ -2162,7 +2193,7 @@ f = open(sys.argv[1]); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$sp/p/held
 
 # --- cpuq jobs and the agent (until they go) -------------------------------------------------
 
-TESTS=${*:-budget tasks io cpus_limit timeout retry wait_max share fair order drain drain_all drain_turn drain_part limit lock_stuck storm kill ctrl_z nested driver removed \
+TESTS=${*:-budget tasks io cpus_limit timeout retry wait_max share fair order drain drain_cpus drain_turn drain_part limit lock_stuck storm kill ctrl_z nested driver removed \
   kill_holder leftovers leaked_descendant kill_waiter term_waiting lost_seq long_command waiters_cpu \
   exit_status direct_sigint terminal_sigint tasks_sigint ignored_signals stack_limit \
   status progress usage zombie outside status_host history note wait record min_available min_disk hook \

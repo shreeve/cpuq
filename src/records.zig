@@ -64,6 +64,8 @@ const JsonJob = struct {
     exit: ?u8,
     signal: ?u32,
     stopped: ?[]const u8 = null,
+    /// A drain whose CPUs saw outside work while its command ran.
+    noisy: ?@import("history.zig").Noisy = null,
 };
 
 /// `cpuq record`: samples this machine every few seconds into samples.jsonl beside the
@@ -375,6 +377,7 @@ pub fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
             .exit = j.exit,
             .signal = j.signal,
             .stopped = j.stopped,
+            .noisy = j.noisy,
         }) catch {};
         std.json.Stringify.value(out.items, .{ .whitespace = .indent_2 }, w) catch {};
         w.writeAll("\n") catch {};
