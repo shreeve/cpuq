@@ -2,7 +2,7 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
-## 0.41.0 — unreleased
+## 0.41.0 — 2026-11-28
 
 No stream of arrivals starves a waiting run: the two rule changes that the Lean model proves
 starvation-free (`run_starts_fixed`, `Rules.nostarve` in `formal/`).
