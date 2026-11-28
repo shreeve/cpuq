@@ -156,6 +156,8 @@ structure RunCfg where
   cap : Nat := 1
   /-- `--urgent`: its first task goes ahead of the line. -/
   urgent : Bool := false
+  /-- `-j K` (0.43): the tokens each task holds while it runs (0 counts as 1, `Cfg.wd`). -/
+  width : Nat := 1
   deriving Repr
 
 structure DrainCfg where
@@ -186,6 +188,10 @@ structure Rules where
   what outside load past the reserve keeps busy); the share is of `N`; every start goes to the
   first in the one line. No admission by measured busy, no 4T backstop. -/
   tokens : Bool := false
+  /-- 0.43, with `tokens`: a wide task first in line that does not fit holds the line, and freed
+  tokens go to no one else (rule 4(a)). Off (rule 4(b)): the line skips a task whose `K` tokens are
+  not free, and the next that fits takes them. With every `K = 1` the two agree. -/
+  hold : Bool := true
   deriving Repr
 
 /-- DESIGN-0.40.md as written. -/
@@ -197,6 +203,10 @@ def Rules.nostarve : Rules := { busyAll := false, drainFifo := true, arrivalKey 
 /-- cpuq 0.42.0: the token pool with 0.41's line (`Token.lean`). -/
 def Rules.tokens042 : Rules :=
   { busyAll := false, drainFifo := true, arrivalKey := true, oneLine := true, tokens := true }
+/-- cpuq 0.43.0, rule 4(a): tasks of `K` tokens, the line held for a wide task (`Wide.lean`). -/
+def Rules.wide043a : Rules := Rules.tokens042
+/-- cpuq 0.43.0, rule 4(b): tasks of `K` tokens, no hold. -/
+def Rules.wide043b : Rules := { Rules.tokens042 with hold := false }
 
 structure Cfg where
   /-- The pool's CPUs (the budget). -/
@@ -229,6 +239,8 @@ def np (c : Cfg) : Nat := c.runs.foldr (fun x m => max (x.proj + 1) m) 0
 running count times it is its share ÷ weight in whole numbers. -/
 def wprod (c : Cfg) : Nat := rprod c.np c.w
 def limitOf (c : Cfg) (d : Nat) : Nat := min (c.drain d).limit c.ceil
+/-- A task's tokens, `K` (at least 1). -/
+def wd (c : Cfg) (r : Nat) : Nat := max 1 (c.run r).width
 end Cfg
 
 theorem Cfg.w_pos (c : Cfg) (p : Nat) : 0 < c.w p := by
@@ -331,8 +343,10 @@ def capT (s : St) : Nat := cfg.pool - iso cfg s
 def capN (s : St) : Nat := cfg.pool - s.reserve
 /-- 0.42: the tokens handed out, `N` less the outside load past the reserve. -/
 def capTok (s : St) : Nat := capN cfg s - (s.outside - s.reserve)
+/-- 0.43: the tokens tasks hold, `K` for each task running. -/
+def tokT (s : St) : Nat := rsum cfg.nr (fun r => (s.run r).running * cfg.wd r)
 /-- 0.42: the tokens held, by tasks and by started drains. -/
-def used (s : St) : Nat := total cfg s + iso cfg s
+def used (s : St) : Nat := tokT cfg s + iso cfg s
 /-- What the fair share divides: `T`, or with `tokens` `N`. -/
 def shareCap (s : St) : Nat := if cfg.rules.tokens then capN cfg s else capT cfg s
 /-- Busy as the rules measure it. -/
@@ -356,6 +370,12 @@ instance (s : St) (r : Nat) : Decidable (under cfg s r) := by unfold under; infe
 /-- Arrived, a task waiting, and not held by its own `-c`. -/
 def eligible (s : St) (r : Nat) : Bool :=
   (s.run r).here && decide (0 < (s.run r).pend) && decide ((s.run r).running < (s.run r).cap)
+
+/-- 0.43: a task of `r` fits: its `K` tokens are free to hand out. -/
+def fits (s : St) (r : Nat) : Bool := decide (used cfg s + cfg.wd r ≤ capTok cfg s)
+
+/-- In line: waiting, not held by its `-c`, and (with tokens and no hold, rule 4(b)) it fits. -/
+def cand (s : St) (r : Nat) : Bool := eligible s r && (!cfg.rules.tokens || cfg.rules.hold || fits cfg s r)
 
 /-- 0 for an urgent run's first task, else 1. -/
 def urg (s : St) (r : Nat) : Nat := if (cfg.run r).urgent && !(s.run r).ran then 0 else 1
@@ -385,10 +405,10 @@ def pbefore (s : St) (i j : Nat) : Bool :=
 
 /-- The project's first waiter: no waiter of its project comes before it. -/
 def projFirst (s : St) (r : Nat) : Bool :=
-  !anyLT cfg.nr (fun i => eligible s i && decide ((cfg.run i).proj = (cfg.run r).proj) && pbefore cfg s i r)
+  !anyLT cfg.nr (fun i => cand cfg s i && decide ((cfg.run i).proj = (cfg.run r).proj) && pbefore cfg s i r)
 
 /-- A waiter that may take a start: waiting, and its project's first waiter. -/
-def front (s : St) (r : Nat) : Bool := eligible s r && projFirst cfg s r
+def front (s : St) (r : Nat) : Bool := cand cfg s r && projFirst cfg s r
 end
 
 /-- The first of `l` by `lt` among those with `p`. -/
@@ -419,10 +439,10 @@ def head2 (s : St) : Option Nat := pick (front cfg s) (before2 cfg s) (List.rang
 /-- A run may start a task: it waits, not held by its `-c`; the gates are open and fewer than
 4T tasks run; it is its project's first waiter; and its project is under share, or there is room
 and it is the first in line. With `oneLine`: it is the first in the one line, and under share or
-with room. -/
+with room. With `tokens`: its `K` tokens are free, and it is the first in the one line. -/
 def canStart (s : St) (r : Nat) : Bool :=
   eligible s r && s.gate &&
-    (if cfg.rules.tokens then decide (used cfg s + 1 ≤ capTok cfg s) else decide (total cfg s < 4 * capT cfg s)) &&
+    (if cfg.rules.tokens then decide (used cfg s + cfg.wd r ≤ capTok cfg s) else decide (total cfg s < 4 * capT cfg s)) &&
     (projFirst cfg s r && (if cfg.rules.tokens then head2 cfg s == some r
       else if cfg.rules.oneLine then head2 cfg s == some r && (decide (under cfg s r) || decide (room cfg s))
       else decide (under cfg s r) || (decide (room cfg s) && head cfg s == some r)))
@@ -727,6 +747,17 @@ theorem total_admit {cfg : Cfg} {s : St} {r : Nat} (hr : r < cfg.nr) : total cfg
   unfold total admit
   omega
 
+theorem total_le_tokT (cfg : Cfg) (s : St) : total cfg s ≤ tokT cfg s :=
+  rsum_le (fun r _ => Nat.le_mul_of_pos_right _ (by unfold Cfg.wd; omega))
+
+theorem cand_elig {cfg : Cfg} {s : St} {r : Nat} (h : cand cfg s r = true) : eligible s r = true := by
+  simp only [cand, Bool.and_eq_true] at h; exact h.1
+
+/-- Without tokens, or with the hold (rule 4(a)), every waiter is in line. -/
+theorem cand_of {cfg : Cfg} {s : St} {r : Nat} (hh : cfg.rules.tokens = false ∨ cfg.rules.hold = true)
+    (he : eligible s r = true) : cand cfg s r = true := by
+  rcases hh with h | h <;> simp [cand, he, h]
+
 /-! ## The invariant -/
 
 structure Inv (cfg : Cfg) (s : St) : Prop where
@@ -777,7 +808,9 @@ theorem inv_pass1 {cfg : Cfg} {s t : St} (i : Inv cfg s) (h : pass1 cfg s = some
         have h2 := hc.1.2
         have hcap : capT cfg s ≤ cfg.pool := Nat.sub_le _ _
         split at h2
-        · have h3 : used cfg s + 1 ≤ capTok cfg s := by simpa using h2
+        · have h3 : used cfg s + cfg.wd r ≤ capTok cfg s := by simpa using h2
+          have h4 := total_le_tokT cfg s
+          have h5 : 1 ≤ cfg.wd r := by unfold Cfg.wd; omega
           unfold used capTok capN at h3; omega
         · simp only [decide_eq_true_eq] at h2; omega
       have ht := total_admit (s := s) hm
@@ -1053,9 +1086,9 @@ theorem pbefore_trans (cfg : Cfg) (s : St) (a b c : Nat) :
   omega
 
 /-- Every project with a waiter has a first waiter. -/
-theorem first_exists {cfg : Cfg} {s : St} {r : Nat} (hr : r < cfg.nr) (he : eligible s r = true) :
+theorem first_exists {cfg : Cfg} {s : St} {r : Nat} (hr : r < cfg.nr) (he : cand cfg s r = true) :
     ∃ h < cfg.nr, (cfg.run h).proj = (cfg.run r).proj ∧ front cfg s h = true := by
-  let p : Nat → Bool := fun i => eligible s i && decide ((cfg.run i).proj = (cfg.run r).proj)
+  let p : Nat → Bool := fun i => cand cfg s i && decide ((cfg.run i).proj = (cfg.run r).proj)
   have hs := foldl_pick_isSome p (pbefore cfg s) (List.range cfg.nr) none
     (Or.inr ⟨r, List.mem_range.2 hr, by simp [p, he]⟩)
   obtain ⟨h, e⟩ := Option.isSome_iff_exists.1 hs
@@ -1067,14 +1100,14 @@ theorem first_exists {cfg : Cfg} {s : St} {r : Nat} (hr : r < cfg.nr) (he : elig
   simp only [front, projFirst, hp.1, Bool.true_and, Bool.not_eq_true']
   apply anyLT_false.2
   intro i hi
-  cases hei : eligible s i
+  cases hei : cand cfg s i
   · rfl
   · by_cases hpi : (cfg.run i).proj = (cfg.run h).proj
     · have := hmin i (List.mem_range.2 hi) (by simp [p, hei, hpi, hp.2])
       simp [hpi, this]
     · simp [hpi]
 
-theorem head_isSome {cfg : Cfg} {s : St} {r : Nat} (hr : r < cfg.nr) (he : eligible s r = true) :
+theorem head_isSome {cfg : Cfg} {s : St} {r : Nat} (hr : r < cfg.nr) (he : cand cfg s r = true) :
     (head cfg s).isSome = true := by
   obtain ⟨h, hh, _, hf⟩ := first_exists hr he
   exact foldl_pick_isSome _ _ _ _ (Or.inr ⟨h, List.mem_range.2 hh, hf⟩)
@@ -1111,7 +1144,7 @@ theorem head2_some {cfg : Cfg} {s : St} {h : Nat} (e : head2 cfg s = some h) : h
   · cases e1
   · exact ⟨List.mem_range.1 hm, hp⟩
 
-theorem head2_isSome {cfg : Cfg} {s : St} {r : Nat} (hr : r < cfg.nr) (he : eligible s r = true) :
+theorem head2_isSome {cfg : Cfg} {s : St} {r : Nat} (hr : r < cfg.nr) (he : cand cfg s r = true) :
     (head2 cfg s).isSome = true := by
   obtain ⟨h, hh, _, hf⟩ := first_exists hr he
   exact foldl_pick_isSome _ _ _ _ (Or.inr ⟨h, List.mem_range.2 hh, hf⟩)
@@ -1140,7 +1173,8 @@ held by its `-c` waits only on the gates or the 4T backstop. -/
 theorem no_wait_under {cfg : Cfg} {s : St} (h : Reach cfg s) (htk : cfg.rules.tokens = false) {r : Nat} (hr : r < cfg.nr)
     (he : eligible s r = true) (hu : under cfg s r) :
     s.gate = false ∨ 4 * capT cfg s ≤ total cfg s := by
-  obtain ⟨f, hf, hpf, hff⟩ := first_exists hr he
+  have he' := cand_of (.inl htk) he
+  obtain ⟨f, hf, hpf, hff⟩ := first_exists hr he'
   have hc := reach_start h hf
   have huf : under cfg s f := (under_proj hpf).2 hu
   cases hg : s.gate
@@ -1150,13 +1184,13 @@ theorem no_wait_under {cfg : Cfg} {s : St} (h : Reach cfg s) (htk : cfg.rules.to
     intro hlt
     have hlt' : total cfg s < 4 * capT cfg s := by omega
     cases ho : cfg.rules.oneLine
-    · simp only [front, Bool.and_eq_true] at hff
+    · simp only [front, cand, Bool.and_eq_true] at hff
       simp [canStart, hff.1, hff.2, hg, hlt', huf, ho, htk] at hc
-    · obtain ⟨x, hx⟩ := Option.isSome_iff_exists.1 (head2_isSome hr he)
+    · obtain ⟨x, hx⟩ := Option.isSome_iff_exists.1 (head2_isSome hr he')
       obtain ⟨hxn, hxe⟩ := head2_some hx
       have hxu := head2_under hx hf hff huf
       have hc' := reach_start h hxn
-      simp only [front, Bool.and_eq_true] at hxe
+      simp only [front, cand, Bool.and_eq_true] at hxe
       simp [canStart, hxe.1, hxe.2, hg, hlt', hxu, ho, hx, htk] at hc' 
 
 /-- **Property 1, work-conserving** (with busy counting only the CPUs no drain isolates). A
@@ -1176,15 +1210,16 @@ theorem work_conserving {cfg : Cfg} {s : St} (h : Reach cfg s) (hb : cfg.rules.b
     have hbm : busyM cfg s = taskBusy cfg s + s.outside := by simp [busyM, hb]
     have hroom : room cfg s := by
       unfold room; rw [hbm]; omega
+    have he' := cand_of (.inl htk) he
     cases ho : cfg.rules.oneLine
-    · obtain ⟨x, hx⟩ := Option.isSome_iff_exists.1 (head_isSome hr he)
+    · obtain ⟨x, hx⟩ := Option.isSome_iff_exists.1 (head_isSome hr he')
       obtain ⟨hxn, hxe⟩ := head_some hx
-      simp only [front, Bool.and_eq_true] at hxe
+      simp only [front, cand, Bool.and_eq_true] at hxe
       have hc := reach_start h hxn
       simp [canStart, hxe.1, hxe.2, hg, ht, hroom, hx, ho, htk] at hc
-    · obtain ⟨x, hx⟩ := Option.isSome_iff_exists.1 (head2_isSome hr he)
+    · obtain ⟨x, hx⟩ := Option.isSome_iff_exists.1 (head2_isSome hr he')
       obtain ⟨hxn, hxe⟩ := head2_some hx
-      simp only [front, Bool.and_eq_true] at hxe
+      simp only [front, cand, Bool.and_eq_true] at hxe
       have hc := reach_start h hxn
       simp [canStart, hxe.1, hxe.2, hg, ht, hroom, hx, ho, htk] at hc
 
@@ -1199,7 +1234,7 @@ theorem line_order {cfg : Cfg} {s : St} {r : Nat} (hc : canStart cfg s r = true)
     (cfg.rules.tokens = false → cfg.rules.oneLine = true →
       (under cfg s r ∨ room cfg s) ∧ ∀ i < cfg.nr, front cfg s i = true → before2 cfg s i r = false) ∧
     (cfg.rules.tokens = true →
-      used cfg s + 1 ≤ capTok cfg s ∧ ∀ i < cfg.nr, front cfg s i = true → before2 cfg s i r = false) := by
+      used cfg s + cfg.wd r ≤ capTok cfg s ∧ ∀ i < cfg.nr, front cfg s i = true → before2 cfg s i r = false) := by
   simp only [canStart, Bool.and_eq_true] at hc
   refine ⟨hc.2.1, fun ht ho hu => ?_, fun ht ho => ?_, fun ht => ?_⟩
   · have h2 := hc.2.2
@@ -1222,7 +1257,7 @@ theorem line_order {cfg : Cfg} {s : St} {r : Nat} (hc : canStart cfg s r = true)
 started first; then ticket), so a run holding nothing goes before a long run of its project, and
 a run that has just started a task goes behind the others holding nothing. -/
 theorem project_turn {cfg : Cfg} {s : St} {r : Nat} (hc : canStart cfg s r = true) :
-    ∀ i < cfg.nr, eligible s i = true → (cfg.run i).proj = (cfg.run r).proj → pbefore cfg s i r = false := by
+    ∀ i < cfg.nr, cand cfg s i = true → (cfg.run i).proj = (cfg.run r).proj → pbefore cfg s i r = false := by
   have := (line_order hc).1
   simp only [projFirst, Bool.not_eq_true'] at this
   intro i hi he hp

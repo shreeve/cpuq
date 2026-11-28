@@ -18,3 +18,4 @@ import CpuqModel.Contest035
 import CpuqModel.Stream
 import CpuqModel.StreamCex
 import CpuqModel.Token
+import CpuqModel.Wide

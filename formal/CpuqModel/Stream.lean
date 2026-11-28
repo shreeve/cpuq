@@ -534,7 +534,8 @@ theorem urg_le (cfg : Cfg) (s : St) (r : Nat) : urg cfg s r ≤ 1 := by unfold u
 /-- Along the pass, while `r` waits holding nothing and is not started, the measure only goes
 down: a run of `r`'s project that starts comes before `r` (else `r` would go first), and after its
 start, stamped later than `r`'s last start, it no longer does. -/
-theorem pass_phi {cfg : Cfg} {u t : St} (p : PassPath cfg u t) {r U0 L T0 : Nat} (hr : r < cfg.nr)
+theorem pass_phi {cfg : Cfg} (hhold : cfg.rules.tokens = false ∨ cfg.rules.hold = true) {u t : St}
+    (p : PassPath cfg u t) {r U0 L T0 : Nat} (hr : r < cfg.nr)
     (hh : (u.run r).here = true) (hp : 0 < (u.run r).pend) (h0 : (u.run r).running = 0)
     (hc : 1 ≤ (u.run r).cap) (hU : urg cfg u r = U0) (hl : lastKey cfg u r = L) (htk : (u.run r).ticket = T0)
     (hn : L ≤ u.now) (hk : (t.run r).pend = (u.run r).pend) (ht : Tickets t) :
@@ -562,7 +563,7 @@ theorem pass_phi {cfg : Cfg} {u t : St} (p : PassPath cfg u t) {r U0 L T0 : Nat}
         · have hel : eligible s r = true := by
             simp only [eligible, hh, Bool.true_and, Bool.and_eq_true, decide_eq_true_eq]
             exact ⟨hp, by omega⟩
-          have hpb : pbefore cfg s r r' = false := project_turn hs r hr hel hpj.symm
+          have hpb : pbefore cfg s r r' = false := project_turn hs r hr (cand_of hhold hel) hpj.symm
           have her' : (s.run r').here = true := by
             simp only [canStart, eligible, Bool.and_eq_true] at hs; exact hs.1.1.1.1.1
           -- the tickets of `r'` and `r` differ (both present; the pass keeps tickets)
@@ -675,7 +676,8 @@ theorem lastKey_le {cfg : Cfg} {s : St} (r : Nat) (h : (s.run r).last ≤ s.now)
 project that arrives is not urgent and arrives under `arrivalKey` (or none arrives), every task
 of the project ends and one tick passes, then from some time on the project holds nothing and
 `r` waits holding nothing, its `-c` allowing a task. -/
-theorem project_empties {cfg : Cfg} (ρ : RunS cfg) {n r : Nat} (hr : r < cfg.nr)
+theorem project_empties {cfg : Cfg} (hhold : cfg.rules.tokens = false ∨ cfg.rules.hold = true) (ρ : RunS cfg)
+    {n r : Nat} (hr : r < cfg.nr)
     (hh : ((ρ.st n).run r).here = true) (hp : 0 < ((ρ.st n).run r).pend)
     (hge : ∀ m ≥ n, ((ρ.st n).run r).pend ≤ ((ρ.st m).run r).pend)
     (arrOk : ∀ m ≥ n, ∀ b, ρ.mv m = .act (.arrive b) → (cfg.run b).proj = (cfg.run r).proj →
@@ -734,7 +736,7 @@ theorem project_empties {cfg : Cfg} (ρ : RunS cfg) {n r : Nat} (hr : r < cfg.nr
     have h0 : (u.run r).running = 0 := by have := zero m (by omega); omega
     have hk : ((pass cfg u).run r).pend = (u.run r).pend := by
       rw [← ht, w2, hs'.2.1, hs.2.1]
-    have hpp := pass_phi (pass_path cfg u) hr w1 (by rw [w2, hs.2.1]; exact hp) h0 (iu.cap r w1)
+    have hpp := pass_phi hhold (pass_path cfg u) hr w1 (by rw [w2, hs.2.1]; exact hp) h0 (iu.cap r w1)
       ((urg_eq w3).trans (hUm m hmn)) ((lastKey_eq w3 w4).trans (hLm m hmn))
       (w5.trans (hTm m hmn)) (by have := hL m (by omega); omega) hk
       (by rw [← ht]; exact reachS_tickets (ρ.reach (m + 1)))
@@ -782,7 +784,7 @@ theorem run_starts {cfg : Cfg} (htk : cfg.rules.tokens = false) (ρ : RunS cfg) 
   have hge : ∀ m ≥ n, ((ρ.st n).run r).pend ≤ ((ρ.st m).run r).pend := fun m hm =>
     Nat.not_lt.1 (fun h => hno ⟨m, hm, h⟩)
   have W := waits_on ρ hh hp hge
-  obtain ⟨T, hT, hz⟩ := project_empties ρ hr hh hp hge
+  obtain ⟨T, hT, hz⟩ := project_empties (.inl htk) ρ hr hh hp hge
     (fun m hm b hb hpb => absurd hpb (noNew m hm b hb)) ends htime
   -- with the gates open under the backstop, the project, under share, starts a task
   obtain ⟨m, hm, hg, htot⟩ := hroom T
@@ -795,17 +797,18 @@ theorem run_starts {cfg : Cfg} (htk : cfg.rules.tokens = false) (ρ : RunS cfg) 
   have hu : under cfg (ρ.st m) r := by
     unfold under; rw [(hz m hm).1, Nat.zero_mul, shareCap_old htk]
     exact Nat.mul_pos (by omega) (Cfg.w_pos _ _)
+  replace hel := cand_of (.inl htk) hel
   obtain ⟨f, hf, hpf, hff⟩ := first_exists hr hel
   have hc := reachS_start (ρ.reach m) hf
   have huf : under cfg (ρ.st m) f := (under_proj hpf).2 hu
   cases ho : cfg.rules.oneLine
-  · simp only [front, Bool.and_eq_true] at hff
+  · simp only [front, cand, Bool.and_eq_true] at hff
     simp [canStart, hff.1, hff.2, hg, htot, huf, ho, htk] at hc
   · obtain ⟨x, hx⟩ := Option.isSome_iff_exists.1 (head2_isSome hr hel)
     obtain ⟨hxn, hxe⟩ := head2_some hx
     have hxu := head2_under hx hf hff huf
     have hc' := reachS_start (ρ.reach m) hxn
-    simp only [front, Bool.and_eq_true] at hxe
+    simp only [front, cand, Bool.and_eq_true] at hxe
     simp [canStart, hxe.1, hxe.2, hg, htot, hxu, ho, hx, htk] at hc'
 
 /-- The backstop condition of `run_starts` from a bound: if fewer than `4 × (pool − drain_max)`
@@ -911,7 +914,8 @@ theorem pre_psi {cfg : Cfg} {s u : St} {m : Move} (h : pre cfg s m u) {q Tk : Na
 nothing: every start is another project's, and it is ahead of `r`'s project's first waiter in the
 one line, so an urgent first task or a run with an older ticket than that waiter; each lowers
 `psi`. So `psi` plus the tasks running does not go up. -/
-theorem pass_psi {cfg : Cfg} (hol : cfg.rules.oneLine = true) {u t : St} (p : PassPath cfg u t)
+theorem pass_psi {cfg : Cfg} (hol : cfg.rules.oneLine = true)
+    (hhold : cfg.rules.tokens = false ∨ cfg.rules.hold = true) {u t : St} (p : PassPath cfg u t)
     {r U0 L T0 Tk : Nat} (hr : r < cfg.nr)
     (hh : (u.run r).here = true) (hp : 0 < (u.run r).pend) (h0 : (u.run r).running = 0)
     (hc : 1 ≤ (u.run r).cap) (hU : urg cfg u r = U0) (hl : lastKey cfg u r = L) (htk : (u.run r).ticket = T0)
@@ -970,6 +974,7 @@ theorem pass_psi {cfg : Cfg} (hol : cfg.rules.oneLine = true) {u t : St} (p : Pa
       have hel : eligible s r = true := by
         simp only [eligible, hh, Bool.true_and, Bool.and_eq_true, decide_eq_true_eq]
         exact ⟨hp, by omega⟩
+      replace hel := cand_of hhold hel
       obtain ⟨F, hF, hpF, hfF⟩ := first_exists hr hel
       have lo : 0 < shareCap cfg s ∧ ∀ i < cfg.nr, front cfg s i = true → before2 cfg s i x = false := by
         cases htk : cfg.rules.tokens
@@ -983,13 +988,14 @@ theorem pass_psi {cfg : Cfg} (hol : cfg.rules.oneLine = true) {u t : St} (p : Pa
           rw [shareCap_tok htk]
           have h1 := l.1
           have h2 : capTok cfg s ≤ capN cfg s := Nat.sub_le _ _
+          have h3 : 1 ≤ cfg.wd x := by unfold Cfg.wd; omega
           omega
       have hcap := lo.1
       have huF : under cfg s F := by
         unfold under; rw [hpF, hzs, Nat.zero_mul]; exact Nat.mul_pos hcap (Cfg.w_pos _ _)
       have hFx : before2 cfg s F x = false := lo.2 F hF hfF
       have hFh : (s.run F).here = true := by
-        simp only [front, eligible, Bool.and_eq_true] at hfF; exact hfF.1.1.1
+        simp only [front, cand, eligible, Bool.and_eq_true] at hfF; exact hfF.1.1.1.1
       have hneF : F ≠ x := fun h => hxp (h ▸ hpF)
       have hxF : before2 cfg s x F = true := by
         rcases before2_total (cfg := cfg) (s := s) (hts.2 x F (Ne.symm hneF) hxh hFh) with h | h
@@ -1146,37 +1152,22 @@ theorem pass_shrink {cfg : Cfg} {u t : St} (p : PassPath cfg u t) {r U0 L T0 : N
       rw [e1] at h1 h2
       exact ⟨h1, h2⟩
 
-/-- **No starvation with endless arrivals, on the fixed rules** (`arrivalKey`, `oneLine`, as in
-`Rules.nostarve`). Runs and drains arrive and leave forever, runs of the waiting run's own project
-included. A run `r` waits at time `n`. Suppose that from then on:
-- no urgent run arrives;
-- every task that runs later ends (each `-t`);
-- one tick passes;
-- the gates are open again and again;
-
-and `drain_max` < pool. Then `r` starts a task. No assumption on `-c` or on drains. New runs of
-`r`'s project come after it (their arrival is no earlier than its last start, their ticket newer);
-its project empties as in `run_starts`; then every start is another project's, ahead of its first
-waiter in the one line: an urgent first task or a run with an older ticket, finitely many. So
-starts stop, every task ends, and at the next open gates the first in the one line, under share,
-starts. -/
-theorem run_starts_fixed {cfg : Cfg} (hak : cfg.rules.arrivalKey = true) (hol : cfg.rules.oneLine = true)
-    (hD : cfg.drainMax < cfg.pool) (ρ : RunS cfg) {n r : Nat} (hr : r < cfg.nr)
+/-- On the fixed rules (and with tokens, the hold), a run `r` that waits at `n` and never starts a
+task: from some time on nothing runs and its project holds nothing (the first half of
+`run_starts_fixed`). -/
+theorem starts_stop {cfg : Cfg} (hak : cfg.rules.arrivalKey = true) (hol : cfg.rules.oneLine = true)
+    (hhold : cfg.rules.tokens = false ∨ cfg.rules.hold = true) (ρ : RunS cfg) {n r : Nat} (hr : r < cfg.nr)
     (hh : ((ρ.st n).run r).here = true) (hp : 0 < ((ρ.st n).run r).pend)
     (noUrgent : ∀ m ≥ n, ∀ b, ρ.mv m = .act (.arrive b) → (cfg.run b).urgent = false)
     (ends : ∀ m b, b < cfg.nr → 0 < ((ρ.st m).run b).running → ∃ m' ≥ m, finOfM b (ρ.mv m'))
     (htime : ∃ m ≥ n, ρ.mv m = .act .tick)
-    (gates : ∀ m, ∃ m' ≥ m, (ρ.st m').gate = true ∧ (cfg.rules.tokens = true →
-      (ρ.st m').outside ≤ (ρ.st m').reserve ∧ cfg.drainMax < cfg.pool - (ρ.st m').reserve)) :
-    ∃ m ≥ n, ((ρ.st m).run r).pend < ((ρ.st n).run r).pend := by
-  apply Classical.byContradiction
-  intro hno
-  have hge : ∀ m ≥ n, ((ρ.st n).run r).pend ≤ ((ρ.st m).run r).pend := fun m hm =>
-    Nat.not_lt.1 (fun h => hno ⟨m, hm, h⟩)
+    (hge : ∀ m ≥ n, ((ρ.st n).run r).pend ≤ ((ρ.st m).run r).pend) :
+    ∃ n5 ≥ n, ∀ m ≥ n5, (∀ b < cfg.nr, ((ρ.st m).run b).running = 0) ∧
+      projRun cfg (ρ.st m) (cfg.run r).proj = 0 := by
   have W := waits_on ρ hh hp hge
   have arrOk : ∀ m ≥ n, ∀ b, ρ.mv m = .act (.arrive b) → (cfg.run b).proj = (cfg.run r).proj →
       cfg.rules.arrivalKey = true ∧ (cfg.run b).urgent = false := fun m hm b hb _ => ⟨hak, noUrgent m hm b hb⟩
-  obtain ⟨T, hT, hz⟩ := project_empties ρ hr hh hp hge arrOk (fun m b hb _ hrun => ends m b hb hrun) htime
+  obtain ⟨T, hT, hz⟩ := project_empties hhold ρ hr hh hp hge arrOk (fun m b hb _ hrun => ends m b hb hrun) htime
   obtain ⟨U0, hU0⟩ : ∃ x, urg cfg (ρ.st n) r = x := ⟨_, rfl⟩
   obtain ⟨L, hL0⟩ : ∃ x, lastKey cfg (ρ.st n) r = x := ⟨_, rfl⟩
   obtain ⟨T0, hT0⟩ : ∃ x, ((ρ.st n).run r).ticket = x := ⟨_, rfl⟩
@@ -1247,7 +1238,7 @@ theorem run_starts_fixed {cfg : Cfg} (hak : cfg.rules.arrivalKey = true) (hol : 
       obtain ⟨h1, h2⟩ := pre_shrink hu (fun b hb' => arrOk m hmn b hb') hU1 (hLnow m hmn)
         (by have := hNext m hmn; omega) b hb
       rw [h2]; exact bound' m hmn b h1
-    have hps := pass_psi hol (pass_path cfg u) hr w1 (by rw [w2, hs.2.1]; exact hp) h0 (iu.cap r w1)
+    have hps := pass_psi hol hhold (pass_path cfg u) hr w1 (by rw [w2, hs.2.1]; exact hp) h0 (iu.cap r w1)
       ((urg_eq w3).trans (hUm m hmn)) ((lastKey_eq w3 w4).trans (hLm m hmn)) (w5.trans (hTm m hmn)) hk
       (by rw [← ht]; exact reachS_tickets (ρ.reach (m + 1))) (by rw [← ht]; exact (hz (m + 1) (by omega)).1)
       hmp hT0k
@@ -1263,35 +1254,73 @@ theorem run_starts_fixed {cfg : Cfg} (hak : cfg.rules.arrivalKey = true) (hol : 
     have := (Sstep k (by omega)).2 b hb hf
     have e1 := hc5 k (by omega); have e2 := hc5 (k + 1) (by omega)
     omega
+  exact ⟨n5, by omega, fun m hm => ⟨tz m hm, (hz m (by omega)).1⟩⟩
+
+/-- **No starvation with endless arrivals, on the fixed rules** (`arrivalKey`, `oneLine`, as in
+`Rules.nostarve`). Runs and drains arrive and leave forever, runs of the waiting run's own project
+included. A run `r` waits at time `n`. Suppose that from then on:
+- no urgent run arrives;
+- every task that runs later ends (each `-t`);
+- one tick passes;
+- the gates are open again and again;
+
+and `drain_max` < pool. With tokens (0.42, 0.43): the hold (rule 4(a)), and at those open-gate times
+outside load within the reserve and every task's `K + drain_max ≤ N`. Then `r` starts a task. No
+assumption on `-c` or on drains. New runs of
+`r`'s project come after it (their arrival is no earlier than its last start, their ticket newer);
+its project empties as in `run_starts`; then every start is another project's, ahead of its first
+waiter in the one line: an urgent first task or a run with an older ticket, finitely many. So
+starts stop, every task ends, and at the next open gates the first in the one line, under share,
+starts. -/
+theorem run_starts_fixed {cfg : Cfg} (hak : cfg.rules.arrivalKey = true) (hol : cfg.rules.oneLine = true)
+    (hD : cfg.drainMax < cfg.pool) (ρ : RunS cfg) {n r : Nat} (hr : r < cfg.nr)
+    (hh : ((ρ.st n).run r).here = true) (hp : 0 < ((ρ.st n).run r).pend)
+    (noUrgent : ∀ m ≥ n, ∀ b, ρ.mv m = .act (.arrive b) → (cfg.run b).urgent = false)
+    (ends : ∀ m b, b < cfg.nr → 0 < ((ρ.st m).run b).running → ∃ m' ≥ m, finOfM b (ρ.mv m'))
+    (htime : ∃ m ≥ n, ρ.mv m = .act .tick)
+    (hhold : cfg.rules.tokens = false ∨ cfg.rules.hold = true)
+    (gates : ∀ m, ∃ m' ≥ m, (ρ.st m').gate = true ∧ (cfg.rules.tokens = true →
+      (ρ.st m').outside ≤ (ρ.st m').reserve ∧ ∀ x < cfg.nr, cfg.drainMax + cfg.wd x ≤ cfg.pool - (ρ.st m').reserve)) :
+    ∃ m ≥ n, ((ρ.st m).run r).pend < ((ρ.st n).run r).pend := by
+  apply Classical.byContradiction
+  intro hno
+  have hge : ∀ m ≥ n, ((ρ.st n).run r).pend ≤ ((ρ.st m).run r).pend := fun m hm =>
+    Nat.not_lt.1 (fun h => hno ⟨m, hm, h⟩)
+  have W := waits_on ρ hh hp hge
+  obtain ⟨n5, hn5, hq⟩ := starts_stop hak hol hhold ρ hr hh hp noUrgent ends htime hge
   -- at open gates the first in the one line, under share, starts
   obtain ⟨m, hm, hg, htokg⟩ := gates n5
   have hs := W m (by omega)
   have i := (reachS_inv (ρ.reach m)).1
-  have htot : total cfg (ρ.st m) = 0 := rsum_eq_zero.2 (fun b hb => tz m hm b hb)
+  have htot : total cfg (ρ.st m) = 0 := rsum_eq_zero.2 (fun b hb => (hq m hm).1 b hb)
+  have htokT : tokT cfg (ρ.st m) = 0 := rsum_eq_zero.2 (fun b hb => by rw [(hq m hm).1 b hb, Nat.zero_mul])
   have hcap : 0 < shareCap cfg (ρ.st m) := by
     cases htk : cfg.rules.tokens
     · rw [shareCap_old htk]; have := i.half; unfold capT; omega
-    · rw [shareCap_tok htk]; have := htokg htk; unfold capN; omega
+    · rw [shareCap_tok htk]; have := (htokg htk).2 r hr
+      have : 1 ≤ cfg.wd r := by unfold Cfg.wd; omega
+      unfold capN; omega
   have hel : eligible (ρ.st m) r = true := by
-    have h1 := i.cap r hs.1; have h2 := (hz m (by omega)).2
+    have h1 := i.cap r hs.1; have h2 := (hq m hm).1 r hr
     simp only [eligible, hs.1, Bool.true_and, Bool.and_eq_true, decide_eq_true_eq]
     exact ⟨by rw [hs.2.1]; exact hp, by omega⟩
   have hu : under cfg (ρ.st m) r := by
-    unfold under; rw [(hz m (by omega)).1, Nat.zero_mul]
+    unfold under; rw [(hq m hm).2, Nat.zero_mul]
     exact Nat.mul_pos hcap (Cfg.w_pos _ _)
+  replace hel := cand_of hhold hel
   obtain ⟨f, hf, hpf, hff⟩ := first_exists hr hel
   have huf : under cfg (ρ.st m) f := (under_proj hpf).2 hu
   obtain ⟨x, hx⟩ := Option.isSome_iff_exists.1 (head2_isSome hr hel)
   obtain ⟨hxn, hxe⟩ := head2_some hx
   have hxu := head2_under hx hf hff huf
   have hc := reachS_start (ρ.reach m) hxn
-  simp only [front, Bool.and_eq_true] at hxe
+  simp only [front, cand, Bool.and_eq_true] at hxe
   cases htk : cfg.rules.tokens
   · have hc4 : 0 < capT cfg (ρ.st m) := by rw [← shareCap_old htk]; exact hcap
     have h4 : total cfg (ρ.st m) < 4 * capT cfg (ρ.st m) := by omega
     simp [canStart, hxe.1, hxe.2, hg, h4, hxu, hol, hx, htk] at hc
-  · have h5 : used cfg (ρ.st m) + 1 ≤ capTok cfg (ρ.st m) := by
-      have := htokg htk; have := i.half
+  · have h5 : used cfg (ρ.st m) + cfg.wd x ≤ capTok cfg (ρ.st m) := by
+      have := (htokg htk).1; have := (htokg htk).2 x hxn; have := i.half
       unfold used capTok capN; omega
     simp [canStart, hxe.1, hxe.2, hg, h5, hx, htk] at hc
 

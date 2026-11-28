@@ -191,7 +191,9 @@ theorem Sh.capN_ (h : Sh cfg R s t) : capN cfg t = capN cfg s := by unfold capN;
 theorem Sh.capTok_ (h : Sh cfg R s t) : capTok cfg t = capTok cfg s := by
   unfold capTok; rw [h.capN_, h.outside, h.reserve]
 
-theorem Sh.used_ (h : Sh cfg R s t) : used cfg t = used cfg s := by unfold used; rw [h.total_, h.iso_]
+theorem Sh.tokT_ (h : Sh cfg R s t) : tokT cfg t = tokT cfg s := rsum_congr (fun _ hr => by rw [h.running_ hr])
+
+theorem Sh.used_ (h : Sh cfg R s t) : used cfg t = used cfg s := by unfold used; rw [h.tokT_, h.iso_]
 
 theorem Sh.shareCap_ (h : Sh cfg R s t) : shareCap cfg t = shareCap cfg s := by
   unfold shareCap; rw [h.capN_, h.capT_]
@@ -201,6 +203,9 @@ theorem Sh.under_ (h : Sh cfg R s t) (r : Nat) : under cfg t r ↔ under cfg s r
 
 theorem Sh.eligible_ (h : Sh cfg R s t) {r : Nat} (hr : r < cfg.nr) : eligible t r = eligible s r := by
   simp only [eligible, (h.run r hr).here, (h.run r hr).pend, (h.run r hr).cap, h.running_ hr]
+
+theorem Sh.cand_ (h : Sh cfg R s t) {r : Nat} (hr : r < cfg.nr) : cand cfg t r = cand cfg s r := by
+  simp only [cand, fits, h.eligible_ hr, h.used_, h.capTok_]
 
 theorem Sh.emptyWaiter_ (h : Sh cfg R s t) {r : Nat} (hr : r < cfg.nr) : emptyWaiter t r = emptyWaiter s r := by
   simp only [emptyWaiter, (h.run r hr).here, (h.run r hr).pend, h.running_ hr]
@@ -233,17 +238,17 @@ theorem Sh.projFirst_ (h : Sh cfg R s t) {r : Nat} (hr : r < cfg.nr) (er : (s.ru
     projFirst cfg t r = projFirst cfg s r := by
   unfold projFirst
   rw [anyLT_congr (fun i hi => ?_)]
-  rw [h.eligible_ hi]
-  cases e : eligible s i
+  rw [h.cand_ hi]
+  cases e : cand cfg s i
   · rfl
-  · rw [h.pbefore_ hi hr (here_of_eligible e) er]
+  · rw [h.pbefore_ hi hr (here_of_eligible (cand_elig e)) er]
 
 theorem Sh.front_ (h : Sh cfg R s t) {r : Nat} (hr : r < cfg.nr) : front cfg t r = front cfg s r := by
   unfold front
-  rw [h.eligible_ hr]
-  cases e : eligible s r
+  rw [h.cand_ hr]
+  cases e : cand cfg s r
   · rfl
-  · rw [h.projFirst_ hr (here_of_eligible e)]
+  · rw [h.projFirst_ hr (here_of_eligible (cand_elig e))]
 
 theorem Sh.head_ (h : Sh cfg R s t) : head cfg t = head cfg s := by
   unfold head pick
@@ -251,8 +256,8 @@ theorem Sh.head_ (h : Sh cfg R s t) : head cfg t = head cfg s := by
   apply pick_congr (List.range cfg.nr)
     (fun i hi => (h.front_ (List.mem_range.1 hi)).symm)
     (fun i hi j hj ei ej => by
-      have h1 : eligible s i = true := by simp only [front, Bool.and_eq_true] at ei; exact ei.1
-      have h2 : eligible s j = true := by simp only [front, Bool.and_eq_true] at ej; exact ej.1
+      have h1 : eligible s i = true := by simp only [front, Bool.and_eq_true] at ei; exact cand_elig ei.1
+      have h2 : eligible s j = true := by simp only [front, Bool.and_eq_true] at ej; exact cand_elig ej.1
       exact (h.before_ (List.mem_range.1 hi) (List.mem_range.1 hj) (here_of_eligible h1)
         (here_of_eligible h2)).symm)
     _ _ (fun x hx => hx) (fun j hj => by cases hj)
@@ -268,8 +273,8 @@ theorem Sh.head2_ (h : Sh cfg R s t) : head2 cfg t = head2 cfg s := by
   apply pick_congr (List.range cfg.nr)
     (fun i hi => (h.front_ (List.mem_range.1 hi)).symm)
     (fun i hi j hj ei ej => by
-      have h1 : eligible s i = true := by simp only [front, Bool.and_eq_true] at ei; exact ei.1
-      have h2 : eligible s j = true := by simp only [front, Bool.and_eq_true] at ej; exact ej.1
+      have h1 : eligible s i = true := by simp only [front, Bool.and_eq_true] at ei; exact cand_elig ei.1
+      have h2 : eligible s j = true := by simp only [front, Bool.and_eq_true] at ej; exact cand_elig ej.1
       exact (h.before2_ (List.mem_range.1 hi) (List.mem_range.1 hj) (here_of_eligible h1)
         (here_of_eligible h2)).symm)
     _ _ (fun x hx => hx) (fun j hj => by cases hj)
