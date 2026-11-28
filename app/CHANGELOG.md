@@ -3,6 +3,29 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.26.0 — unreleased
+
+- **Reads cpuq 0.40's status,** where no task holds a CPU: cpuq bounds how many tasks run and the
+  kernel shares the CPUs among them. Needs cpuq 0.40.0 or later; a machine still on cpuq 0.35
+  shows as before, its jobs as runs, while the machines move over.
+- **The cells** show each CPU's own busy, from the Mac's CPU counters (another machine's from the
+  counters its cpuq reports), plain grey, or in a drain's project color on the CPUs its command
+  runs on. CPUs a drain isolates have a violet rim and a lock. The legend keeps each project's
+  CPUs busy.
+- **Jobs:** each project's tasks running and waiting against its fair share by weight; each run's
+  tasks done of all, its tasks running, those in the background (and why: over its share, or a
+  drain), on I/O, and its last tasks ("last task, running 32m"). What cpuq flags shows in orange,
+  in words: a task running more than one job, tasks held back by the run's own `-c`, a drain idle,
+  past its time or noisy, a driver busy itself. **BUSY · TASKS** is the CPUs a run keeps busy and
+  its tasks; a drain shows its CPUs, a driver its own busy. A waiting run says how many tasks wait
+  and why, in cpuq's words.
+- **Rose** means runs waiting while cpuq has room for more and the gate is open: its next look
+  starts one, so a wait that lasts is the case to fix. A drain gathering its CPUs makes the line
+  wait on purpose.
+- **The chip** fills with the CPUs busy of the capacity; its tooltip reads "cpuq: 7 tasks on 10
+  CPUs · 9.1 busy · 2 waiting". A cloud machine counts as idle with no runs and none waiting.
+- History counts **Task-hours** (each run's most tasks at once, for its time) beside CPU-hours busy.
+
 ## 0.25.0 — 2026-11-27
 
 - **The last hour no longer shows drops to zero that never happened.** A column of the chart

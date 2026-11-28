@@ -2,7 +2,7 @@ import Charts
 import CpuqCore
 import SwiftUI
 
-/// The Now tab: the Mac's ten CPUs as glass cells that fill with each project's color, the jobs
+/// The Now tab: the Mac's ten CPUs as glass cells, each filled to how busy its CPU is, the jobs
 /// waiting for room beside them, the last hour on the same 0-to-10 scale, and the jobs. Empty
 /// glass is calm; empty glass while someone waits glows rose, the one case worth hunting.
 /// Pointing at the hour replays that moment in the cells.
@@ -55,46 +55,75 @@ func roughly(_ s: TimeInterval) -> String {
     return "\(m / 60)h " + String(format: "%02dm", m % 60)
 }
 
-/// How far a running job is: "4,210 of 12,629 · 3 failing · ~9m left" from its own count,
-/// or "usually 46m" from its label's history.
-/// What cpuq sees wrong with a run, in `cpuq status`'s words; a pause shows on its own.
-func flagWords(_ h: Status.Holder) -> [String] {
-    let per = (h.using ?? 0) / Double(max(h.cores, 1))
-    return h.flags.compactMap { f in
+/// What cpuq sees wrong with a run, in `cpuq status`'s words; a stop shows on its own.
+func flagWords(_ r: Status.Run) -> [String] {
+    let per = (r.using ?? 0) / Double(max(r.running - r.paused, 1))
+    return r.flags.compactMap { f in
         switch f {
-        case "low_use": h.tasks > 1 ? String(format: "its CPUs average %.2f busy each; -x could be higher", per) : String(format: "its CPU averages %.2f busy", per)
-        case "over_cpu": String(format: "%.2f busy per CPU held: its tasks run beyond their CPUs", per)
+        case "over_cpu": String(format: "%.2f CPUs busy per task: a task runs more than one job", per)
+        case "capped": "\(GraphModel.tasks(max(r.tasks - r.done - r.failed - r.running, 0))) held back by its own -c \(r.limit) while there is room"
+        case "idle_drain": String(format: "a drain keeping only %.2f CPUs busy", r.using ?? 0)
+        case "long_drain": "a drain past the config's drain_timeout"
+        case "noisy": String(format: "other work keeps %.2f CPUs busy on its CPUs", r.noise) + (r.noisyTop.isEmpty ? "" : ", most \(r.noisyTop)") + ": its timing is noisy"
+        case "driver_cpu": String(format: "the driver itself keeps %.1f CPUs busy", r.driverBusy)
+        case "low_use": String(format: "its tasks average %.2f busy each", per)
         case "stopped": nil
         default: f
         }
     }
 }
 
-/// How far a run is, then what cpuq sees wrong with it, in orange.
-func progressText(_ h: Status.Holder) -> Text {
-    let flags = flagWords(h).joined(separator: "; ")
-    switch (progressOnly(h), flags.isEmpty) {
-    case (let p?, true): return p
-    case (let p?, false): return p + Text(" · " + flags).foregroundStyle(.orange)
-    case (nil, false): return Text(flags).foregroundStyle(.orange)
-    case (nil, true): return Text("")
+/// How its tasks run, in grey: in the background (and why), on I/O, and its tail ("last task,
+/// running 32m").
+func stateWords(_ r: Status.Run, now: Double = Date().timeIntervalSince1970) -> [String] {
+    var out: [String] = []
+    if r.demoted > 0 {
+        let why = r.demotedFor.isEmpty ? "" : " (\(r.demotedFor))"
+        out.append((r.demoted >= r.running ? "background" : "\(r.demoted) in background") + why)
     }
+    if let io = r.ioWait, io > 0 { out.append("\(io) on I/O") }
+    if r.tail, r.oldest > 0 {
+        out.append((r.running == 1 ? "last task" : "last \(r.running) tasks") + ", running " + roughly(now - Double(r.oldest)))
+    }
+    return out
 }
 
-private func progressOnly(_ h: Status.Holder) -> Text? {
-    if h.progress == nil, h.tasks > 1 {
-        var t = Text("\(h.done + h.failed) of \(h.tasks) tasks").foregroundStyle(Alive.ink)
-        if h.failed > 0 { t = t + Text(" · \(h.failed) failed").foregroundStyle(.red) }
-        if h.running > 0 { t = t + Text(" · \(h.running) running").foregroundStyle(Alive.ink2) }
+/// How far a run is, then how its tasks run, then what cpuq sees wrong with it, in orange.
+func progressText(_ r: Status.Run) -> Text {
+    var parts: [Text] = []
+    if let p = progressOnly(r) { parts.append(p) }
+    let state = stateWords(r).joined(separator: " · ")
+    if !state.isEmpty { parts.append(Text(state).foregroundStyle(Alive.ink2)) }
+    let flags = flagWords(r).joined(separator: "; ")
+    if !flags.isEmpty { parts.append(Text(flags).foregroundStyle(.orange)) }
+    guard var t = parts.first else { return Text("") }
+    for p in parts.dropFirst() { t = t + Text(" · ").foregroundStyle(Alive.ink3) + p }
+    return t
+}
+
+/// How far a run is: "4,210 of 12,629 · 3 failing · ~9m left" from its count, or "usually 46m"
+/// from its label's history; a drain's CPUs, a driver's own busy.
+private func progressOnly(_ r: Status.Run) -> Text? {
+    if r.drain {
+        var t = Text("drain on CPU\(r.cpus.count == 1 ? "" : "s") \(cpuRanges(r.cpus))").foregroundStyle(Alive.windowTint)
+        if r.noise >= 0.01 { t = t + Text(String(format: " · noise %.2f", r.noise)).foregroundStyle(Alive.ink2) }
         return t
     }
-    if let p = h.progress, p.total > 0 {
+    if r.driver { return Text(String(format: "driver · its own tree %.1f busy", r.driverBusy)).foregroundStyle(Alive.ink2) }
+    if let p = r.progress, p.total > 0 {
         var t = Text("\(p.done.formatted()) of \(p.total.formatted())").foregroundStyle(Alive.ink)
         if p.failing > 0 { t = t + Text(" · \(p.failing.formatted()) failing").foregroundStyle(.red) }
-        if let left = h.left, h.leftFrom == "progress" { t = t + Text(" · ~\(roughly(left)) left").foregroundStyle(Alive.ink2) }
+        if r.tasks > 1, r.running > 0, !r.tail { t = t + Text(" · \(r.running) running").foregroundStyle(Alive.ink2) }
+        if let left = r.left, r.leftFrom == "progress" { t = t + Text(" · ~\(roughly(left)) left").foregroundStyle(Alive.ink2) }
         return t
     }
-    if let typical = h.typical { return Text("usually \(roughly(typical))").foregroundStyle(Alive.ink3) }
+    if r.tasks > 1 {
+        var t = Text("\(r.done + r.failed) of \(r.tasks) tasks").foregroundStyle(Alive.ink)
+        if r.failed > 0 { t = t + Text(" · \(r.failed) failed").foregroundStyle(.red) }
+        if r.running > 0, !r.tail { t = t + Text(" · \(r.running) running").foregroundStyle(Alive.ink2) }
+        return t
+    }
+    if let typical = r.typical { return Text("usually \(roughly(typical))").foregroundStyle(Alive.ink3) }
     return nil
 }
 
@@ -108,7 +137,6 @@ struct Moment {
         let label: String
         let project: String
         let asks: String
-        let need: Int
         let since: Date
     }
 
@@ -119,11 +147,18 @@ struct Moment {
     var waiters: [Waiter] = []
     /// Why cpuq's gate was shut, if it was.
     var gateShut: String?
-    /// A drain (`cpuq drain`) holding the Mac, or first in line and waiting for it to
-    /// empty: its label. Jobs waiting meanwhile wait on purpose.
+    /// A drain (`cpuq drain`) waiting for its turn: its label and the CPUs it asks. The line
+    /// waits behind it on purpose while it gathers them.
     var window: String?
-    /// The window holds the Mac now (else it waits for running work to end).
-    var windowHolds = false
+    var windowCPUs = 0
+    /// The drains running: each one's label, the CPUs it isolates, and the noise on them.
+    var drains: [(label: String, cpus: [Int], noise: Double)] = []
+    /// Each CPU's busy share then, 0 to 1, in the kernel's order: the cells draw these.
+    var perCPU: [Double]?
+    /// The CPUs drains run on, by the project each counts for: the one place a CPU's work is known.
+    var pinned: [Int: String] = [:]
+    /// The CPUs drains isolate.
+    var isolated: Set<Int> = []
     /// The 1-minute load: threads running or ready to run, the demand on the CPUs.
     var load: Double?
     /// The machine's CPUs.
@@ -134,13 +169,13 @@ struct Moment {
     /// The app was running then and measured the CPUs; before it was, jobs and waits are known
     /// from cpuq but how busy the CPUs were is not.
     var watched = true
-    /// The pool's CPUs no one held or was promised (cpuq's `free`): the machine's other CPUs
-    /// are outside the pool, and an empty one there is no one's to take. Nil when unknown.
-    var poolFree: Int?
-    /// Jobs waited while pool CPUs sat free with the gate open: the case to fix, since cpuq hands
-    /// a free CPU to the line at once. Never judged from a moment the app did not watch, nor
-    /// without the pool's count: unknown is not idle.
-    var needless: Bool { watched && !waiters.isEmpty && (poolFree ?? 0) >= 1 && gateShut == nil && window == nil }
+    /// Room for more of cpuq's tasks (cpuq's `room`): CPUs outside the line, or busy with other
+    /// work, are no one's to take, and room counts them out. Nil when unknown.
+    var room: Double?
+    /// Jobs waited beside room with the gate open: the case to fix, since cpuq starts the first
+    /// waiter's next task at its next look. Never judged from a moment the app did not watch, nor
+    /// without cpuq's room: unknown is not idle.
+    var needless: Bool { watched && !waiters.isEmpty && (room ?? 0) > 0 && gateShut == nil && window == nil }
 
     /// No more than the CPUs, whatever the readings say.
     mutating func fit() {
@@ -154,7 +189,7 @@ struct Moment {
     static func now(_ m: GraphModel) -> Moment {
         guard let s = m.status else { return Moment() }
         var by: [String: Double] = [:]
-        for h in s.holders { by[GraphModel.group(h.label, h.note), default: 0] += h.using ?? 0 }
+        for r in s.runs { by[GraphModel.group(r.label, r.note), default: 0] += GraphModel.busy(r) ?? 0 }
         var out = Moment()
         out.cpus = m.cpus
         out.shares = by.keys.sorted { (m.slot($0), $0) < (m.slot($1), $1) }.map { Share(project: $0, cpu: by[$0] ?? 0) }
@@ -163,16 +198,22 @@ struct Moment {
         if let busy = m.samples.last?.busy { out.outside = max(busy * m.cpus - jobs, 0) } else { out.outside = s.outside.reduce(0) { $0 + $1.using } }
         out.waiters = s.waiters.map {
             Waiter(id: "\($0.pid)-\($0.since)", ticket: $0.ticket, label: GraphModel.label($0.label, $0.command), project: GraphModel.group($0.label, $0.note),
-                   asks: GraphModel.wants($0), need: $0.exclusive ? Int(m.cpus) : max($0.cores, 1), since: Date(timeIntervalSince1970: Double($0.since)))
+                   asks: GraphModel.wants($0), since: Date(timeIntervalSince1970: Double($0.since)))
         }
         out.gateShut = s.gate.state == "open" ? nil : s.gate.text
-        out.poolFree = s.free
+        out.room = s.room
         out.load = s.load.first
-        if let h = s.holders.first(where: \.exclusive) {
-            out.window = GraphModel.label(h.label, h.command)
-            out.windowHolds = true
-        } else if let w = s.waiters.min(by: { $0.order < $1.order }), w.exclusive {
+        out.perCPU = m.samples.last?.perCPU
+        out.isolated = Set(s.isolated)
+        for r in s.runs where r.drain {
+            let project = GraphModel.group(r.label, r.note)
+            for c in r.pin { out.pinned[c] = project }
+            out.isolated.formUnion(r.cpus)
+            out.drains.append((GraphModel.label(r.label, r.command), r.cpus.isEmpty ? r.pin : r.cpus, r.noise))
+        }
+        if let w = s.waiters.filter(\.drain).min(by: { $0.order < $1.order }) {
             out.window = GraphModel.label(w.label, w.command)
+            out.windowCPUs = w.max
         }
         out.fit()
         return out
@@ -193,18 +234,21 @@ struct Moment {
         out.watched = sample != nil
         if let sample {
             out.load = sample.load
-            out.poolFree = sample.poolFree
+            out.room = sample.room
+            out.perCPU = sample.perCPU
             out.outside = sample.busy.map { max($0 * m.cpus - jobs, 0) } ?? sample.outside
             if !sample.gateOpen { out.gateShut = sample.gateText }
         }
-        if let b = m.blocks.first(where: { $0.exclusive && $0.from <= t && ($0.to ?? .distantFuture) >= t }) {
-            out.window = b.label
-            out.windowHolds = true
-        } else if let w = m.waits.first(where: { $0.exclusive && $0.from <= t && ($0.to ?? .distantFuture) >= t }) {
+        for b in m.blocks where b.drain && b.from <= t && (b.to ?? .distantFuture) >= t {
+            for c in b.pin { out.pinned[c] = b.project }
+            out.isolated.formUnion(b.isolated)
+            out.drains.append((b.label, b.isolated.isEmpty ? b.pin : b.isolated, 0))
+        }
+        if let w = m.waits.first(where: { $0.drain && $0.from <= t && ($0.to ?? .distantFuture) >= t }) {
             out.window = w.label
         }
         out.waiters = m.waits.filter { $0.from <= t && ($0.to ?? .distantFuture) >= t }.map {
-            Waiter(id: $0.id, ticket: 0, label: $0.label, project: $0.project, asks: $0.cores, need: $0.need, since: $0.from)
+            Waiter(id: $0.id, ticket: 0, label: $0.label, project: $0.project, asks: $0.asks, since: $0.from)
         }
         out.fit()
         return out
@@ -224,15 +268,15 @@ final class HourCache {
         /// The app was watching: there are machine readings.
         var watched = false
         var gateShut = false
-        /// A drain held the Mac or waited for it to empty: waiting then was on purpose.
+        /// A drain waited for its turn: the line waiting behind it then was on purpose.
         var window = false
         var perCPU: [Double]?
         /// The machine's CPUs.
         var cpus = 1.0
         var total: Double { shares.values.reduce(0, +) + outside }
-        /// The fewest pool CPUs free in the column's samples (cpuq's `free`); nil when unknown.
-        var poolFree: Int?
-        var needless: Bool { watched && waiting > 0 && (poolFree ?? 0) >= 1 && !gateShut && !window }
+        /// The least room in the column's samples (cpuq's `room`); nil when unknown.
+        var room: Double?
+        var needless: Bool { watched && waiting > 0 && (room ?? 0) > 0 && !gateShut && !window }
     }
 
     struct Hour {
@@ -303,7 +347,7 @@ final class HourCache {
             guard i >= 0 && i < total else { continue }
             if let b = s.busy { let e = busy[i] ?? (0, 0); busy[i] = (e.0 + b, e.1 + 1) }
             let g = shut[i] ?? (0, 0); shut[i] = (g.0 + (s.gateOpen ? 0 : 1), g.1 + 1)
-            if let f = s.poolFree { cols[i].poolFree = min(cols[i].poolFree ?? f, f) }
+            if let r = s.room { cols[i].room = min(cols[i].room ?? r, r) }
             if let p = s.perCPU {
                 var e = per[i] ?? (Array(repeating: 0, count: p.count), 0)
                 if e.0.count == p.count { for j in p.indices { e.0[j] += p[j] }; e.1 += 1 }
@@ -331,8 +375,7 @@ final class HourCache {
             cols[i].waiting = waiting.count
 
             let c = cols[i]
-            cols[i].window = m.blocks.contains { $0.exclusive && $0.from < c.to && ($0.to ?? end) > c.from }
-                || m.waits.contains { $0.exclusive && $0.from < c.to && ($0.to ?? end) > c.from }
+            cols[i].window = m.waits.contains { $0.drain && $0.from < c.to && ($0.to ?? end) > c.from }
         }
         let projects = Set(cols.flatMap(\.shares.keys)).sorted { (m.slot($0), $0) < (m.slot($1), $1) }
         return Hour(span: span, step: step, end: end, columns: cols, projects: projects)
@@ -481,16 +524,19 @@ struct HeroCard: View {
     @ViewBuilder private var capacityVerdict: some View {
         let free = String(format: "%.1f", moment.free)
         if let w = moment.window {
-            verdict("lock.fill", "Drain", moment.windowHolds ? "\(w) has \(model.machine.name) alone" : "\(w) waits for \(model.machine.name) to empty",
-                    tint: Alive.windowTint)
+            let n = moment.windowCPUs
+            verdict("lock.fill", "Drain", n > 0 ? "\(w) gathers \(n) CPU\(n == 1 ? "" : "s") of its own" : "\(w) gathers its CPUs", tint: Alive.windowTint)
         } else if !moment.watched {
             verdict("eye.slash", "Not watched", "The app wasn't running then: how busy the CPUs were is unknown")
         } else if moment.needless {
-            let n = moment.poolFree ?? 0
-            verdict("exclamationmark.triangle.fill", "\(moment.waiters.count) waiting while \(n) of the pool's CPUs sit free",
+            verdict("exclamationmark.triangle.fill", "\(moment.waiters.count) waiting with room for " + String(format: "%.1f", moment.room ?? 0) + " CPUs",
                     "Waiting with room to spare", tint: Alive.rose)
         } else if let shut = moment.gateShut {
             verdict("pause.circle.fill", "cpuq's gate is shut", shut.hasPrefix("closed: ") ? String(shut.dropFirst(8)) : shut, tint: .orange)
+        } else if let d = moment.drains.first {
+            let more = moment.drains.count > 1 ? " (+\(moment.drains.count - 1) more)" : ""
+            verdict("lock.fill", "Drain", "\(d.label) times on CPU\(d.cpus.count == 1 ? "" : "s") \(cpuRanges(d.cpus))\(more)" + (d.noise >= 0.1 ? String(format: " · noise %.2f", d.noise) : ""),
+                    tint: Alive.windowTint)
         } else if moment.total >= cpus * 0.8 {
             verdict("checkmark.circle", "Working at full capacity", "\(free) CPUs free")
         } else if moment.total < 1.5 && moment.waiters.isEmpty && moment.shares.allSatisfy({ $0.cpu < 0.05 }) {
@@ -505,15 +551,15 @@ struct HeroCard: View {
         let ref = moment.at ?? Date()
         if let longest = moment.waiters.map({ ref.timeIntervalSince($0.since) }).max() {
             if moment.window != nil {
-                verdict("clock", "\(moment.waiters.count) waiting \(duration(longest))", "They start when the drain ends")
+                verdict("clock", "\(moment.waiters.count) waiting \(duration(longest))", "The line waits while the drain gathers its CPUs")
             } else if !moment.watched {
-                verdict("clock", "\(moment.waiters.count) waiting \(duration(longest))", "Whether CPUs were free is unknown")
+                verdict("clock", "\(moment.waiters.count) waiting \(duration(longest))", "Whether there was room is unknown")
             } else if moment.needless {
                 verdict("clock.fill", "Longest wait \(duration(longest))", "This is the case to fix", tint: Alive.rose)
             } else if moment.gateShut != nil {
                 verdict("clock", "\(moment.waiters.count) waiting \(duration(longest))", "They start when the gate opens")
             } else {
-                verdict("clock", "\(moment.waiters.count) waiting \(duration(longest)) · fair", "CPUs are full: each starts when room opens")
+                verdict("clock", "\(moment.waiters.count) waiting \(duration(longest)) · fair", "The machine is busy: each starts when room opens")
             }
         } else {
             verdict("checkmark.circle", "Nobody waiting", moment.total < 1.5 ? "Queue empty" : "Every job that asked is running")
@@ -606,7 +652,7 @@ struct WaitingTray: View {
                     .foregroundStyle(bad ? Alive.rose : Alive.ink2).fontWeight(bad ? .semibold : .regular)
             }
             .font(.caption)
-            Text(moment.window != nil ? "asks \(w.asks) · drain" : bad ? "asks \(w.asks) · pool CPUs free" : "asks \(w.asks) · pool full")
+            Text(moment.window != nil ? "\(w.asks) · behind the drain" : bad ? "\(w.asks) · room to spare" : "\(w.asks) · machine busy")
                 .font(.system(size: 10.5)).foregroundStyle(Alive.ink2).lineLimit(1).padding(.leading, 14)
         }
         .padding(.horizontal, 8).padding(.vertical, 5)
@@ -683,7 +729,8 @@ final class Liveliness: ObservableObject {
     }
 }
 
-/// The cells' animated state: each layer's fill eases toward its reading, and the rose glow
+/// The cells' animated state: each CPU's fill (and each layer's, before the CPUs are read) eases
+/// toward its reading, and the rose glow
 /// fades in and out, so a new poll pours rather than jumps.
 final class CellMotion {
     var fill: [String: Double] = [:]
@@ -706,6 +753,8 @@ final class CellMotion {
         let k = instantly || first ? 1 : 1 - exp(-dt / 0.3)
         var target: [String: Double] = ["~outside": m.outside]
         for s in m.shares { target[s.project] = s.cpu }
+        // Each CPU's own busy, under "#" and its number.
+        for (c, v) in (m.perCPU ?? []).enumerated() { target["#\(c)"] = v }
         for key in Set(target.keys).union(fill.keys) {
             let v = fill[key] ?? 0
             fill[key] = v + ((target[key] ?? 0) - v) * k
@@ -715,9 +764,11 @@ final class CellMotion {
     }
 }
 
-/// Ten glass cells, one per CPU, filled left to right with each project's CPU in palette order,
-/// then other work, with a gentle wave on the surface. Drawn with Canvas and paused when motion
-/// is reduced.
+/// Ten glass cells, one per CPU, each filled to how busy that CPU is: in the color of the project
+/// whose drain runs there, else plain busy. A CPU a drain isolates has a rim of the drain's color
+/// and a lock. Before the first reading of each CPU, the cells fill left to right with each
+/// project's CPU in palette order, then other work. A gentle wave on the surface. Drawn with
+/// Canvas and paused when motion is reduced.
 struct CellsCanvas: View {
     let model: GraphModel
     private var cpus: Double { model.cpus }
@@ -746,6 +797,40 @@ struct CellsCanvas: View {
     /// in the same order and colors, with no waves or bubbles at that size.
     static let gridAbove = 16
 
+    /// Each CPU's reading, when there is one for every CPU drawn.
+    private func perCPU(_ n: Int) -> [Double]? {
+        moment.perCPU.flatMap { $0.count == n ? $0 : nil }
+    }
+
+    /// The color a CPU's busy is drawn in: its drain's project's, else plain busy.
+    private func color(ofCPU c: Int) -> Color {
+        moment.pinned[c].map { model.color($0) } ?? Alive.busy
+    }
+
+    /// The layers in each cell, as ranges from 0 (empty) to 1 (full): the CPU's own busy when
+    /// each CPU has a reading (`fill` gives it, eased or not), else the machine's work poured in
+    /// left to right, projects in palette order, then other work.
+    private func cellLayers(_ n: Int, fill: (Int) -> Double) -> [[(Color, Double, Double)]] {
+        if perCPU(n) != nil {
+            return (0..<n).map { c in [(color(ofCPU: c), 0, min(max(fill(c), 0), 1))] }
+        }
+        var layers: [(Color, Double, Double)] = []
+        var acc = 0.0
+        let keys = moment.shares.map(\.project)
+        for k in keys + motion.fill.keys.filter({ $0 != "~outside" && !$0.hasPrefix("#") && !keys.contains($0) }) {
+            let v = motion.fill[k] ?? 0
+            layers.append((model.color(k), acc, acc + v)); acc += v
+        }
+        let ov = motion.fill["~outside"] ?? 0
+        layers.append((Alive.out, acc, acc + ov))
+        return (0..<n).map { c in
+            layers.compactMap { color, a, b in
+                let lo = min(max(a - Double(c), 0), 1), hi = min(max(b - Double(c), 0), 1)
+                return hi - lo > 0.004 ? (color, lo, hi) : nil
+            }
+        }
+    }
+
     private func draw(_ gc: inout GraphicsContext, size: CGSize, t: Double) {
         let n = Int(cpus)
         if n > Self.gridAbove { return drawGrid(&gc, size: size, n: n) }
@@ -756,31 +841,20 @@ struct CellsCanvas: View {
         let h = max(bottom - top, 20)
         let dark = scheme == .dark
         let pulse = 0.5 + 0.5 * sin(t * 2.4)
-        // Layers as ranges on the 0-to-n scale: projects in palette order, then other work.
-        var layers: [(Color, Double, Double)] = []
-        var acc = 0.0
-        let keys = moment.shares.map(\.project)
-        for k in keys + motion.fill.keys.filter({ $0 != "~outside" && !keys.contains($0) }) {
-            let v = motion.fill[k] ?? 0
-            layers.append((model.color(k), acc, acc + v)); acc += v
-        }
-        let ov = motion.fill["~outside"] ?? 0
-        layers.append((Alive.out, acc, acc + ov)); acc += ov
-        let total = acc
+        let cells = cellLayers(n) { motion.fill["#\($0)"] ?? 0 }
+        let levels = cells.map { $0.map(\.2).max() ?? 0 }
 
-        // A soft bloom of each project's color under the glass, wider the more it uses.
-        for (color, a, b) in layers {
-            let v = b - a
-            guard v >= 0.05 else { continue }
-            let mid = a + v / 2
-            let cx = x0 + mid * (w + gap) - gap / 2, r = 24 + v * 22
+        // A soft bloom of each cell's color under the glass, wider the busier it is.
+        for c in 0..<n {
+            guard let (color, _, v) = cells[c].last, v >= 0.05 else { continue }
+            let cx = x0 + Double(c) * (w + gap) + w / 2, r = 24 + v * 22
             var g = gc
             g.translateBy(x: cx, y: bottom + 2)
             // Flattened into an ellipse no taller than the room under the cells, so it fades
             // out before the canvas's edge rather than being cut off at it.
             g.scaleBy(x: 1, y: min(0.38, (size.height - bottom - 3) / r))
             g.fill(Path(ellipseIn: CGRect(x: -r, y: -r, width: 2 * r, height: 2 * r)),
-                   with: .radialGradient(Gradient(colors: [color.opacity(dark ? 0.34 : 0.22), color.opacity(0)]), center: .zero, startRadius: 0, endRadius: r))
+                   with: .radialGradient(Gradient(colors: [color.opacity(dark ? 0.26 : 0.16), color.opacity(0)]), center: .zero, startRadius: 0, endRadius: r))
         }
         // Bubbles: a few rise through each busy cell, more the busier it is; only while the
         // effects move (t is 0 when they keep still), as a bubble jumping once a second looks wrong.
@@ -789,13 +863,14 @@ struct CellsCanvas: View {
         if t == 0 { motion.bubbles = [] }
         if t > 0 {
             for c in 0..<n {
-                let level = min(max(total - Double(c), 0), 1)
+                let level = levels[c]
                 if level > 0.15 && Double.random(in: 0..<1) < 1.05 * level * dt {
                     motion.bubbles.append((c, Double.random(in: 4...max(w - 4, 5)), bottom - 2, Double.random(in: 10...26), Double.random(in: 0.7...1.8)))
                 }
             }
             motion.bubbles = motion.bubbles.compactMap { b in
-                let surface = bottom - min(max(total - Double(b.cell), 0), 1) * h + 3
+                guard b.cell < n else { return nil }
+                let surface = bottom - levels[b.cell] * h + 3
                 let y = b.y - b.speed * dt
                 return y < surface ? nil : (b.cell, b.x, y, b.speed, b.r)
             }
@@ -805,21 +880,21 @@ struct CellsCanvas: View {
             let x = x0 + Double(c) * (w + gap)
             let cell = CGRect(x: x, y: top, width: w, height: h)
             let shape = Path(roundedRect: cell, cornerRadius: min(10, w / 3))
-            let level = min(max(total - Double(c), 0), 1)
-            gc.fill(shape, with: .color(Alive.glass))
+            let level = levels[c]
+            let isolated = moment.isolated.contains(c)
+            gc.fill(shape, with: .color(isolated ? Alive.windowTint.opacity(0.08) : Alive.glass))
             var inner = gc
             inner.clip(to: shape)
-            // Empty glass while someone waits needlessly glows rose.
-            if motion.rose > 0.01 && level < 1 {
+            // Empty glass while someone waits needlessly glows rose; a drain's own CPUs are no
+            // one else's to take.
+            if motion.rose > 0.01 && level < 1 && !isolated {
                 let yTop = bottom - level * h
                 inner.fill(Path(CGRect(x: x, y: top, width: w, height: yTop - top + 2)),
                            with: .linearGradient(Gradient(colors: [Alive.rose.opacity((0.30 + 0.14 * pulse) * motion.rose),
                                                                    Alive.rose.opacity((0.10 + 0.06 * pulse) * motion.rose)]),
                                                  startPoint: CGPoint(x: x, y: top), endPoint: CGPoint(x: x, y: yTop)))
             }
-            for (color, a, b) in layers {
-                let lo = min(max(a - Double(c), 0), 1), hi = min(max(b - Double(c), 0), 1)
-                guard hi - lo > 0.004 else { continue }
+            for (color, lo, hi) in cells[c] {
                 let yTop = bottom - hi * h, yBot = bottom - lo * h
                 var p = Path()
                 if hi >= level - 0.0001 && level < 0.999 {
@@ -848,10 +923,13 @@ struct CellsCanvas: View {
             inner.fill(Path(cell), with: .linearGradient(Gradient(stops: [.init(color: .white.opacity(dark ? 0.10 : 0.28), location: 0),
                                                                         .init(color: .white.opacity(0), location: 0.3)]),
                                                         startPoint: CGPoint(x: x, y: 0), endPoint: CGPoint(x: x + w, y: 0)))
-            let rimRose = motion.rose > 0.5 && level < 1
+            let rimRose = motion.rose > 0.5 && level < 1 && !isolated
             gc.stroke(Path(roundedRect: cell.insetBy(dx: 0.5, dy: 0.5), cornerRadius: min(9.5, w / 3)),
-                      with: .color(rimRose ? Alive.rose.opacity(0.55 + 0.3 * pulse) : Alive.glassEdge), lineWidth: 1)
-            if motion.rose > 0.4 && level < 0.35 && w >= 24 {
+                      with: .color(isolated ? Alive.windowTint.opacity(0.8) : rimRose ? Alive.rose.opacity(0.55 + 0.3 * pulse) : Alive.glassEdge),
+                      lineWidth: isolated ? 1.5 : 1)
+            if isolated {
+                gc.draw(Text(Image(systemName: "lock.fill")).font(.system(size: 9)).foregroundColor(Alive.windowTint), at: CGPoint(x: x + w / 2, y: top + 12))
+            } else if motion.rose > 0.4 && level < 0.35 && w >= 24 {
                 gc.draw(Text("idle").font(.system(size: 10, weight: .semibold)).foregroundColor(Alive.rose.opacity(motion.rose)),
                         at: CGPoint(x: x + w / 2, y: top + 18))
             }
@@ -874,27 +952,40 @@ extension CellsCanvas {
         let h = (height - gap * Double(rows - 1)) / Double(rows)
         // The reading itself, not the eased fill the glass cells use: tiles do not animate, and
         // easing let them lag the numbers (most of all while pointing at the hour).
-        var layers: [(Color, Double, Double)] = []
-        var acc = 0.0
-        for share in moment.shares {
-            layers.append((model.color(share.project), acc, acc + share.cpu)); acc += share.cpu
+        let per = perCPU(n)
+        let cells: [[(Color, Double, Double)]]
+        if let per {
+            cells = (0..<n).map { c in [(color(ofCPU: c), 0, min(max(per[c], 0), 1))] }
+        } else {
+            var layers: [(Color, Double, Double)] = []
+            var acc = 0.0
+            for share in moment.shares {
+                layers.append((model.color(share.project), acc, acc + share.cpu)); acc += share.cpu
+            }
+            layers.append((Alive.out, acc, acc + moment.outside))
+            cells = (0..<n).map { c in
+                layers.compactMap { color, a, b in
+                    let lo = min(max(a - Double(c), 0), 1), hi = min(max(b - Double(c), 0), 1)
+                    return hi - lo > 0.004 ? (color, lo, hi) : nil
+                }
+            }
         }
-        layers.append((Alive.out, acc, acc + moment.outside))
         for c in 0..<n {
             let x = x0 + Double(c % perRow) * (w + gap), y = top + Double(c / perRow) * (h + gap)
             let cell = CGRect(x: x, y: y, width: w, height: h)
             let shape = Path(roundedRect: cell, cornerRadius: min(4, w / 4))
-            gc.fill(shape, with: .color(Alive.glass))
+            let isolated = moment.isolated.contains(c)
+            gc.fill(shape, with: .color(isolated ? Alive.windowTint.opacity(0.08) : Alive.glass))
             var inner = gc
             inner.clip(to: shape)
-            for (color, a, b) in layers {
-                let lo = min(max(a - Double(c), 0), 1), hi = min(max(b - Double(c), 0), 1)
-                guard hi - lo > 0.004 else { continue }
+            for (color, lo, hi) in cells[c] {
                 inner.fill(Path(CGRect(x: x, y: y + h - hi * h, width: w, height: (hi - lo) * h)), with: .color(color))
             }
-            gc.stroke(Path(roundedRect: cell.insetBy(dx: 0.5, dy: 0.5), cornerRadius: min(4, w / 4)), with: .color(Alive.glassEdge), lineWidth: 1)
+            gc.stroke(Path(roundedRect: cell.insetBy(dx: 0.5, dy: 0.5), cornerRadius: min(4, w / 4)),
+                      with: .color(isolated ? Alive.windowTint.opacity(0.8) : Alive.glassEdge), lineWidth: isolated ? 1.5 : 1)
         }
-        gc.draw(Text("\(n) CPUs").font(.system(size: 10)).foregroundColor(Alive.ink3),
+        let drained = moment.isolated.count
+        gc.draw(Text("\(n) CPUs" + (drained > 0 ? " · \(drained) isolated by a drain" : "")).font(.system(size: 10)).foregroundColor(Alive.ink3),
                 at: CGPoint(x: x0 + width / 2, y: bottom + 9))
     }
 }
@@ -989,7 +1080,7 @@ struct HourCard: View {
             let end = hour.columns.last?.to ?? Date()
             let a = Int((end.timeIntervalSince(hour.columns[last.lowerBound].from) / 60).rounded())
             let b = Int((end.timeIntervalSince(hour.columns[last.upperBound].to) / 60).rounded())
-            t = t + Text(" · waited with CPUs idle ").foregroundColor(.secondary)
+            t = t + Text(" · waited with room to spare ").foregroundColor(.secondary)
                 + Text(minutes < 1 ? "<1 min" : "\(Int(minutes.rounded())) min").foregroundColor(Alive.rose).bold()
                 + Text(b < 1 ? ", ending \(a) min ago" : a == b ? ", \(a) min ago" : ", \(a)–\(b) min ago").foregroundColor(.secondary)
                 + Text(" · otherwise waits were seconds").foregroundColor(.secondary)
@@ -1206,7 +1297,7 @@ struct HourCard: View {
         .chartYAxis(.hidden)
         .chartBackground { yLabels($0, [(4.5, "wait")]) }
         .padding(.leading, labelColumn)
-        .help("Jobs waiting: grey while the CPUs were full, a fair wait; rose while CPUs sat idle.")
+        .help("Jobs waiting: grey while the CPUs were full, a fair wait; rose while there was room to spare.")
     }
 
     private func scrubber(_ proxy: ChartProxy) -> some View {
@@ -1240,14 +1331,14 @@ enum JobOrder: String, CaseIterable, Identifiable {
     case started = "Started", name = "Name", cpu = "CPU", left = "Left"
     var id: String { rawValue }
 
-    func sorted(_ hs: [Status.Holder]) -> [Status.Holder] {
+    func sorted(_ hs: [Status.Run]) -> [Status.Run] {
         hs.sorted { a, b in
             switch self {
             case .started: return (a.since, a.pid) < (b.since, b.pid)
             case .name:
                 let x = (a.label + " " + a.note).lowercased(), y = (b.label + " " + b.note).lowercased()
                 return x == y ? (a.since, a.pid) < (b.since, b.pid) : x < y
-            case .cpu: return (a.using ?? 0, b.since) > (b.using ?? 0, a.since)
+            case .cpu: return (GraphModel.busy(a) ?? 0, b.since) > (GraphModel.busy(b) ?? 0, a.since)
             case .left:
                 // A job with no estimate goes last.
                 switch (a.left, b.left) {
@@ -1273,17 +1364,17 @@ struct JobsCard: View {
 
     var body: some View {
         let s = model.status
-        let holders = order.sorted(s?.holders ?? [])
+        let runs = order.sorted(s?.runs ?? [])
         let waiters = s?.waiters ?? []
         // Work outside cpuq, by what started it: shown once it keeps a CPU busy, so a build an
         // agent ran without cpuq, or `ssh HOST 'make'`, is named beside the jobs it slows.
         let outside = (s?.outsideWork ?? []).filter { $0.using >= 0.5 && $0.ranBySomeone }
-        let free = Moment.now(model).free
-        let scale = max(4, holders.map { $0.using ?? 0 }.max() ?? 0).rounded(.up)
+        let scale = max(4, runs.map { GraphModel.busy($0) ?? 0 }.max() ?? 0).rounded(.up)
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline) {
                 Text("JOBS").eyebrow()
-                (Text("· \(holders.count) running · \(waiters.count) waiting").foregroundStyle(Alive.ink)
+                // "· 3 runs · 12 tasks on 8 CPUs · 7 waiting": tasks, as cpuq counts them.
+                (Text("· \(runs.count) run\(runs.count == 1 ? "" : "s") · \(GraphModel.tasks(s?.running ?? 0)) on \(s?.capacity ?? 0) CPUs · \(s?.waiting ?? 0) waiting").foregroundStyle(Alive.ink)
                     + Text(outside.isEmpty ? "" : " · \(outside.count) outside cpuq").foregroundStyle(.orange))
                     .font(.system(size: 13, weight: .medium))
                 Picker("Order", selection: $order) {
@@ -1300,29 +1391,30 @@ struct JobsCard: View {
                 }
                 .font(.system(size: 11)).foregroundStyle(Alive.ink3).lineLimit(1)
             }
-            // Each project's CPUs against its fair share by weight, once two share the pool.
-            if let ps = s?.projects, ps.count > 1 {
+            // Each project's tasks running and waiting against its fair share by weight, once two
+            // share the machine or one waits.
+            if let ps = s?.projects, ps.count > 1 || ps.contains(where: { $0.waiting > 0 }) {
                 HStack(spacing: 14) {
                     ForEach(ps, id: \.name) { p in
                         HStack(spacing: 5) {
                             Circle().fill(model.color(p.name)).frame(width: 7, height: 7)
                             Text(p.name).fontWeight(.medium).foregroundStyle(Alive.ink)
-                            Text("\(p.held) of fair \(String(format: "%.1f", p.fair))" + (p.weight == 1 ? "" : " · weight \(p.weight)"))
-                                .foregroundStyle(Alive.ink2)
+                            Text("\(p.running) running" + (p.waiting > 0 ? " · \(p.waiting) waiting" : "") + " · fair \(String(format: "%.1f", p.fair))" + (p.weight == 1 ? "" : " · weight \(p.weight)"))
+                                .foregroundStyle(Double(p.running) > p.fair && p.fair > 0 ? Alive.ink : Alive.ink2)
                         }
-                        .help("\(p.name): \(p.ops) run\(p.ops == 1 ? "" : "s") holding \(p.held) CPU\(p.held == 1 ? "" : "s"), wanting \(p.want); its fair share by weight is \(String(format: "%.1f", p.fair))")
+                        .help("\(p.name): \(p.runs) run\(p.runs == 1 ? "" : "s") with \(GraphModel.tasks(p.running)) running and \(p.waiting) waiting; its fair share by weight is \(String(format: "%.1f", p.fair)) tasks. Under it, its next task starts at once; over it, its tasks wait for room.")
                     }
                 }
                 .font(.system(size: 11.5)).monospacedDigit().lineLimit(1)
             }
-            if !holders.isEmpty { columnHeads }
+            if !runs.isEmpty { columnHeads }
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 0) {
                     // First: work outside cpuq is what to act on, and a long list mustn't hide it.
                     ForEach(outside, id: \.pid) { o in outsideRow(o) }
-                    ForEach(holders, id: \.pid) { h in running(h, scale: scale) }
-                    ForEach(waiters, id: \.pid) { w in waiting(w, free: free) }
-                    if holders.isEmpty && waiters.isEmpty && outside.isEmpty {
+                    ForEach(runs, id: \.pid) { r in running(r, scale: scale) }
+                    ForEach(waiters, id: \.pid) { w in waiting(w) }
+                    if runs.isEmpty && waiters.isEmpty && outside.isEmpty {
                         Text("Nothing running or waiting.").foregroundStyle(Alive.ink2).frame(maxWidth: .infinity, alignment: .leading).frame(height: 21)
                     }
                 }
@@ -1339,7 +1431,7 @@ struct JobsCard: View {
             // three rows in sight looked like a job had gone missing.
             // Centred, so it covers no column's figures.
             .overlay(alignment: .bottom) {
-                let below = holders.count + waiters.count + outside.count - Int(((listHeight + scrolled) / rowHeight).rounded(.down))
+                let below = runs.count + waiters.count + outside.count - Int(((listHeight + scrolled) / rowHeight).rounded(.down))
                 if below > 0 {
                     Text("+\(below) more ↓").font(.system(size: 11, weight: .medium)).foregroundStyle(Alive.ink2)
                         .padding(.horizontal, 7).padding(.vertical, 2)
@@ -1360,16 +1452,17 @@ struct JobsCard: View {
             Text("PROGRESS").frame(maxWidth: 362, alignment: .leading)
             Text("").frame(minWidth: 0, maxWidth: .infinity)
             Text("WEIGHT").frame(width: 56, alignment: .trailing)
-            Text("CPUS").frame(width: 100, alignment: .trailing)
+            Text("BUSY · TASKS").frame(width: 100, alignment: .trailing)
             Text("RUNNING").frame(width: 64, alignment: .trailing)
         }
         .font(.system(size: 9.5, weight: .semibold)).tracking(0.6).foregroundStyle(Alive.ink3)
         .lineLimit(1).frame(height: 14)
     }
 
-    private func running(_ h: Status.Holder, scale: Double) -> some View {
+    private func running(_ h: Status.Run, scale: Double) -> some View {
         let project = GraphModel.group(h.label, h.note)
-        let use = h.using ?? 0
+        let busy = GraphModel.busy(h)
+        let use = busy ?? 0
         // How far it is, when it says (DONE of TOTAL); else an estimate, its time so far against
         // its label's usual time (a lighter bar); else the bar is its CPU.
         let done: Double? = h.progress.flatMap { $0.total > 0 ? min(Double($0.done) / Double($0.total), 1) : nil }
@@ -1392,7 +1485,7 @@ struct JobsCard: View {
                     }
                 }
                 .frame(maxWidth: 300).frame(height: 8)
-                if h.paused {
+                if h.stopped {
                     Text("paused").foregroundStyle(.orange).frame(width: 52, alignment: .leading)
                 } else if let done {
                     Text("\(Int((done * 100).rounded(.down)))%").fontWeight(.medium).foregroundStyle(Alive.ink).frame(width: 52, alignment: .leading)
@@ -1400,7 +1493,7 @@ struct JobsCard: View {
                     // Minutes left by its usual time; "over" once past it.
                     Text(ran < usual ? "~\(roughly(usual - ran))" : "over").fontWeight(.medium)
                         .foregroundStyle(ran < usual ? Alive.ink : .orange).frame(width: 52, alignment: .leading)
-                } else if h.using == nil {
+                } else if busy == nil {
                     Text("starting").foregroundStyle(Alive.ink2).frame(width: 52, alignment: .leading)
                 } else {
                     Text(String(format: "%.1f", use)).fontWeight(.medium).foregroundStyle(Alive.ink).frame(width: 52, alignment: .leading)
@@ -1419,12 +1512,12 @@ struct JobsCard: View {
         .contextMenu {
             let name = GraphModel.label(h.label, h.command)
             if let control {
-                // Pause is Ctrl-Z: its tasks stop and its CPUs go back to the line.
-                Button(h.paused ? "Resume \(name)" : "Pause \(name)") { control(h.paused ? "resume" : "pause", h.pid, name) }
+                // Pause is Ctrl-Z: its tasks stop, and it counts in no share until it resumes.
+                Button(h.stopped ? "Resume \(name)" : "Pause \(name)") { control(h.stopped ? "resume" : "pause", h.pid, name) }
                 if h.ticket > 0 { Button("Stop \(name)…") { control("stop", h.ticket, name) } }
             }
         }
-        .help(flagWords(h).joined(separator: "\n"))
+        .help((stateWords(h) + flagWords(h)).joined(separator: "\n"))
     }
 
     /// Work outside cpuq: what started it and its command, where it runs, and the CPUs it keeps
@@ -1452,38 +1545,44 @@ struct JobsCard: View {
         .help("Not under cpuq: started by \(o.via.isEmpty ? "an unknown parent" : o.via) (pid \(o.pid)), in \(o.cwd.isEmpty ? "?" : o.cwd)\n\(o.command)\n\nIt takes CPUs cpuq can't see or share; run it with cpuq run.")
     }
 
-    /// Its project's weight (the config's `weights`): its share of the pool against the other
+    /// Its project's weight (the config's `weights`): its share of the machine against the other
     /// projects'.
-    private func weight(_ h: Status.Holder) -> some View {
+    private func weight(_ h: Status.Run) -> some View {
         Text("\(h.weight)").font(.system(size: 11.5)).foregroundStyle(h.weight == 1 ? Alive.ink3 : Alive.ink2)
             .frame(width: 56, alignment: .trailing)
-            .help("\(h.project.isEmpty ? "Its project" : h.project)'s weight: its share of the pool against the other projects' (the config's weights)")
+            .help("\(h.project.isEmpty ? "Its project" : h.project)'s weight: its share of the machine against the other projects' (the config's weights)")
     }
 
-    /// The CPU its tasks use, of the CPUs it holds: one per running task.
-    private func reserved(_ h: Status.Holder) -> some View {
-        let text = h.paused ? "paused" : h.exclusive ? "every CPU" : h.using.map { String(format: "%.1f of %d", $0, h.cores) } ?? "\(h.cores) held"
-        return Text(text).font(.system(size: 11.5))
-            .foregroundStyle(h.exclusive ? Alive.windowTint : Alive.ink3).frame(width: 100, alignment: .trailing)
+    /// The CPUs it keeps busy and its tasks running; a drain's CPUs of its own; a driver's own
+    /// busy.
+    private func reserved(_ h: Status.Run) -> some View {
+        let tasks = GraphModel.tasks(h.running)
+        let text = h.stopped ? "paused"
+            : h.drain ? "drain · \(h.cpus.isEmpty ? h.limit : h.cpus.count) CPU\((h.cpus.isEmpty ? h.limit : h.cpus.count) == 1 ? "" : "s")"
+            : h.driver ? String(format: "driver · %.1f", h.driverBusy)
+            : h.using.map { String(format: "%.1f · ", $0) + tasks } ?? tasks
+        return Text(text).font(.system(size: 11.5)).lineLimit(1)
+            .foregroundStyle(h.drain ? Alive.windowTint : h.flags.contains("driver_cpu") ? .orange : Alive.ink3).frame(width: 100, alignment: .trailing)
     }
 
-    private func waiting(_ w: Status.Waiter, free: Double) -> some View {
+    private func waiting(_ w: Status.Waiter) -> some View {
         let project = GraphModel.group(w.label, w.note)
         let name = GraphModel.label(w.label, w.command)
-        let gate = model.status?.gate.state ?? "open"
+        let s = model.status
+        let gate = s?.gate.state ?? "open"
         let window = Moment.now(model).window
-        let poolFree = Double(model.status?.free ?? 0)
-        let needless = poolFree >= 1 && gate == "open" && window == nil
-        let guess = w.exclusive ? "a drain: waits for \(model.machine.name) to empty" : window != nil ? "waits for the drain" : gate != "open" ? "the gate is shut" : needless ? "pool CPUs free" : "every pool CPU is held"
-        // cpuq's own reason when it gives one; idle CPUs beside a waiter stay the app's alarm.
-        let why = needless || w.why.isEmpty ? guess : w.why
+        let needless = s?.waitsBesideRoom ?? false
+        let guess = w.drain ? "a drain: waits for \(w.max) CPU\(w.max == 1 ? "" : "s") of its own" : window != nil ? "waits behind the drain" : gate != "open" ? "the gate is shut" : needless ? "room to spare" : "the machine is busy"
+        // cpuq's own reason when it gives one; room beside a waiter is the app's alarm, in rose.
+        let why = w.why.isEmpty ? guess : w.why
         return HStack(spacing: 10) {
             Circle().strokeBorder(model.color(project), lineWidth: 2).frame(width: 8, height: 8)
             (Text(name).fontWeight(.medium).foregroundStyle(Alive.ink)
                 + Text(w.note.isEmpty ? "" : "  \(w.note)").foregroundStyle(Alive.ink2))
                 .lineLimit(1).truncationMode(.middle).frame(width: 230, alignment: .leading)
-            Text("waiting · asks \(GraphModel.wants(w)) · \(why)").foregroundStyle(needless ? Alive.rose : Alive.ink2)
+            Text("waiting · \(GraphModel.wants(w))" + (w.running > 0 ? " (\(w.running) running)" : "") + " · \(why)").foregroundStyle(needless ? Alive.rose : Alive.ink2)
                 .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                .help(why)
             Text(duration(Date().timeIntervalSince1970 - Double(w.since))).foregroundStyle(needless ? Alive.rose : Alive.ink2)
                 .frame(width: 64, alignment: .trailing)
         }
@@ -1532,6 +1631,8 @@ enum Alive {
     static let out = tone(\.out)
     /// A drain: calm, deliberate, not an alarm.
     static let windowTint = color(0x5856d6, 0x7d7aff)
+    /// A CPU busy with work the app can't tell apart: every CPU but a drain's.
+    static let busy = tone(\.ink2, alpha: 0.75)
 }
 
 extension View {

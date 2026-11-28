@@ -38,7 +38,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var idleWait = Episode()
     private var cloudIdle: [String: Episode] = [:]
     private var outsideHeavy: [String: Episode] = [:]
-    /// Per machine watched from here: jobs waiting beside idle CPUs, and a machine overloaded
+    /// Per machine watched from here: jobs waiting with room to spare, and a machine overloaded
     /// while another has room.
     private var idleWaitThere: [String: Episode] = [:]
     private var overloaded: [String: Episode] = [:]
@@ -420,34 +420,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         m.addItem(withTitle: "Quit Cpuq", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }
 
-    /// What is wrong, a line each: the gate shut, jobs waiting beside idle CPUs, a cloud machine
+    /// What is wrong, a line each: the gate shut, jobs waiting with room to spare, a cloud machine
     /// running (and costing money). Empty while all is well.
     private func alerts() -> [String] {
         var out: [String] = []
         if let s = status {
             if s.gate.state != "open" { out.append("⚠︎ cpuq's gate is \(s.gate.text)") }
             let now = Moment.now(graphs)
-            if now.needless { out.append("⚠︎ \(now.waiters.count) waiting beside idle CPUs") }
+            if now.needless { out.append("⚠︎ \(now.waiters.count) waiting with room to spare") }
         }
         for m in remotes where m.isCloudRunning {
-            let held = m.status.map { " · \($0.held) of \(Int(m.cpus)) CPUs in use" } ?? ""
+            let tasks = m.status.map { " · \(GraphModel.tasks($0.running)) on \(Int(m.cpus)) CPUs" } ?? ""
             let month = m.monthHours.map { " · " + GraphModel.hours($0) + " this month" } ?? ""
-            out.append("☁︎ \(m.machine.name) running · up \(m.upFor)\(month)\(held)")
+            out.append("☁︎ \(m.machine.name) running · up \(m.upFor)\(month)\(tasks)")
         }
         return out
     }
 
-    /// The chip: calm while all is well; orange while something is wrong (the gate shut, or jobs
-    /// waiting beside idle CPUs); struck through when cpuq cannot be read; and "☁ 23m" beside it
-    /// while a cloud machine runs.
+    /// The chip: its cells fill with the CPUs busy of the capacity; calm while all is well; orange
+    /// while something is wrong (the gate shut, or jobs waiting with room to spare); struck through
+    /// when cpuq cannot be read; and "☁ 23m" beside it while a cloud machine runs.
     private func updateChip() {
         let s = status
         let wrong = s.map { $0.gate.state != "open" || Moment.now(graphs).needless } ?? false
-        item.button?.image = chip(level: meterLevel(held: s?.held ?? 0, budget: s?.capacity ?? 0), tint: wrong ? .systemOrange : nil, broken: s == nil)
+        // The Mac's busy as the app measures it, else cpuq's.
+        let busy = graphs.samples.last?.busy.map { $0 * graphs.cpus } ?? s?.busyNow ?? 0
+        item.button?.image = chip(level: meterLevel(busy: busy, capacity: s?.capacity ?? 0), tint: wrong ? .systemOrange : nil, broken: s == nil)
         let clouds = remotes.filter(\.isCloudRunning)
         // "☁ 23m / 14h": up since it booted, and its hours this month.
         item.button?.title = clouds.isEmpty ? "" : " ☁ " + clouds.map { $0.upFor + ($0.monthHours.map { " / " + GraphModel.hours($0) } ?? "") }.joined(separator: "  ")
-        var tip = s.map { "cpuq: \($0.held) of \($0.capacity) CPUs in use" + ($0.waiters.isEmpty ? "" : " · \($0.waiters.count) waiting") } ?? "cpuq: \(problem ?? "cannot read cpuq")"
+        // "cpuq: 7 tasks on 10 CPUs · 9.1 busy · 2 waiting"
+        var tip = s.map { "cpuq: \(GraphModel.tasks($0.running)) on \($0.capacity) CPUs · " + String(format: "%.1f busy", busy) + ($0.waiters.isEmpty ? "" : " · \($0.waiters.count) waiting") }
+            ?? "cpuq: \(problem ?? "cannot read cpuq")"
         for line in alerts() { tip += "\n" + line }
         item.button?.toolTip = tip
         checkAlerts()
@@ -471,7 +475,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     /// What is worth an interruption, each once it has lasted: cpuq's gate shut (30 s), jobs
-    /// waiting beside idle CPUs (a minute), heavy work outside cpuq (3 minutes), a job that looks stuck or a machine
+    /// waiting with room to spare (a minute), heavy work outside cpuq (3 minutes), a job that looks stuck or a machine
     /// overloaded while another has room (10 minutes), and a cloud machine up with nothing to do
     /// (15 minutes: its own 10-minute idle stop failed, and it is billing). Those that need the
     /// owner are texted too.
@@ -484,8 +488,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
             let m = Moment.now(graphs)
             track(&idleWait, m.needless, after: 60, now) {
-                notify("idle", "\(m.waiters.count) waiting beside idle CPUs",
-                       String(format: "%.1f CPUs free on %@, and nothing starts: a job may be stuck, or asking for more than there is.", m.free, graphs.machine.name))
+                notify("idle", "\(m.waiters.count) waiting with room to spare",
+                       String(format: "Room for %.1f more CPUs of work on %@, and nothing starts: cpuq's line may be stuck.", m.room ?? 0, graphs.machine.name))
             }
         }
         // Heavy work outside cpuq, on this Mac or another machine: most of its CPUs (at least 40%,
@@ -505,10 +509,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             outsideHeavy[id] = e
         }
         // A job that looks stuck: almost no CPU (under 0.2) for 10 minutes, and its count (when it
-        // reports one) unmoved as long. A slow tail that still counts, or a paused job, isn't.
+        // reports one) unmoved as long. A slow tail that still counts, a paused job, a drain or a
+        // driver (whose work runs as runs of its own) isn't.
         var seen: Set<String> = []
         for (id, name, s) in machines {
-            for h in s.holders where !h.exclusive {
+            for h in s.runs where !h.drain && !h.driver {
                 let key = "\(id)-\(h.pid)-\(h.since)"
                 seen.insert(key)
                 var t = hung[key] ?? Hang(done: h.progress?.done, moved: now)
@@ -516,7 +521,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                     t.done = h.progress?.done
                     t.moved = now
                 }
-                let idle = !h.paused && (h.using ?? 1) < 0.2
+                let idle = !h.stopped && (h.using ?? 1) < 0.2
                 let stalled = now.timeIntervalSince(t.moved) >= 600
                 if idle && stalled {
                     if t.still == nil { t.still = now }
@@ -525,7 +530,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                         let what = h.label + (h.note.isEmpty ? "" : " " + h.note)
                         let count = h.progress.map { " Its count has stood at \($0.done) of \($0.total) for 10 minutes." } ?? ""
                         notify("hung-\(key)", "\(name): \(what) looks stuck",
-                               String(format: "Almost no CPU (%.1f of the %d it holds) for 10 minutes.%@ Running %@; its owner can stop it with cpuq kill %d.", h.using ?? 0, h.cores, count, duration(now.timeIntervalSince1970 - Double(h.since)), h.ticket), text: true)
+                               String(format: "Almost no CPU (%.1f busy on its %@) for 10 minutes.%@ Running %@; its owner can stop it with cpuq kill %d.", h.using ?? 0, GraphModel.tasks(h.running), count, duration(now.timeIntervalSince1970 - Double(h.since)), h.ticket), text: true)
                     }
                 } else {
                     t.still = nil
@@ -535,13 +540,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
         }
         hung = hung.filter { seen.contains($0.key) }
-        // The same idle-CPU check on each machine watched from here (the Mac's is above).
+        // The same room check on each machine watched from here (the Mac's is above).
         for c in remotes where c.status != nil {
             let m = Moment.now(c)
             var e = idleWaitThere[c.machine.id] ?? Episode()
             track(&e, m.needless, after: 60, now) {
-                notify("idle-\(c.machine.id)", "\(c.machine.name): \(m.waiters.count) waiting beside idle CPUs",
-                       String(format: "%.1f of %.0f CPUs free, and nothing starts: a run may be stuck holding CPUs it doesn't use.", m.free, m.cpus))
+                notify("idle-\(c.machine.id)", "\(c.machine.name): \(m.waiters.count) waiting with room to spare",
+                       String(format: "Room for %.1f more CPUs of work on %.0f CPUs, and nothing starts: cpuq's line may be stuck.", m.room ?? 0, m.cpus))
             }
             idleWaitThere[c.machine.id] = e
         }
@@ -561,7 +566,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             overloaded[id] = e
         }
         for c in remotes where c.machine.start != nil {
-            let idle = c.isCloudRunning && (c.status.map { $0.holders.isEmpty && $0.waiters.isEmpty } ?? false)
+            let idle = c.isCloudRunning && (c.status.map { $0.runs.isEmpty && $0.waiters.isEmpty } ?? false)
             var e = cloudIdle[c.machine.id] ?? Episode()
             track(&e, idle, after: 15 * 60, now) {
                 notify("cloud-\(c.machine.id)", "\(c.machine.name) is running with nothing to do",
