@@ -68,8 +68,11 @@ const Task = struct {
     start_ms: i64 = 0,
     /// When it last started or continued (monotonic ms): fresh for `pool.fresh_ms`.
     fresh_ms: i64 = 0,
-    /// When cpuq stopped it (monotonic ms); 0 while it runs.
+    /// When cpuq stopped it (monotonic ms): a drain's command waiting for its turn again after a
+    /// Ctrl-Z; 0 while it runs.
     paused_ms: i64 = 0,
+    /// macOS: run in the background (demoted) for sharing, or beside a drain.
+    demoted: bool = false,
     /// When TERM was sent for its time limit (0: not yet).
     term_ms: i64 = 0,
     /// When it started, in Unix seconds (for status).
@@ -267,6 +270,7 @@ const Run = struct {
             .since = t.since_s,
             .fresh = t.fresh_ms,
             .paused = t.paused_ms != 0,
+            .demoted = t.demoted,
         }) catch break;
         r.rec.tasks_now = r.now_buf.items;
     }
@@ -614,11 +618,16 @@ fn signalTree(r: *Run, t: Task, sig: c.SIG) void {
     };
 }
 
-fn pauseTask(r: *Run, t: *Task, now: i64) void {
-    if (t.paused_ms != 0) return;
-    signalTree(r, t.*, .STOP);
-    t.paused_ms = now;
-    r.freed = true;
+/// macOS: demotes a task (runs it, and all it started, in the background), or restores it. A
+/// task of many by its process group's members, a single task by its tree. Run again each look
+/// for a demoted task, so processes it starts meanwhile follow.
+fn demoteTask(t: *Task, on: bool, procs: []const sys.Proc, a: std.mem.Allocator) void {
+    t.demoted = on;
+    const in_tree = a.alloc(bool, procs.len) catch return;
+    @memset(in_tree, false);
+    sys.markTree(procs, t.pid, in_tree);
+    sys.setBackground(t.pid, on);
+    for (procs, in_tree) |p, yes| if (yes and p.pid != t.pid) sys.setBackground(p.pid, on);
 }
 
 fn resumeTask(r: *Run, t: *Task, now: i64) void {
@@ -832,13 +841,25 @@ fn look(r: *Run) void {
                 repin = true;
             }
         }
-        // macOS: share time by stopping and continuing tasks, as the plan says.
-        if (!is_linux) {
-            for (pool_mod.pausePlan(a, ops, sample, cx)) |step| {
+        // macOS: share time by demoting tasks (never stopping one: it could hold a lock others
+        // wait on), as the plan says; beside a drain, which can't isolate cores there, every task
+        // is demoted.
+        if (!is_linux and r.running.items.len != 0) {
+            const procs = sys.processes(r.ctx.io, a);
+            const beside_drain = pool_mod.isolated(a, ops, now).len != 0;
+            const want = a.alloc(bool, r.running.items.len) catch a.alloc(bool, 0) catch unreachable;
+            for (r.running.items, 0..) |t, i| {
+                if (i < want.len) want[i] = beside_drain or t.demoted;
+            }
+            if (!beside_drain) for (pool_mod.demotePlan(a, ops, sample, cx)) |step| {
                 if (step.ticket != r.rec.ticket) continue;
-                for (r.running.items) |*t| if (t.pid == step.pid) {
-                    if (step.pause) pauseTask(r, t, now) else resumeTask(r, t, now);
+                for (r.running.items, 0..) |t, i| if (t.pid == step.pid and i < want.len) {
+                    want[i] = step.demote;
                 };
+            };
+            for (r.running.items, 0..) |*t, i| {
+                if (i >= want.len) break;
+                if (want[i] or t.demoted) demoteTask(t, want[i], procs, a);
             }
         }
         r.refresh();
@@ -854,7 +875,7 @@ fn look(r: *Run) void {
                 r.setWhy(whyText(r, w, cx, ops, a));
                 // Busy, behind or after its project's first: the first waiter looks each second
                 // (`head`), the rest are woken.
-                blocked = w == .paused or w == .backstop;
+                blocked = w == .backstop;
                 break;
             }
             startTask(r, a);
@@ -998,22 +1019,36 @@ fn isolateOthers(r: *Run, a: std.mem.Allocator, ops: []const Op) void {
     for (ops) |o| if (o.ticket != r.rec.ticket) r.pool.wakeOp(o.ticket);
 }
 
+/// Whether process `p` may be what crowds a drain: on Linux last seen on its CPUs; on macOS any.
+fn onDrainCpus(r: *const Run, p: sys.Proc) bool {
+    if (!is_linux) return true;
+    const cpu = p.last_cpu orelse return false;
+    return std.mem.findScalar(u32, r.rec.cpus, cpu) != null;
+}
+
 /// Busy CPUs from outside a drain on its CPUs at which history and status call it noisy.
 pub const noisy_min: f64 = 0.1;
 
-/// Linux, while a drain isolates: once a second, the busy share of each of its CPUs (kernel
-/// ticks) less its own command's CPU time is the work from outside it there (kernel threads,
-/// interrupts, processes cpuq doesn't run). Noted in its record for status; while its command
-/// runs, summed for history; above `noisy_min`, the busiest process last seen on those CPUs is
-/// named.
+/// While a drain isolates: once a second, the work from outside it on its CPUs. Linux: the busy
+/// share of each of its CPUs (kernel ticks) less its own command's CPU time (kernel threads,
+/// interrupts, processes cpuq doesn't run). macOS, where no CPU is its own: the machine's busy
+/// CPUs less its command's, beyond the CPUs it leaves to everything else. Noted in its record for
+/// status; while its command runs, summed for history; above `noisy_min`, the busiest such
+/// process (on Linux, last seen on its CPUs) is named.
 fn noiseDrain(r: *Run) void {
-    if (!is_linux or r.rec.dstart == 0 or r.stopped) return;
+    if (r.rec.dstart == 0 or r.stopped) return;
     const now = sys.monoMs();
     if (r.noise_at_ms >= r.rec.dstart and now - r.noise_at_ms < 1000) return;
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const ticks = sys.numberedTicks(r.ctx.io, a) orelse return;
+    // macOS: the machine's ticks, as one entry for CPU 0 standing for all.
+    const ticks: []const sys.NumberedTicks = if (is_linux) sys.numberedTicks(r.ctx.io, a) orelse return else blk: {
+        const t = sys.cpuTicks(r.ctx.io) orelse return;
+        const one = a.alloc(sys.NumberedTicks, 1) catch return;
+        one[0] = .{ .cpu = 0, .busy = t.busy, .total = t.total };
+        break :blk one;
+    };
     const procs = sys.processes(r.ctx.io, a);
     const me = sys.getpid();
     var own_self: u64 = 0;
@@ -1027,22 +1062,23 @@ fn noiseDrain(r: *Run) void {
     const fresh = r.noise_at_ms < r.rec.dstart;
     var busy_on: f64 = 0;
     if (!fresh) for (ticks) |t| {
-        if (std.mem.findScalar(u32, r.rec.cpus, t.cpu) == null) continue;
+        if (is_linux and std.mem.findScalar(u32, r.rec.cpus, t.cpu) == null) continue;
         for (r.noise_ticks.items) |q| if (q.cpu == t.cpu and t.total > q.total) {
             busy_on += @as(f64, @floatFromInt(t.busy -| q.busy)) / @as(f64, @floatFromInt(t.total - q.total));
         };
     };
+    // macOS: the machine's share busy, in CPUs, and what it leaves to others.
+    const others: f64 = if (is_linux) 0 else @floatFromInt(r.ncpu -| @as(u32, @intCast(r.rec.pin.len)));
+    if (!is_linux) busy_on *= @floatFromInt(r.ncpu);
     const dt: f64 = @floatFromInt(@max(now - r.noise_at_ms, 1));
     const own_busy = if (fresh) 0 else @as(f64, @floatFromInt(own -| r.noise_own_ns)) / 1e6 / dt;
-    const outside = if (fresh) 0 else @max(0, busy_on - own_busy);
+    const outside = if (fresh) 0 else @max(0, busy_on - own_busy - others);
     // The busiest process outside it last seen on its CPUs, by its CPU time since the last look.
     var top: []const u8 = "";
     if (!fresh and outside >= noisy_min) {
         var best: u64 = 0;
         for (procs, in_tree) |p, mine| {
-            if (mine) continue;
-            const cpu = p.last_cpu orelse continue;
-            if (std.mem.findScalar(u32, r.rec.cpus, cpu) == null) continue;
+            if (mine or !onDrainCpus(r, p)) continue;
             const was = r.noise_procs.get(p.pid) orelse continue;
             const used = p.own_ns -| was;
             if (used > best) {
@@ -1052,9 +1088,8 @@ fn noiseDrain(r: *Run) void {
         }
     }
     r.noise_procs.clearRetainingCapacity();
-    for (procs, in_tree) |p, mine| if (!mine) {
-        const cpu = p.last_cpu orelse continue;
-        if (std.mem.findScalar(u32, r.rec.cpus, cpu) != null) r.noise_procs.put(r.a, p.pid, p.own_ns) catch {};
+    for (procs, in_tree) |p, mine| if (!mine and onDrainCpus(r, p)) {
+        r.noise_procs.put(r.a, p.pid, p.own_ns) catch {};
     };
     r.noise_ticks.clearRetainingCapacity();
     r.noise_ticks.appendSlice(r.a, ticks) catch {};
@@ -1106,7 +1141,6 @@ fn whyText(r: *Run, w: pool_mod.Wait, cx: pool_mod.Cx, ops: []const Op, a: std.m
     const t = pool_mod.capacity(ops, cx.pool_n, cx.now_ms);
     return switch (w) {
         .go, .idle => "",
-        .paused => if (r.pausedCount() != 0) "its tasks are stopped to share the CPUs" else "stopped tasks continue first",
         .backstop => a.print("{d} tasks run, {d} times the capacity", .{ pool_mod.backstop * t, pool_mod.backstop }) catch "too many tasks run",
         .busy => a.print("over its share ({d:.1} of {d}); the machine is busy ({d:.1} of {d} CPUs)", .{ pool_mod.fairShare(a, ops, r.rec.project, t), t, cx.busy + @as(f64, @floatFromInt(pool_mod.starting(ops, cx.now_ms))), t }) catch "the machine is busy",
         .behind => "over its share; another run goes first",
@@ -1450,7 +1484,6 @@ pub fn cmdDrain(ctx: *Ctx, args: []const [:0]const u8) u8 {
         } else if (std.mem.eql(u8, arg, "--quiet-max")) {
             const q = std.fmt.parseFloat(f64, v) catch -1;
             if (!(q >= 0)) return main.usageError("--quiet-max needs the busy CPUs from outside it allows, such as 0.1, not '{s}'", .{v});
-            if (!is_linux) return main.usageError("--quiet-max needs Linux, where a drain's CPUs are its own to measure", .{});
             o.quiet_max = q;
         } else return main.usageError("unknown option '{s}'", .{arg});
         i += 1;

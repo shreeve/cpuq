@@ -316,9 +316,12 @@ t_share() {
   "$CPUQ" run -n 4 --label b:work -- sh -c 'python3 -c "import time; print(time.time())" >>"$1"; "$2" -2 0.5' sh "$T/b" "$BURN" 2>/dev/null & local b=$!
   wait_file "$T/b"
   local first; first=$(python3 -c "print('%.2f' % ($(head -1 "$T/b") - $t0))")
-  local most_b=0 both=0 looks=0 line
+  local most_b=0 both=0 looks=0 line demoted=0 stopped=0 d
   while kill -0 $b 2>/dev/null && kill -0 $a 2>/dev/null && [ $looks -lt 200 ]; do
     line=$(sj '" ".join("%s=%d" % (p["name"], p["running"]) for p in sorted(s["projects"], key=lambda p: p["name"]))')
+    # macOS shares time by demoting a's newest task (never stopping it); Linux by weights.
+    d=$(sj 'sum(h["demoted"] for h in s["runs"] if h["label"] == "a:work")'); [ "${d:-0}" -gt 0 ] && demoted=$((demoted + 1))
+    for k in $(descendants $a); do ps -o stat= -p "$k" 2>/dev/null; done | grep -q '^T' && stopped=$((stopped + 1))
     looks=$((looks + 1))
     case " $line " in *" b=1 "*) case " $line " in *" a=0 "*) ;; *) both=$((both + 1)) ;; esac ;; esac
     case " $line " in *" b=2 "*|*" b=3 "*|*" b=4 "*) most_b=2 ;; esac
@@ -326,6 +329,11 @@ t_share() {
   wait $a; local ra=$?; wait $b; local rb=$?
   check "b's first task starts ${first}s after b came, on a pool a keeps busy" "fl '$first < 1.5'"
   check "while a runs, b runs one task, never two ($most_b; both running in $both of $looks looks); both finish (rc $ra $rb)" "[ $most_b = 0 ] && [ $both -ge 2 ] && [ $ra = 0 ] && [ $rb = 0 ]"
+  if [ "$(uname)" = Linux ]; then
+    check "Linux demotes nothing: the kernel shares by weight ($demoted looks with a task demoted)" "[ $demoted = 0 ]"
+  else
+    check "macOS demotes a's newest task while b runs ($demoted looks), and never stops one ($stopped looks)" "[ $demoted -ge 1 ] && [ $stopped = 0 ]"
+  fi
 }
 
 t_fair() {
@@ -1134,6 +1142,13 @@ t_progress() {
   local text; text=$("$CPUQ" status --no-usage | grep 'p:count')
   wait $p
   check "status shows a run's progress and time left (got $got; '$(echo $text)')" "[ \"$got\" = \"(True, 8, 1, True, 'progress')\" ] && [[ '$text' == *'/8'* ]]"
+  # With only its running tasks left, status shows the tail: how long the oldest has run.
+  "$CPUQ" run -n 2 --label p:tail -- sleep 3 2>/dev/null & p=$!
+  wait_running 2; sleep 1.1
+  local tail; tail=$("$CPUQ" status --no-usage | grep 'p:tail')
+  local tj; tj=$(sj '[(h["tail"], h["oldest"] > 0) for h in s["runs"] if h["label"] == "p:tail"][0]')
+  wait $p
+  check "status shows a run's tail: 'last 2 tasks, oldest running ...' ($(echo $tail); $tj)" "[[ '$tail' == *'last 2 tasks, oldest running '* ]] && [ \"$tj\" = '(True, True)' ]"
 }
 
 t_usage() {

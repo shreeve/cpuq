@@ -1140,6 +1140,14 @@ test "statStart" {
     try std.testing.expectEqual(@as(?u64, null), statStart("17 (a) Z 1 17 17 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 4242 1000 10"));
 }
 
+/// macOS: runs process `pid` in the background (PRIO_DARWIN_BG: efficiency cores, throttled
+/// disk), or back in the foreground; a process's own user may do both, where a nice value once
+/// raised can't be lowered again. Elsewhere it does nothing.
+pub fn setBackground(pid: c.pid_t, on: bool) void {
+    if (!is_darwin) return;
+    _ = setpriority(4, @intCast(pid), if (on) 0x1000 else 0); // PRIO_DARWIN_PROCESS, PRIO_DARWIN_BG
+}
+
 /// Linux: this process's CPU affinity, as CPU numbers; empty elsewhere or when unreadable.
 pub fn ownAffinity(a: std.mem.Allocator) []const u32 {
     if (is_darwin) return &.{};

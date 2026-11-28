@@ -165,6 +165,9 @@ const Measured = struct {
     using: []?f64,
     /// Whether each operation's cpuq is stopped.
     stopped: []bool,
+    /// Linux: each operation's tasks waiting on a disk or other device (a process of its tree in
+    /// state D); null when not measured.
+    io: []?u32,
     /// CPUs the whole machine kept busy, and all the operations' tasks together.
     busy: ?f64 = null,
     tasks: ?f64 = null,
@@ -211,7 +214,9 @@ fn measureOps(io: Io, a: std.mem.Allocator, ops: []const Op, ncpu: u32, measure:
     @memset(using, null);
     const stopped = a.alloc(bool, ops.len) catch main.fail("out of memory", .{});
     @memset(stopped, false);
-    var m: Measured = .{ .using = using, .stopped = stopped };
+    const io_wait = a.alloc(?u32, ops.len) catch main.fail("out of memory", .{});
+    @memset(io_wait, null);
+    var m: Measured = .{ .using = using, .stopped = stopped, .io = io_wait };
     if (!measure) return m;
     const t0 = Io.Clock.awake.now(io);
     const ticks0 = sys.cpuTicks(io);
@@ -235,6 +240,20 @@ fn measureOps(io: Io, a: std.mem.Allocator, ops: []const Op, ncpu: u32, measure:
         };
     }
     m.tasks = tasks;
+    // Linux: a task waits on I/O while a process of its tree is in state D.
+    if (builtin.os.tag == .linux) for (ops, io_wait) |o, *w| {
+        var n: u32 = 0;
+        for (o.tasks_now) |t| {
+            const in_tree = a.alloc(bool, after.len) catch break;
+            @memset(in_tree, false);
+            sys.markTree(after, t.pid, in_tree);
+            for (after, in_tree) |p, yes| if (yes and p.blocked) {
+                n += 1;
+                break;
+            };
+        }
+        w.* = n;
+    };
     // Everything else, but this process: outside load. A process's own CPU only: its reaped
     // children were counted while they ran (see sys.Proc.own_ns).
     const in_op = a.alloc(bool, after.len) catch return m;
@@ -400,7 +419,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
     var waiting: u32 = 0;
     // The runs: every run with a task running, or a drain isolating.
     var runs: std.ArrayList(JsonRun) = .empty;
-    for (ops, m.using, m.stopped) |o, using, stopped| {
+    for (ops, m.using, m.stopped, m.io) |o, using, stopped, io_n| {
         if (o.counts() or o.drain) {
             running += o.running;
             paused += o.paused();
@@ -434,6 +453,10 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
             .paused = o.paused(),
             .waiting = if (o.drain) 0 else o.waiting,
             .running_tasks = tasksJson(a, o.tasks_now),
+            .demoted = demotedOf(o),
+            .io_wait = io_n,
+            .tail = !o.drain and !o.driver and o.running != 0 and o.done + o.failed + o.running >= o.tasks,
+            .oldest = oldestOf(o),
             .stopped = stopped or o.stopped,
             .driver = o.driver,
             .driver_busy = o.dbusy,
@@ -561,11 +584,34 @@ fn cpuText(a: std.mem.Allocator, cpus: []const u32) []const u8 {
     return policy.cpuListText(a, cpus);
 }
 
-/// How far a run is: "12/20 · 1 failed", or "running" for a single task.
-fn tasksText(a: std.mem.Allocator, h: JsonRun) []const u8 {
-    if (h.tasks <= 1) return if (h.running != 0) "running" else "starting";
+/// How far a run is: "12/20 · 1 failed"; with only its running tasks left, the tail: "last
+/// task, running 32m", "last 3 tasks, oldest running 32m"; a single task, "running 32m".
+fn tasksText(a: std.mem.Allocator, h: JsonRun, now: i64) []const u8 {
+    var b: [16]u8 = undefined;
+    const ran = if (h.oldest != 0) age(&b, now - h.oldest) else "";
+    if (h.tasks <= 1) return if (h.running != 0) (a.print("running {s}", .{ran}) catch "running") else "starting";
     const failed = if (h.failed != 0) a.print(" · {d} failed", .{h.failed}) catch "" else "";
+    if (h.tail) {
+        if (h.running == 1) return a.print("last task, running {s}{s}", .{ ran, failed }) catch "last task";
+        return a.print("last {d} tasks, oldest running {s}{s}", .{ h.running, ran, failed }) catch "last tasks";
+    }
     return a.print("{d}/{d}{s}", .{ h.done + h.failed, h.tasks, failed }) catch "?";
+}
+
+/// How many of a run's tasks are demoted (macOS: run in the background).
+fn demotedOf(o: Op) u32 {
+    var n: u32 = 0;
+    for (o.tasks_now) |t| n += @intFromBool(t.demoted);
+    return n;
+}
+
+/// When a run's oldest running task started (Unix seconds); 0 when none runs.
+fn oldestOf(o: Op) i64 {
+    var oldest: i64 = 0;
+    for (o.tasks_now) |t| if (t.since != 0 and (oldest == 0 or t.since < oldest)) {
+        oldest = t.since;
+    };
+    return oldest;
 }
 
 /// Its tasks running, with those cpuq has stopped, its -c, or a drain's CPUs: "3 · 1 stopped",
@@ -576,9 +622,10 @@ fn runText(a: std.mem.Allocator, h: JsonRun) []const u8 {
         const iso = if (h.cpus.len > h.pin.len) a.print(" (isolates {s})", .{cpuText(a, h.cpus)}) catch "" else "";
         return a.print("drain {s}{s}", .{ cpuText(a, h.pin), iso }) catch "drain";
     }
-    const p = if (h.paused != 0) a.print(" · {d} stopped", .{h.paused}) catch "" else "";
+    const d = if (h.demoted != 0) a.print(" · {d} in background", .{h.demoted}) catch "" else "";
+    const io = if (h.io_wait) |n| (if (n != 0) a.print(" · {d} on I/O", .{n}) catch "" else "") else "";
     const c = if (h.running >= h.limit and h.tasks > 1) a.print(" of -c {d}", .{h.limit}) catch "" else "";
-    return a.print("{d}{s}{s}", .{ h.running, c, p }) catch "?";
+    return a.print("{d}{s}{s}{s}", .{ h.running, c, d, io }) catch "?";
 }
 
 /// How long it has run, with the time left at its rate so far: "2m10s · ~1m left".
@@ -743,8 +790,8 @@ fn boxed(ctx: *Ctx, st: JsonStatus, remote: ?[]const u8) void {
                 .{ .text = a.print("{d}", .{h.ticket}) catch "?", .tint = .dim },
                 .{ .text = dash(h.project) },
                 .{ .text = dash(h.label), .tint = .accent },
-                .{ .text = tasksText(a, h), .tint = if (h.failed != 0) .warn else null },
-                .{ .text = runText(a, h), .tint = if (h.paused != 0) .warn else null },
+                .{ .text = tasksText(a, h, now), .tint = if (h.failed != 0) .warn else null },
+                .{ .text = runText(a, h), .tint = if (h.demoted != 0) .warn else null },
                 using,
                 .{ .text = sinceText(a, h, now) },
                 .{ .text = a.print("{d}", .{h.pid}) catch "?", .tint = if (h.stopped) .bad else .dim },
@@ -905,7 +952,7 @@ fn plain(ctx: *Ctx, st: JsonStatus) void {
         var ub: [16]u8 = undefined;
         const using = if (h.using) |u| std.mem.print(&ub, "{d:.2}", .{u}) catch "?" else "-";
         w.print("  {d:<6} {s:<8} {s:<12} {s:<20} {s:<12} {s:<16} {s:<5} {s:<8} {s}\n", .{
-            h.ticket, pidText(a, h.pid), dash(h.project), dash(h.label), tasksText(a, h), runText(a, h), using, age(&b, now - h.since), h.command,
+            h.ticket, pidText(a, h.pid), dash(h.project), dash(h.label), tasksText(a, h, now), runText(a, h), using, age(&b, now - h.since), h.command,
         }) catch {};
     }
     for (flagNotes(a, st.runs)) |n| w.print("  flag: {s}\n", .{n}) catch {};

@@ -19,7 +19,7 @@
 //! A file whose lock can be taken has no live holder: whoever finds it so ends what it left
 //! running and removes it, under the pool's lock.
 //!
-//! The rules, as pure functions over the records (`mayStart`, `drainMayStart`, `pausePlan`):
+//! The rules, as pure functions over the records (`mayStart`, `drainMayStart`, `demotePlan`):
 //!   - Capacity T: the pool's CPUs less those drains isolate.
 //!   - A project's fair share: T × its weight ÷ the weights of the projects running or waiting.
 //!   - Within a project, its first waiter goes first: an urgent run's first task, then the run
@@ -367,8 +367,9 @@ extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 /// A task running now: its number, its try, its pid and that process's start time (so a reused
 /// pid is never taken for it), when it started (Unix seconds), when it last started or continued
-/// (monotonic ms: fresh for `fresh_ms`), and whether cpuq has it stopped (macOS sharing, or a
-/// drain of the whole machine).
+/// (monotonic ms: fresh for `fresh_ms`), whether cpuq has it stopped (a drain's command waiting
+/// for its turn again after a Ctrl-Z), and whether it is demoted (macOS: run in the background,
+/// for sharing or beside a drain).
 pub const TaskNow = struct {
     task: u32 = 0,
     attempt: u32 = 1,
@@ -377,6 +378,7 @@ pub const TaskNow = struct {
     since: i64 = 0,
     fresh: i64 = 0,
     paused: bool = false,
+    demoted: bool = false,
 };
 
 /// One task's measure in the sample: its process tree's CPU time so far (ns) and its busy CPUs
@@ -528,7 +530,7 @@ pub const Op = struct {
         try w.writeAll("\npin=");
         for (r.pin, 0..) |cpu, i| try w.print("{s}{d}", .{ if (i == 0) "" else ",", cpu });
         try w.print("\nnpool={d}\nnoise={d:.3}\nnoisy_top={s}\nlast={d}\ndstart={d}\nsince={d}\ntlimit={d}\nwhy={s}\nnow=", .{ r.npool, r.noise, r.noisy_top, r.last, r.dstart, r.since, r.tlimit, r.why });
-        for (r.tasks_now, 0..) |t, i| try w.print("{s}{d}:{d}:{d}:{d}:{d}:{d}:{d}", .{ if (i == 0) "" else ",", t.task, t.attempt, t.pid, t.start, t.since, t.fresh, @intFromBool(t.paused) });
+        for (r.tasks_now, 0..) |t, i| try w.print("{s}{d}:{d}:{d}:{d}:{d}:{d}:{d}:{d}", .{ if (i == 0) "" else ",", t.task, t.attempt, t.pid, t.start, t.since, t.fresh, @intFromBool(t.paused), @intFromBool(t.demoted) });
         try w.writeAll("\ncmd=");
         // The command is for people reading status: its first 1,000 bytes are plenty.
         for (r.cmd[0..@min(r.cmd.len, 1000)]) |ch| try w.writeByte(if (ch == '\n' or ch == '\t') ' ' else ch);
@@ -604,6 +606,7 @@ fn parseTasks(a: std.mem.Allocator, v: []const u8) []const TaskNow {
             .since = std.fmt.parseInt(i64, f.next() orelse continue, 10) catch continue,
             .fresh = std.fmt.parseInt(i64, f.next() orelse continue, 10) catch continue,
             .paused = eq(f.next() orelse "0", "1"),
+            .demoted = eq(f.next() orelse "0", "1"),
         }) catch break;
     }
     return out.items;
@@ -734,8 +737,6 @@ pub const Cx = struct {
 pub const Wait = enum {
     /// It starts a task now.
     go,
-    /// Tasks cpuq has stopped (its own, or others') continue before a task starts in spare room.
-    paused,
     /// Running tasks are at `backstop` × T.
     backstop,
     /// Over its share, and the machine has no room.
@@ -806,12 +807,6 @@ pub fn starting(ops: []const Op, now_ms: i64) u32 {
     return n;
 }
 
-/// Whether any run's task is stopped by cpuq for sharing (not for a drain of the whole machine).
-fn anyPaused(ops: []const Op) bool {
-    for (ops) |o| if (o.counts() and o.paused() > 0) return true;
-    return false;
-}
-
 /// Whether `x` goes ahead of `y` for spare room: an urgent run's first task, then the project
 /// running the fewest tasks for its weight, then the run running the fewest, then the run whose
 /// last task started longest ago (one that has started none first), then the older ticket.
@@ -836,7 +831,7 @@ pub fn projectFirst(a: std.mem.Allocator, ops: []const Op, project: []const u8) 
     const m = projects(a, ops);
     var best: ?Op = null;
     for (ops) |o| {
-        if (!o.counts() or o.waiting == 0 or o.paused() > 0) continue;
+        if (!o.counts() or o.waiting == 0) continue;
         if (!std.mem.eql(u8, o.project, project)) continue;
         if (best == null or ahead(m, o, best.?)) best = o;
     }
@@ -849,7 +844,7 @@ pub fn firstWaiter(a: std.mem.Allocator, ops: []const Op, t: u32) ?u64 {
     const m = projects(a, ops);
     var best: ?Op = null;
     for (ops) |o| {
-        if (!o.counts() or o.waiting == 0 or o.paused() > 0) continue;
+        if (!o.counts() or o.waiting == 0) continue;
         if (under(m, o.project, t)) continue;
         if (best == null or ahead(m, o, best.?)) best = o;
     }
@@ -863,7 +858,6 @@ pub fn mayStart(a: std.mem.Allocator, ops: []const Op, me: u64, cx: Cx) Wait {
         if (o.ticket == me) break o;
     } else return .idle;
     if (!o.counts() or o.waiting == 0) return .idle;
-    if (o.paused() > 0) return .paused;
     const t = capacity(ops, cx.pool_n, cx.now_ms);
     var total: u32 = 0;
     for (ops) |x| if (x.counts()) {
@@ -873,7 +867,6 @@ pub fn mayStart(a: std.mem.Allocator, ops: []const Op, me: u64, cx: Cx) Wait {
     if (projectFirst(a, ops, o.project) != me) return .project;
     const m = projects(a, ops);
     if (under(m, o.project, t)) return .go;
-    if (anyPaused(ops)) return .paused;
     const room = @as(f64, @floatFromInt(t)) - headroom;
     if (cx.busy + @as(f64, @floatFromInt(starting(ops, cx.now_ms))) >= room) return .busy;
     if (firstWaiter(a, ops, t) != me) return .behind;
@@ -915,8 +908,8 @@ pub fn busyNow(a: std.mem.Allocator, ops: []const Op, s: ?Sample, outside_check:
 
 // --- macOS: sharing time by stopping and continuing tasks -----------------------------------
 
-/// One step of the plan: stop or continue one task.
-pub const Step = struct { ticket: u64, pid: i32, pause: bool };
+/// One step of the plan: demote or restore one task.
+pub const Step = struct { ticket: u64, pid: i32, demote: bool };
 
 /// A task's busy CPUs for the plan: one while fresh or unmeasured, else the sample's.
 fn load(t: TaskNow, s: ?Sample, now_ms: i64) f64 {
@@ -928,98 +921,74 @@ fn load(t: TaskNow, s: ?Sample, now_ms: i64) f64 {
 
 const Live = struct { ticket: u64, task: TaskNow, project: []const u8, load: f64 };
 
-/// macOS, where nothing shares CPU time by project: while cpuq's runnable tasks keep more than
-/// T + `headroom` CPUs busy, stop the newest tasks of the project furthest over its share until
-/// they keep no more than that; while they keep less than T and tasks are stopped, continue the
-/// oldest stopped task of the project furthest under its share, while one more fits within T.
-/// A project at or under its share is never stopped. Every cpuq computes the same plan from the
-/// records and carries out the steps for its own tasks.
-pub fn pausePlan(a: std.mem.Allocator, ops: []const Op, s: ?Sample, cx: Cx) []const Step {
+/// macOS, where nothing shares CPU time by project, and a stopped task could hold a lock
+/// everyone waits on: tasks are demoted (run in the background), never stopped. While cpuq's
+/// tasks not demoted keep more than T + `headroom` CPUs busy, demote the newest task of the
+/// project furthest over its share (by its tasks running and its drivers' own CPUs) until they
+/// keep no more than that. A demoted task is restored once all cpuq's tasks keep no more than T
+/// CPUs busy, or once its project is no longer over its share. A project at or under its share is
+/// never demoted. Every cpuq computes the same plan from the records and carries out the steps for
+/// its own tasks.
+pub fn demotePlan(a: std.mem.Allocator, ops: []const Op, s: ?Sample, cx: Cx) []const Step {
     var out: std.ArrayList(Step) = .empty;
     const t = capacity(ops, cx.pool_n, cx.now_ms);
     const m = projects(a, ops);
-    // Each project's share, and its tasks running unstopped.
-    var run: std.StringArrayHashMapUnmanaged(f64) = .empty;
-    var live: std.ArrayList(Live) = .empty;
-    var stopped: std.ArrayList(Live) = .empty;
-    var r: f64 = 0;
-    for (ops) |o| if (o.counts()) for (o.tasks_now) |task| {
-        const l: Live = .{ .ticket = o.ticket, .task = task, .project = o.project, .load = load(task, s, cx.now_ms) };
-        const gop = run.getOrPut(a, o.project) catch continue;
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        if (task.paused) {
-            stopped.append(a, l) catch {};
-        } else {
-            gop.value_ptr.* += 1;
-            live.append(a, l) catch {};
-            r += l.load;
-        }
-    };
-    // A driver computing keeps CPUs busy too, and counts toward its project, though it can't be
-    // stopped: its project's tasks are, if any.
-    for (ops) |o| if (o.driver and !o.stopped and o.dbusy >= driver_min) {
-        const gop = run.getOrPut(a, o.project) catch continue;
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* += o.dbusy;
-        r += o.dbusy;
-    };
     const tf: f64 = @floatFromInt(t);
     const w: f64 = @floatFromInt(weights(m));
-    const share = struct {
-        fn of(mm: std.StringArrayHashMapUnmanaged(Proj), p: []const u8, tt: f64, ww: f64) f64 {
-            const pr = mm.get(p) orelse return 0;
-            return tt * @as(f64, @floatFromInt(pr.weight)) / ww;
+    var normal: std.ArrayList(Live) = .empty;
+    var demoted: std.ArrayList(Live) = .empty;
+    var all: f64 = 0;
+    var kept: f64 = 0;
+    for (ops) |o| if (o.counts()) for (o.tasks_now) |task| {
+        if (task.paused) continue;
+        const l: Live = .{ .ticket = o.ticket, .task = task, .project = o.project, .load = load(task, s, cx.now_ms) };
+        all += l.load;
+        if (task.demoted) {
+            demoted.append(a, l) catch {};
+        } else {
+            normal.append(a, l) catch {};
+            kept += l.load;
         }
     };
-    if (r > tf + headroom) {
-        while (r > tf + headroom) {
-            // The project furthest over its share, by tasks running unstopped.
-            var worst: ?[]const u8 = null;
-            var worst_by: f64 = 0;
-            for (run.keys(), run.values()) |p, n| {
-                const by = n - share.of(m, p, tf, w);
-                if (by <= 0) continue;
-                if (worst == null or by > worst_by or (by == worst_by and std.mem.order(u8, p, worst.?) == .lt)) {
-                    worst = p;
-                    worst_by = by;
-                }
-            }
-            const p = worst orelse break;
-            // Its newest task running.
-            var pick: ?usize = null;
-            for (live.items, 0..) |l, i| {
-                if (!std.mem.eql(u8, l.project, p)) continue;
-                if (pick == null or l.task.fresh > live.items[pick.?].task.fresh) pick = i;
-            }
-            const i = pick orelse break;
-            const l = live.swapRemove(i);
-            out.append(a, .{ .ticket = l.ticket, .pid = l.task.pid, .pause = true }) catch break;
-            r -= l.load;
-            run.getPtr(p).?.* -= 1;
+    // A driver computing keeps CPUs busy too; it can't be demoted, but its project's tasks can.
+    for (ops) |o| if (o.driver and !o.stopped and o.dbusy >= driver_min) {
+        all += o.dbusy;
+        kept += o.dbusy;
+    };
+    const over = struct {
+        fn by(mm: std.StringArrayHashMapUnmanaged(Proj), p: []const u8, tt: f64, ww: f64) f64 {
+            const pr = mm.get(p) orelse return 0;
+            return loadOf(pr) - tt * @as(f64, @floatFromInt(pr.weight)) / ww;
         }
-        return out.items;
+    };
+    // Restore: room for everyone, or a project no longer over its share.
+    for (demoted.items) |l| {
+        if (all <= tf or over.by(m, l.project, tf, w) <= 0) {
+            out.append(a, .{ .ticket = l.ticket, .pid = l.task.pid, .demote = false }) catch break;
+            kept += l.load;
+        }
     }
-    while (stopped.items.len > 0 and r + 1 <= tf) {
-        // The project furthest under its share, of those with a task stopped.
-        var best: ?[]const u8 = null;
-        var best_by: f64 = 0;
-        for (stopped.items) |l| {
-            const by = (run.get(l.project) orelse 0) - share.of(m, l.project, tf, w);
-            if (best == null or by < best_by or (by == best_by and std.mem.order(u8, l.project, best.?) == .lt)) {
-                best = l.project;
-                best_by = by;
+    // Demote: the newest task of the project furthest over its share, while the rest crowd.
+    while (kept > tf + headroom) {
+        var worst: ?[]const u8 = null;
+        var worst_by: f64 = 0;
+        for (normal.items) |l| {
+            const b = over.by(m, l.project, tf, w);
+            if (b <= 0) continue;
+            if (worst == null or b > worst_by or (b == worst_by and std.mem.order(u8, l.project, worst.?) == .lt)) {
+                worst = l.project;
+                worst_by = b;
             }
         }
-        const p = best.?;
+        const p = worst orelse break;
         var pick: ?usize = null;
-        for (stopped.items, 0..) |l, i| {
+        for (normal.items, 0..) |l, i| {
             if (!std.mem.eql(u8, l.project, p)) continue;
-            if (pick == null or l.task.fresh < stopped.items[pick.?].task.fresh) pick = i;
+            if (pick == null or l.task.fresh > normal.items[pick.?].task.fresh) pick = i;
         }
-        const l = stopped.swapRemove(pick.?);
-        out.append(a, .{ .ticket = l.ticket, .pid = l.task.pid, .pause = false }) catch break;
-        r += 1;
-        run.getPtr(p).?.* += 1;
+        const l = normal.swapRemove(pick.?);
+        out.append(a, .{ .ticket = l.ticket, .pid = l.task.pid, .demote = true }) catch break;
+        kept -= l.load;
     }
     return out.items;
 }
@@ -1191,15 +1160,6 @@ test "admission: hard limits" {
     const idle = [_]Op{ .{ .ticket = 1, .project = "rig" }, .{ .ticket = 2, .project = "q", .waiting = 1, .stopped = true } };
     try std.testing.expectEqual(Wait.idle, mayStart(a, &idle, 1, .{ .pool_n = 2 }));
     try std.testing.expectEqual(Wait.idle, mayStart(a, &idle, 2, .{ .pool_n = 2 }));
-    // A run whose tasks cpuq has stopped starts none; others take no spare room meanwhile.
-    var p = [_]TaskNow{tk(5, 0)};
-    p[0].paused = true;
-    const paused = [_]Op{
-        .{ .ticket = 1, .project = "rig", .running = 3, .waiting = 1, .tasks_now = &p },
-        .{ .ticket = 2, .project = "trig", .running = 3, .waiting = 1 },
-    };
-    try std.testing.expectEqual(Wait.paused, mayStart(a, &paused, 1, .{ .pool_n = 4 }));
-    try std.testing.expectEqual(Wait.paused, mayStart(a, &paused, 2, .{ .pool_n = 4 }));
 }
 
 test "drains: isolation, the half-pool bound, and the turn" {
@@ -1289,7 +1249,7 @@ test "busy: tasks from the sample, outside load beyond the CPUs left to it, isol
     try std.testing.expectApproxEqAbs(1.5, busyNow(a, &.{ ops[0], d }, lin, true, 4, 4, 2), 1e-9);
 }
 
-test "pause plan: stop the newest of the project furthest over its share, continue when room returns" {
+test "demote plan: the newest of the project furthest over its share, restored when room returns" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1299,21 +1259,25 @@ test "pause plan: stop the newest of the project furthest over its share, contin
         .{ .ticket = 1, .project = "rig", .running = 3, .tasks_now = &.{ tk(1, 10_000), tk(2, 20_000), tk(3, 30_000) } },
         .{ .ticket = 2, .project = "trig", .running = 1, .tasks_now = &.{tk(4, 10_000)} },
     };
-    const plan = pausePlan(a, &busy, null, .{ .pool_n = 2, .now_ms = now });
+    const plan = demotePlan(a, &busy, null, .{ .pool_n = 2, .now_ms = now });
     try std.testing.expectEqual(2, plan.len);
     try std.testing.expectEqual(3, plan[0].pid);
-    try std.testing.expect(plan[0].pause);
+    try std.testing.expect(plan[0].demote);
     try std.testing.expectEqual(2, plan[1].pid);
-    // Tasks waiting on I/O keep no CPU busy: nothing stops.
+    // Tasks waiting on I/O keep no CPU busy: nothing is demoted.
     const s: Sample = .{ .ms = 1, .per = &.{ .{ .pid = 1, .start = 1, .cum = 0, .busy = 0.1 }, .{ .pid = 2, .start = 2, .cum = 0, .busy = 0.1 }, .{ .pid = 3, .start = 3, .cum = 0, .busy = 0.1 }, .{ .pid = 4, .start = 4, .cum = 0, .busy = 1 } } };
-    try std.testing.expectEqual(0, pausePlan(a, &busy, s, .{ .pool_n = 2, .now_ms = now }).len);
-    // Room again (trig's task ended): rig's oldest stopped task continues, one per CPU free.
-    var p = [_]TaskNow{ tk(1, 10_000), tk(2, 20_000), tk(3, 30_000) };
-    p[1].paused = true;
-    p[2].paused = true;
-    const room = [_]Op{.{ .ticket = 1, .project = "rig", .running = 3, .tasks_now = &p }};
-    const back = pausePlan(a, &room, null, .{ .pool_n = 2, .now_ms = now });
+    try std.testing.expectEqual(0, demotePlan(a, &busy, s, .{ .pool_n = 2, .now_ms = now }).len);
+    // Demoted, and still crowding: they stay demoted (no step).
+    var d = [_]TaskNow{ tk(1, 10_000), tk(2, 20_000), tk(3, 30_000) };
+    d[1].demoted = true;
+    d[2].demoted = true;
+    const still = [_]Op{ .{ .ticket = 1, .project = "rig", .running = 3, .tasks_now = &d }, busy[1] };
+    try std.testing.expectEqual(0, demotePlan(a, &still, null, .{ .pool_n = 2, .now_ms = now }).len);
+    // trig gone: rig alone is at its share... over by 1 of 2, and all tasks keep 3 > 2 busy: they
+    // stay. Then one ends: 2 tasks keep 2 busy, room for all: restored.
+    const two = [_]Op{.{ .ticket = 1, .project = "rig", .running = 2, .tasks_now = d[0..2] }};
+    const back = demotePlan(a, &two, null, .{ .pool_n = 2, .now_ms = now });
     try std.testing.expectEqual(1, back.len);
     try std.testing.expectEqual(2, back[0].pid);
-    try std.testing.expect(!back[0].pause);
+    try std.testing.expect(!back[0].demote);
 }
