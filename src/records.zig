@@ -68,8 +68,8 @@ const JsonJob = struct {
 
 /// `cpuq record`: samples this machine every few seconds into samples.jsonl beside the
 /// history, one JSON line each: `t` (Unix seconds), `cpu` (each CPU's busy share since the last
-/// sample, in percent, in the kernel's order), `load` (1-minute), `held` (the pool's CPUs held),
-/// `wait` (runs holding none yet) and `gate`. It only watches: nothing in cpuq waits on it or reads it but
+/// sample, in percent, in the kernel's order), `load` (1-minute), `running` (cpuq's tasks running),
+/// `wait` (runs with tasks waiting) and `gate`. It only watches: nothing in cpuq waits on it or reads it but
 /// `cpuq samples`, and every command works the same without it. One runs per machine (a lock
 /// beside the file); it exits when its own binary is replaced, so the service that keeps it
 /// running starts the new one. `--install` sets up that service: a launchd agent on macOS, a
@@ -136,14 +136,15 @@ pub fn cmdRecord(ctx: *Ctx, args: []const [:0]const u8) u8 {
         pool.lock();
         const ops = pool.scan(a);
         pool.unlock();
-        var held: usize = 0;
+        var running: usize = 0;
         var waiting: usize = 0;
         for (ops) |o| {
-            held += o.held.len;
-            if (o.held.len == 0) waiting += 1;
+            if (!o.counts()) continue;
+            running += o.running;
+            if (o.waiting != 0) waiting += 1;
         }
         const g = policy.gate(ctx.cfg, machine(ctx));
-        line.print(a, "],\"load\":{d:.2},\"held\":{d},\"wait\":{d},\"gate\":\"{t}\"}}\n", .{ sys.loadAverage()[0], held, waiting, g }) catch continue;
+        line.print(a, "],\"load\":{d:.2},\"running\":{d},\"wait\":{d},\"gate\":\"{t}\"}}\n", .{ sys.loadAverage()[0], running, waiting, g }) catch continue;
         history.appendLine(io, path, line.items, samples_rotate_bytes);
         if (n % 20 == 19) {
             if (exe) |e| {
@@ -467,7 +468,7 @@ pub fn cmdHistory(ctx: *Ctx, args: []const [:0]const u8) u8 {
     sum.print(a, "{d} runs; waited {s} median, {s} longest", .{ picked.items.len, duration(&b1, history.median(waits.items)), duration(&b2, longest) }) catch {};
     if (measured != 0) {
         const m: f64 = @floatFromInt(measured);
-        sum.print(a, "; {d:.1} CPUs busy of {d:.1} held on average", .{ used / m, granted / m }) catch {};
+        sum.print(a, "; {d:.1} CPUs busy of {d:.1} tasks running on average", .{ used / m, granted / m }) catch {};
     }
     if (lost != 0) sum.print(a, "; {d} lost (the machine restarted or cpuq was killed)", .{lost}) catch {};
     if (boxed) {

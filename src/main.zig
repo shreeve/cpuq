@@ -50,7 +50,7 @@ test {
 pub const version = @import("build_options").version;
 
 const usage =
-    \\usage: cpuq run [-n M] [-c C] [-x K] [-t T] [-r N] [run options] [--] CMD [ARGS...]
+    \\usage: cpuq run [-n M] [-c C] [-t T] [-r N] [run options] [--] CMD [ARGS...]
     \\       cpuq drain -c N | --all [--max T] [-t T] [--label L] [--] CMD [ARGS...]
     \\       cpuq kill TICKET|PID|LABEL
     \\       cpuq limit TICKET|PID|LABEL -c C [--host HOST]
@@ -71,18 +71,21 @@ const usage =
     \\       cpuq hook                (an agent harness's pre-command hook)
     \\       cpuq budget | --version | --help
     \\
-    \\run: M tasks of CMD (none: one, with the terminal), each on one CPU of the pool:
-    \\  -n M                  M tasks; each gets CPUQ_TASK (1..M), CPUQ_TASKS and CPUQ_CPU,
-    \\                        and its output goes to a file of its own
-    \\  -c C | -c P%          hold at most C CPUs, or P% of the pool (default 100%)
-    \\  -x K                  K tasks per CPU, for tasks that mostly wait (default 1)
-    \\  -t T                  each task's time limit (30s, 10m, 2h; config `timeout`, 1h)
+    \\run: M tasks of CMD (none: one, with the terminal), each counting as one CPU. A run starts
+    \\a task at once while its project runs under its fair share of the pool, else when the
+    \\machine has room (a task that waits on I/O leaves room); the kernel shares the CPUs:
+    \\  -n M                  M tasks; each gets CPUQ_TASK (1..M) and CPUQ_TASKS, and its
+    \\                        output goes to a file of its own
+    \\  -c C | -c P%          run at most C tasks at once, or P% of the pool (default: as the
+    \\                        line allows)
+    \\  -t T                  each task's time limit, counting only time it runs (30s, 10m,
+    \\                        2h; config `timeout`, 1h)
     \\  -r N                  try a failed task up to N more times (CPUQ_ATTEMPT says which)
     \\  --label PROJECT:TASK  the run's name in status and history
     \\  --note TEXT           what the run is for, kept beside its label
-    \\  --urgent              its first CPU goes ahead of the line (a rebuild someone waits on)
-    \\  --wait-max S          give up (exit 75) if no CPU comes within S seconds
-    \\  --driver              a test runner that starts `cpuq run`s of its own: holds no CPU
+    \\  --urgent              its first task goes ahead of the line (a rebuild someone waits on)
+    \\  --wait-max S          give up (exit 75) if no task starts within S seconds
+    \\  --driver              a test runner that starts `cpuq run`s of its own: no task itself
     \\  --on HOST             run on HOST, one of this machine's remotes (config `remotes`):
     \\                        the repo is copied there with rsync; it waits in HOST's line, and
     \\                        a stopped HOST is started (config `remote_start.HOST`)
@@ -91,23 +94,25 @@ const usage =
     \\                        .git included (also listed in the repo's .cpuqinclude)
     \\
     \\commands:
-    \\  drain                 for timing: gather N CPUs ahead of the line (-c N), then run CMD
-    \\                        alone on them, pinned on Linux (CPUQ_CPUS lists them), while the
-    \\                        rest of the machine keeps working; --all empties the whole
-    \\                        machine (at most 20m); --max T gives up (exit 75); -t T ends CMD
-    \\                        (exit 124; default 20m, at most 2h)
+    \\  drain                 for timing: after the runs queued before it, N CPUs (-c N, at most
+    \\                        half the pool) are isolated for CMD at once: pinned on Linux
+    \\                        (CPUQ_CPUS lists them), others' tasks kept off them; macOS stops
+    \\                        others' tasks while they would crowd the rest. --all stops every
+    \\                        other task (at most 20m); --max T gives up (exit 75); -t T ends
+    \\                        CMD (exit 124; default 20m, at most 2h)
     \\  kill                  end a run here: SIGTERM to its tasks, SIGKILL 5 s later
-    \\  limit                 change a running run's -c (a count or 50%): raised, it takes
-    \\                        free CPUs at once; lowered, it gives CPUs back as tasks end
+    \\  limit                 change a running run's -c (a count or 50%): raised, it starts
+    \\                        more as the line allows; lowered, it starts none till fewer run
     \\  lease                 hold one of NAME's --slots places (default 1) while CMD runs, first
     \\                        come first served; --host holds it on HOST over ssh, --hold prints
     \\                        `held NAME@HOST ENTRY` and holds until stdin closes
     \\  wait                  until no run whose label matches (PATTERN* a prefix) runs or waits
-    \\  status                who holds which CPU, the line and why each waits; --json for
-    \\                        programs, --watch on a terminal, --host HOST
+    \\  status                running and waiting tasks per project against fair share, the
+    \\                        machine's busy CPUs, why each run waits; --json for programs,
+    \\                        --watch on a terminal, --host HOST
     \\  history               newest first: --label PATTERN, --limit N (20), --json
-    \\  record                sample this machine every 3 s (CPUs busy, load, CPUs held,
-    \\                        waiting, gate) into a day of samples beside the history;
+    \\  record                sample this machine every 3 s (CPUs busy, load, tasks running,
+    \\                        runs waiting, gate) into a day of samples beside the history;
     \\                        --install keeps it running (launchd / systemd --user)
     \\  samples               the recorded samples since a time, one JSON line each
     \\  cap                   run one program under limits on its memory, time and output:
@@ -119,15 +124,15 @@ const usage =
     \\  budget                print the pool's size in CPUs
     \\
     \\environment: CPUQ_DIR (state directory), CPUQ_CONFIG (~/.config/cpuq/config),
-    \\CPUQ_BUDGET (the pool's size), CPUQ_HISTORY. A task gets CPUQ_TASK, CPUQ_TASKS, CPUQ_CPU,
-    \\CPUQ_OP, CPUQ_ATTEMPT and CPUQ_ATTEMPTS; a lease's command gets CPUQ_LEASES.
+    \\CPUQ_BUDGET (the pool's size), CPUQ_HISTORY. A task gets CPUQ_TASK, CPUQ_TASKS, CPUQ_OP,
+    \\CPUQ_ATTEMPT and CPUQ_ATTEMPTS; a lease's command gets CPUQ_LEASES.
     \\
     \\exit: one task: its own status, 124 at its time limit; many: 0 when every task
     \\passed, else 1; 128+N killed by signal N; 75 gave up waiting (nothing ran);
     \\125 cpuq failed; 126/127 not executable/not found; 2 usage or config error.
     \\
     \\for agents and scripts:
-    \\  a build runs on one CPU: cpuq run --label app:build -- zig build -j1
+    \\  a build is one task, one job: cpuq run --label app:build -- zig build -j1
     \\  many independent pieces run as tasks: cpuq run -n 40 -- sh -c 'test/one "$CPUQ_TASK"'
     \\  exit 75: nothing ran; run it again later, not in a loop.
     \\  see AGENTS.md: https://github.com/shreeve/cpuq/blob/main/AGENTS.md

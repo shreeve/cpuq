@@ -1107,22 +1107,75 @@ test "statStart" {
     try std.testing.expectEqual(@as(?u64, null), statStart("17 (a) Z 1 17 17 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 4242 1000 10"));
 }
 
-/// Linux: pins every thread of process `pid` to `cpu` (sched_setaffinity works per thread,
-/// so each in /proc/PID/task). Elsewhere it does nothing.
-pub fn pinThreads(io: Io, a: std.mem.Allocator, pid: c.pid_t, cpu: u32) void {
-    if (is_darwin) return;
+/// Linux: this process's CPU affinity, as CPU numbers; empty elsewhere or when unreadable.
+pub fn ownAffinity(a: std.mem.Allocator) []const u32 {
+    if (is_darwin) return &.{};
     var set: std.os.linux.cpu_set_t = @splat(0);
-    const bits = @bitSizeOf(usize);
-    if (cpu >= set.len * bits) return;
-    set[cpu / bits] |= @as(usize, 1) << @intCast(cpu % bits);
-    const path = std.fmt.allocPrint(a, "/proc/{d}/task", .{pid}) catch return;
-    var dir = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return;
+    if (std.os.linux.syscall3(.sched_getaffinity, 0, @sizeOf(std.os.linux.cpu_set_t), @intFromPtr(&set)) > std.math.maxInt(isize)) return &.{};
+    return setList(a, set);
+}
+
+/// Linux: the threads of process `pid`, from /proc/PID/task; empty elsewhere.
+fn threadsOf(io: Io, a: std.mem.Allocator, pid: c.pid_t) []const i32 {
+    if (is_darwin) return &.{};
+    var out: std.ArrayList(i32) = .empty;
+    const path = std.fmt.allocPrint(a, "/proc/{d}/task", .{pid}) catch return &.{};
+    var dir = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return &.{};
     defer dir.close(io);
     var it = dir.iterate();
-    while (it.next(io) catch null) |e| {
-        const tid = std.fmt.parseInt(i32, e.name, 10) catch continue;
+    while (it.next(io) catch null) |e| out.append(a, std.fmt.parseInt(i32, e.name, 10) catch continue) catch break;
+    return out.items;
+}
+
+/// Linux: sets every thread of process `pid` to run on `cpus` only (sched_setaffinity works per
+/// thread, so each in /proc/PID/task). Elsewhere, or with no CPUs, it does nothing.
+pub fn setThreads(io: Io, a: std.mem.Allocator, pid: c.pid_t, cpus: []const u32) void {
+    if (is_darwin or cpus.len == 0) return;
+    const set = listSet(cpus);
+    for (threadsOf(io, a, pid)) |tid| {
         _ = std.os.linux.syscall3(.sched_setaffinity, @as(usize, @bitCast(@as(isize, tid))), @sizeOf(std.os.linux.cpu_set_t), @intFromPtr(&set));
     }
+}
+
+/// Linux: takes `cpus` out of the affinity of every thread of process `pid`, leaving alone a
+/// thread that would have no CPU left. Elsewhere it does nothing.
+pub fn excludeThreads(io: Io, a: std.mem.Allocator, pid: c.pid_t, cpus: []const u32) void {
+    if (is_darwin or cpus.len == 0) return;
+    const out = listSet(cpus);
+    for (threadsOf(io, a, pid)) |tid| {
+        const t: usize = @bitCast(@as(isize, tid));
+        var set: std.os.linux.cpu_set_t = @splat(0);
+        if (std.os.linux.syscall3(.sched_getaffinity, t, @sizeOf(std.os.linux.cpu_set_t), @intFromPtr(&set)) > std.math.maxInt(isize)) continue;
+        var left = false;
+        for (&set, out) |*w, x| {
+            w.* &= ~x;
+            if (w.* != 0) left = true;
+        }
+        if (left) _ = std.os.linux.syscall3(.sched_setaffinity, t, @sizeOf(std.os.linux.cpu_set_t), @intFromPtr(&set));
+    }
+}
+
+fn listSet(cpus: []const u32) std.os.linux.cpu_set_t {
+    var set: std.os.linux.cpu_set_t = @splat(0);
+    const bits = @bitSizeOf(usize);
+    for (cpus) |cpu| if (cpu < set.len * bits) {
+        set[cpu / bits] |= @as(usize, 1) << @intCast(cpu % bits);
+    };
+    return set;
+}
+
+fn setList(a: std.mem.Allocator, set: std.os.linux.cpu_set_t) []const u32 {
+    var out: std.ArrayList(u32) = .empty;
+    const bits = @bitSizeOf(usize);
+    for (set, 0..) |w, i| {
+        var x = w;
+        while (x != 0) {
+            const b = @ctz(x);
+            out.append(a, @intCast(i * bits + b)) catch break;
+            x &= x - 1;
+        }
+    }
+    return out.items;
 }
 
 /// A process's parent, or null when it is gone or can't be read: macOS proc_bsdinfo's

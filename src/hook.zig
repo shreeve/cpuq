@@ -4,9 +4,9 @@
 //! with the corrected form, so the queue is enforced where agents act rather
 //! than asked for in AGENTS.md.
 //!
-//! Every task of a `cpuq run` has one CPU, so what it runs is held to one job: `zig build -j1`,
-//! `make` with no -j, `go build -p 1`, `pytest` with no -n. Linux pins a task to its CPU; macOS
-//! can't, and there a build left to its own parallelism takes every CPU from one slot.
+//! Every task of a `cpuq run` counts as one CPU, so what it runs is held to one job: `zig build
+//! -j1`, `make` with no -j, `go build -p 1`, `pytest` with no -n. A build left to its own
+//! parallelism takes a CPU for every job while the line counts one.
 //!
 //! It reads the command's text, and what the caller knows (through an Advisor): whether a `cpuq
 //! run`'s work goes faster elsewhere. Nothing it cannot parse is refused. A line that ends in the
@@ -54,25 +54,26 @@ pub fn check(a: std.mem.Allocator, command: []const u8, project: []const u8, adv
 }
 
 /// The `cpuq run` and `cpuq lease` options that take a value (`-n 8`, or `--label=app:test`).
-pub const run_value_options = [_][]const u8{ "--label", "--note", "--host", "--slots", "--return", "--on", "--include", "--repo", "-n", "-c", "-x", "-t", "-r", "--wait-max" };
+pub const run_value_options = [_][]const u8{ "--label", "--note", "--host", "--slots", "--return", "--on", "--include", "--repo", "-n", "-c", "-t", "-r", "--wait-max" };
 
 /// The options `cpuq run` and `cpuq lease` don't take, each with what replaces it, as cpuq says
 /// when given one.
 pub const removed_options = [_][2][]const u8{
-    .{ "--cores", "--cores is gone: every task gets one CPU. Run M tasks with -n M (at most -c C CPUs at once); a build runs on one CPU" },
+    .{ "--cores", "--cores is gone: every task counts as one CPU. Run M tasks with -n M (at most -c C at once); a build is one task, one job" },
     .{ "--priority", "--priority is gone: --urgent puts a run's first CPU ahead of the line; there is no low" },
     .{ "--max-wait", "--max-wait is now --wait-max" },
     .{ "--exclusive", "--exclusive is gone: `cpuq drain -c N -- CMD` times CMD alone on N CPUs; `--all` empties the machine" },
     .{ "--no-load-check", "--no-load-check is gone: the pool limits CPU work, and outside load is measured" },
     .{ "--qos", "--qos is gone: tasks run as they are" },
-    .{ "--opaque", "--opaque is gone: every task holds its one CPU, inside a container or not" },
+    .{ "--opaque", "--opaque is gone: every task counts as one CPU, inside a container or not" },
+    .{ "-x", "-x is gone: cpuq starts more tasks when its tasks wait (I/O, sleep, a server); drop -x" },
 };
 
 /// `--exclusive`, given to `cpuq lease`.
 pub const lease_exclusive = "--exclusive is gone: `cpuq lease NAME -- cpuq drain --all -- CMD` holds the lease and runs CMD alone on the emptied machine";
 
 /// The removed options that took a value: skipped with it.
-const removed_value_options = [_][]const u8{ "--cores", "--priority", "--max-wait", "--qos" };
+const removed_value_options = [_][]const u8{ "--cores", "--priority", "--max-wait", "--qos", "-x" };
 
 /// What one check knows: the project for suggested labels, and the advisor for the `cpuq run`s on
 /// this machine.
@@ -126,8 +127,8 @@ const Simple = struct {
     skip: bool = false,
 };
 
-/// A `cpuq run` (or lease): no removed option and no `$CPUQ_CORES`, one job for each task's one
-/// CPU, and `--driver` only for a test runner.
+/// A `cpuq run` (or lease): no removed option and no `$CPUQ_CORES`, one job for each task (one
+/// CPU), and `--driver` only for a test runner.
 fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, advisor: ?Advisor) ?Refusal {
     if (w.len < 2) return null;
     const lease = std.mem.eql(u8, w[1], "lease");
@@ -156,7 +157,7 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, advisor: 
     }
     if (removed) |why| return .{ .reason = why, .instead = fixRun(a, w, false).text };
     if (mentionsCores(cmd.text)) return .{
-        .reason = "cpuq gives each task one CPU; $CPUQ_CORES no longer exists",
+        .reason = "cpuq counts each task as one CPU; there is no $CPUQ_CORES",
         .instead = fixRun(a, w, false).text,
     };
     if (i >= w.len) return null;
@@ -172,7 +173,7 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, advisor: 
         const fixed = fixRun(a, w, false);
         const more = " (or split the work into tasks with -n M)";
         return .{
-            .reason = a.print("{s}, but a task has one CPU (and macOS can't pin it there)", .{what}) catch "a task has one CPU",
+            .reason = a.print("{s}, but a task counts as one CPU", .{what}) catch "a task counts as one CPU",
             .instead = if (fixed.whole)
                 a.print("{s}{s}", .{ fixed.text, more }) catch fixed.text
             else
@@ -226,9 +227,9 @@ fn innerCommands(a: std.mem.Allocator, inner: []const []const u8, heredoc: ?[]co
     return one;
 }
 
-/// `--driver`: a test runner that starts its own `cpuq run`s, holding no CPU itself. A build
-/// under it would run on no CPU at all, except `rig build` with RIG_UNIT_LAUNCHER a `cpuq run`:
-/// each unit's compile is then a run of its own, on a CPU of its own.
+/// `--driver`: a test runner that starts its own `cpuq run`s, and is no task itself. A build
+/// under it would go unseen by the line, except `rig build` with RIG_UNIT_LAUNCHER a `cpuq run`:
+/// each unit's compile is then a run of its own, admitted on its own.
 fn checkDriver(a: std.mem.Allocator, w: []const []const u8, cmds: []const Simple, text: []const u8) ?Refusal {
     var runner = false;
     for (cmds) |ic| {
@@ -240,20 +241,20 @@ fn checkDriver(a: std.mem.Allocator, w: []const []const u8, cmds: []const Simple
                 continue;
             }
             return .{
-                .reason = a.print("`rig {s}` under --driver: it holds no CPU unless each unit's compile is a `cpuq run` (RIG_UNIT_LAUNCHER)", .{iw[1]}) catch "rig build under --driver: set RIG_UNIT_LAUNCHER",
+                .reason = a.print("`rig {s}` under --driver: it is no task, so its compiles go unseen unless each unit's compile is a `cpuq run` (RIG_UNIT_LAUNCHER)", .{iw[1]}) catch "rig build under --driver: set RIG_UNIT_LAUNCHER",
                 .instead = launcherFix(a, w, iw),
             };
         }
         if (isBuildTool(iw) or heavyName(iw) != null) return .{
-            .reason = a.print("`{s}` under --driver: --driver holds no CPU; run builds as tasks", .{toolLabel(a, iw)}) catch "--driver holds no CPU; run builds as tasks",
+            .reason = a.print("`{s}` under --driver: --driver is no task, so the build goes unseen; run builds as tasks", .{toolLabel(a, iw)}) catch "--driver is no task; run builds as tasks",
             .instead = fixRun(a, w, true).text,
         };
         if (isRunner(iw)) runner = true;
     }
     if (runner) return null;
     return .{
-        .reason = "--driver is for a test runner that starts its own `cpuq run`s (swarm, rip, a script under test/, run, run.sh, run-tests…), and holds no CPU itself",
-        .instead = a.print("{s} (one task, on one CPU)", .{fixRun(a, w, true).text}) catch "cpuq run --label P:T -- CMD",
+        .reason = "--driver is for a test runner that starts its own `cpuq run`s (swarm, rip, a script under test/, run, run.sh, run-tests…), and is no task itself",
+        .instead = a.print("{s} (one task)", .{fixRun(a, w, true).text}) catch "cpuq run --label P:T -- CMD",
     };
 }
 
@@ -830,7 +831,7 @@ fn singleQuoted(a: std.mem.Allocator, text: []const u8) []const u8 {
     return out.items;
 }
 
-/// What to run instead: the command under cpuq, held to one job for its task's one CPU.
+/// What to run instead: the command under cpuq, held to one job for its task (one CPU).
 fn suggest(a: std.mem.Allocator, w: []const []const u8, project: []const u8, host: ?[]const u8) []const u8 {
     const tool = toolOf(w);
     const testing = std.mem.eql(u8, tool, "pytest") or std.mem.eql(u8, tool, "py.test") or std.mem.eql(u8, tool, "ctest") or for (w[1..@min(w.len, 4)]) |x| {
@@ -1184,7 +1185,7 @@ test "inside cpuq run, a task runs one job" {
 }
 
 test "a run's every option value is skipped" {
-    try std.testing.expect(refused("cpuq run -n 4 -c 50% -x 2 -t 30s -r 1 --wait-max 9 --label a:b -- zig build"));
+    try std.testing.expect(refused("cpuq run -n 4 -c 50% -t 30s -r 1 --wait-max 9 --label a:b -- zig build"));
     try std.testing.expect(refused("cpuq run --note x --label a:b -- zig build"));
     try std.testing.expect(refused("cpuq run --repo X --urgent -- zig build"));
     try std.testing.expect(refused("cpuq run -c=4 --label=a:b -- zig build"));
@@ -1197,10 +1198,10 @@ test "the fix for too many jobs is one job, or tasks" {
     defer arena.deinit();
     const a = arena.allocator();
     var r = refusal(a, "cpuq run --label a:b -- zig build test");
-    try std.testing.expectEqualStrings("`zig build` without -j1 runs a job for every CPU, but a task has one CPU (and macOS can't pin it there)", r.reason);
+    try std.testing.expectEqualStrings("`zig build` without -j1 runs a job for every CPU, but a task counts as one CPU", r.reason);
     try std.testing.expectEqualStrings("cpuq run --label a:b -- zig build test -j1 (or split the work into tasks with -n M)", r.instead);
     r = refusal(a, "cpuq run --label a:b -- make -j8 all");
-    try std.testing.expectEqualStrings("`-j8` runs 8 jobs at once, but a task has one CPU (and macOS can't pin it there)", r.reason);
+    try std.testing.expectEqualStrings("`-j8` runs 8 jobs at once, but a task counts as one CPU", r.reason);
     try std.testing.expectEqualStrings("cpuq run --label a:b -- make all (or split the work into tasks with -n M)", r.instead);
     r = refusal(a, "cpuq run --label a:b -- sh -c 'zig build test -j 16'");
     try std.testing.expectEqualStrings("cpuq run --label a:b -- zig build test -j1 (or split the work into tasks with -n M)", r.instead);
@@ -1223,7 +1224,7 @@ test "$CPUQ_CORES is refused, with the run at one job" {
     };
     for (cases) |c| {
         const r = refusal(a, c[0]);
-        try std.testing.expectEqualStrings("cpuq gives each task one CPU; $CPUQ_CORES no longer exists", r.reason);
+        try std.testing.expectEqualStrings("cpuq counts each task as one CPU; there is no $CPUQ_CORES", r.reason);
         try std.testing.expectEqualStrings(c[1], r.instead);
         try std.testing.expect(!refused(c[1]));
     }
@@ -1243,6 +1244,7 @@ test "removed options are refused as cpuq refuses them, with the run they become
         .{ "cpuq run --qos none -- ./x", "--qos", "cpuq run -- ./x" },
         .{ "cpuq run --label e:t --cores 4 --opaque -- incus exec c -- make", "--cores", "cpuq run --label e:t -- incus exec c -- make" },
         .{ "ssh pup 'cd repo && cpuq run --cores 2 -- make'", "--cores", "cpuq run -- make" },
+        .{ "cpuq run -n 20 -x 4 --label a:fetch -- sh -c './fetch \"$CPUQ_TASK\"'", "-x", "cpuq run -n 20 --label a:fetch -- sh -c './fetch \"$CPUQ_TASK\"'" },
     };
     for (cases) |c| {
         const r = refusal(a, c[0]);
@@ -1269,7 +1271,7 @@ test "--driver takes `rig build` whose units are `cpuq run`s, and only those" {
     try std.testing.expect(!refused("cpuq run --driver -- sh -c 'export RIG_UNIT_LAUNCHER=\"cpuq run --\"; ./bin/rig build --units=4 a.rig'"));
     // Without the launcher, each unit's compile would run on no CPU.
     const r = refusal(a, "cpuq run --driver --label rig:build -- rig build --units=8 app.rig");
-    try std.testing.expect(std.mem.startsWith(u8, r.reason, "`rig build` under --driver: it holds no CPU"));
+    try std.testing.expect(std.mem.startsWith(u8, r.reason, "`rig build` under --driver: it is no task"));
     try std.testing.expectEqualStrings("cpuq run --driver --label rig:build -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build --units=8 app.rig", r.instead);
     // A launcher that isn't cpuq doesn't count.
     try std.testing.expect(refused("cpuq run --driver -- env RIG_UNIT_LAUNCHER=nice rig build a.rig"));
@@ -1286,9 +1288,9 @@ test "--driver runs only a test runner, never a build" {
     try std.testing.expect(!refused("cpuq run --driver -- ./scripts/run-tests.sh"));
     try std.testing.expect(!refused("cpuq run --driver -- ./run"));
     try std.testing.expect(!refused("cpuq run --driver -- sh -c 'cd sub && ./tests/check.py'"));
-    // A build under --driver would hold no CPU.
+    // A build under --driver would go unseen by the line.
     var r = refusal(a, "cpuq run --driver --label a:b -- zig build test");
-    try std.testing.expectEqualStrings("`zig build` under --driver: --driver holds no CPU; run builds as tasks", r.reason);
+    try std.testing.expectEqualStrings("`zig build` under --driver: --driver is no task, so the build goes unseen; run builds as tasks", r.reason);
     try std.testing.expectEqualStrings("cpuq run --label a:b -- zig build test -j1", r.instead);
     try std.testing.expect(refused("cpuq run --driver -- make test"));
     try std.testing.expect(refused("cpuq run --driver -- cc -O2 x.c"));
@@ -1296,7 +1298,7 @@ test "--driver runs only a test runner, never a build" {
     // Anything else is a task.
     r = refusal(a, "cpuq run --driver --label a:b -- ./bench");
     try std.testing.expect(std.mem.startsWith(u8, r.reason, "--driver is for a test runner"));
-    try std.testing.expectEqualStrings("cpuq run --label a:b -- ./bench (one task, on one CPU)", r.instead);
+    try std.testing.expectEqualStrings("cpuq run --label a:b -- ./bench (one task)", r.instead);
 }
 
 test "a run here is put to the advisor, with its command; one sent elsewhere never is" {

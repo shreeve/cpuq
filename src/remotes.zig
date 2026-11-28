@@ -193,8 +193,9 @@ fn sendTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     if (repo_named) |r| remote.print(a, "export CPUQ_REPO={s} && ", .{shellQuote(a, r)}) catch {};
     remote.print(a, "exec cpuq run --tethered", .{}) catch fail("out of memory", .{});
     if (o.tasks != 0) remote.print(a, " -n {d}", .{o.tasks}) catch {};
-    if (o.cpus_percent) remote.print(a, " -c {d}%", .{o.cpus}) catch {} else remote.print(a, " -c {d}", .{o.cpus}) catch {};
-    if (o.overload != 1) remote.print(a, " -x {d}", .{o.overload}) catch {};
+    if (o.cpus != 0) {
+        if (o.cpus_percent) remote.print(a, " -c {d}%", .{o.cpus}) catch {} else remote.print(a, " -c {d}", .{o.cpus}) catch {};
+    }
     if (o.timeout_s) |t| remote.print(a, " -t {d}", .{t}) catch {};
     if (o.retries != 0) remote.print(a, " -r {d}", .{o.retries}) catch {};
     if (o.urgent) remote.print(a, " --urgent", .{}) catch {};

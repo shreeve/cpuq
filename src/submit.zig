@@ -101,8 +101,8 @@ const Spec = struct {
     setup: ?[]const u8 = null,
     /// Read only to refuse it, with what replaces it.
     cores: ?std.json.Value = null,
-    /// The job is a runner (`cpuq run --driver`): it holds no CPU, and the `cpuq run`s it
-    /// starts take their own. Without it, the job is one task on one CPU.
+    /// The job is a runner (`cpuq run --driver`): it is no task itself, and the `cpuq run`s it
+    /// starts are admitted each on its own. Without it, the job is one task.
     driver: bool = false,
     time: ?[]const u8 = null,
     mem: ?[]const u8 = null,

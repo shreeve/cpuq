@@ -1,11 +1,12 @@
-//! The pool's CPUs: which of this machine's CPUs cpuq hands out, and in what order. Every cpuq
-//! on the machine works the list out the same way, so they agree on it.
+//! The pool's CPUs: how many CPUs the line shares (its capacity), and which ones, in what order
+//! (a drain isolates CPUs from the end of it). Every cpuq on the machine works the list out the
+//! same way, so they agree on it.
 //!
 //! - `cpus = LIST` in the config (a Linux CPU list, "12-19,2") is the pool, in that order.
 //! - Otherwise, Linux: the CPUs online, less those isolated from the scheduler, within the CPUs
 //!   the machine's init may use (a container's CPU set), one hyperthread of each physical core
 //!   first, then their siblings. macOS: 0 to the active CPU count less one (it cannot pin, so
-//!   the numbers only name slots).
+//!   the numbers only count).
 //! - `budget = N` (or CPUQ_BUDGET) keeps the first N.
 const std = @import("std");
 const Io = std.Io;

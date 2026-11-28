@@ -1,46 +1,64 @@
-//! The pool: this machine's CPUs as token files, the operations that hold them, and the line
-//! that decides which operation gets the next one. Everything lives under a versioned folder in
-//! the state directory, so a cpuq of another version never reads these files as its own:
+//! The pool: how many of cpuq's tasks run on this machine, and the line that decides which run
+//! starts its next task. cpuq bounds how many tasks run; it never decides which CPU a task runs
+//! on. The kernel shares CPU time among the running tasks (on Linux by each project's weight), and
+//! a task that waits (on a disk, a socket, a child, a sleep) uses nothing while others take the
+//! time. Everything lives under a versioned folder in the state directory, so a cpuq of another
+//! version never reads these files as its own:
 //!
-//!   v2/lock          the pool's lock: every scan, take, promise and release happens under it
-//!   v2/seq           the last ticket number handed out
-//!   v2/ops/C-TICKET  one per running operation, exclusively locked by its cpuq for its whole
-//!                    life (C: 0 urgent, 1 normal). Its text says what it holds and wants. Its
-//!                    ticket is renewed (the file renamed) each time it gives a CPU up, so it
-//!                    takes its turn again behind the others
-//!   v2/wake/TICKET   the operation's FIFO: whoever promises it a CPU writes a byte there
-//!   v2/cpus/N        one per pool CPU, named by the CPU's number. An exclusive lock is a held
-//!                    CPU. Only an operation's own cpuq holds it (close-on-exec), never its
-//!                    tasks, so no leftover process can keep a CPU. Its text names the task
-//!                    groups running on it, so whoever takes it next can end a dead
-//!                    operation's leftovers first
-//!   v2/grants/N      a promise of CPU N to one waiting operation (its ticket), valid while that
-//!                    operation's file is still locked
-//!   v2/drain         present while `cpuq drain` waits for or holds the machine
-//!   v2/ticks         the last sample of the machine's CPU ticks, for the outside-load gate
+//!   v3/lock          the pool's lock: every scan, start and record write happens under it
+//!   v3/seq           the last ticket number handed out
+//!   v3/ops/C-TICKET  one per live run, exclusively locked by its cpuq for its whole life (C: 0
+//!                    urgent, 1 normal). Its text says what it runs, what it could start, and its
+//!                    tasks (pid and start time), so whoever finds it dead ends its leftovers
+//!   v3/wake/TICKET   the run's FIFO: whoever frees room for it writes a byte there
+//!   v3/limits/PID    `cpuq limit`'s request: the run's new -c
+//!   v3/sample        the last measure of the machine: its busy CPUs (kernel ticks) and each
+//!                    task's (its process tree's CPU time), renewed at most once a second by
+//!                    whichever cpuq finds it old (v3/sample.lock keeps it to one at a time)
 //!
-//! A file whose lock can be taken has no live holder: whoever finds it so removes it, under the
-//! pool's lock. Nothing depends on a pid being alive except killing a dead operation's leftover
-//! processes, and that checks each group leader's start time first.
+//! A file whose lock can be taken has no live holder: whoever finds it so ends what it left
+//! running and removes it, under the pool's lock.
+//!
+//! The rules, as pure functions over the records (`mayStart`, `drainMayStart`, `pausePlan`):
+//!   - Capacity T: the pool's CPUs less those drains isolate.
+//!   - A project's fair share: T × its weight ÷ the weights of the projects running or waiting.
+//!   - Within a project, its first waiter goes first: an urgent run's first task, then the run
+//!     running the fewest tasks, then the run whose last task started longest ago (one that has
+//!     started none first, by ticket).
+//!   - A project under its share starts its next task at once, however busy the machine.
+//!   - Over its share, a run starts a task only while the machine has room (busy + starting <
+//!     T − 0.5), and only the first such waiter in the line (the project running the fewest for
+//!     its weight, then as within a project) takes it.
+//!   - Hard limits: a run's -c, the memory, disk and pressure gates, and 4T tasks running.
 const std = @import("std");
 const Io = std.Io;
 const sys = @import("sys.zig");
+
+/// Tasks started (or continued) this recently count as one busy CPU each: the sample can't have
+/// seen them yet.
+pub const fresh_ms: i64 = 2000;
+/// Room the machine keeps: a waiter over its share starts only while busy + starting < T − this.
+pub const headroom: f64 = 0.5;
+/// Running tasks machine-wide are kept to this many times T: a backstop for when every task
+/// that waited wakes at once.
+pub const backstop: u32 = 4;
+/// A drain isolates CPUs at most this long past its own time limit: a drain's cpuq that is stuck
+/// or gone stops counting then, whatever its record says.
+pub const drain_grace_s: i64 = 60;
 
 pub const Pool = struct {
     io: Io,
     path: []const u8,
     dir: Io.Dir,
-    cpus: Io.Dir,
     ops: Io.Dir,
     wake: Io.Dir,
-    grants: Io.Dir,
-    /// `cpuq limit`'s requests: a file named by the operation's pid, holding its new -c.
+    /// `cpuq limit`'s requests: a file named by the run's pid, holding its new -c.
     limits: Io.Dir,
     lock_file: Io.File,
 
     /// Opens (making it if need be) the pool under `state_dir`.
     pub fn open(io: Io, a: std.mem.Allocator, state_dir: []const u8) !Pool {
-        const path = try std.fmt.allocPrint(a, "{s}/v2", .{state_dir});
+        const path = try std.fmt.allocPrint(a, "{s}/v3", .{state_dir});
         const cwd = Io.Dir.cwd();
         try cwd.createDirPath(io, path);
         const dir = try cwd.openDir(io, path, .{ .iterate = true });
@@ -48,10 +66,8 @@ pub const Pool = struct {
             .io = io,
             .path = path,
             .dir = dir,
-            .cpus = try subdir(io, dir, "cpus"),
             .ops = try subdir(io, dir, "ops"),
             .wake = try subdir(io, dir, "wake"),
-            .grants = try subdir(io, dir, "grants"),
             .limits = try subdir(io, dir, "limits"),
             .lock_file = try createShared(io, dir, "lock"),
         };
@@ -122,8 +138,8 @@ pub const Pool = struct {
         p.lock_file.unlock(p.io);
     }
 
-    /// The next ticket number, above `seq` and every operation's ticket, so a lost `seq` never
-    /// hands out a live number. Under the lock.
+    /// The next ticket number, above `seq` and every run's ticket, so a lost `seq` never hands
+    /// out a live number. Under the lock.
     pub fn nextTicket(p: *Pool) !u64 {
         var buf: [32]u8 = undefined;
         var last: u64 = blk: {
@@ -138,9 +154,9 @@ pub const Pool = struct {
         return last + 1;
     }
 
-    /// Enters an operation: its file, written and locked under a temporary name and renamed
-    /// into place (so no scan sees it unlocked), and its FIFO. Under the lock. The returned file
-    /// stays locked for the operation's life; its ticket is set in `r`.
+    /// Enters a run: its file, written and locked under a temporary name and renamed into place
+    /// (so no scan sees it unlocked), and its FIFO. Under the lock. The returned file stays
+    /// locked for the run's life; its ticket is set in `r`.
     pub fn enter(p: *Pool, r: *Op) !Io.File {
         r.ticket = try p.nextTicket();
         var tmp_buf: [48]u8 = undefined;
@@ -157,8 +173,8 @@ pub const Pool = struct {
         return f;
     }
 
-    /// Opens the operation's FIFO to read, without blocking: it is open before the operation
-    /// first looks for a CPU, so a promise made after that look always finds it open.
+    /// Opens the run's FIFO to read, without blocking: it is open before the run first looks
+    /// for room, so a wake sent after that look always finds it open.
     pub fn openWake(p: *Pool, ticket: u64) !std.c.fd_t {
         var buf: [1024]u8 = undefined;
         const fifo = try std.fmt.bufPrintSentinel(&buf, "{s}/wake/{d}", .{ p.path, ticket }, 0);
@@ -168,8 +184,8 @@ pub const Pool = struct {
         return fd;
     }
 
-    /// Asks the operation whose cpuq is `pid` to hold at most `n` CPUs from now on (`cpuq
-    /// limit`): a file named by its pid, which outlives a new ticket, written whole by a rename.
+    /// Asks the run whose cpuq is `pid` to run at most `n` tasks at once from now on (`cpuq
+    /// limit`): a file named by its pid, written whole by a rename.
     pub fn askLimit(p: *Pool, pid: i32, n: u32) !void {
         var name_buf: [24]u8 = undefined;
         var tmp_buf: [32]u8 = undefined;
@@ -180,7 +196,7 @@ pub const Pool = struct {
         try p.limits.rename(tmp, p.limits, name, p.io);
     }
 
-    /// The new limit asked for the operation whose cpuq is `pid`, if any: read once and removed.
+    /// The new limit asked for the run whose cpuq is `pid`, if any: read once and removed.
     pub fn takeLimit(p: *Pool, pid: i32) ?u32 {
         var name_buf: [24]u8 = undefined;
         const name = std.fmt.bufPrint(&name_buf, "{d}", .{pid}) catch return null;
@@ -190,8 +206,7 @@ pub const Pool = struct {
         return std.fmt.parseInt(u32, std.mem.trim(u8, text, " \n"), 10) catch null;
     }
 
-    /// Wakes a waiting operation: one byte to its FIFO, never blocking. A full FIFO already
-    /// holds a wake.
+    /// Wakes a run: one byte to its FIFO, never blocking. A full FIFO already holds a wake.
     pub fn wakeOp(p: *Pool, ticket: u64) void {
         var buf: [1024]u8 = undefined;
         const fifo = std.fmt.bufPrintSentinel(&buf, "{s}/wake/{d}", .{ p.path, ticket }, 0) catch return;
@@ -201,25 +216,10 @@ pub const Pool = struct {
         _ = std.c.write(fd, "w", 1);
     }
 
-    /// Gives the operation a new ticket, behind every other: it renames its file and FIFO. The
-    /// open file keeps its lock. Under the lock.
-    pub fn renew(p: *Pool, f: Io.File, r: *Op) !void {
-        var old_buf: [48]u8 = undefined;
-        const old = opName(&old_buf, r.*);
-        var old_fifo_buf: [64]u8 = undefined;
-        const old_fifo = try std.fmt.bufPrint(&old_fifo_buf, "{d}", .{r.ticket});
-        r.ticket = try p.nextTicket();
-        var new_buf: [48]u8 = undefined;
-        try p.ops.rename(old, p.ops, opName(&new_buf, r.*), p.io);
-        var new_fifo_buf: [64]u8 = undefined;
-        try p.wake.rename(old_fifo, p.wake, try std.fmt.bufPrint(&new_fifo_buf, "{d}", .{r.ticket}), p.io);
-        try p.write(f, r.*);
-    }
-
-    /// Rewrites an operation's record in place. Readers read only under the lock, as the
-    /// writer writes, so none sees it half written.
+    /// Rewrites a run's record in place. Readers read only under the lock, as the writer
+    /// writes, so none sees it half written.
     pub fn write(p: *Pool, f: Io.File, r: Op) !void {
-        var buf: [4096]u8 = undefined;
+        var buf: [32 << 10]u8 = undefined;
         var w: Io.Writer = .fixed(&buf);
         r.format(&w) catch return error.RecordTooLong;
         const text = w.buffered();
@@ -227,8 +227,8 @@ pub const Pool = struct {
         try f.setLength(p.io, text.len);
     }
 
-    /// Leaves the pool: removes the operation's file and FIFO, then closes the file (its lock
-    /// goes with it). Under the lock.
+    /// Leaves the pool: removes the run's file and FIFO, then closes the file (its lock goes
+    /// with it). Under the lock.
     pub fn leave(p: *Pool, f: Io.File, r: Op) void {
         var name_buf: [48]u8 = undefined;
         p.ops.deleteFile(p.io, opName(&name_buf, r)) catch {};
@@ -237,7 +237,8 @@ pub const Pool = struct {
         f.close(p.io);
     }
 
-    /// Every live operation, in ticket order. A dead one's files are removed. Under the lock.
+    /// Every live run, in ticket order. A dead one's leftover tasks are ended and its files
+    /// removed. Under the lock.
     pub fn scan(p: *Pool, a: std.mem.Allocator) []Op {
         var list: std.ArrayList(Op) = .empty;
         var it = p.ops.iterate();
@@ -246,15 +247,18 @@ pub const Pool = struct {
             const ticket = ticketOf(e.name) orelse continue;
             const f = p.ops.openFile(p.io, e.name, .{}) catch continue;
             defer f.close(p.io);
+            var rd = f.reader(p.io, &.{});
             if (f.tryLock(p.io, .shared) catch false) {
-                // Nobody holds it: its operation has ended, however it ended.
+                // Nobody holds it: its run has ended, however it ended. What it left running
+                // (macOS has no parent-death signal) is ended before anyone counts the room.
+                const text = rd.interface.allocRemaining(a, .limited(64 << 10)) catch "";
+                killLeftovers(Op.parse(a, text));
                 p.ops.deleteFile(p.io, e.name) catch {};
                 var fifo_buf: [32]u8 = undefined;
                 p.wake.deleteFile(p.io, std.fmt.bufPrint(&fifo_buf, "{d}", .{ticket}) catch "") catch {};
                 f.unlock(p.io);
                 continue;
             }
-            var rd = f.reader(p.io, &.{});
             const text = rd.interface.allocRemaining(a, .limited(64 << 10)) catch continue;
             var op = Op.parse(a, text);
             op.ticket = ticket;
@@ -268,166 +272,78 @@ pub const Pool = struct {
         return list.items;
     }
 
-    /// The promises in force: CPU to ticket. A promise to an operation no longer live, or of
-    /// a CPU no longer in the pool, is dropped. Under the lock.
-    pub fn promises(p: *Pool, a: std.mem.Allocator, live: []const Op, pool_cpus: []const u32) []Promise {
-        var list: std.ArrayList(Promise) = .empty;
-        var it = p.grants.iterate();
-        while (it.next(p.io) catch null) |e| {
-            if (e.name[0] == '.') continue;
-            const cpu = std.fmt.parseInt(u32, e.name, 10) catch continue;
-            var buf: [32]u8 = undefined;
-            const text = p.grants.readFile(p.io, e.name, &buf) catch continue;
-            const ticket = std.fmt.parseInt(u64, std.mem.trim(u8, text, " \n"), 10) catch 0;
-            const valid = ticket != 0 and std.mem.findScalar(u32, pool_cpus, cpu) != null and for (live) |o| {
-                if (o.ticket == ticket) break true;
-            } else false;
-            if (!valid) {
-                p.grants.deleteFile(p.io, e.name) catch {};
-                continue;
-            }
-            list.append(a, .{ .cpu = cpu, .ticket = ticket }) catch break;
-        }
-        return list.items;
+    /// The last sample of the machine, or null when there is none.
+    pub fn readSample(p: *Pool, a: std.mem.Allocator) ?Sample {
+        const text = p.dir.readFileAlloc(p.io, "sample", a, .limited(4 << 20)) catch return null;
+        return Sample.parse(a, text);
     }
 
-    /// Promises CPU `cpu` to the operation `ticket`, by rename, so the promise is never seen
-    /// half written. Under the lock.
-    pub fn promise(p: *Pool, cpu: u32, ticket: u64) void {
-        var tmp_buf: [32]u8 = undefined;
-        const tmp = std.fmt.bufPrint(&tmp_buf, ".g{d}", .{cpu}) catch return;
-        var text_buf: [32]u8 = undefined;
-        p.grants.writeFile(p.io, .{ .sub_path = tmp, .data = std.fmt.bufPrint(&text_buf, "{d}\n", .{ticket}) catch return }) catch return;
-        var name_buf: [16]u8 = undefined;
-        p.grants.rename(tmp, p.grants, std.fmt.bufPrint(&name_buf, "{d}", .{cpu}) catch return, p.io) catch {};
-    }
-
-    pub fn dropPromise(p: *Pool, cpu: u32) void {
-        var name_buf: [16]u8 = undefined;
-        p.grants.deleteFile(p.io, std.fmt.bufPrint(&name_buf, "{d}", .{cpu}) catch return) catch {};
-    }
-
-    /// Whether CPU `cpu`'s token is free: nobody holds its lock. Under the lock, so a probe never
-    /// makes a free CPU look held to anyone deciding.
-    pub fn isFree(p: *Pool, cpu: u32) bool {
-        var name_buf: [16]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "{d}", .{cpu}) catch return false;
-        const f = createShared(p.io, p.cpus, name) catch return false;
-        defer f.close(p.io);
-        if (f.tryLock(p.io, .exclusive) catch false) {
-            f.unlock(p.io);
-            return true;
-        }
-        return false;
-    }
-
-    /// Takes CPU `cpu`: locks its token, first ending what a dead holder left running on it.
-    /// The descriptor is close-on-exec, so only this process holds the CPU. Null when someone
-    /// holds it. Under the lock.
-    pub fn take(p: *Pool, a: std.mem.Allocator, cpu: u32) ?Io.File {
-        var name_buf: [16]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "{d}", .{cpu}) catch return null;
-        const f = createShared(p.io, p.cpus, name) catch return null;
-        if (!(f.tryLock(p.io, .exclusive) catch false)) {
-            f.close(p.io);
-            return null;
-        }
-        var rd = f.reader(p.io, &.{});
-        const text = rd.interface.allocRemaining(a, .limited(64 << 10)) catch "";
-        killLeftovers(text);
-        f.setLength(p.io, 0) catch {};
-        return f;
-    }
-
-    /// Notes on a held CPU's token the task groups running on it, as `PGID START` lines (the
-    /// group leader's start time), so a next holder can end them if this operation dies.
-    pub fn noteGroups(f: Io.File, groups: []const Group) void {
-        var buf: [4096]u8 = undefined;
-        var w: Io.Writer = .fixed(&buf);
-        for (groups) |g| w.print("{d} {d}{s}\n", .{ g.pgid, g.start, if (g.alone) " p" else "" }) catch break;
-        const text = w.buffered();
-        _ = std.c.pwrite(f.handle, text.ptr, text.len, 0);
-        _ = std.c.ftruncate(f.handle, @intCast(text.len));
-    }
-
-    /// Gives a CPU back: clears its notes, then unlocks and closes it. Under the lock.
-    pub fn release(p: *Pool, f: Io.File) void {
-        f.setLength(p.io, 0) catch {};
-        f.unlock(p.io);
-        f.close(p.io);
-    }
-
-    /// The machine's busy CPUs over the last second or so, from the kernel's CPU ticks: the
-    /// sample in `ticks` is renewed once at least a second old, so every operation shares one
-    /// measure. Null until two samples exist. Under the lock.
-    pub fn machineBusy(p: *Pool, cpus: u32) ?f64 {
+    /// Renews the sample when it is at least a second old: the machine's busy CPUs from the
+    /// kernel's ticks, and each running task's busy CPUs from its process tree's CPU time. One
+    /// cpuq at a time does it (`sample.lock`, never waited for), outside the pool's lock: a
+    /// process listing takes milliseconds. `ops` names the tasks; `ncpu` is the machine's CPUs.
+    pub fn renewSample(p: *Pool, a: std.mem.Allocator, ops: []const Op, ncpu: u32) void {
         const now = sys.monoMs();
-        const t = sys.cpuTicks(p.io) orelse return null;
-        var buf: [128]u8 = undefined;
-        var last_busy: ?f64 = null;
-        var prev: ?struct { busy: u64, total: u64, ms: i64 } = null;
-        if (p.dir.readFile(p.io, "ticks", &buf)) |text| {
-            var f = std.mem.tokenizeScalar(u8, std.mem.trim(u8, text, " \n"), ' ');
-            const b = std.fmt.parseInt(u64, f.next() orelse "", 10) catch 0;
-            const tot = std.fmt.parseInt(u64, f.next() orelse "", 10) catch 0;
-            const ms = std.fmt.parseInt(i64, f.next() orelse "", 10) catch 0;
-            if (f.next()) |lb| last_busy = std.fmt.parseFloat(f64, lb) catch null;
-            if (tot != 0) prev = .{ .busy = b, .total = tot, .ms = ms };
-        } else |_| {}
-        if (prev) |q| if (now - q.ms < 1000 and now >= q.ms) return last_busy;
-        var busy = last_busy;
-        if (prev) |q| if (t.total > q.total and t.busy >= q.busy) {
-            busy = @as(f64, @floatFromInt(t.busy - q.busy)) / @as(f64, @floatFromInt(t.total - q.total)) * @as(f64, @floatFromInt(cpus));
+        const prev = p.readSample(a);
+        if (prev) |s| if (now - s.ms < 1000 and now >= s.ms) return;
+        const lf = createShared(p.io, p.dir, "sample.lock") catch return;
+        defer lf.close(p.io);
+        if (!(lf.tryLock(p.io, .exclusive) catch false)) return;
+        defer lf.unlock(p.io);
+        // Someone may have renewed it while this one took the lock.
+        const last = p.readSample(a);
+        if (last) |s| if (now - s.ms < 1000 and now >= s.ms) return;
+        var has_tasks = false;
+        for (ops) |o| if (o.tasks_now.len != 0) {
+            has_tasks = true;
         };
-        var out: [128]u8 = undefined;
-        const text = std.fmt.bufPrint(&out, "{d} {d} {d} {d:.2}\n", .{ t.busy, t.total, now, busy orelse 0 }) catch return busy;
-        p.dir.writeFile(p.io, .{ .sub_path = "ticks.new", .data = text }) catch return busy;
-        p.dir.rename("ticks.new", p.dir, "ticks", p.io) catch {};
-        return if (prev != null) busy else null;
-    }
-
-    /// Marks that `cpuq drain` waits for the machine: a `drain` file each drain holds a shared
-    /// lock on for its life, so any number of drains hold it at once and none waits for
-    /// another here, under the pool's lock. Under the lock.
-    pub fn markDrain(p: *Pool) !Io.File {
-        return p.dir.createFile(p.io, "drain", .{ .lock = .shared, .truncate = false });
-    }
-
-    /// Whether `cpuq drain` is waiting for or holding the machine: some drain holds the `drain`
-    /// file's lock.
-    pub fn draining(p: *Pool) bool {
-        const f = p.dir.openFile(p.io, "drain", .{}) catch return false;
-        defer f.close(p.io);
-        if (f.tryLock(p.io, .exclusive) catch false) {
-            f.unlock(p.io);
-            return false;
-        }
-        return true;
+        const procs: []const sys.Proc = if (has_tasks) sys.processes(p.io, a) else &.{};
+        var per: std.ArrayList(TaskBusy) = .empty;
+        var total: f64 = 0;
+        for (ops) |o| for (o.tasks_now) |t| {
+            const cum = sys.treeCpu(procs, t.pid);
+            var busy: f64 = 0;
+            const before: ?TaskBusy = if (last) |s| s.find(t.pid, t.start) else null;
+            if (before) |b| {
+                const ms = @max(now - last.?.ms, 1);
+                busy = @as(f64, @floatFromInt(cum -| b.cum)) / 1e6 / @as(f64, @floatFromInt(ms));
+            } else if (t.fresh != 0) {
+                busy = @as(f64, @floatFromInt(cum)) / 1e6 / @as(f64, @floatFromInt(@max(now - t.fresh, 1)));
+            }
+            if (t.paused) busy = 0;
+            total += busy;
+            per.append(a, .{ .pid = t.pid, .start = t.start, .cum = cum, .busy = busy }) catch break;
+        };
+        const ticks = sys.cpuTicks(p.io);
+        var machine: ?f64 = null;
+        if (ticks) |t| if (last) |s| if (s.ticks_total != 0 and t.total > s.ticks_total and t.busy >= s.ticks_busy) {
+            machine = @as(f64, @floatFromInt(t.busy - s.ticks_busy)) / @as(f64, @floatFromInt(t.total - s.ticks_total)) * @as(f64, @floatFromInt(ncpu));
+        };
+        const s: Sample = .{
+            .ms = now,
+            .ticks_busy = if (ticks) |t| t.busy else 0,
+            .ticks_total = if (ticks) |t| t.total else 0,
+            .machine = machine,
+            .tasks = total,
+            .per = per.items,
+        };
+        var out: std.ArrayList(u8) = .empty;
+        s.format(a, &out) catch return;
+        p.dir.writeFile(p.io, .{ .sub_path = "sample.new", .data = out.items }) catch return;
+        p.dir.rename("sample.new", p.dir, "sample", p.io) catch {};
     }
 };
 
-/// A task group running on a CPU: its process group and its leader's start time.
-/// A task running on a CPU: its process group (or, `alone`, its process: a single task shares
-/// cpuq's group) and the leader's start time.
-pub const Group = struct { pgid: i32, start: u64, alone: bool = false };
-
-/// Ends the task groups a dead holder noted on a CPU's token: each whose leader still runs with
-/// the same start time (a pgid alone may name another group by now) gets SIGKILL, and is waited
-/// for.
-fn killLeftovers(text: []const u8) void {
-    var lines = std.mem.tokenizeScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        var f = std.mem.tokenizeScalar(u8, line, ' ');
-        const pgid = std.fmt.parseInt(i32, f.next() orelse continue, 10) catch continue;
-        const start = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue;
-        if (pgid <= 1) continue;
-        if (sys.procStart(pgid) != start) continue;
-        const alone = if (f.next()) |m| std.mem.eql(u8, m, "p") else false;
-        _ = std.c.kill(if (alone) pgid else -pgid, .KILL);
-        // A kill lands a moment later: wait for the leader to be gone (at most 200 ms), so the
-        // CPU's next task never shares it with what is left.
+/// Ends what a dead run left running: each task whose process still has the start time noted
+/// gets SIGKILL (its whole group, unless it shared its cpuq's group: a single run's task), and is
+/// waited for, at most 200 ms each.
+fn killLeftovers(o: Op) void {
+    for (o.tasks_now) |t| {
+        if (t.pid <= 1 or t.start == 0) continue;
+        if (sys.procStart(t.pid) != t.start) continue;
+        _ = std.c.kill(if (o.single) t.pid else -t.pid, .KILL);
         var waited: u32 = 0;
-        while (waited < 100 and sys.procStart(pgid) == start) : (waited += 1) {
+        while (waited < 100 and sys.procStart(t.pid) == t.start) : (waited += 1) {
             var ts: std.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
             _ = std.c.nanosleep(&ts, null);
         }
@@ -436,11 +352,73 @@ fn killLeftovers(text: []const u8) void {
 
 extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
-pub const Promise = struct { cpu: u32, ticket: u64 };
+/// A task running now: its number, its try, its pid and that process's start time (so a reused
+/// pid is never taken for it), when it started (Unix seconds), when it last started or continued
+/// (monotonic ms: fresh for `fresh_ms`), and whether cpuq has it stopped (macOS sharing, or a
+/// drain of the whole machine).
+pub const TaskNow = struct {
+    task: u32 = 0,
+    attempt: u32 = 1,
+    pid: i32 = 0,
+    start: u64 = 0,
+    since: i64 = 0,
+    fresh: i64 = 0,
+    paused: bool = false,
+};
 
-/// A task running now: its number, its try, the CPU it runs on, its pid, and when it started
-/// (Unix seconds).
-pub const TaskNow = struct { task: u32, attempt: u32, cpu: u32, pid: i32, since: i64 };
+/// One task's measure in the sample: its process tree's CPU time so far (ns) and its busy CPUs
+/// over the last interval.
+pub const TaskBusy = struct { pid: i32, start: u64, cum: u64, busy: f64 };
+
+/// The machine as last measured (`v3/sample`).
+pub const Sample = struct {
+    /// When (monotonic ms).
+    ms: i64 = 0,
+    /// The kernel's CPU ticks then, busy and total.
+    ticks_busy: u64 = 0,
+    ticks_total: u64 = 0,
+    /// The machine's busy CPUs over the interval before it; null for a first sample.
+    machine: ?f64 = null,
+    /// cpuq's tasks' busy CPUs over that interval, all of them.
+    tasks: f64 = 0,
+    per: []const TaskBusy = &.{},
+
+    pub fn find(s: Sample, pid: i32, start: u64) ?TaskBusy {
+        for (s.per) |t| if (t.pid == pid and t.start == start) return t;
+        return null;
+    }
+
+    fn format(s: Sample, a: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try out.print(a, "{d} {d} {d} ", .{ s.ms, s.ticks_busy, s.ticks_total });
+        if (s.machine) |m| try out.print(a, "{d:.3}", .{m}) else try out.append(a, '-');
+        try out.print(a, " {d:.3}\n", .{s.tasks});
+        for (s.per) |t| try out.print(a, "{d} {d} {d} {d:.3}\n", .{ t.pid, t.start, t.cum, t.busy });
+    }
+
+    fn parse(a: std.mem.Allocator, text: []const u8) ?Sample {
+        var lines = std.mem.tokenizeScalar(u8, text, '\n');
+        var f = std.mem.tokenizeScalar(u8, lines.next() orelse return null, ' ');
+        var s: Sample = .{};
+        s.ms = std.fmt.parseInt(i64, f.next() orelse return null, 10) catch return null;
+        s.ticks_busy = std.fmt.parseInt(u64, f.next() orelse return null, 10) catch return null;
+        s.ticks_total = std.fmt.parseInt(u64, f.next() orelse return null, 10) catch return null;
+        const m = f.next() orelse return null;
+        s.machine = std.fmt.parseFloat(f64, m) catch null;
+        s.tasks = std.fmt.parseFloat(f64, f.next() orelse "0") catch 0;
+        var per: std.ArrayList(TaskBusy) = .empty;
+        while (lines.next()) |line| {
+            var g = std.mem.tokenizeScalar(u8, line, ' ');
+            per.append(a, .{
+                .pid = std.fmt.parseInt(i32, g.next() orelse continue, 10) catch continue,
+                .start = std.fmt.parseInt(u64, g.next() orelse continue, 10) catch continue,
+                .cum = std.fmt.parseInt(u64, g.next() orelse continue, 10) catch continue,
+                .busy = std.fmt.parseFloat(f64, g.next() orelse continue) catch continue,
+            }) catch break;
+        }
+        s.per = per.items;
+        return s;
+    }
+};
 
 fn ticketOf(name: []const u8) ?u64 {
     const dash = std.mem.findScalar(u8, name, '-') orelse return null;
@@ -451,55 +429,60 @@ fn opName(buf: []u8, r: Op) []const u8 {
     return std.fmt.bufPrint(buf, "{d}-{d}", .{ @intFromBool(!r.urgent), r.ticket }) catch "";
 }
 
-/// An operation, as its file records it.
+/// A run, as its file records it.
 pub const Op = struct {
     ticket: u64 = 0,
-    /// "Rebuild first": its first CPU goes ahead of the line.
+    /// "Rebuild first": its first task goes ahead of the line.
     urgent: bool = false,
-    /// It has held a CPU: urgent no more, even holding none again.
+    /// It has started a task: urgent no more.
     served: bool = false,
-    /// `cpuq drain`: gathers its CPUs ahead of the line and runs alone on them.
+    /// When it last started a task (monotonic ms); 0: never. Of runs running as many, the one
+    /// that started longest ago goes first, so a run that ends a task and would start the next
+    /// takes its turn behind the others.
+    last: i64 = 0,
+    /// `cpuq drain`: isolates `limit` CPUs (or with `all`, stops every other task) for its
+    /// command, once its turn comes.
     drain: bool = false,
-    /// A drain of the whole machine (--all); else of `limit` CPUs (-c N).
     all: bool = false,
+    /// One task, sharing its cpuq's process group (`cpuq run -- CMD`).
+    single: bool = false,
+    /// Its cpuq is stopped (Ctrl-Z): its tasks are stopped, and it starts none.
+    stopped: bool = false,
     pid: i32 = 0,
     project: []const u8 = "",
     label: []const u8 = "",
     weight: u32 = 1,
-    /// CPUs it could use now beyond those it holds (promises to it count against this when
-    /// CPUs are handed out).
-    want: u32 = 0,
-    /// The CPUs it holds, by number.
-    held: []const u32 = &.{},
-    /// How many of those it is emptying to give up.
-    draining: u32 = 0,
-    /// Processes per CPU (-x), and the most CPUs it may hold (-c, worked out).
-    overload: u32 = 1,
+    /// The most tasks it runs at once (-c, worked out); a drain's CPUs.
     limit: u32 = 1,
     tasks: u32 = 1,
     done: u32 = 0,
     failed: u32 = 0,
+    /// Its tasks running, those cpuq has stopped included.
     running: u32 = 0,
+    /// Tasks it could start now (none while stopped, or at its -c); a drain waiting: 1.
+    waiting: u32 = 0,
+    /// A drain: the CPUs it isolates, once it has started.
+    cpus: []const u32 = &.{},
+    /// A drain: when its isolation began (monotonic ms); 0 while it waits for its turn.
+    dstart: i64 = 0,
     since: i64 = 0,
     /// The longest a task of it may run, in seconds, with the time a kill takes; 0: no limit.
     tlimit: u32 = 0,
-    /// The latest its running tasks may end (Unix seconds; 0 when none runs).
-    ends: i64 = 0,
-    /// Why it waits, for status ("gate: memory pressure"); empty when it isn't held back.
+    /// Why it waits, for status ("memory pressure"); empty when it isn't held back.
     why: []const u8 = "",
-    /// Its tasks running now, for status: at most 256, the oldest first.
+    /// Its tasks running now.
     tasks_now: []const TaskNow = &.{},
     cmd: []const u8 = "",
 
     pub fn format(r: Op, w: *Io.Writer) Io.Writer.Error!void {
-        try w.print("pid={d}\nurgent={d}\nserved={d}\ndrain={d}\nall={d}\nproject={s}\nlabel={s}\nweight={d}\nwant={d}\nheld=", .{
-            r.pid, @intFromBool(r.urgent), @intFromBool(r.served), @intFromBool(r.drain), @intFromBool(r.all), r.project, r.label, r.weight, r.want,
+        try w.print("pid={d}\nurgent={d}\nserved={d}\ndrain={d}\nall={d}\nsingle={d}\nstopped={d}\nproject={s}\nlabel={s}\nweight={d}\nlimit={d}\ntasks={d}\ndone={d}\nfailed={d}\nrunning={d}\nwaiting={d}\ncpus=", .{
+            r.pid,     @intFromBool(r.urgent), @intFromBool(r.served), @intFromBool(r.drain), @intFromBool(r.all), @intFromBool(r.single), @intFromBool(r.stopped),
+            r.project, r.label,                r.weight,               r.limit,               r.tasks,             r.done,                 r.failed,
+            r.running, r.waiting,
         });
-        for (r.held, 0..) |cpu, i| try w.print("{s}{d}", .{ if (i == 0) "" else ",", cpu });
-        try w.print("\ndraining={d}\noverload={d}\nlimit={d}\ntasks={d}\ndone={d}\nfailed={d}\nrunning={d}\nsince={d}\ntlimit={d}\nends={d}\nwhy={s}\nnow=", .{
-            r.draining, r.overload, r.limit, r.tasks, r.done, r.failed, r.running, r.since, r.tlimit, r.ends, r.why,
-        });
-        for (r.tasks_now[0..@min(r.tasks_now.len, 256)], 0..) |t, i| try w.print("{s}{d}:{d}:{d}:{d}:{d}", .{ if (i == 0) "" else ",", t.task, t.attempt, t.cpu, t.pid, t.since });
+        for (r.cpus, 0..) |cpu, i| try w.print("{s}{d}", .{ if (i == 0) "" else ",", cpu });
+        try w.print("\nlast={d}\ndstart={d}\nsince={d}\ntlimit={d}\nwhy={s}\nnow=", .{ r.last, r.dstart, r.since, r.tlimit, r.why });
+        for (r.tasks_now, 0..) |t, i| try w.print("{s}{d}:{d}:{d}:{d}:{d}:{d}:{d}", .{ if (i == 0) "" else ",", t.task, t.attempt, t.pid, t.start, t.since, t.fresh, @intFromBool(t.paused) });
         try w.writeAll("\ncmd=");
         // The command is for people reading status: its first 1,000 bytes are plenty.
         for (r.cmd[0..@min(r.cmd.len, 1000)]) |ch| try w.writeByte(if (ch == '\n' or ch == '\t') ' ' else ch);
@@ -517,21 +500,22 @@ pub const Op = struct {
             if (eq(k, "served")) r.served = eq(v, "1");
             if (eq(k, "drain")) r.drain = eq(v, "1");
             if (eq(k, "all")) r.all = eq(v, "1");
+            if (eq(k, "single")) r.single = eq(v, "1");
+            if (eq(k, "stopped")) r.stopped = eq(v, "1");
             if (eq(k, "project")) r.project = v;
             if (eq(k, "label")) r.label = v;
             if (eq(k, "weight")) r.weight = @max(1, n);
-            if (eq(k, "want")) r.want = n;
-            if (eq(k, "held")) r.held = parseList(a, v);
-            if (eq(k, "draining")) r.draining = n;
-            if (eq(k, "overload")) r.overload = @max(1, n);
             if (eq(k, "limit")) r.limit = n;
             if (eq(k, "tasks")) r.tasks = n;
             if (eq(k, "done")) r.done = n;
             if (eq(k, "failed")) r.failed = n;
             if (eq(k, "running")) r.running = n;
+            if (eq(k, "waiting")) r.waiting = n;
+            if (eq(k, "cpus")) r.cpus = parseList(a, v);
+            if (eq(k, "last")) r.last = std.fmt.parseInt(i64, v, 10) catch 0;
+            if (eq(k, "dstart")) r.dstart = std.fmt.parseInt(i64, v, 10) catch 0;
             if (eq(k, "since")) r.since = std.fmt.parseInt(i64, v, 10) catch 0;
             if (eq(k, "tlimit")) r.tlimit = n;
-            if (eq(k, "ends")) r.ends = std.fmt.parseInt(i64, v, 10) catch 0;
             if (eq(k, "why")) r.why = v;
             if (eq(k, "now")) r.tasks_now = parseTasks(a, v);
             if (eq(k, "cmd")) r.cmd = v;
@@ -539,9 +523,16 @@ pub const Op = struct {
         return r;
     }
 
-    /// CPUs it keeps: held, less those it is giving up.
-    pub fn keeps(r: Op) u32 {
-        return @intCast(r.held.len -| r.draining);
+    /// Its tasks cpuq has stopped (macOS sharing, a drain of the whole machine).
+    pub fn paused(r: Op) u32 {
+        var n: u32 = 0;
+        for (r.tasks_now) |t| n += @intFromBool(t.paused);
+        return n;
+    }
+
+    /// Whether it counts in the line: a run, not a drain, whose cpuq isn't stopped.
+    pub fn counts(r: Op) bool {
+        return !r.drain and !r.stopped;
     }
 };
 
@@ -557,9 +548,11 @@ fn parseTasks(a: std.mem.Allocator, v: []const u8) []const TaskNow {
         out.append(a, .{
             .task = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue,
             .attempt = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue,
-            .cpu = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue,
             .pid = std.fmt.parseInt(i32, f.next() orelse continue, 10) catch continue,
+            .start = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue,
             .since = std.fmt.parseInt(i64, f.next() orelse continue, 10) catch continue,
+            .fresh = std.fmt.parseInt(i64, f.next() orelse continue, 10) catch continue,
+            .paused = eq(f.next() orelse "0", "1"),
         }) catch break;
     }
     return out.items;
@@ -572,510 +565,594 @@ fn parseList(a: std.mem.Allocator, v: []const u8) []const u32 {
     return out.items;
 }
 
-// --- The line: pure decisions over the operations' records ----------------------------------
+// --- Drains: which CPUs are isolated, and whose turn it is ----------------------------------
 
-/// One operation's standing in the line while CPUs are handed out.
-const Standing = struct {
-    op: *const Op,
-    /// CPUs it keeps plus those promised to it so far.
-    has: u32,
-    /// CPUs it may still be promised.
-    left: u32,
+/// Whether drain `o` isolates now: started, its cpuq not stopped, and within its time limit
+/// plus `drain_grace_s` (a stuck or vanished drain's record never holds the machine longer).
+pub fn isolating(o: Op, now_ms: i64) bool {
+    if (!o.drain or o.stopped or o.dstart == 0) return false;
+    if (o.tlimit == 0) return true;
+    return now_ms - o.dstart <= (@as(i64, o.tlimit) + drain_grace_s) * 1000;
+}
+
+/// Whether a drain of the whole machine (--all) runs: every other task is stopped meanwhile.
+pub fn allDrain(ops: []const Op, now_ms: i64) bool {
+    for (ops) |o| if (o.all and isolating(o, now_ms)) return true;
+    return false;
+}
+
+/// The CPUs drains of a few CPUs (-c N) isolate now, in no order.
+pub fn isolated(a: std.mem.Allocator, ops: []const Op, now_ms: i64) []const u32 {
+    var out: std.ArrayList(u32) = .empty;
+    for (ops) |o| if (!o.all and isolating(o, now_ms)) for (o.cpus) |c| {
+        if (std.mem.findScalar(u32, out.items, c) == null) out.append(a, c) catch break;
+    };
+    return out.items;
+}
+
+/// The capacity the line shares: the pool's CPUs less those isolated; none while a drain has the
+/// whole machine.
+pub fn capacity(ops: []const Op, pool_n: u32, now_ms: i64) u32 {
+    if (allDrain(ops, now_ms)) return 0;
+    var iso: u32 = 0;
+    for (ops) |o| if (!o.all and isolating(o, now_ms)) {
+        iso += @intCast(o.cpus.len);
+    };
+    return pool_n -| iso;
+}
+
+/// The most CPUs drains may isolate at once: half the pool, at least one.
+pub fn drainRoom(pool_n: u32) u32 {
+    return @max(1, pool_n / 2);
+}
+
+pub const DrainWait = enum {
+    /// Its turn: it isolates now.
+    go,
+    /// A run that queued before it has tasks waiting: a drain passes no older waiter.
+    older_waiter,
+    /// An older drain waits too: drains go in their order.
+    older_drain,
+    /// Its CPUs would take the drains' isolation past half the pool.
+    half_pool,
+    /// A drain of the whole machine runs, or (for --all) any drain runs.
+    other_drain,
 };
 
-/// Whether `x` goes ahead of `y` for the next CPU: urgent first (only for an operation's first
-/// CPU, so once it has held one it is urgent no more, and only while its project holds no
-/// urgent CPU), then an operation holding nothing, then the project holding the fewest CPUs for
-/// its weight, then the operation holding the fewest, then the older ticket.
-fn ahead(projects: *const std.StringHashMapUnmanaged(Count), x: Standing, y: Standing) bool {
-    const ux = urgentNow(projects, x);
-    const uy = urgentNow(projects, y);
-    if (ux != uy) return ux;
-    // An operation holding nothing goes before every holder, so it can't starve behind a head
-    // nobody may give to.
-    if ((x.has == 0) != (y.has == 0)) return x.has == 0;
-    const px = projects.get(x.op.project) orelse Count{};
-    const py = projects.get(y.op.project) orelse Count{};
-    // px.cpus / x.weight < py.cpus / y.weight, without division.
-    const lx = @as(u64, px.cpus) * y.op.weight;
-    const ly = @as(u64, py.cpus) * x.op.weight;
-    if (lx != ly) return lx < ly;
-    if (x.has != y.has) return x.has < y.has;
-    return x.op.ticket < y.op.ticket;
-}
-
-fn urgentNow(projects: *const std.StringHashMapUnmanaged(Count), s: Standing) bool {
-    if (!s.op.urgent or s.op.served or s.has != 0) return false;
-    const c = projects.get(s.op.project) orelse return true;
-    return c.urgent == 0;
-}
-
-const Count = struct { cpus: u32 = 0, urgent: u32 = 0 };
-
-fn countProjects(a: std.mem.Allocator, ops: []const Op, given: []const Promise) std.StringHashMapUnmanaged(Count) {
-    var m: std.StringHashMapUnmanaged(Count) = .empty;
+/// Whether drain `me` may begin isolating now.
+pub fn drainMayStart(ops: []const Op, me: u64, pool_n: u32, now_ms: i64) DrainWait {
+    const d = for (ops) |o| {
+        if (o.ticket == me) break o;
+    } else return .older_waiter;
+    var iso: u32 = 0;
+    var any = false;
     for (ops) |o| {
-        const gop = m.getOrPut(a, o.project) catch continue;
-        if (!gop.found_existing) gop.value_ptr.* = .{};
-        var has = o.keeps();
-        for (given) |g| if (g.ticket == o.ticket) {
-            has += 1;
-        };
-        gop.value_ptr.cpus += has;
-        if (o.urgent and has != 0) gop.value_ptr.urgent += 1;
+        if (o.ticket == me) continue;
+        if (o.ticket < me and o.counts() and o.waiting > 0) return .older_waiter;
+        if (o.ticket < me and o.drain and !o.stopped and o.dstart == 0) return .older_drain;
+        if (isolating(o, now_ms)) {
+            any = true;
+            if (o.all and !d.all) return .other_drain;
+            if (!o.all) iso += @intCast(o.cpus.len);
+        }
     }
-    return m;
+    if (d.all) return if (any) .other_drain else .go;
+    if (iso + d.limit > drainRoom(pool_n)) return .half_pool;
+    return .go;
 }
 
-/// Hands out `free` CPUs (in the pool's order) to the line, one at a time, re-ranking after
-/// each: the CPUs already promised (`given`) count as held by their operation. Returns the new
-/// promises. While a `cpuq drain` wants CPUs, every CPU goes to a drain alone: the one holding
-/// or promised the most, then the older, so two drains never each hold part of the pool waiting
-/// for the other's. A stopped one (which wants none) is passed over. Two exceptions, in the
-/// line's order: a run that queued before the drain and has yet to start goes first (`before`:
-/// a drain takes its turn); then backfill, a waiter whose task would end before the drain could
-/// start anyway (`fits`).
-pub fn handOut(a: std.mem.Allocator, ops: []const Op, given: []const Promise, free: []const u32, now: i64) []Promise {
-    var out: std.ArrayList(Promise) = .empty;
-    if (free.len == 0) return out.items;
-    var all: std.ArrayList(Promise) = .empty;
-    all.appendSlice(a, given) catch return out.items;
-    const standings = a.alloc(Standing, ops.len) catch return out.items;
-    var drains = false;
-    for (ops, standings) |*o, *s| {
-        var promised: u32 = 0;
-        for (given) |g| if (g.ticket == o.ticket) {
-            promised += 1;
-        };
-        s.* = .{ .op = o, .has = o.keeps() + promised, .left = o.want -| promised };
-        if (o.drain and o.want > 0) drains = true;
-    }
-    for (free) |cpu| {
-        var projects = countProjects(a, ops, all.items);
-        var best: ?usize = null;
-        if (drains) {
-            const turn = turnOf(ops);
-            for (standings, 0..) |st, i| {
-                if (st.left == 0 or !before(st.op.*, turn)) continue;
-                if (best == null or ahead(&projects, st, standings[best.?])) best = i;
-            }
-            if (best == null) if (shadow(ops)) |sh| for (standings, 0..) |st, i| {
-                if (st.left == 0 or !fits(st.op.*, sh, now)) continue;
-                if (best == null or ahead(&projects, st, standings[best.?])) best = i;
-            };
-            if (best == null) {
-                var d: ?usize = null;
-                for (standings, 0..) |s, i| {
-                    if (!s.op.drain or s.op.want == 0) continue;
-                    const ds = if (d) |j| standings[j] else null;
-                    if (ds == null or s.has > ds.?.has or (s.has == ds.?.has and s.op.ticket < ds.?.op.ticket)) d = i;
-                }
-                if (standings[d.?].left > 0) best = d;
-            }
-        }
-        // No drain wants, or it has all it asked for (-c N): the line as usual.
-        if (best == null) for (standings, 0..) |s, i| {
-            if (s.left == 0) continue;
-            if (best == null or ahead(&projects, s, standings[best.?])) best = i;
-        };
-        const b = best orelse break;
-        const p: Promise = .{ .cpu = cpu, .ticket = standings[b].op.ticket };
-        out.append(a, p) catch break;
-        all.append(a, p) catch break;
-        standings[b].has += 1;
-        standings[b].left -= 1;
+/// The `n` CPUs a drain isolates: from the end of the pool's order, none another drain isolates.
+pub fn pickDrainCpus(a: std.mem.Allocator, pool_cpus: []const u32, taken: []const u32, n: u32) []const u32 {
+    var out: std.ArrayList(u32) = .empty;
+    var i = pool_cpus.len;
+    while (i > 0 and out.items.len < n) {
+        i -= 1;
+        if (std.mem.findScalar(u32, taken, pool_cpus[i]) != null) continue;
+        out.append(a, pool_cpus[i]) catch break;
     }
     return out.items;
 }
 
-/// A drain takes its turn: it passes no run that queued before it. Of the gathering drains, the
-/// oldest; an operation older than it that holds no CPU and wants one (`before`) gets CPUs ahead
-/// of it, and a CPU it takes runs a task before it is emptied for the drain. An operation that
-/// gives CPUs back takes a new ticket (`renew`), so after its turn it is younger than the drains
-/// that came meanwhile: they go first, then it. Null when no drain gathers.
-pub fn turnOf(ops: []const Op) ?u64 {
-    for (ops) |o| if (o.drain and o.want > 0) return o.ticket;
-    return null;
+// --- The line: pure decisions over the runs' records ----------------------------------------
+
+/// What a decision knows besides the records.
+pub const Cx = struct {
+    /// The pool's CPUs.
+    pool_n: u32,
+    /// The machine's busy CPUs as admission counts them (`busyNow`).
+    busy: f64 = 0,
+    /// Monotonic ms now.
+    now_ms: i64 = 0,
+};
+
+pub const Wait = enum {
+    /// It starts a task now.
+    go,
+    /// A drain has the whole machine.
+    drain_all,
+    /// Tasks cpuq has stopped (its own, or others') continue before a task starts in spare room.
+    paused,
+    /// Running tasks are at `backstop` × T.
+    backstop,
+    /// Over its share, and the machine has no room.
+    busy,
+    /// Over its share, and another waiter goes first for the room.
+    behind,
+    /// Another run of its project goes first.
+    project,
+    /// Nothing to start.
+    idle,
+};
+
+/// A project's running tasks and weight, among those running or waiting.
+const Proj = struct { running: u32 = 0, weight: u32 = 1 };
+
+fn projects(a: std.mem.Allocator, ops: []const Op) std.StringArrayHashMapUnmanaged(Proj) {
+    var m: std.StringArrayHashMapUnmanaged(Proj) = .empty;
+    for (ops) |o| {
+        if (!o.counts() or (o.running == 0 and o.waiting == 0)) continue;
+        const gop = m.getOrPut(a, o.project) catch continue;
+        if (!gop.found_existing) gop.value_ptr.* = .{ .weight = o.weight };
+        gop.value_ptr.running += o.running;
+        gop.value_ptr.weight = @max(gop.value_ptr.weight, o.weight);
+    }
+    return m;
 }
 
-/// Whether `o` queued before the gathering drain `turn`, holds no CPU and wants one: it goes
-/// first.
-pub fn before(o: Op, turn: ?u64) bool {
-    const t = turn orelse return false;
-    return !o.drain and o.ticket < t and o.held.len == 0 and o.want > 0;
+fn weights(m: std.StringArrayHashMapUnmanaged(Proj)) u64 {
+    var w: u64 = 0;
+    for (m.values()) |p| w += p.weight;
+    return @max(w, 1);
 }
 
-/// Whether a drain gathers the whole machine (--all): every
-/// operation that has started stops filling its CPUs for it (unless its tasks backfill). A
-/// drain of fewer CPUs (-c N) is owed them one at a time by the line's giver instead.
-pub fn drainWantsAll(ops: []const Op) bool {
-    for (ops) |o| if (o.drain and o.all and o.want > 0) return true;
+/// A project's fair share of capacity `t`: t × its weight ÷ the weights of the projects running
+/// or waiting.
+pub fn fairShare(a: std.mem.Allocator, ops: []const Op, project: []const u8, t: u32) f64 {
+    const m = projects(a, ops);
+    const p = m.get(project) orelse return 0;
+    return @as(f64, @floatFromInt(t)) * @as(f64, @floatFromInt(p.weight)) / @as(f64, @floatFromInt(weights(m)));
+}
+
+/// Whether the project's running tasks are under its share: running × Σw < t × w, without
+/// division.
+fn under(m: std.StringArrayHashMapUnmanaged(Proj), project: []const u8, t: u32) bool {
+    const p = m.get(project) orelse return t > 0;
+    return @as(u64, p.running) * weights(m) < @as(u64, t) * p.weight;
+}
+
+/// Tasks started or continued in the last `fresh_ms`, which the sample can't have measured yet.
+pub fn starting(ops: []const Op, now_ms: i64) u32 {
+    var n: u32 = 0;
+    for (ops) |o| if (o.counts()) for (o.tasks_now) |t| {
+        if (!t.paused and t.fresh != 0 and now_ms - t.fresh < fresh_ms) n += 1;
+    };
+    return n;
+}
+
+/// Whether any run's task is stopped by cpuq for sharing (not for a drain of the whole machine).
+fn anyPaused(ops: []const Op) bool {
+    for (ops) |o| if (o.counts() and o.paused() > 0) return true;
     return false;
 }
 
-/// While one `cpuq drain` gathers the machine: the latest the tasks it waits for may end (Unix
-/// seconds), so the soonest it could start. Null when no drain gathers, when another drain
-/// holds CPUs too, when nothing it waits for runs, or when a task it waits for has no time
-/// limit: then no task may go ahead of it. Every task started for backfill ends by this time,
-/// so it never grows while the drain gathers, and the drain starts by the first one it had.
-pub fn shadow(ops: []const Op) ?i64 {
-    var gathering: u32 = 0;
-    var latest: i64 = 0;
+/// Whether `x` goes ahead of `y` for spare room: an urgent run's first task, then the project
+/// running the fewest tasks for its weight, then the run running the fewest, then the run whose
+/// last task started longest ago (one that has started none first), then the older ticket.
+fn ahead(m: std.StringArrayHashMapUnmanaged(Proj), x: Op, y: Op) bool {
+    const ux = x.urgent and !x.served;
+    const uy = y.urgent and !y.served;
+    if (ux != uy) return ux;
+    const px = m.get(x.project) orelse Proj{};
+    const py = m.get(y.project) orelse Proj{};
+    const lx = @as(u64, px.running) * py.weight;
+    const ly = @as(u64, py.running) * px.weight;
+    if (lx != ly) return lx < ly;
+    if (x.running != y.running) return x.running < y.running;
+    if (x.last != y.last) return x.last < y.last;
+    return x.ticket < y.ticket;
+}
+
+/// A project's first waiter: of its runs with tasks waiting and none of their own stopped by
+/// cpuq, the one `ahead` puts first (within one project: an urgent run's first task, the run
+/// running the fewest, the one whose last task started longest ago, the older ticket). Only it starts the project's next task.
+pub fn projectFirst(a: std.mem.Allocator, ops: []const Op, project: []const u8) ?u64 {
+    const m = projects(a, ops);
+    var best: ?Op = null;
     for (ops) |o| {
-        if (o.drain) {
-            // A drain of a few CPUs (-c N) is owed them one by one, not the machine: no backfill.
-            if (o.want > 0 and !o.all) return null;
-            if (o.want > 0) gathering += 1 else if (o.held.len > 0) return null;
-            continue;
-        }
-        if (o.held.len == 0 or o.running == 0) continue;
-        if (o.tlimit == 0) return null;
-        latest = @max(latest, o.ends);
-    }
-    if (gathering != 1 or latest == 0) return null;
-    return latest;
-}
-
-/// Whether a task `o` starts now ends by `shadow`, so a gathering drain lends it a CPU.
-pub fn fits(o: Op, sh: i64, now: i64) bool {
-    return !o.drain and o.tlimit != 0 and now + @as(i64, o.tlimit) <= sh;
-}
-
-/// How many more of its CPUs the gathering drain lends: what the waiters that fit still want,
-/// beyond what is promised them and what the drain already empties. Null when it lends none.
-pub fn lends(ops: []const Op, given: []const Promise, now: i64) ?struct { ticket: u64, n: u32 } {
-    const sh = shadow(ops) orelse return null;
-    var want: u32 = 0;
-    var drain: ?*const Op = null;
-    for (ops) |*o| {
-        if (o.drain and o.want > 0) drain = o;
-        if (!fits(o.*, sh, now)) continue;
-        want += standing(o, given).left;
-    }
-    const d = drain orelse return null;
-    const idle: u32 = d.keeps();
-    const n = @min(want -| d.draining, idle);
-    return if (n == 0) null else .{ .ticket = d.ticket, .n = n };
-}
-
-/// The first operation in the line still wanting a CPU once every promise is counted, if any.
-pub fn firstWaiter(a: std.mem.Allocator, ops: []const Op, given: []const Promise) ?Standing {
-    var projects = countProjects(a, ops, given);
-    var best: ?Standing = null;
-    for (ops) |*o| {
-        var promised: u32 = 0;
-        for (given) |g| if (g.ticket == o.ticket) {
-            promised += 1;
-        };
-        const s: Standing = .{ .op = o, .has = o.keeps() + promised, .left = o.want -| promised };
-        if (s.left == 0) continue;
-        if (best == null or ahead(&projects, s, best.?)) best = s;
-    }
-    return best;
-}
-
-/// Whether waiter `wt` goes ahead of `gt` in the line once `gt` has given one CPU up (and
-/// wants one again).
-fn behindAfter(a: std.mem.Allocator, ops: []const Op, given: []const Promise, wt: u64, gt: u64) bool {
-    const after = a.dupe(Op, ops) catch return false;
-    var wi: ?usize = null;
-    var gi: ?usize = null;
-    for (after, 0..) |*o, i| {
-        if (o.ticket == wt) wi = i;
-        if (o.ticket == gt) {
-            gi = i;
-            o.draining += 1;
-        }
-    }
-    const w = wi orelse return false;
-    const g = gi orelse return false;
-    // Giving a CPU up renews the giver's ticket (`renew`): it takes its turn behind everyone.
-    var newest: u64 = 0;
-    for (after) |o| newest = @max(newest, o.ticket);
-    after[g].ticket = newest + 1;
-    var projects = countProjects(a, after, given);
-    const sw = standing(&after[w], given);
-    var sg = standing(&after[g], given);
-    sg.left = @max(sg.left, 1);
-    return ahead(&projects, sw, sg);
-}
-
-fn standing(o: *const Op, given: []const Promise) Standing {
-    var promised: u32 = 0;
-    for (given) |p| if (p.ticket == o.ticket) {
-        promised += 1;
-    };
-    return .{ .op = o, .has = o.keeps() + promised, .left = o.want -| promised };
-}
-
-/// Which operation should empty one of its CPUs for the first waiter, if any: drains are owed
-/// to the first waiter alone, at most as many as it still wants, counted over every operation
-/// (so twelve don't all drain for one). A giver qualifies when the waiter holds nothing, or when
-/// after the move the waiter's project would still hold no more than the giver's for their
-/// weights: (waiter's + 1) / its weight <= (giver's - 1) / the giver's. Of those, the one whose
-/// project holds the most for its weight gives, then the one keeping the most, then the newest.
-/// A CPU being emptied counts as given up already. While a `cpuq drain` waits, every operation
-/// gives.
-pub fn giver(a: std.mem.Allocator, ops: []const Op, given: []const Promise) ?u64 {
-    const w = firstWaiter(a, ops, given) orelse return null;
-    var owed: u32 = 0;
-    for (ops) |o| owed += o.draining;
-    if (owed >= w.left) return null;
-    var projects = countProjects(a, ops, given);
-    const wp = (projects.get(w.op.project) orelse Count{}).cpus;
-    var best: ?*const Op = null;
-    for (ops) |*g| {
-        if (g.ticket == w.op.ticket or g.drain or g.keeps() == 0) continue;
-        const gp = (projects.get(g.project) orelse Count{}).cpus;
-        const room = w.op.drain or w.has == 0 or
-            (@as(u64, wp + 1) * g.weight <= @as(u64, gp -| 1) * w.op.weight and gp >= 1);
-        if (!room) continue;
-        // Only if the waiter still goes ahead of the giver once the giver holds one fewer:
-        // else the freed CPU would come straight back to the giver.
-        if (!w.op.drain and !behindAfter(a, ops, given, w.op.ticket, g.ticket)) continue;
-        if (best) |b| {
-            const bp = (projects.get(b.project) orelse Count{}).cpus;
-            const lg = @as(u64, gp) * b.weight;
-            const lb = @as(u64, bp) * g.weight;
-            if (lg < lb) continue;
-            if (lg == lb) {
-                if (g.keeps() < b.keeps()) continue;
-                if (g.keeps() == b.keeps() and g.ticket < b.ticket) continue;
-            }
-        }
-        best = g;
+        if (!o.counts() or o.waiting == 0 or o.paused() > 0) continue;
+        if (!std.mem.eql(u8, o.project, project)) continue;
+        if (best == null or ahead(m, o, best.?)) best = o;
     }
     return if (best) |b| b.ticket else null;
 }
 
-test "the line: urgent only until served; a stopped drain is passed over" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    // U (urgent, served) and B (another project) hold one CPU each; C, of U's project, holds
-    // nothing. U gives: holding nothing again it is not urgent, so C still goes ahead of it.
-    const ops = [_]Op{
-        .{ .ticket = 1, .project = "q", .held = &.{0}, .want = 9 },
-        .{ .ticket = 2, .project = "p", .urgent = true, .served = true, .held = &.{1}, .want = 9 },
-        .{ .ticket = 3, .project = "p", .want = 1 },
-    };
-    try std.testing.expectEqual(2, giver(a, &ops, &.{}).?);
-    // Not yet served, an urgent op holding nothing still goes first.
-    const fresh = [_]Op{ ops[0], .{ .ticket = 5, .project = "p", .urgent = true, .want = 1 } };
-    try std.testing.expectEqual(5, handOut(a, &fresh, &.{}, &.{2}, 0)[0].ticket);
-    // A stopped drain wants nothing: free CPUs go to the line, not to no one.
-    const stopped = [_]Op{ .{ .ticket = 1, .project = "q", .want = 2 }, .{ .ticket = 2, .project = "x", .drain = true, .all = true } };
-    const got = handOut(a, &stopped, &.{}, &.{ 0, 1 }, 0);
-    try std.testing.expectEqual(2, got.len);
-    try std.testing.expectEqual(1, got[0].ticket);
+/// The first run in the line for spare room: of the runs with tasks waiting, over their share,
+/// none of their own stopped by cpuq. Null when there is none.
+pub fn firstWaiter(a: std.mem.Allocator, ops: []const Op, t: u32) ?u64 {
+    const m = projects(a, ops);
+    var best: ?Op = null;
+    for (ops) |o| {
+        if (!o.counts() or o.waiting == 0 or o.paused() > 0) continue;
+        if (under(m, o.project, t)) continue;
+        if (best == null or ahead(m, o, best.?)) best = o;
+    }
+    return if (best) |b| b.ticket else null;
 }
 
-test "backfill: a waiter that ends before the drain could start goes first" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    // A build holds CPU 0 until 1000 at the latest; the drain holds CPU 1 and wants CPU 0.
-    const ops = [_]Op{
-        .{ .ticket = 1, .project = "rig", .held = &.{0}, .running = 1, .tlimit = 3600, .ends = 1000 },
-        .{ .ticket = 2, .project = "x", .drain = true, .all = true, .held = &.{1}, .want = 2 },
-        .{ .ticket = 3, .project = "trig", .want = 1, .tlimit = 130 },
-        .{ .ticket = 4, .project = "rip", .want = 1, .tlimit = 3610 },
+/// Whether run `me` may start one more task now. The caller has checked the gates and its -c
+/// (`waiting` > 0).
+pub fn mayStart(a: std.mem.Allocator, ops: []const Op, me: u64, cx: Cx) Wait {
+    const o = for (ops) |o| {
+        if (o.ticket == me) break o;
+    } else return .idle;
+    if (!o.counts() or o.waiting == 0) return .idle;
+    if (allDrain(ops, cx.now_ms)) return .drain_all;
+    if (o.paused() > 0) return .paused;
+    const t = capacity(ops, cx.pool_n, cx.now_ms);
+    var total: u32 = 0;
+    for (ops) |x| if (x.counts()) {
+        total += x.running;
     };
-    try std.testing.expectEqual(1000, shadow(&ops).?);
-    // At 500, trig's task (130 s) ends by 1000: it goes ahead of the drain; rip's (an hour) doesn't.
-    try std.testing.expectEqual(3, handOut(a, &ops, &.{}, &.{2}, 500)[0].ticket);
-    // So too once the drain has lent its CPU and holds none.
-    var lent = ops;
-    lent[1].held = &.{};
-    try std.testing.expectEqual(3, handOut(a, &lent, &.{}, &.{1}, 500)[0].ticket);
-    // At 900, trig's would end after 1000: the drain takes it.
-    try std.testing.expectEqual(2, handOut(a, &ops, &.{}, &.{2}, 900)[0].ticket);
-    // The drain lends one idle CPU for trig, none for rip.
-    const l = lends(&ops, &.{}, 500).?;
-    try std.testing.expectEqual(2, l.ticket);
-    try std.testing.expectEqual(1, l.n);
-    try std.testing.expectEqual(null, lends(&ops, &.{}, 900));
-    // One already promised to trig: nothing more to lend.
-    try std.testing.expectEqual(null, lends(&ops, &.{.{ .cpu = 2, .ticket = 3 }}, 500));
-    // A task with no time limit in the way, another drain holding CPUs, or nothing running: no
-    // backfill.
-    var open = ops;
-    open[0].tlimit = 0;
-    try std.testing.expectEqual(null, shadow(&open));
-    const two = [_]Op{ ops[0], ops[1], .{ .ticket = 5, .project = "y", .drain = true, .all = true, .held = &.{2} } };
-    try std.testing.expectEqual(null, shadow(&two));
-    var idle = ops;
-    idle[0].running = 0;
-    try std.testing.expectEqual(null, shadow(&idle));
+    if (total >= backstop * t) return .backstop;
+    if (projectFirst(a, ops, o.project) != me) return .project;
+    const m = projects(a, ops);
+    if (under(m, o.project, t)) return .go;
+    if (anyPaused(ops)) return .paused;
+    const room = @as(f64, @floatFromInt(t)) - headroom;
+    if (cx.busy + @as(f64, @floatFromInt(starting(ops, cx.now_ms))) >= room) return .busy;
+    if (firstWaiter(a, ops, t) != me) return .behind;
+    return .go;
 }
 
-test "a drain takes its turn: it passes no run that queued before it" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    // A run (1) holds CPU 0; an older waiter (2) has never run a task; then a drain (3); then a
-    // newer waiter (4). Two CPUs free: the older waiter's first, then the drain's; not the newer.
-    const ops = [_]Op{
-        .{ .ticket = 1, .project = "a", .served = true, .held = &.{0}, .running = 1, .tlimit = 3600, .ends = 4000 },
-        .{ .ticket = 2, .project = "rig", .want = 1 },
-        .{ .ticket = 3, .project = "trig", .drain = true, .all = true, .urgent = true, .want = 3 },
-        .{ .ticket = 4, .project = "z", .want = 1 },
+/// The machine's busy CPUs as admission counts them: the running tasks' busy CPUs from the
+/// sample (tasks that ended since count no more; tasks cpuq stopped use nothing), plus, with the
+/// outside check on, the load outside cpuq beyond the CPUs the pool leaves to it (`ncpu` −
+/// `pool_n`). A drain's command is left out: its CPUs are out of the capacity.
+pub fn busyNow(ops: []const Op, s: ?Sample, outside_check: bool, ncpu: u32, pool_n: u32) f64 {
+    const sample = s orelse return 0;
+    var tasks: f64 = 0;
+    for (ops) |o| if (o.counts()) for (o.tasks_now) |t| {
+        if (t.paused) continue;
+        if (sample.find(t.pid, t.start)) |b| tasks += b.busy;
     };
-    try std.testing.expectEqual(3, turnOf(&ops).?);
-    try std.testing.expect(before(ops[1], turnOf(&ops)));
-    try std.testing.expect(!before(ops[0], turnOf(&ops)));
-    try std.testing.expect(!before(ops[3], turnOf(&ops)));
-    const got = handOut(a, &ops, &.{}, &.{ 1, 2 }, 0);
-    try std.testing.expectEqual(2, got.len);
-    try std.testing.expectEqual(2, got[0].ticket);
-    try std.testing.expectEqual(3, got[1].ticket);
-    // Once it holds a CPU it asks no more ahead of the drain; a run that has had tasks, holds
-    // nothing and still wants (a long run between turns) goes first again while older.
-    try std.testing.expect(!before(.{ .ticket = 2, .project = "rig", .held = &.{1}, .want = 1 }, 3));
-    try std.testing.expect(before(.{ .ticket = 2, .project = "rig", .done = 5, .want = 1 }, 3));
+    if (!outside_check) return tasks;
+    const machine = sample.machine orelse return tasks;
+    const outside = @max(0, machine - sample.tasks);
+    const spill = @max(0, outside - @as(f64, @floatFromInt(ncpu -| pool_n)));
+    return tasks + spill;
 }
 
-test "the line: of two drains, the one holding the most takes the free CPUs" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    // B (older) holds nothing, C holds one: the free CPU goes to C, not to B.
-    const ops = [_]Op{
-        .{ .ticket = 1, .project = "x", .drain = true, .all = true, .urgent = true, .want = 2 },
-        .{ .ticket = 2, .project = "x", .drain = true, .all = true, .urgent = true, .held = &.{0}, .want = 1 },
-    };
-    try std.testing.expectEqual(2, handOut(a, &ops, &.{}, &.{1}, 0)[0].ticket);
-    // Holding the same, the older goes first.
-    const even = [_]Op{ .{ .ticket = 1, .project = "x", .drain = true, .all = true, .want = 2 }, .{ .ticket = 2, .project = "x", .drain = true, .all = true, .want = 2 } };
-    try std.testing.expectEqual(1, handOut(a, &even, &.{}, &.{0}, 0)[0].ticket);
+// --- macOS: sharing time by stopping and continuing tasks -----------------------------------
+
+/// One step of the plan: stop or continue one task.
+pub const Step = struct { ticket: u64, pid: i32, pause: bool };
+
+/// A task's busy CPUs for the plan: one while fresh or unmeasured, else the sample's.
+fn load(t: TaskNow, s: ?Sample, now_ms: i64) f64 {
+    if (t.fresh == 0 or now_ms - t.fresh < fresh_ms) return 1;
+    const sample = s orelse return 1;
+    const b = sample.find(t.pid, t.start) orelse return 1;
+    return b.busy;
 }
 
-test "the line: projects take turns, by weight" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    // rig holds 3, trig 1, a newcomer from rip none; 3 CPUs free.
-    const ops = [_]Op{
-        .{ .ticket = 1, .project = "rig", .held = &.{ 0, 1, 2 }, .want = 10 },
-        .{ .ticket = 2, .project = "trig", .held = &.{3}, .want = 10 },
-        .{ .ticket = 3, .project = "rip", .want = 10 },
+const Live = struct { ticket: u64, task: TaskNow, project: []const u8, load: f64 };
+
+/// macOS, where nothing shares CPU time by project: while cpuq's runnable tasks keep more than
+/// T + `headroom` CPUs busy, stop the newest tasks of the project furthest over its share until
+/// they keep no more than that; while they keep less than T and tasks are stopped, continue the
+/// oldest stopped task of the project furthest under its share, while one more fits within T.
+/// A project at or under its share is never stopped. Every cpuq computes the same plan from the
+/// records and carries out the steps for its own tasks.
+pub fn pausePlan(a: std.mem.Allocator, ops: []const Op, s: ?Sample, cx: Cx) []const Step {
+    var out: std.ArrayList(Step) = .empty;
+    const t = capacity(ops, cx.pool_n, cx.now_ms);
+    if (allDrain(ops, cx.now_ms)) return out.items;
+    const m = projects(a, ops);
+    // Each project's share, and its tasks running unstopped.
+    var run: std.StringArrayHashMapUnmanaged(f64) = .empty;
+    var live: std.ArrayList(Live) = .empty;
+    var stopped: std.ArrayList(Live) = .empty;
+    var r: f64 = 0;
+    for (ops) |o| if (o.counts()) for (o.tasks_now) |task| {
+        const l: Live = .{ .ticket = o.ticket, .task = task, .project = o.project, .load = load(task, s, cx.now_ms) };
+        const gop = run.getOrPut(a, o.project) catch continue;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        if (task.paused) {
+            stopped.append(a, l) catch {};
+        } else {
+            gop.value_ptr.* += 1;
+            live.append(a, l) catch {};
+            r += l.load;
+        }
     };
-    const got = handOut(a, &ops, &.{}, &.{ 4, 5, 6 }, 0);
-    try std.testing.expectEqual(3, got.len);
-    try std.testing.expectEqual(3, got[0].ticket); // rip 0 -> 1
-    // rip 1 and trig 1 tie: the fewer the op holds, then the older ticket: trig (ticket 2).
-    try std.testing.expectEqual(2, got[1].ticket);
-    try std.testing.expectEqual(3, got[2].ticket);
+    const tf: f64 = @floatFromInt(t);
+    const w: f64 = @floatFromInt(weights(m));
+    const share = struct {
+        fn of(mm: std.StringArrayHashMapUnmanaged(Proj), p: []const u8, tt: f64, ww: f64) f64 {
+            const pr = mm.get(p) orelse return 0;
+            return tt * @as(f64, @floatFromInt(pr.weight)) / ww;
+        }
+    };
+    if (r > tf + headroom) {
+        while (r > tf + headroom) {
+            // The project furthest over its share, by tasks running unstopped.
+            var worst: ?[]const u8 = null;
+            var worst_by: f64 = 0;
+            for (run.keys(), run.values()) |p, n| {
+                const by = n - share.of(m, p, tf, w);
+                if (by <= 0) continue;
+                if (worst == null or by > worst_by or (by == worst_by and std.mem.order(u8, p, worst.?) == .lt)) {
+                    worst = p;
+                    worst_by = by;
+                }
+            }
+            const p = worst orelse break;
+            // Its newest task running.
+            var pick: ?usize = null;
+            for (live.items, 0..) |l, i| {
+                if (!std.mem.eql(u8, l.project, p)) continue;
+                if (pick == null or l.task.fresh > live.items[pick.?].task.fresh) pick = i;
+            }
+            const i = pick orelse break;
+            const l = live.swapRemove(i);
+            out.append(a, .{ .ticket = l.ticket, .pid = l.task.pid, .pause = true }) catch break;
+            r -= l.load;
+            run.getPtr(p).?.* -= 1;
+        }
+        return out.items;
+    }
+    while (stopped.items.len > 0 and r + 1 <= tf) {
+        // The project furthest under its share, of those with a task stopped.
+        var best: ?[]const u8 = null;
+        var best_by: f64 = 0;
+        for (stopped.items) |l| {
+            const by = (run.get(l.project) orelse 0) - share.of(m, l.project, tf, w);
+            if (best == null or by < best_by or (by == best_by and std.mem.order(u8, l.project, best.?) == .lt)) {
+                best = l.project;
+                best_by = by;
+            }
+        }
+        const p = best.?;
+        var pick: ?usize = null;
+        for (stopped.items, 0..) |l, i| {
+            if (!std.mem.eql(u8, l.project, p)) continue;
+            if (pick == null or l.task.fresh < stopped.items[pick.?].task.fresh) pick = i;
+        }
+        const l = stopped.swapRemove(pick.?);
+        out.append(a, .{ .ticket = l.ticket, .pid = l.task.pid, .pause = false }) catch break;
+        r += 1;
+        run.getPtr(p).?.* += 1;
+    }
+    return out.items;
 }
 
-test "the line: weight, urgent, drain" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const ops = [_]Op{
-        .{ .ticket = 1, .project = "rig", .weight = 2, .held = &.{ 0, 1 }, .want = 5, .running = 2 },
-        .{ .ticket = 2, .project = "trig", .held = &.{2}, .want = 5, .running = 1 },
-        .{ .ticket = 3, .project = "trig", .urgent = true, .want = 5 },
-    };
-    // The urgent op's first CPU goes first; then rig (2/2 = 1) ties trig (2/1 = 2)? No: rig is lower.
-    const got = handOut(a, &ops, &.{}, &.{ 3, 4 }, 0);
-    try std.testing.expectEqual(3, got[0].ticket);
-    try std.testing.expectEqual(1, got[1].ticket);
-    // A drain takes every CPU.
-    const with_drain = [_]Op{ ops[0], .{ .ticket = 9, .project = "x", .drain = true, .all = true, .want = 8 } };
-    const d = handOut(a, &with_drain, &.{}, &.{ 3, 4 }, 0);
-    try std.testing.expectEqual(2, d.len);
-    try std.testing.expectEqual(9, d[0].ticket);
-    try std.testing.expectEqual(9, d[1].ticket);
-}
+// --- Tests ----------------------------------------------------------------------------------
 
-test "the giver: yields only to the first waiter, once per CPU owed" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    // rig holds 8 over two ops; trig waits with nothing: rig's bigger op gives.
-    const ops = [_]Op{
-        .{ .ticket = 1, .project = "rig", .held = &.{ 0, 1, 2, 3, 4 }, .want = 0 },
-        .{ .ticket = 2, .project = "rig", .held = &.{ 5, 6, 7 }, .want = 0 },
-        .{ .ticket = 3, .project = "trig", .want = 1 },
-    };
-    try std.testing.expectEqual(1, giver(a, &ops, &.{}).?);
-    // One drain is already owed for trig's one CPU: nobody else drains.
-    var owing = ops;
-    owing[0].draining = 1;
-    try std.testing.expectEqual(null, giver(a, &owing, &.{}));
-    // Near a tie, nobody gives: trig 4, rig 5 -> (4 + 1) <= (5 - 1) fails.
-    const close = [_]Op{
-        .{ .ticket = 1, .project = "rig", .held = &.{ 0, 1, 2, 3, 4 } },
-        .{ .ticket = 2, .project = "trig", .held = &.{ 5, 6, 7, 8 }, .want = 3 },
-    };
-    try std.testing.expectEqual(null, giver(a, &close, &.{}));
-    // A promise already made to the waiter counts: it wants no more, so nobody drains.
-    const promised = [_]Promise{.{ .cpu = 9, .ticket = 3 }};
-    try std.testing.expectEqual(null, giver(a, &ops, &promised));
+fn tk(pid: i32, fresh: i64) TaskNow {
+    return .{ .pid = pid, .start = @intCast(pid), .fresh = fresh, .since = 1 };
 }
 
 test "an op record round trip" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    var buf: [1024]u8 = undefined;
+    var buf: [2048]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
-    const now = [_]TaskNow{.{ .task = 17, .attempt = 2, .cpu = 9, .pid = 4242, .since = 1700000000 }};
-    const r: Op = .{ .tasks_now = &now, .pid = 7, .project = "rig", .label = "rig:test", .weight = 2, .want = 3, .held = &.{ 4, 9 }, .draining = 1, .overload = 3, .limit = 8, .tasks = 100, .done = 5, .cmd = "a\tb\nc" };
+    const now = [_]TaskNow{.{ .task = 17, .attempt = 2, .pid = 4242, .start = 99, .since = 1700000000, .fresh = 12345, .paused = true }};
+    const r: Op = .{ .tasks_now = &now, .pid = 7, .project = "rig", .label = "rig:test", .weight = 2, .waiting = 3, .cpus = &.{ 4, 9 }, .dstart = 77, .limit = 8, .tasks = 100, .done = 5, .single = true, .cmd = "a\tb\nc" };
     try r.format(&w);
     const p = Op.parse(arena.allocator(), w.buffered());
     try std.testing.expectEqualStrings("rig", p.project);
-    try std.testing.expectEqualSlices(u32, &.{ 4, 9 }, p.held);
-    try std.testing.expectEqual(3, p.overload);
-    try std.testing.expectEqual(1, p.keeps());
+    try std.testing.expectEqualSlices(u32, &.{ 4, 9 }, p.cpus);
+    try std.testing.expectEqual(77, p.dstart);
+    try std.testing.expectEqual(3, p.waiting);
+    try std.testing.expect(p.single);
     try std.testing.expectEqualStrings("a b c", p.cmd);
     try std.testing.expectEqual(1, p.tasks_now.len);
     try std.testing.expectEqual(17, p.tasks_now[0].task);
     try std.testing.expectEqual(4242, p.tasks_now[0].pid);
+    try std.testing.expectEqual(99, p.tasks_now[0].start);
+    try std.testing.expectEqual(12345, p.tasks_now[0].fresh);
+    try std.testing.expect(p.tasks_now[0].paused);
+    try std.testing.expectEqual(1, p.paused());
 }
 
-test "the line: a waiter holding nothing isn't starved behind a head nobody may give to" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+test "a sample round trip" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // Lean counterexample 1: A (P) holds 2, B (Q) holds 1 and wants more, C (P) holds none.
-    const ops = [_]Op{
-        .{ .ticket = 1, .project = "P", .held = &.{ 1, 2 }, .want = 1 },
-        .{ .ticket = 2, .project = "Q", .held = &.{0}, .want = 1 },
-        .{ .ticket = 3, .project = "P", .want = 1 },
-    };
-    try std.testing.expectEqual(3, firstWaiter(a, &ops, &.{}).?.op.ticket);
-    try std.testing.expectEqual(1, giver(a, &ops, &.{}).?);
+    const s: Sample = .{ .ms = 5, .ticks_busy = 10, .ticks_total = 20, .machine = 3.5, .tasks = 1.25, .per = &.{.{ .pid = 4, .start = 8, .cum = 1000, .busy = 0.75 }} };
+    var out: std.ArrayList(u8) = .empty;
+    try s.format(a, &out);
+    const p = Sample.parse(a, out.items).?;
+    try std.testing.expectEqual(5, p.ms);
+    try std.testing.expectEqual(3.5, p.machine.?);
+    try std.testing.expectEqual(0.75, p.find(4, 8).?.busy);
+    try std.testing.expectEqual(null, p.find(4, 9));
 }
 
-test "the giver: never one that would take the CPU straight back" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+test "admission: under its share a project starts at once, however busy" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // Lean counterexample 2: weights P=2, Q=1; C (Q, urgent) holds a CPU, A (P) holds none.
-    // Were C to give it, C (urgent, holding nothing) would rank first and take it back.
+    // Pool of 4; rig runs 4 tasks, the machine is full; trig arrives with 2 waiting.
     const ops = [_]Op{
-        .{ .ticket = 1, .project = "P", .weight = 2, .want = 3 },
-        .{ .ticket = 2, .project = "Q", .held = &.{ 0, 1 } },
-        .{ .ticket = 3, .project = "Q", .urgent = true, .held = &.{2}, .want = 1 },
+        .{ .ticket = 1, .project = "rig", .running = 4, .waiting = 6, .tasks_now = &.{ tk(1, 0), tk(2, 0), tk(3, 0), tk(4, 0) } },
+        .{ .ticket = 2, .project = "trig", .waiting = 2 },
     };
-    // B (ticket 2) may give: A holding nothing stays ahead of B holding one.
-    try std.testing.expectEqual(2, giver(a, &ops, &.{}).?);
-    // With B gone, C alone could give, and would take it back: nobody gives.
-    const just_c = [_]Op{ ops[0], ops[2] };
-    try std.testing.expectEqual(null, giver(a, &just_c, &.{}));
+    const cx: Cx = .{ .pool_n = 4, .busy = 4, .now_ms = 100_000 };
+    try std.testing.expectEqual(Wait.go, mayStart(a, &ops, 2, cx));
+    try std.testing.expectEqual(Wait.busy, mayStart(a, &ops, 1, cx));
+    // trig at 2 of its share of 2: no longer under it, and the machine is busy.
+    var two = ops;
+    two[1].running = 2;
+    try std.testing.expectEqual(Wait.busy, mayStart(a, &two, 2, cx));
+    // Weights: trig 3 to rig's 1 has a share of 3.
+    two[1].weight = 3;
+    try std.testing.expectEqual(Wait.go, mayStart(a, &two, 2, cx));
 }
 
-test "the giver: a newcomer gets a CPU from equals, since a giver takes a new ticket" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+test "admission: spare room goes to the first waiter over its share" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // Lean finding 4: 2 CPUs, C and B hold one each (projects X, Y), A (Z) arrives with none.
+    // Pool of 4, both projects over their share of 2, the machine half idle (tasks waiting on I/O).
     const ops = [_]Op{
-        .{ .ticket = 1, .project = "X", .held = &.{0}, .want = 1 },
-        .{ .ticket = 2, .project = "Y", .held = &.{1}, .want = 1 },
-        .{ .ticket = 3, .project = "Z", .want = 1 },
+        .{ .ticket = 1, .project = "rig", .running = 3, .waiting = 5 },
+        .{ .ticket = 2, .project = "trig", .running = 2, .waiting = 5 },
     };
-    try std.testing.expectEqual(3, firstWaiter(a, &ops, &.{}).?.op.ticket);
-    try std.testing.expect(giver(a, &ops, &.{}) != null);
+    const cx: Cx = .{ .pool_n = 4, .busy = 1.0, .now_ms = 100_000 };
+    // trig runs fewer for its weight: it goes first; rig waits behind it.
+    try std.testing.expectEqual(Wait.go, mayStart(a, &ops, 2, cx));
+    try std.testing.expectEqual(Wait.behind, mayStart(a, &ops, 1, cx));
+    try std.testing.expectEqual(2, firstWaiter(a, &ops, 4).?);
+    // Room is busy + starting < T - 0.5: three tasks just started fill it.
+    var fresh = ops;
+    fresh[0].tasks_now = &.{ tk(1, 99_000), tk(2, 99_500), tk(3, 99_900) };
+    try std.testing.expectEqual(Wait.busy, mayStart(a, &fresh, 2, cx));
+    // An urgent run's first task goes ahead of the line.
+    var urgent = ops;
+    urgent[0].urgent = true;
+    try std.testing.expectEqual(Wait.go, mayStart(a, &urgent, 1, cx));
+}
+
+test "admission: within a project, the run running the fewest goes first" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // rig's long run (1) holds rig's share; it ends a task, so rig is under its share again. A
+    // newer rig run (3) running nothing takes that start, not the long run.
+    const ops = [_]Op{
+        .{ .ticket = 1, .project = "rig", .running = 1, .waiting = 20 },
+        .{ .ticket = 2, .project = "trig", .running = 2, .waiting = 5 },
+        .{ .ticket = 3, .project = "rig", .waiting = 1 },
+    };
+    const cx: Cx = .{ .pool_n = 4, .busy = 4, .now_ms = 100_000 };
+    try std.testing.expectEqual(Wait.go, mayStart(a, &ops, 3, cx));
+    try std.testing.expectEqual(Wait.project, mayStart(a, &ops, 1, cx));
+    try std.testing.expectEqual(3, projectFirst(a, &ops, "rig").?);
+    // Running the same, the older ticket; an urgent run's first task before either.
+    var even = ops;
+    even[2].running = 1;
+    try std.testing.expectEqual(1, projectFirst(a, &even, "rig").?);
+    even[2].urgent = true;
+    try std.testing.expectEqual(3, projectFirst(a, &even, "rig").?);
+    // The long run has just ended its task: running none, as the newer run, it takes its turn
+    // behind it (its last start is the newer).
+    var tie = ops;
+    tie[0].running = 0;
+    tie[0].last = 90_000;
+    try std.testing.expectEqual(3, projectFirst(a, &tie, "rig").?);
+    tie[2].last = 95_000;
+    try std.testing.expectEqual(1, projectFirst(a, &tie, "rig").?);
+    // For spare room too: over their shares, the newer rig run (running 0) is first in line.
+    const over = [_]Op{
+        .{ .ticket = 1, .project = "rig", .running = 3, .waiting = 20 },
+        .{ .ticket = 2, .project = "trig", .running = 3, .waiting = 5 },
+        .{ .ticket = 3, .project = "rig", .waiting = 1 },
+    };
+    try std.testing.expectEqual(3, firstWaiter(a, &over, 4).?);
+}
+
+test "admission: hard limits" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The backstop: 4T tasks running, even a project under its share waits.
+    const full = [_]Op{
+        .{ .ticket = 1, .project = "rig", .running = 8, .waiting = 1 },
+        .{ .ticket = 2, .project = "trig", .waiting = 1 },
+    };
+    try std.testing.expectEqual(Wait.backstop, mayStart(a, &full, 2, .{ .pool_n = 2 }));
+    // A run with nothing to start, or stopped, is idle.
+    const idle = [_]Op{ .{ .ticket = 1, .project = "rig" }, .{ .ticket = 2, .project = "q", .waiting = 1, .stopped = true } };
+    try std.testing.expectEqual(Wait.idle, mayStart(a, &idle, 1, .{ .pool_n = 2 }));
+    try std.testing.expectEqual(Wait.idle, mayStart(a, &idle, 2, .{ .pool_n = 2 }));
+    // A run whose tasks cpuq has stopped starts none; others take no spare room meanwhile.
+    var p = [_]TaskNow{tk(5, 0)};
+    p[0].paused = true;
+    const paused = [_]Op{
+        .{ .ticket = 1, .project = "rig", .running = 3, .waiting = 1, .tasks_now = &p },
+        .{ .ticket = 2, .project = "trig", .running = 3, .waiting = 1 },
+    };
+    try std.testing.expectEqual(Wait.paused, mayStart(a, &paused, 1, .{ .pool_n = 4 }));
+    try std.testing.expectEqual(Wait.paused, mayStart(a, &paused, 2, .{ .pool_n = 4 }));
+}
+
+test "drains: isolation, the half-pool bound, and the turn" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const now: i64 = 1_000_000;
+    // A drain of 2 isolating CPUs 6 and 7 of 8: capacity 6.
+    const d1: Op = .{ .ticket = 1, .drain = true, .limit = 2, .cpus = &.{ 6, 7 }, .dstart = now - 1000, .tlimit = 600 };
+    try std.testing.expectEqual(6, capacity(&.{d1}, 8, now));
+    try std.testing.expectEqualSlices(u32, &.{ 6, 7 }, isolated(a, &.{d1}, now));
+    // Past its limit and grace, it isolates nothing.
+    try std.testing.expectEqual(8, capacity(&.{d1}, 8, now + 700_000));
+    // A second drain of 3 would pass half the pool (4): it waits; one of 2 goes.
+    const d2: Op = .{ .ticket = 2, .drain = true, .limit = 3, .waiting = 1 };
+    try std.testing.expectEqual(DrainWait.half_pool, drainMayStart(&.{ d1, d2 }, 2, 8, now));
+    var d3 = d2;
+    d3.limit = 2;
+    try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{ d1, d3 }, 2, 8, now));
+    try std.testing.expectEqualSlices(u32, &.{ 5, 4 }, pickDrainCpus(a, &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, &.{ 6, 7 }, 2));
+    // A run older than the drain with tasks waiting goes first; a newer one doesn't hold it.
+    const old: Op = .{ .ticket = 1, .project = "rig", .waiting = 1 };
+    const young: Op = .{ .ticket = 3, .project = "rig", .waiting = 1 };
+    try std.testing.expectEqual(DrainWait.older_waiter, drainMayStart(&.{ old, d3 }, 2, 8, now));
+    try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{ d3, young }, 2, 8, now));
+    // An older drain waiting goes first; --all waits for any drain running.
+    const w1: Op = .{ .ticket = 1, .drain = true, .limit = 1, .waiting = 1 };
+    try std.testing.expectEqual(DrainWait.older_drain, drainMayStart(&.{ w1, d3 }, 2, 8, now));
+    const all: Op = .{ .ticket = 2, .drain = true, .all = true, .limit = 8, .waiting = 1 };
+    try std.testing.expectEqual(DrainWait.other_drain, drainMayStart(&.{ d1, all }, 2, 8, now));
+    try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{all}, 2, 8, now));
+    // A drain of the whole machine running: capacity 0, nothing starts.
+    var on = all;
+    on.dstart = now;
+    on.tlimit = 1200;
+    try std.testing.expectEqual(0, capacity(&.{on}, 8, now));
+    try std.testing.expectEqual(Wait.drain_all, mayStart(a, &.{ on, young }, 3, .{ .pool_n = 8, .now_ms = now }));
+    // A stopped drain isolates nothing.
+    var stopped = d1;
+    stopped.stopped = true;
+    try std.testing.expectEqual(8, capacity(&.{stopped}, 8, now));
+}
+
+test "busy: tasks from the sample, outside load beyond the CPUs left to it" {
+    const ops = [_]Op{.{ .ticket = 1, .project = "rig", .running = 2, .tasks_now = &.{ tk(1, 0), tk(2, 0) } }};
+    const s: Sample = .{ .ms = 1, .machine = 7.0, .tasks = 1.5, .per = &.{ .{ .pid = 1, .start = 1, .cum = 0, .busy = 1.0 }, .{ .pid = 2, .start = 2, .cum = 0, .busy = 0.5 }, .{ .pid = 3, .start = 3, .cum = 0, .busy = 1 } } };
+    // Outside: 7 - 1.5 = 5.5 busy, the pool leaves 2 of 10 CPUs to it: 3.5 spills in.
+    try std.testing.expectApproxEqAbs(5.0, busyNow(&ops, s, true, 10, 8), 1e-9);
+    try std.testing.expectApproxEqAbs(1.5, busyNow(&ops, s, false, 10, 8), 1e-9);
+    try std.testing.expectEqual(0, busyNow(&ops, null, true, 10, 8));
+}
+
+test "pause plan: stop the newest of the project furthest over its share, continue when room returns" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const now: i64 = 100_000;
+    // Pool of 2: rig runs 3 busy tasks, trig 1: rig is over its share of 1 by 2.
+    const busy = [_]Op{
+        .{ .ticket = 1, .project = "rig", .running = 3, .tasks_now = &.{ tk(1, 10_000), tk(2, 20_000), tk(3, 30_000) } },
+        .{ .ticket = 2, .project = "trig", .running = 1, .tasks_now = &.{tk(4, 10_000)} },
+    };
+    const plan = pausePlan(a, &busy, null, .{ .pool_n = 2, .now_ms = now });
+    try std.testing.expectEqual(2, plan.len);
+    try std.testing.expectEqual(3, plan[0].pid);
+    try std.testing.expect(plan[0].pause);
+    try std.testing.expectEqual(2, plan[1].pid);
+    // Tasks waiting on I/O keep no CPU busy: nothing stops.
+    const s: Sample = .{ .ms = 1, .per = &.{ .{ .pid = 1, .start = 1, .cum = 0, .busy = 0.1 }, .{ .pid = 2, .start = 2, .cum = 0, .busy = 0.1 }, .{ .pid = 3, .start = 3, .cum = 0, .busy = 0.1 }, .{ .pid = 4, .start = 4, .cum = 0, .busy = 1 } } };
+    try std.testing.expectEqual(0, pausePlan(a, &busy, s, .{ .pool_n = 2, .now_ms = now }).len);
+    // Room again (trig's task ended): rig's oldest stopped task continues, one per CPU free.
+    var p = [_]TaskNow{ tk(1, 10_000), tk(2, 20_000), tk(3, 30_000) };
+    p[1].paused = true;
+    p[2].paused = true;
+    const room = [_]Op{.{ .ticket = 1, .project = "rig", .running = 3, .tasks_now = &p }};
+    const back = pausePlan(a, &room, null, .{ .pool_n = 2, .now_ms = now });
+    try std.testing.expectEqual(1, back.len);
+    try std.testing.expectEqual(2, back[0].pid);
+    try std.testing.expect(!back[0].pause);
 }

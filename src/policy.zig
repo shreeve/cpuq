@@ -12,18 +12,19 @@ pub const Qos = enum { unchanged, utility, background, niced };
 pub const Config = struct {
     /// The pool's size: the first this many of its CPUs (`budget`); null: every one.
     budget: ?u32 = null,
-    /// Hand out no CPU while the OS reports memory pressure.
+    /// Start no task while the OS reports memory pressure.
     pressure_check: bool = true,
-    /// Hand out only the CPUs the machine has idle, judged by its busy CPUs against the CPUs
-    /// held (`outside_check`). Off, the pool alone limits CPU work.
+    /// Count the machine's load outside cpuq (beyond the CPUs the pool leaves to it) as busy
+    /// when deciding whether there is spare room (`outside_check`). Off, only cpuq's own tasks
+    /// count.
     outside_check: bool = true,
     /// Linux: the `some avg10` percentage of /proc/pressure/memory that
     /// counts as pressure.
     pressure_psi: f64 = 10,
-    /// Hand out no CPU while the memory the kernel says is available falls
+    /// Start no task while the memory the kernel says is available falls
     /// under this, in bytes (`min_available`, e.g. 6G); 0 leaves it unchecked.
     min_available: u64 = 0,
-    /// Hand out no CPU while the filesystem holding $HOME or cpuq's state
+    /// Start no task while the filesystem holding $HOME or cpuq's state
     /// directory (the temp directory) has less than this free, in bytes
     /// (`min_disk`, e.g. 5G); 0 leaves it unchecked. A full disk fails every
     /// task and every tool that writes a file; on 2026-10-11 one session's
