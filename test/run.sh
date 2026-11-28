@@ -87,8 +87,8 @@ setup() {
   unset CPUQ_CPU CPUQ_OP CPUQ_SCOPE CPUQ_TASK CPUQ_TASKS CPUQ_ATTEMPT CPUQ_ATTEMPTS CPUQ_PROGRESS \
     CPUQ_PROGRESS_AT CPUQ_LEASES CPUQ_TOKEN CPUQ_CORES CPUQ_HISTORY MAKEFLAGS XDG_STATE_HOME
   # Each key at most once: a line given here replaces the default for its key. `tokens = N` is
-  # the suite's own: the pool's first N CPUs as the pool (all of it when it has fewer), no reserve,
-  # so no test depends on the machine's size.
+  # the suite's own: the pool's last N CPUs as the pool (all of it when it has fewer), no reserve,
+  # so no test depends on the machine's size, nor sits on the CPUs its own cpuq pins tasks to.
   local line keys=" " toks=2 lines=()
   for line in "$@"; do
     case $line in "tokens = "*) toks=${line#tokens = } ;; *) keys="$keys${line%% *} "; lines+=("$line") ;; esac
@@ -104,8 +104,9 @@ setup() {
     *" cpus "*) { cat "$T/config.base"; echo "reserve = 0"; } >"$CPUQ_CONFIG" ;;
     *)
       { cat "$T/config.base"; echo "reserve = 0"; } >"$CPUQ_CONFIG"
-      local first; first=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print(",".join(map(str, json.load(sys.stdin)["pool"][:int(sys.argv[1])])))' "$toks")
-      { cat "$T/config.base"; echo "reserve = 0"; echo "cpus = $first"; } >"$CPUQ_CONFIG" ;;
+      # The pool's last N: a machine's own cpuq pins its tasks to its first CPUs.
+      local last; last=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; p = json.load(sys.stdin)["pool"]; print(",".join(map(str, p[max(0, len(p) - int(sys.argv[1])):])))' "$toks")
+      { cat "$T/config.base"; echo "reserve = 0"; echo "cpus = $last"; } >"$CPUQ_CONFIG" ;;
   esac
   cd "$T" || exit 2
   echo "== $CUR"
