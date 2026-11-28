@@ -64,7 +64,7 @@ theorem renK_lt (R : Ren) (a b : Nat) : renK R a < renK R b ↔ a < b := by
   have := ren_lt R.ks R.cs (a - 1) (b - 1)
   split <;> split <;> omega
 
-structure RSh (R : Ren) (x y : RunSt) : Prop where
+structure RSh (R : Ren) (ak : Bool) (x y : RunSt) : Prop where
   here : y.here = x.here
   pend : y.pend = x.pend
   start : y.start = x.start
@@ -73,7 +73,7 @@ structure RSh (R : Ren) (x y : RunSt) : Prop where
   cap : y.cap = x.cap
   ran : y.ran = x.ran
   ticket : x.here = true → y.ticket = ren R.kt R.ct x.ticket
-  last : x.ran = true → y.last = ren R.ks R.cs x.last
+  last : x.here = true → (x.ran || ak) = true → y.last = ren R.ks R.cs x.last
 
 structure DSh (R : Ren) (x y : DrainSt) : Prop where
   ph : y.ph = x.ph
@@ -84,7 +84,7 @@ structure DSh (R : Ren) (x y : DrainSt) : Prop where
 
 /-- `t` is `s` with tickets and stamps renamed. -/
 structure Sh (cfg : Cfg) (R : Ren) (s t : St) : Prop where
-  run : ∀ r < cfg.nr, RSh R (s.run r) (t.run r)
+  run : ∀ r < cfg.nr, RSh R cfg.rules.arrivalKey (s.run r) (t.run r)
   drain : ∀ d < cfg.nd, DSh R (s.drain d) (t.drain d)
   gate : t.gate = s.gate
   outside : t.outside = s.outside
@@ -93,14 +93,15 @@ structure Sh (cfg : Cfg) (R : Ren) (s t : St) : Prop where
   now : t.now = ren R.ks R.cs s.now
   nowk : R.ks ≤ s.now
 
-theorem RSh.lk_ {R : Ren} {x y : RunSt} (h : RSh R x y) : lk y = renK R (lk x) := by
-  unfold lk renK
+theorem RSh.lk_ {R : Ren} {ak : Bool} {x y : RunSt} (h : RSh R ak x y) (hx : x.here = true) :
+    lkOf ak y = renK R (lkOf ak x) := by
+  unfold lkOf renK
   rw [h.ran]
-  cases e : x.ran
+  cases e : (x.ran || ak)
   · rfl
-  · simp [h.last e]
+  · simp [h.last hx e]
 
-theorem RSh.running_ {R : Ren} {x y : RunSt} (h : RSh R x y) : y.running = x.running := by
+theorem RSh.running_ {R : Ren} {ak : Bool} {x y : RunSt} (h : RSh R ak x y) : y.running = x.running := by
   simp only [RunSt.running, h.start, h.comp, h.blk]
 
 theorem anyLT_congr {n : Nat} {p q : Nat → Bool} (h : ∀ i < n, p i = q i) : anyLT n p = anyLT n q := by
@@ -210,8 +211,8 @@ theorem Sh.before_ (h : Sh cfg R s t) {i j : Nat} (hi : i < cfg.nr) (hj : j < cf
 
 theorem Sh.pbefore_ (h : Sh cfg R s t) {i j : Nat} (hi : i < cfg.nr) (hj : j < cfg.nr)
     (ei : (s.run i).here = true) (ej : (s.run j).here = true) : pbefore cfg t i j = pbefore cfg s i j := by
-  have ki : lastKey t i = renK R (lastKey s i) := (h.run i hi).lk_
-  have kj : lastKey t j = renK R (lastKey s j) := (h.run j hj).lk_
+  have ki : lastKey cfg t i = renK R (lastKey cfg s i) := (h.run i hi).lk_ ei
+  have kj : lastKey cfg t j = renK R (lastKey cfg s j) := (h.run j hj).lk_ ej
   unfold pbefore
   rw [h.urg_ hi, h.urg_ hj, h.running_ hi, h.running_ hj, ki, kj, (h.run i hi).ticket ei,
     (h.run j hj).ticket ej, (mono_dec (ren_lt R.kt R.ct) _ _).1, (mono_dec (renK_lt R) _ _).1,
@@ -245,12 +246,29 @@ theorem Sh.head_ (h : Sh cfg R s t) : head cfg t = head cfg s := by
         (here_of_eligible h2)).symm)
     _ _ (fun x hx => hx) (fun j hj => by cases hj)
 
+theorem Sh.before2_ (h : Sh cfg R s t) {i j : Nat} (hi : i < cfg.nr) (hj : j < cfg.nr)
+    (ei : (s.run i).here = true) (ej : (s.run j).here = true) : before2 cfg t i j = before2 cfg s i j := by
+  unfold before2
+  rw [dec_iff (h.under_ i), dec_iff (h.under_ j), h.before_ hi hj ei ej]
+
+theorem Sh.head2_ (h : Sh cfg R s t) : head2 cfg t = head2 cfg s := by
+  unfold head2 pick
+  symm
+  apply pick_congr (List.range cfg.nr)
+    (fun i hi => (h.front_ (List.mem_range.1 hi)).symm)
+    (fun i hi j hj ei ej => by
+      have h1 : eligible s i = true := by simp only [front, Bool.and_eq_true] at ei; exact ei.1
+      have h2 : eligible s j = true := by simp only [front, Bool.and_eq_true] at ej; exact ej.1
+      exact (h.before2_ (List.mem_range.1 hi) (List.mem_range.1 hj) (here_of_eligible h1)
+        (here_of_eligible h2)).symm)
+    _ _ (fun x hx => hx) (fun j hj => by cases hj)
+
 theorem Sh.canStart_ (h : Sh cfg R s t) {r : Nat} (hr : r < cfg.nr) : canStart cfg t r = canStart cfg s r := by
   unfold canStart
   rw [h.eligible_ hr]
   cases e : eligible s r
   · rfl
-  · rw [h.gate, h.total_, h.capT_, h.projFirst_ hr (here_of_eligible e), h.head_, dec_iff (h.under_ r),
+  · rw [h.gate, h.total_, h.capT_, h.projFirst_ hr (here_of_eligible e), h.head_, h.head2_, dec_iff (h.under_ r),
       dec_iff h.room_]
 
 theorem Sh.olderDrainWaits_ (h : Sh cfg R s t) {d : Nat} (hd : d < cfg.nd) (na : (s.drain d).ph ≠ .absent) :
@@ -298,7 +316,7 @@ theorem Sh.anyWait_ (h : Sh cfg R s t) : anyWait cfg t = anyWait cfg s := by
     anyLT_congr (fun d hd => by rw [(h.drain d hd).ph])
   unfold anyWait; rw [e1, e2]
 
-theorem Sh.setRun_ (h : Sh cfg R s t) {r : Nat} {x y : RunSt} (hx : RSh R x y) :
+theorem Sh.setRun_ (h : Sh cfg R s t) {r : Nat} {x y : RunSt} (hx : RSh R cfg.rules.arrivalKey x y) :
     Sh cfg R (setRun s r x) (setRun t r y) :=
   { h with
     run := fun j hj => by
@@ -334,7 +352,7 @@ theorem Sh.admit_ (h : Sh cfg R s t) {r : Nat} (hr : r < cfg.nr) : Sh cfg R (adm
   have x := h.run r hr
   exact h.setRun_ ⟨by simp [admitR, x.here], by simp [admitR, x.pend], by simp [admitR, x.start],
     by simp [admitR, x.comp], by simp [admitR, x.blk], by simp [admitR, x.cap], by simp [admitR],
-    fun e => by simp only [admitR] at e ⊢; exact x.ticket e, fun _ => by simp only [admitR]; exact h.now⟩
+    fun e => by simp only [admitR] at e ⊢; exact x.ticket e, fun _ _ => by simp only [admitR]; exact h.now⟩
 
 theorem Sh.pass1_ (h : Sh cfg R s t) : OSh cfg R (pass1 cfg s) (pass1 cfg t) := by
   have e1 : (List.range cfg.nd).find? (canDrain cfg t) = (List.range cfg.nd).find? (canDrain cfg s) :=
@@ -385,14 +403,14 @@ theorem DSh.tickD_ {R : Ren} {x y : DrainSt} (hx : DSh R x y) (w : Bool) (d : Na
   · rw [ite_f hs, ite_f hs]; exact ⟨h1, h2, h3, h4, h5⟩
 
 /-- A record change that leaves presence, ticket, `ran` and last start alone. -/
-theorem RSh.frame {R : Ren} {x y x' y' : RunSt} (hx : RSh R x y)
+theorem RSh.frame {R : Ren} {ak : Bool} {x y x' y' : RunSt} (hx : RSh R ak x y)
     (a1 : x'.here = x.here) (a2 : y'.here = y.here) (a3 : x'.ticket = x.ticket) (a4 : y'.ticket = y.ticket)
     (a5 : x'.ran = x.ran) (a6 : y'.ran = y.ran) (a7 : x'.last = x.last) (a8 : y'.last = y.last)
     (b1 : y'.pend = x'.pend) (b2 : y'.start = x'.start) (b3 : y'.comp = x'.comp) (b4 : y'.blk = x'.blk)
-    (b5 : y'.cap = x'.cap) : RSh R x' y' :=
+    (b5 : y'.cap = x'.cap) : RSh R ak x' y' :=
   ⟨by rw [a1, a2, hx.here], b1, b2, b3, b4, b5, by rw [a5, a6, hx.ran],
     fun e => by rw [a4, a3]; exact hx.ticket (by rw [← a1]; exact e),
-    fun e => by rw [a8, a7]; exact hx.last (by rw [← a5]; exact e)⟩
+    fun eh er => by rw [a8, a7]; exact hx.last (by rw [← a1]; exact eh) (by rw [← a5]; exact er)⟩
 
 theorem Sh.act_ (h : Sh cfg R s t) (a : Act) : OSh cfg R (act cfg s a) (act cfg t a) := by
   cases a with
@@ -404,9 +422,9 @@ theorem Sh.act_ (h : Sh cfg R s t) (a : Act) : OSh cfg R (act cfg s a) (act cfg 
       by_cases hh : (s.run r).here = false
       · rw [ite_t ⟨hr, hh⟩, ite_t ⟨hr, hh⟩]
         have h2 := h.setRun_ (r := r)
-          (x := { here := true, ticket := s.next, pend := (cfg.run r).tasks, cap := max 1 (cfg.run r).cap })
-          (y := { here := true, ticket := t.next, pend := (cfg.run r).tasks, cap := max 1 (cfg.run r).cap })
-          ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, fun _ => h.next, fun e => by cases e⟩
+          (x := { here := true, ticket := s.next, pend := (cfg.run r).tasks, cap := max 1 (cfg.run r).cap, last := s.now })
+          (y := { here := true, ticket := t.next, pend := (cfg.run r).tasks, cap := max 1 (cfg.run r).cap, last := t.now })
+          ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, fun _ => h.next, fun _ _ => h.now⟩
         exact { h2 with
           next := by show t.next + 1 = ren R.kt R.ct (s.next + 1); rw [h.next, ren_succ h.nextk]
           nextk := by show R.kt ≤ s.next + 1; have := h.nextk; omega }
@@ -497,7 +515,7 @@ theorem Sh.stepS_ (h : Sh cfg R s t) (m : Move) : OSh cfg R (stepS cfg s m) (ste
           by rw [h.running_ hr]; exact c⟩
     by_cases hc : leaveOk cfg s r
     · rw [ite_t hc, ite_t (hl.2 hc)]
-      exact (h.setRun_ ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, (fun e => by cases e), (fun e => by cases e)⟩).pass_
+      exact (h.setRun_ ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, (fun e => by cases e), (fun e _ => by cases e)⟩).pass_
     · rw [ite_f hc, ite_f (fun c => hc (hl.1 c))]; trivial
   | leaveD d =>
     simp only [Contest.stepS]
@@ -516,7 +534,7 @@ theorem Sh.trans_ {cfg : Cfg} {kt ct ct' ks cs cs' : Nat} {a b c : St}
     exact ⟨by rw [y.here, x.here], by rw [y.pend, x.pend], by rw [y.start, x.start], by rw [y.comp, x.comp],
       by rw [y.blk, x.blk], by rw [y.cap, x.cap], by rw [y.ran, x.ran],
       fun e => by rw [y.ticket (by rw [x.here]; exact e), x.ticket e]; exact ren_comp _ _ _ _,
-      fun e => by rw [y.last (by rw [x.ran]; exact e), x.last e]; exact ren_comp _ _ _ _⟩
+      fun eh er => by rw [y.last (by rw [x.here]; exact eh) (by rw [x.ran]; exact er), x.last eh er]; exact ren_comp _ _ _ _⟩
   drain d hd := by
     have x := h1.drain d hd; have y := h2.drain d hd
     exact ⟨by rw [y.ph, x.ph], by rw [y.busy, x.busy], by rw [y.age, x.age], by rw [y.idle, x.idle],
@@ -530,7 +548,7 @@ theorem Sh.trans_ {cfg : Cfg} {kt ct ct' ks cs cs' : Nat} {a b c : St}
 
 theorem Sh.refl_ {cfg : Cfg} {kt ks : Nat} {s : St} (h1 : kt ≤ s.next) (h2 : ks ≤ s.now) :
     Sh cfg ⟨kt, 0, ks, 0⟩ s s where
-  run _ _ := ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, fun _ => (ren_zero _ _).symm, fun _ => (ren_zero _ _).symm⟩
+  run _ _ := ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, fun _ => (ren_zero _ _).symm, fun _ _ => (ren_zero _ _).symm⟩
   drain _ _ := ⟨rfl, rfl, rfl, rfl, fun _ => (ren_zero _ _).symm⟩
   gate := rfl
   outside := rfl
@@ -547,17 +565,17 @@ def allLT (n : Nat) (p : Nat → Bool) : Bool := (List.range n).all p
 theorem allLT_iff {n : Nat} {p : Nat → Bool} : allLT n p = true ↔ ∀ i < n, p i = true := by
   simp [allLT]
 
-def RShB (R : Ren) (x y : RunSt) : Bool :=
+def RShB (R : Ren) (ak : Bool) (x y : RunSt) : Bool :=
   y.here == x.here && y.pend == x.pend && y.start == x.start && y.comp == x.comp && y.blk == x.blk &&
     y.cap == x.cap && y.ran == x.ran && (!x.here || y.ticket == ren R.kt R.ct x.ticket) &&
-    (!x.ran || y.last == ren R.ks R.cs x.last)
+    (!x.here || !(x.ran || ak) || y.last == ren R.ks R.cs x.last)
 
 def DShB (R : Ren) (x y : DrainSt) : Bool :=
   y.ph == x.ph && y.busy == x.busy && y.age == x.age && y.idle == x.idle &&
     (x.ph == .absent || y.ticket == ren R.kt R.ct x.ticket)
 
 def ShB (cfg : Cfg) (R : Ren) (s t : St) : Bool :=
-  allLT cfg.nr (fun r => RShB R (s.run r) (t.run r)) && allLT cfg.nd (fun d => DShB R (s.drain d) (t.drain d)) &&
+  allLT cfg.nr (fun r => RShB R cfg.rules.arrivalKey (s.run r) (t.run r)) && allLT cfg.nd (fun d => DShB R (s.drain d) (t.drain d)) &&
     t.gate == s.gate && t.outside == s.outside && t.next == ren R.kt R.ct s.next && decide (R.kt ≤ s.next) &&
     t.now == ren R.ks R.cs s.now && decide (R.ks ≤ s.now)
 
@@ -570,12 +588,13 @@ theorem ShB_sound {cfg : Cfg} {R : Ren} {s t : St} (h : ShB cfg R s t = true) : 
   · have := allLT_iff.1 hr r hr'
     simp only [RShB, Bool.and_eq_true, beq_iff_eq, Bool.or_eq_true, Bool.not_eq_true'] at this
     obtain ⟨⟨⟨⟨⟨⟨⟨⟨a1, a2⟩, a3⟩, a4⟩, a5⟩, a6⟩, a7⟩, a8⟩, a9⟩ := this
-    refine ⟨a1, a2, a3, a4, a5, a6, a7, fun e => ?_, fun e => ?_⟩
+    refine ⟨a1, a2, a3, a4, a5, a6, a7, fun e => ?_, fun eh er => ?_⟩
     · rcases a8 with x | x
       · rw [e] at x; cases x
       · exact x
-    · rcases a9 with x | x
-      · rw [e] at x; cases x
+    · rcases a9 with (x | x) | x
+      · rw [eh] at x; cases x
+      · rw [er] at x; cases x
       · exact x
   · have := allLT_iff.1 hd d hd'
     simp only [DShB, Bool.and_eq_true, beq_iff_eq, Bool.or_eq_true] at this
@@ -898,6 +917,39 @@ theorem backstop_starves : ∃ ρ : RunS raceCfg,
     rw [e8]
     simpa [arrB] using hm
 
+/-! ## On the fixed rules the waiting run starts -/
+
+/-- A configuration with the two no-starvation fixes (`Rules.nostarve`). -/
+def withFixes (c : Cfg) : Cfg := { c with rules := .nostarve }
+
+/-- **Fix 1 at work.** The prefix of `same_project_starves`: under the rules as shipped run 0
+waits, the newcomer having gone first; with the fixes run 0, whose last start is older than the
+newcomer's arrival, starts its task. -/
+theorem same_fixed : ((runMoves sameCfg init samePre).map fun s => (s.run 0).pend) = some 1 ∧
+    ((runMoves (withFixes sameCfg) init samePre).map fun s => (s.run 0).pend) = some 0 := by
+  decide +kernel
+
+/-- The backstop race with run 8 arriving last, its ticket the newest at the start. -/
+def racePreLate : List Move :=
+  [.act (.gate false), .act (.arrive 0), .act (.arrive 2), .act (.arrive 4), .act (.arrive 6),
+   .act (.arrive 1), .act (.arrive 3), .act (.arrive 5), .act (.arrive 7), .act (.arrive 8),
+   .act (.gate true)]
+
+/-- **Fix 2 at work.** Under the rules as shipped run 8 waits through a whole round of the race;
+with the fixes the places freed go in line: first to the four runs older than run 8, then, at the
+fifth, to run 8 (the next runs of those projects arrived after it). -/
+theorem race_fixed : ((runMoves raceCfg init (racePreLate ++ raceCyc)).map fun s => (s.run 8).pend) = some 1 ∧
+    ((runMoves (withFixes raceCfg) init (racePreLate ++ raceCyc.take 14)).map fun s => (s.run 8).pend) = some 0 := by
+  decide +kernel
+
+/-- Both counterexample configurations satisfy `run_starts_fixed`'s conditions on the
+configuration: with the fixes, every run of them in which no urgent run arrives, every task ends,
+a tick passes and the gates reopen starts every waiting run's task. -/
+theorem fixes_apply : (withFixes sameCfg).rules.arrivalKey = true ∧ (withFixes sameCfg).rules.oneLine = true ∧
+    (withFixes sameCfg).drainMax < (withFixes sameCfg).pool ∧
+    (withFixes raceCfg).rules.arrivalKey = true ∧ (withFixes raceCfg).rules.oneLine = true ∧
+    (withFixes raceCfg).drainMax < (withFixes raceCfg).pool := by decide
+
 /-! ## Axioms: only the standard three -/
 
 /-- info: 'Cpuq.Contest.same_project_starves' depends on axioms: [propext, Classical.choice, Quot.sound] -/
@@ -905,5 +957,8 @@ theorem backstop_starves : ∃ ρ : RunS raceCfg,
 
 /-- info: 'Cpuq.Contest.backstop_starves' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs in #print axioms backstop_starves
+
+/-- info: 'Cpuq.Contest.race_fixed' depends on axioms: [propext] -/
+#guard_msgs in #print axioms race_fixed
 
 end Cpuq.Contest

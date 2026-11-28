@@ -373,7 +373,7 @@ file).
 | Property | Theorem | Holds |
 |---|---|---|
 | Invariant: nothing that may start waits; ≤ `drainMax` isolated; a started drain's age ≤ limit + grace and idle ≤ `idleMax`; ≤ 4 × pool running | `reach_inv`, `pass_closed` | any rules |
-| 1 Work-conserving: a task that waits, not held by the gates, the backstop or its `-c`, is at or over share and busy + starting ≥ T − 0.5 | `work_conserving` | `busyAll` off |
+| 1 Work-conserving: a task that waits, not held by the gates, the backstop or its `-c`, is at or over share and busy + starting ≥ T − 0.5 | `work_conserving` | `busyAll` off (with or without `oneLine`) |
 | 1 fails as written: busy over the whole machine counts a drain's own command against a T that already excludes its CPUs; a task waits beside an idle CPU | `design_not_work_conserving` | (counterexample) |
 | 2 No wait under share: under share, a waiting task waits only on the gates or the 4T backstop (and its `-c`) | `no_wait_under` | any rules |
 | 2 as written ("only a gate or its `-c`") fails: 4T blocked tasks hold an under-share run | `backstop_blocks_under` | (counterexample) |
@@ -387,12 +387,14 @@ file).
 | 5 No idle hold: the CPUs withheld from tasks are exactly the started drains' sizes, ≤ `drainMax`; nothing waiting holds one; with `drainMax < pool` the others keep ≥ pool − `drainMax` ≥ 1 | `withheld`, `capT_pos` | any rules |
 | 5 A started drain whose command idles while something waits keeps its CPUs ≤ `idleMax` ticks; a started task counts as starting until the next tick | `idle_bound`, `tick_settles` | any rules |
 | 5 fails under 0.35.0: a gathering drain holds a CPU, its command not started, while a run waits holding nothing | `Contest035.idle_hold_035` | (counterexample, slot model) |
-| The line: a run starts only as its project's first waiter; over share, only with room and first in line among the projects' first waiters | `line_order` | any rules |
+| The line: a run starts only as its project's first waiter; over share, only with room and first in line among the projects' first waiters; with `oneLine`, only first in the one line (projects under share first), and under share or with room | `line_order` | any rules |
 | Within a project a run never starts a task while a waiter of its project comes before it: a newer run holding nothing goes before a long run, and a run that has just started goes behind the others holding nothing | `project_turn` | any rules |
 | … the long run's task ends and the newer run, never started, goes first | `newer_run_turn` | (trace) |
 | … each new run of a project goes before a run of the project that started before and waits holding nothing | `newcomers_first` | (trace) |
 | 3 with arrivals that never stop (`Stream.lean`): a waiting run starts a task if no new run of its own project arrives, its project's tasks end, one tick passes, and again and again the gates are open while fewer than 4T tasks run | `run_starts` | any rules |
 | … the last condition holds when fewer than 4 × (pool − `drainMax`) tasks ever run at once and the gates open again and again | `run_starts_gates` | any rules |
+| 3 with arrivals that never stop, on the fixed rules: a waiting run starts a task if no urgent run arrives, every task ends, one tick passes and the gates reopen; `drainMax` < pool. New runs of its own project may arrive forever | `run_starts_fixed` | `arrivalKey`, `oneLine` |
+| … the counterexamples' moves on the fixed rules: the waiting run starts | `same_fixed`, `race_fixed` | (traces) |
 | 3 as asked fails: new runs of its own project starve a waiting run, every other condition holding | `same_project_starves` | (infinite run) |
 | 3 as asked fails: under share, gates always open, no run of its project arriving, 4T tasks run at every step and each place freed under 4T goes to another project's run first in the pass | `backstop_starves` | (infinite run) |
 
@@ -458,6 +460,49 @@ tickets and the tick count grow; it returns to the same state with tickets and s
 (values below a bound kept, the others moved up). The rules read tickets and stamps only through
 comparisons, so renamed states take the same moves to renamed states (`Sh.stepS_`); `cycle_run`
 turns one kernel-checked round into an infinite run.
+
+### The two fixes (`Rules.nostarve`)
+
+`Rules` has two switches, both on in `Rules.nostarve` (with `busyAll` off and `drainFifo` on):
+
+- **`arrivalKey` (fix 1).** Within a project, the order is: an urgent run's first task; fewer
+  tasks running; the older of "last start, or arrival if the run has never started" (stamped in
+  ticks, as last starts are); ticket. Before it, a run that had never started went first.
+- **`oneLine` (fix 2).** A run starts a task only if it is the first in one line among the
+  projects' first waiters. The line orders: project under share first; then an urgent run's
+  first task; project running ÷ weight; fewer tasks running; ticket. The run must also be under
+  share, or there must be room (busy + starting < T − 0.5). The other conditions (waiting, `-c`,
+  gates, fewer than 4T running, its project's first waiter) stay. Before it, a run under share
+  started without a turn. In the atomic pass this changes which runs start only when the 4T
+  backstop or room binds (argued, not proved): the head starts, the pass loops, and every run
+  under share starts in turn otherwise.
+
+`run_starts_fixed` proves no-starvation on these rules. A run `r` waits at `n`. Assume `drainMax`
+< pool, and from then on:
+- no urgent run arrives;
+- every task that runs later ends;
+- one tick passes;
+- the gates are open at times without end.
+
+Then `r` starts a task. New runs of every project, `r`'s included, and drains arrive forever. The
+proof:
+1. New runs of `r`'s project come after it: they arrive no earlier than its last start, with
+   newer tickets (`arrival_not_mayPass`), so `r`'s project empties as in `run_starts`
+   (`project_empties`).
+2. Every start is then another project's, by a run ahead of `r`'s project's first waiter in the
+   one line (`pass_psi`): an urgent first task or a run with an older ticket.
+3. Those are finitely many (`psi`; a run that may come before `r` was there at `n`,
+   `pre_shrink`, `pass_shrink`). So starts stop, every task ends, and at the next open gates the
+   first in the one line, under share, starts.
+
+`work_conserving`, `no_wait_under` and `line_order` hold with either switch. The drain properties
+do not depend on them.
+
+Argued, not proved: `noUrgent` is needed. An urgent first task goes first in its project's order
+and in the one line, so a stream of urgent runs passes `r` forever. `same_fixed` and `race_fixed`
+run the counterexamples' moves on the fixed rules (in `race_fixed`, with `r` arriving last):
+`r` starts. The tickets invariant (present runs' tickets distinct, below `next`) is
+`reachS_tickets`.
 
 Not proved with arrivals that never stop: a waiting drain starts. A drain waits for older drains,
 the `drainMax` bound and (`drainFifo`) older runs that hold nothing; the first two are finitely many

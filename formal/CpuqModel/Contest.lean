@@ -38,6 +38,9 @@ The rules as admission (`canStart`, `canDrain`):
 
 `Rules.design` is DESIGN-0.40.md read literally; `Rules.fixed` has the two rule changes the
 proofs need (`busyAll` off: busy counts the CPUs no drain isolates; `drainFifo` on).
+`Rules.nostarve` adds the two no-starvation fixes (`Stream.lean`): within a project a run that
+never started counts its arrival as its last start (`arrivalKey`), and every start goes to the
+first in one line, projects under share first (`oneLine`).
 -/
 
 namespace Cpuq.Contest
@@ -171,12 +174,21 @@ structure Rules where
   Off: it waits only for older drains, the `drainMax` bound and the gates (the design as
   written, property 4). -/
   drainFifo : Bool
+  /-- Within a project, a run that has never started counts its arrival as its last start, so
+  it goes behind runs whose last start is older (no-starvation fix 1). Off: it goes first. -/
+  arrivalKey : Bool := false
+  /-- One line for every start: a run starts a task only as the first in line among the
+  projects' first waiters, projects under share first, then the line's order (no-starvation fix
+  2). Off: a run under share starts without a turn, and only spare room is taken in line. -/
+  oneLine : Bool := false
   deriving Repr
 
 /-- DESIGN-0.40.md as written. -/
 def Rules.design : Rules := { busyAll := true, drainFifo := false }
 /-- The design with the two changes the proofs need. -/
 def Rules.fixed : Rules := { busyAll := false, drainFifo := true }
+/-- `fixed` with the two no-starvation fixes (`Stream.lean`). -/
+def Rules.nostarve : Rules := { busyAll := false, drainFifo := true, arrivalKey := true, oneLine := true }
 
 structure Cfg where
   /-- The pool's CPUs (the budget). -/
@@ -231,6 +243,10 @@ structure RunSt where
   deriving Repr
 
 def RunSt.running (x : RunSt) : Nat := x.start + x.comp + x.blk
+
+/-- A run's last start key: its last start (or, with `ak`, its arrival if it never started) plus
+one, else 0. -/
+def lkOf (ak : Bool) (x : RunSt) : Nat := if x.ran || ak then x.last + 1 else 0
 
 inductive DPh where
   | absent | waiting | started | over
@@ -337,15 +353,16 @@ def before (s : St) (i j : Nat) : Bool :=
   (decide ((s.run i).running < (s.run j).running) || (decide ((s.run i).running = (s.run j).running) &&
     decide ((s.run i).ticket < (s.run j).ticket))))))
 
-/-- When a run last started a task, 0 if never (so a run that never started goes first). -/
-def lastKey (s : St) (r : Nat) : Nat := if (s.run r).ran then (s.run r).last + 1 else 0
+/-- When a run last started a task (with `arrivalKey`, when it arrived if it never started), one
+more; 0 for a run that never started without `arrivalKey`, so it goes first. -/
+def lastKey (s : St) (r : Nat) : Nat := lkOf cfg.rules.arrivalKey (s.run r)
 
 /-- The order within a project: an urgent run's first task, then fewer tasks running, then the
 oldest last start (a run that never started first), then ticket. -/
 def pbefore (s : St) (i j : Nat) : Bool :=
   decide (urg cfg s i < urg cfg s j) || (decide (urg cfg s i = urg cfg s j) &&
   (decide ((s.run i).running < (s.run j).running) || (decide ((s.run i).running = (s.run j).running) &&
-  (decide (lastKey s i < lastKey s j) || (decide (lastKey s i = lastKey s j) &&
+  (decide (lastKey cfg s i < lastKey cfg s j) || (decide (lastKey cfg s i = lastKey cfg s j) &&
     decide ((s.run i).ticket < (s.run j).ticket))))))
 
 /-- The project's first waiter: no waiter of its project comes before it. -/
@@ -373,12 +390,22 @@ variable (cfg : Cfg)
 /-- The first in line among the projects' first waiters. -/
 def head (s : St) : Option Nat := pick (front cfg s) (before cfg s) (List.range cfg.nr)
 
+/-- The one line (`oneLine`): projects under share first, then the line's order. -/
+def before2 (s : St) (i j : Nat) : Bool :=
+  (decide (under cfg s i) && !decide (under cfg s j)) ||
+    (decide (under cfg s i) == decide (under cfg s j) && before cfg s i j)
+
+/-- The first in the one line among the projects' first waiters. -/
+def head2 (s : St) : Option Nat := pick (front cfg s) (before2 cfg s) (List.range cfg.nr)
+
 /-- A run may start a task: it waits, not held by its `-c`; the gates are open and fewer than
 4T tasks run; it is its project's first waiter; and its project is under share, or there is room
-and it is the first in line. -/
+and it is the first in line. With `oneLine`: it is the first in the one line, and under share or
+with room. -/
 def canStart (s : St) (r : Nat) : Bool :=
   eligible s r && s.gate && decide (total cfg s < 4 * capT cfg s) &&
-    (projFirst cfg s r && (decide (under cfg s r) || (decide (room cfg s) && head cfg s == some r)))
+    (projFirst cfg s r && (if cfg.rules.oneLine then head2 cfg s == some r && (decide (under cfg s r) || decide (room cfg s))
+      else decide (under cfg s r) || (decide (room cfg s) && head cfg s == some r)))
 
 def olderDrainWaits (s : St) (d : Nat) : Bool :=
   anyLT cfg.nd (fun e => decide ((s.drain e).ph = .waiting) && decide ((s.drain e).ticket < (s.drain d).ticket))
@@ -512,7 +539,7 @@ inductive Act where
 def act (cfg : Cfg) (s : St) : Act → Option St
   | .arrive r =>
     if r < cfg.nr ∧ (s.run r).here = false then
-      some { setRun s r { here := true, ticket := s.next, pend := (cfg.run r).tasks, cap := max 1 (cfg.run r).cap }
+      some { setRun s r { here := true, ticket := s.next, pend := (cfg.run r).tasks, cap := max 1 (cfg.run r).cap, last := s.now }
              with next := s.next + 1 }
     else none
   | .arriveD d =>
@@ -757,7 +784,7 @@ theorem inv_act {cfg : Cfg} {s u : St} {a : Act} (i : Inv cfg s) (h : act cfg s 
       · by_cases hjr : j = r
         · subst hjr; simp only [setRun_run, ite_true]; omega
         · simp only [setRun_run, hjr, ite_false] at hj ⊢; exact i.cap j hj
-      · have : total cfg { setRun s r { here := true, ticket := s.next, pend := (cfg.run r).tasks, cap := max 1 (cfg.run r).cap } with next := s.next + 1 } ≤ total cfg s :=
+      · have : total cfg { setRun s r { here := true, ticket := s.next, pend := (cfg.run r).tasks, cap := max 1 (cfg.run r).cap, last := s.now } with next := s.next + 1 } ≤ total cfg s :=
           total_le (fun j => by
             by_cases hjr : j = r
             · subst hjr; simp [RunSt.running]
@@ -1032,6 +1059,38 @@ theorem under_proj {cfg : Cfg} {s : St} {r h : Nat} (hp : (cfg.run h).proj = (cf
     under cfg s h ↔ under cfg s r := by
   unfold under; rw [hp]
 
+theorem before2_irr (cfg : Cfg) (s : St) (a : Nat) : before2 cfg s a a = false := by
+  simp [before2, before_irr]
+
+theorem before2_trans (cfg : Cfg) (s : St) (a b c : Nat) :
+    before2 cfg s a b = true → before2 cfg s b c = true → before2 cfg s a c = true := by
+  intro h1 h2
+  have bt := before_trans cfg s a b c
+  unfold before2 at *
+  cases ha : decide (under cfg s a) <;> cases hb : decide (under cfg s b) <;>
+    cases hc : decide (under cfg s c) <;> simp only [ha, hb, hc] at h1 h2 ⊢ <;> simp_all
+
+theorem head2_some {cfg : Cfg} {s : St} {h : Nat} (e : head2 cfg s = some h) : h < cfg.nr ∧ front cfg s h = true := by
+  rcases foldl_pick_some _ _ _ _ h e with e1 | ⟨hm, hp⟩
+  · cases e1
+  · exact ⟨List.mem_range.1 hm, hp⟩
+
+theorem head2_isSome {cfg : Cfg} {s : St} {r : Nat} (hr : r < cfg.nr) (he : eligible s r = true) :
+    (head2 cfg s).isSome = true := by
+  obtain ⟨h, hh, _, hf⟩ := first_exists hr he
+  exact foldl_pick_isSome _ _ _ _ (Or.inr ⟨h, List.mem_range.2 hh, hf⟩)
+
+theorem head2_first {cfg : Cfg} {s : St} {h : Nat} (e : head2 cfg s = some h) :
+    ∀ i < cfg.nr, front cfg s i = true → before2 cfg s i h = false :=
+  fun i hi he => (foldl_pick_min _ _ (before2_irr cfg s) (before2_trans cfg s) _ _ h e).2 i (List.mem_range.2 hi) he
+
+/-- With `oneLine`, if a project's first waiter is under share, so is the first in the one line. -/
+theorem head2_under {cfg : Cfg} {s : St} {h f : Nat} (e : head2 cfg s = some h) (hf : f < cfg.nr)
+    (ff : front cfg s f = true) (hu : under cfg s f) : under cfg s h := by
+  have := head2_first e f hf ff
+  apply Classical.byContradiction; intro hn
+  simp [before2, hu, hn] at this
+
 /-! ## In every reachable state nothing that may start waits -/
 
 theorem reach_start {cfg : Cfg} {s : St} (h : Reach cfg s) {r : Nat} (hr : r < cfg.nr) : canStart cfg s r = false :=
@@ -1048,14 +1107,21 @@ theorem no_wait_under {cfg : Cfg} {s : St} (h : Reach cfg s) {r : Nat} (hr : r <
   obtain ⟨f, hf, hpf, hff⟩ := first_exists hr he
   have hc := reach_start h hf
   have huf : under cfg s f := (under_proj hpf).2 hu
-  simp only [front, Bool.and_eq_true] at hff
   cases hg : s.gate
   · exact Or.inl rfl
   · right
     apply Classical.byContradiction
     intro hlt
     have hlt' : total cfg s < 4 * capT cfg s := by omega
-    simp [canStart, hff.1, hff.2, hg, hlt', huf] at hc
+    cases ho : cfg.rules.oneLine
+    · simp only [front, Bool.and_eq_true] at hff
+      simp [canStart, hff.1, hff.2, hg, hlt', huf, ho] at hc
+    · obtain ⟨x, hx⟩ := Option.isSome_iff_exists.1 (head2_isSome hr he)
+      obtain ⟨hxn, hxe⟩ := head2_some hx
+      have hxu := head2_under hx hf hff huf
+      have hc' := reach_start h hxn
+      simp only [front, Bool.and_eq_true] at hxe
+      simp [canStart, hxe.1, hxe.2, hg, hlt', hxu, ho, hx] at hc' 
 
 /-- **Property 1, work-conserving** (with busy counting only the CPUs no drain isolates). A
 task that waits, not held by the gates, the backstop or its run's `-c`, waits only when its
@@ -1073,11 +1139,17 @@ theorem work_conserving {cfg : Cfg} {s : St} (h : Reach cfg s) (hb : cfg.rules.b
     have hbm : busyM cfg s = taskBusy cfg s + s.outside := by simp [busyM, hb]
     have hroom : room cfg s := by
       unfold room; rw [hbm]; omega
-    obtain ⟨x, hx⟩ := Option.isSome_iff_exists.1 (head_isSome hr he)
-    obtain ⟨hxn, hxe⟩ := head_some hx
-    simp only [front, Bool.and_eq_true] at hxe
-    have hc := reach_start h hxn
-    simp [canStart, hxe.1, hxe.2, hg, ht, hroom, hx] at hc
+    cases ho : cfg.rules.oneLine
+    · obtain ⟨x, hx⟩ := Option.isSome_iff_exists.1 (head_isSome hr he)
+      obtain ⟨hxn, hxe⟩ := head_some hx
+      simp only [front, Bool.and_eq_true] at hxe
+      have hc := reach_start h hxn
+      simp [canStart, hxe.1, hxe.2, hg, ht, hroom, hx, ho] at hc
+    · obtain ⟨x, hx⟩ := Option.isSome_iff_exists.1 (head2_isSome hr he)
+      obtain ⟨hxn, hxe⟩ := head2_some hx
+      simp only [front, Bool.and_eq_true] at hxe
+      have hc := reach_start h hxn
+      simp [canStart, hxe.1, hxe.2, hg, ht, hroom, hx, ho] at hc
 
 /-- **The line.** A run starts a task only as its project's first waiter (no waiter of its
 project has fewer tasks running, or as many and an older ticket); over its share, only with room
@@ -1085,12 +1157,21 @@ and first in line among the projects' first waiters (urgent first task, project 
 weight, fewer running, ticket). -/
 theorem line_order {cfg : Cfg} {s : St} {r : Nat} (hc : canStart cfg s r = true) :
     projFirst cfg s r = true ∧
-    (¬ under cfg s r → room cfg s ∧ ∀ i < cfg.nr, front cfg s i = true → before cfg s i r = false) := by
-  simp only [canStart, Bool.and_eq_true, Bool.or_eq_true, decide_eq_true_eq, beq_iff_eq] at hc
-  refine ⟨hc.2.1, fun hu => ?_⟩
-  rcases hc.2.2 with hu' | ⟨hroom, hh⟩
-  · exact absurd hu' hu
-  · exact ⟨hroom, head_first hh⟩
+    (cfg.rules.oneLine = false → ¬ under cfg s r →
+      room cfg s ∧ ∀ i < cfg.nr, front cfg s i = true → before cfg s i r = false) ∧
+    (cfg.rules.oneLine = true →
+      (under cfg s r ∨ room cfg s) ∧ ∀ i < cfg.nr, front cfg s i = true → before2 cfg s i r = false) := by
+  simp only [canStart, Bool.and_eq_true] at hc
+  refine ⟨hc.2.1, fun ho hu => ?_, fun ho => ?_⟩
+  · have h2 := hc.2.2
+    simp only [ho, Bool.false_eq_true, ↓reduceIte, Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq,
+      beq_iff_eq] at h2
+    rcases h2 with hu' | ⟨hroom, hh⟩
+    · exact absurd hu' hu
+    · exact ⟨hroom, head_first hh⟩
+  · have h2 := hc.2.2
+    simp only [ho, ↓reduceIte, Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at h2
+    exact ⟨h2.2, head2_first h2.1⟩
 
 /-- Within a project: a run never starts a task while a waiter of its project comes before it
 (an urgent first task; fewer tasks running; as many and an older last start, a run that never
@@ -1164,7 +1245,7 @@ theorem tick_settles {cfg : Cfg} {s u : St} (h : act cfg s .tick = some u) : ∀
 
 def runAfter (cfg : Cfg) (s : St) (a : Act) (r : Nat) : RunSt :=
   match a with
-  | .arrive e => if e = r then { here := true, ticket := s.next, pend := (cfg.run r).tasks, cap := max 1 (cfg.run r).cap } else s.run r
+  | .arrive e => if e = r then { here := true, ticket := s.next, pend := (cfg.run r).tasks, cap := max 1 (cfg.run r).cap, last := s.now } else s.run r
   | .finS e => if e = r then { s.run r with start := (s.run r).start - 1 } else s.run r
   | .finC e => if e = r then { s.run r with comp := (s.run r).comp - 1 } else s.run r
   | .finB e => if e = r then { s.run r with blk := (s.run r).blk - 1 } else s.run r
