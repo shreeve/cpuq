@@ -6,7 +6,7 @@ design's five properties for every configuration (no search).
 What a state is: per run (`cpuq run -n M -c C`) its arrival and ticket, its tasks waiting
 (`pend`), and its running tasks, each starting (started since the last tick: the design's
 "started in the last 2 s"), computing or blocked (waiting on I/O, a sleep, a child); its `-c`.
-Per drain (`cpuq drain -c N`): absent, waiting, started (its N CPUs isolated) or over; its ticket;
+Per drain (`cpuq drain -c N` or `--cpus`): absent, waiting, started (its cores isolated, `held`) or over; its ticket;
 whether its command computes; how long it has been isolated (`age`) and idle (`idle`), in ticks.
 Machine-wide: whether the gates (memory, disk, pressure) are open, and the CPUs busy outside cpuq.
 
@@ -159,11 +159,14 @@ structure RunCfg where
   deriving Repr
 
 structure DrainCfg where
-  /-- `-c N`: the CPUs it isolates, SMT siblings of the chosen CPUs included; which CPUs
-  (`--cpus`) is left abstract. 0.40.0 has no `--all`. -/
+  /-- `-c N`: how many cores it isolates (a core is a CPU with its SMT siblings). 0.40.0 has no
+  `--all`. -/
   size : Nat := 1
   /-- `-t`, in ticks (at most `Cfg.ceil`). -/
   limit : Nat := 1
+  /-- `--cpus`: the cores it names. Empty: `-c size`, which takes the first free cores in the
+  pool's order (`pickCpus`). -/
+  cpus : List Nat := []
   deriving Repr
 
 structure Rules where
@@ -181,6 +184,10 @@ structure Rules where
   projects' first waiters, projects under share first, then the line's order (no-starvation fix
   2). Off: a run under share starts without a turn, and only spare room is taken in line. -/
   oneLine : Bool := false
+  /-- Drain backfill: a drain may start ahead of older waiting drains when its cores are free,
+  none of them is named by an older waiting drain, and the isolation stays within `drain_max`
+  counting every older waiting drain's cores too. Off: drains start in their order. -/
+  backfill : Bool := false
   deriving Repr
 
 /-- DESIGN-0.40.md as written. -/
@@ -189,6 +196,9 @@ def Rules.design : Rules := { busyAll := true, drainFifo := false }
 def Rules.fixed : Rules := { busyAll := false, drainFifo := true }
 /-- `fixed` with the two no-starvation fixes (`Stream.lean`). -/
 def Rules.nostarve : Rules := { busyAll := false, drainFifo := true, arrivalKey := true, oneLine := true }
+/-- `nostarve` with drain backfill (`DrainFill.lean`). -/
+def Rules.drainfill : Rules :=
+  { busyAll := false, drainFifo := true, arrivalKey := true, oneLine := true, backfill := true }
 
 structure Cfg where
   /-- The pool's CPUs (the budget). -/
@@ -221,6 +231,8 @@ def np (c : Cfg) : Nat := c.runs.foldr (fun x m => max (x.proj + 1) m) 0
 running count times it is its share ÷ weight in whole numbers. -/
 def wprod (c : Cfg) : Nat := rprod c.np c.w
 def limitOf (c : Cfg) (d : Nat) : Nat := min (c.drain d).limit c.ceil
+/-- The cores drain `d` isolates: those it names, else `-c`'s count. -/
+def dsize (c : Cfg) (d : Nat) : Nat := if (c.drain d).cpus = [] then (c.drain d).size else (c.drain d).cpus.length
 end Cfg
 
 theorem Cfg.w_pos (c : Cfg) (p : Nat) : 0 < c.w p := by
@@ -261,6 +273,8 @@ structure DrainSt where
   age : Nat := 0
   /-- Ticks in a row its command has been idle while others wait. -/
   idle : Nat := 0
+  /-- The cores it isolates, chosen when it starts. -/
+  held : List Nat := []
   deriving Repr
 
 structure St where
@@ -309,12 +323,12 @@ def projRun (s : St) (p : Nat) : Nat :=
   rsum cfg.nr (fun r => if (cfg.run r).proj = p then (s.run r).running else 0)
 def taskBusy (s : St) : Nat := rsum cfg.nr (fun r => (s.run r).comp)
 def startingN (s : St) : Nat := rsum cfg.nr (fun r => (s.run r).start)
-def isoF (d : Nat) (y : DrainSt) : Nat := if y.ph = .started then (cfg.drain d).size else 0
+def isoF (d : Nat) (y : DrainSt) : Nat := if y.ph = .started then cfg.dsize d else 0
 /-- The CPUs isolated: the sizes of the started drains. -/
 def iso (s : St) : Nat := rsum cfg.nd (fun d => isoF cfg d (s.drain d))
 /-- What the started drains' commands keep busy. -/
 def drainLoad (s : St) : Nat :=
-  rsum cfg.nd (fun d => if (s.drain d).ph = .started ∧ (s.drain d).busy = true then (cfg.drain d).size else 0)
+  rsum cfg.nd (fun d => if (s.drain d).ph = .started ∧ (s.drain d).busy = true then cfg.dsize d else 0)
 /-- Capacity T. -/
 def capT (s : St) : Nat := cfg.pool - iso cfg s
 /-- Busy as the rules measure it. -/
@@ -417,23 +431,52 @@ def emptyWaiter (s : St) (r : Nat) : Bool :=
 def olderEmptyWaits (s : St) (d : Nat) : Bool :=
   anyLT cfg.nr (fun r => emptyWaiter s r && decide ((s.run r).ticket < (s.drain d).ticket))
 
-/-- A drain may start: it waits, no older drain waits, at most `drainMax` CPUs are then isolated,
-the gates are open, and (with `drainFifo`) no older run that holds nothing waits. -/
+/-- Core `c` is isolated by a started drain. -/
+def heldBy (s : St) (c : Nat) : Bool :=
+  anyLT cfg.nd (fun e => decide ((s.drain e).ph = .started) && (s.drain e).held.contains c)
+
+/-- Core `c` is named by a drain older than `d` that waits. -/
+def reserved (s : St) (d c : Nat) : Bool :=
+  anyLT cfg.nd (fun e => decide ((s.drain e).ph = .waiting) && decide ((s.drain e).ticket < (s.drain d).ticket) &&
+    (cfg.drain e).cpus.contains c)
+
+/-- The cores drain `d` would isolate now: those it names, else the first `size` of the pool's
+cores (0 … pool−1) that are neither isolated nor named by an older waiting drain. -/
+def pickCpus (s : St) (d : Nat) : List Nat :=
+  if (cfg.drain d).cpus = [] then
+    ((List.range cfg.pool).filter (fun c => !heldBy cfg s c && !reserved cfg s d c)).take (cfg.drain d).size
+  else (cfg.drain d).cpus
+
+/-- Its cores are free and named by no older waiting drain, and there are enough of them. -/
+def fits (s : St) (d : Nat) : Bool :=
+  (pickCpus cfg s d).all (fun c => !heldBy cfg s c && !reserved cfg s d c) &&
+    (pickCpus cfg s d).length == cfg.dsize d
+
+/-- The cores the drains older than `d` that wait will isolate. -/
+def olderSum (s : St) (d : Nat) : Nat :=
+  rsum cfg.nd (fun e => if (s.drain e).ph = .waiting ∧ (s.drain e).ticket < (s.drain d).ticket then cfg.dsize e else 0)
+
+/-- A drain may start: it waits, the gates are open, at most `drainMax` cores are then isolated,
+its cores are free (`fits`), (with `drainFifo`) no older run that holds nothing waits, and no
+older drain waits, or (with `backfill`) the isolation stays within `drainMax` counting every older
+waiting drain's cores too. -/
 def canDrain (s : St) (d : Nat) : Bool :=
-  decide ((s.drain d).ph = .waiting) && s.gate && decide (iso cfg s + (cfg.drain d).size ≤ cfg.drainMax) &&
-    !olderDrainWaits cfg s d && !(cfg.rules.drainFifo && olderEmptyWaits cfg s d)
+  decide ((s.drain d).ph = .waiting) && s.gate && decide (iso cfg s + cfg.dsize d ≤ cfg.drainMax) &&
+    fits cfg s d &&
+    ((!olderDrainWaits cfg s d || (cfg.rules.backfill && decide (iso cfg s + cfg.dsize d + olderSum cfg s d ≤ cfg.drainMax))) &&
+      !(cfg.rules.drainFifo && olderEmptyWaits cfg s d))
 
 def admitR (t : Nat) (x : RunSt) : RunSt := { x with pend := x.pend - 1, start := x.start + 1, ran := true, last := t }
-def startDr (y : DrainSt) : DrainSt := { y with ph := .started, age := 0, idle := 0, busy := true }
+def startDr (y : DrainSt) (h : List Nat) : DrainSt := { y with ph := .started, age := 0, idle := 0, busy := true, held := h }
 
 def admit (s : St) (r : Nat) : St := setRun s r (admitR s.now (s.run r))
 
-def startD (s : St) (d : Nat) : St := setDrain s d (startDr (s.drain d))
+def startD (s : St) (d : Nat) : St := setDrain s d (startDr (s.drain d) (pickCpus cfg s d))
 
 /-- One start of the pass: a drain if one may start, else a run. -/
 def pass1 (s : St) : Option St :=
   match (List.range cfg.nd).find? (canDrain cfg s) with
-  | some d => some (startD s d)
+  | some d => some (startD cfg s d)
   | none => ((List.range cfg.nr).find? (canStart cfg s)).map (admit s)
 
 def passN : Nat → St → St
@@ -614,10 +657,10 @@ theorem pass1_work {cfg : Cfg} {s t : St} (h : pass1 cfg s = some t) : work cfg 
     have hm := List.mem_range.1 (List.mem_of_find?_eq_some hd)
     simp only [canDrain, Bool.and_eq_true, decide_eq_true_eq] at hc
     have hw := hc.1.1.1.1
-    have h1 := sum_setDrain (fun _ y => isWaiting y) s (startDr (s.drain d)) hm
+    have h1 := sum_setDrain (fun _ y => isWaiting y) s (startDr (s.drain d) (pickCpus cfg s d)) hm
     try dsimp only at h1
     have e1 : isWaiting (s.drain d) = 1 := by simp [isWaiting, hw]
-    have e2 : isWaiting (startDr (s.drain d)) = 0 := by simp [isWaiting, startDr]
+    have e2 : isWaiting (startDr (s.drain d) (pickCpus cfg s d)) = 0 := by simp [isWaiting, startDr]
     rw [e1, e2] at h1
     unfold work startD
     simp only [setDrain_run]
@@ -684,10 +727,10 @@ theorem iso_le {cfg : Cfg} {s t : St} (h : ∀ d, (t.drain d).ph = .started → 
   · simp [isoF, ht]
 
 theorem iso_startD {cfg : Cfg} {s : St} {d : Nat} (hd : d < cfg.nd) (hw : (s.drain d).ph = .waiting) :
-    iso cfg (startD s d) = iso cfg s + (cfg.drain d).size := by
-  have h := sum_setDrain (isoF cfg) s (startDr (s.drain d)) hd
+    iso cfg (startD cfg s d) = iso cfg s + cfg.dsize d := by
+  have h := sum_setDrain (isoF cfg) s (startDr (s.drain d) (pickCpus cfg s d)) hd
   have e1 : isoF cfg d (s.drain d) = 0 := by simp [isoF, hw]
-  have e2 : isoF cfg d (startDr (s.drain d)) = (cfg.drain d).size := by
+  have e2 : isoF cfg d (startDr (s.drain d) (pickCpus cfg s d)) = cfg.dsize d := by
     simp [isoF, startDr]
   rw [e1, e2] at h
   show rsum cfg.nd (fun j => isoF cfg j ((setDrain s d _).drain j)) = rsum cfg.nd (fun j => isoF cfg j (s.drain j)) + _
@@ -1190,19 +1233,41 @@ theorem project_turn {cfg : Cfg} {s : St} {r : Nat} (hc : canStart cfg s r = tru
 nothing. -/
 theorem drain_waits_for {cfg : Cfg} {s : St} (h : Reach cfg s) {d : Nat} (hd : d < cfg.nd)
     (hw : (s.drain d).ph = .waiting) :
-    s.gate = false ∨ cfg.drainMax < iso cfg s + (cfg.drain d).size ∨ olderDrainWaits cfg s d = true ∨
-      (cfg.rules.drainFifo = true ∧ olderEmptyWaits cfg s d = true) := by
+    s.gate = false ∨ cfg.drainMax < iso cfg s + cfg.dsize d ∨ fits cfg s d = false ∨
+      olderDrainWaits cfg s d = true ∨ (cfg.rules.drainFifo = true ∧ olderEmptyWaits cfg s d = true) := by
   have hc := reach_drain h hd
   cases hg : s.gate
   · exact Or.inl rfl
   · right
-    by_cases hp : cfg.drainMax < iso cfg s + (cfg.drain d).size
+    by_cases hp : cfg.drainMax < iso cfg s + cfg.dsize d
     · exact Or.inl hp
     · right
-      cases ho : olderDrainWaits cfg s d
-      · cases hf : cfg.rules.drainFifo <;> cases he : olderEmptyWaits cfg s d <;>
-          simp_all [canDrain] <;> omega
+      cases hfi : fits cfg s d
       · exact Or.inl rfl
+      · right
+        cases ho : olderDrainWaits cfg s d
+        · cases hf : cfg.rules.drainFifo <;> cases he : olderEmptyWaits cfg s d <;>
+            simp_all [canDrain] <;> omega
+        · exact Or.inl rfl
+
+/-- With no drain started and none older waiting, a drain's cores are free, if it asks no more
+cores than the pool has. -/
+theorem fits_free {cfg : Cfg} {s : St} {d : Nat} (hn : ∀ e < cfg.nd, (s.drain e).ph ≠ .started)
+    (ho : olderDrainWaits cfg s d = false) (hp : cfg.dsize d ≤ cfg.pool) : fits cfg s d = true := by
+  have h1 : ∀ c, heldBy cfg s c = false := fun c => anyLT_false.2 (fun e he => by simp [hn e he])
+  have h2 : ∀ c, reserved cfg s d c = false := fun c => anyLT_false.2 (fun e he => by
+    have := anyLT_false.1 ho e he
+    simp only [this, Bool.false_and])
+  unfold fits pickCpus
+  simp only [h1, h2, Bool.not_false, Bool.and_self]
+  split
+  · rename_i hc
+    simp only [Cfg.dsize, hc, ite_true] at hp ⊢
+    rw [List.filter_eq_self.2 (fun _ _ => rfl)]
+    simp [List.length_range]
+    omega
+  · rename_i hc
+    simp [Cfg.dsize, hc]
 
 /-! ## Property 5: what is withheld from tasks -/
 
@@ -1229,7 +1294,7 @@ theorem drain_clock {cfg : Cfg} {s : St} (h : Reach cfg s) {d : Nat} (hs : (s.dr
 
 /-- A drain larger than `drainMax` never starts: the rules must refuse it. -/
 theorem big_drain_never {cfg : Cfg} {s : St} (h : Reach cfg s) {d : Nat} (hd : d < cfg.nd)
-    (hb : cfg.drainMax < (cfg.drain d).size) : (s.drain d).ph ≠ .started := by
+    (hb : cfg.drainMax < cfg.dsize d) : (s.drain d).ph ≠ .started := by
   intro hs
   have h1 := (reach_inv h).1.half
   have h2 : isoF cfg d (s.drain d) ≤ iso cfg s := le_rsum (f := fun j => isoF cfg j (s.drain j)) hd
@@ -1292,7 +1357,7 @@ theorem act_drain {cfg : Cfg} {s u : St} {a : Act} (h : act cfg s a = some u) (d
 
 inductive PassPath (cfg : Cfg) : St → St → Prop where
   | refl (s : St) : PassPath cfg s s
-  | drain {s u : St} (d : Nat) : canDrain cfg s d = true → PassPath cfg (startD s d) u → PassPath cfg s u
+  | drain {s u : St} (d : Nat) : canDrain cfg s d = true → PassPath cfg (startD cfg s d) u → PassPath cfg s u
   | admit {s u : St} (r : Nat) : canStart cfg s r = true → PassPath cfg (admit s r) u → PassPath cfg s u
 
 theorem pass1_path {cfg : Cfg} {s t u : St} (h : pass1 cfg s = some t) (p : PassPath cfg t u) : PassPath cfg s u := by
@@ -1374,9 +1439,9 @@ theorem M_pass1 {cfg : Cfg} {s t : St} (h : pass1 cfg s = some t) : M cfg t + 1 
     have hm := List.mem_range.1 (List.mem_of_find?_eq_some hd)
     simp only [canDrain, Bool.and_eq_true, decide_eq_true_eq] at hc
     have hw := hc.1.1.1.1
-    have h1 := sum_setDrain (fun _ y => dval y) s (startDr (s.drain d)) hm
+    have h1 := sum_setDrain (fun _ y => dval y) s (startDr (s.drain d) (pickCpus cfg s d)) hm
     have e1 : dval (s.drain d) = 2 := by simp [dval, hw]
-    have e2 : dval (startDr (s.drain d)) = 1 := by simp [dval, startDr]
+    have e2 : dval (startDr (s.drain d) (pickCpus cfg s d)) = 1 := by simp [dval, startDr]
     try dsimp only at h1
     rw [e1, e2] at h1
     unfold M startD
@@ -1608,8 +1673,8 @@ theorem step_keeps {cfg : Cfg} {s t : St} {a : Act} (ha : a.arrival = false) (hs
 (every run holding a running task later sees one of them end), the gates are open again and
 again, and time keeps passing, then from some time on nothing waits: every task and every
 drain has started. Drains no larger than `drainMax`. -/
-theorem no_starvation {cfg : Cfg} (hp : 0 < cfg.pool)
-    (hsz : ∀ d < cfg.nd, (cfg.drain d).size ≤ cfg.drainMax)
+theorem no_starvation {cfg : Cfg} (hp : 0 < cfg.pool) (hDp : cfg.drainMax ≤ cfg.pool)
+    (hsz : ∀ d < cfg.nd, cfg.dsize d ≤ cfg.drainMax)
     (ρ : Run cfg) (n0 : Nat) (calm : ∀ n ≥ n0, (ρ.act n).arrival = false)
     (ends : ∀ n r, r < cfg.nr → 0 < ((ρ.st n).run r).running → ∃ m ≥ n, finOf r (ρ.act m))
     (gates : ∀ n, ∃ m ≥ n, (ρ.st m).gate = true)
@@ -1705,7 +1770,8 @@ theorem no_starvation {cfg : Cfg} (hp : 0 < cfg.pool)
     have hoe : olderEmptyWaits cfg (ρ.st m) e = false := anyLT_false.2 (fun x hx => by
       simp [emptyWaiter, pend0 x hx])
     have hs := hsz e he
-    simp [canDrain, hew, hg, hiso, ho, hoe, hs] at hc
+    have hfi : fits cfg (ρ.st m) e = true := fits_free (noIso m hm) ho (Nat.le_trans hs hDp)
+    simp [canDrain, hew, hg, hiso, ho, hoe, hs, hfi] at hc
   -- nothing waits from then on
   have all : ∀ j, Quiet cfg (ρ.st (m + j)) := by
     intro j
@@ -1756,26 +1822,27 @@ started a task, and every older drain that waited has started. -/
 theorem PassPath.fifo {cfg : Cfg} (hf : cfg.rules.drainFifo = true) {s u : St} (p : PassPath cfg s u)
     {d : Nat} (hw : (s.drain d).ph = .waiting) (hs : (u.drain d).ph = .started) :
     (∀ r < cfg.nr, emptyWaiter s r = true → (s.run r).ticket < (s.drain d).ticket → 0 < (u.run r).running) ∧
-    (∀ e < cfg.nd, (s.drain e).ph = .waiting → (s.drain e).ticket < (s.drain d).ticket → (u.drain e).ph = .started) := by
+    (cfg.rules.backfill = false →
+      ∀ e < cfg.nd, (s.drain e).ph = .waiting → (s.drain e).ticket < (s.drain d).ticket → (u.drain e).ph = .started) := by
   induction p with
   | refl _ => rw [hw] at hs; cases hs
   | @drain s' u' e hc p ih =>
     by_cases hed : e = d
     · subst hed
-      simp only [canDrain, Bool.and_eq_true, Bool.not_eq_true', decide_eq_true_eq, hf, Bool.true_and] at hc
-      obtain ⟨⟨_, ho⟩, hoe⟩ := hc
-      refine ⟨fun r hr he ht => ?_, fun e' he' hw' ht' => ?_⟩
+      simp only [canDrain, Bool.and_eq_true, Bool.not_eq_true', hf, Bool.true_and] at hc
+      obtain ⟨_, hmode, hoe⟩ := hc
+      refine ⟨fun r hr he ht => ?_, fun hb e' he' hw' ht' => ?_⟩
       · have : olderEmptyWaits cfg s' e = true := anyLT_iff.2 ⟨r, hr, by simp [he, ht]⟩
         rw [this] at hoe; cases hoe
       · have : olderDrainWaits cfg s' e = true := anyLT_iff.2 ⟨e', he', by simp [hw', ht']⟩
-        rw [this] at ho; cases ho
-    · have hw2 : ((startD s' e).drain d).ph = .waiting := by simp [startD, Ne.symm hed, hw]
+        rw [this, hb] at hmode; simp at hmode
+    · have hw2 : ((startD cfg s' e).drain d).ph = .waiting := by simp [startD, Ne.symm hed, hw]
       obtain ⟨i1, i2⟩ := ih hw2 hs
       have fr := p.frame
-      refine ⟨fun r hr he ht => i1 r hr he (by simpa [startD, Ne.symm hed] using ht), fun e' he' hw' ht' => ?_⟩
+      refine ⟨fun r hr he ht => i1 r hr he (by simpa [startD, Ne.symm hed] using ht), fun hb e' he' hw' ht' => ?_⟩
       by_cases hee : e' = e
       · subst hee; exact fr.2.2.2.1 e' (by simp [startD, startDr])
-      · exact i2 e' he' (by simpa [startD, hee] using hw') (by simpa [startD, hee, Ne.symm hed] using ht')
+      · exact i2 hb e' he' (by simpa [startD, hee] using hw') (by simpa [startD, hee, Ne.symm hed] using ht')
   | @admit s' u' r' hc p ih =>
     obtain ⟨i1, i2⟩ := ih hw hs
     have fr := p.frame
@@ -1788,13 +1855,13 @@ theorem PassPath.fifo {cfg : Cfg} (hf : cfg.rules.drainFifo = true) {s u : St} (
     · exact i1 r hr (by simpa [emptyWaiter, Contest.admit, hrr] using he) (by simpa [Contest.admit, hrr] using ht)
 
 /-- **Property 4, FIFO** (with `drainFifo`). In a move whose pass starts drain `d`, every run
-older than `d` that waited holding nothing has started a task, and every older drain that waited
-has started. -/
+older than `d` that waited holding nothing has started a task, and (without `backfill`) every
+older drain that waited has started. -/
 theorem drain_no_pass {cfg : Cfg} (hf : cfg.rules.drainFifo = true) {s t u : St} {a : Act}
     (hu : act cfg s a = some u) (ht : step cfg s a = some t) {d : Nat}
     (hw : (u.drain d).ph = .waiting) (hs : (t.drain d).ph = .started) :
     (∀ r < cfg.nr, emptyWaiter u r = true → (u.run r).ticket < (u.drain d).ticket → 0 < (t.run r).running) ∧
-    (∀ e < cfg.nd, (u.drain e).ph = .waiting → (u.drain e).ticket < (u.drain d).ticket → (t.drain e).ph = .started) := by
+    (cfg.rules.backfill = false → ∀ e < cfg.nd, (u.drain e).ph = .waiting → (u.drain e).ticket < (u.drain d).ticket → (t.drain e).ph = .started) := by
   unfold step at ht; rw [hu] at ht; cases ht
   exact (pass_path cfg u).fifo hf hw hs
 
@@ -2062,14 +2129,14 @@ theorem Run.calm {cfg : Cfg} (ρ : Run cfg) : ∃ n0, ∀ n ≥ n0, (ρ.act n).a
 /-- **Property 3, for every run of the model.** Arrivals at any times (each run and drain of the
 configuration arrives at most once): if every task ends, the gates reopen and time passes, then
 from some time on nothing waits. -/
-theorem no_starvation_all {cfg : Cfg} (hp : 0 < cfg.pool)
-    (hsz : ∀ d < cfg.nd, (cfg.drain d).size ≤ cfg.drainMax) (ρ : Run cfg)
+theorem no_starvation_all {cfg : Cfg} (hp : 0 < cfg.pool) (hDp : cfg.drainMax ≤ cfg.pool)
+    (hsz : ∀ d < cfg.nd, cfg.dsize d ≤ cfg.drainMax) (ρ : Run cfg)
     (ends : ∀ n r, r < cfg.nr → 0 < ((ρ.st n).run r).running → ∃ m ≥ n, finOf r (ρ.act m))
     (gates : ∀ n, ∃ m ≥ n, (ρ.st m).gate = true)
     (time : ∀ n, ∃ m ≥ n, ρ.act m = .tick) :
     ∃ n, ∀ m ≥ n, Quiet cfg (ρ.st m) :=
   let ⟨n0, calm⟩ := ρ.calm
-  no_starvation hp hsz ρ n0 calm ends gates time
+  no_starvation hp hDp hsz ρ n0 calm ends gates time
 
 /-! ## Within a project: the oldest last start goes first -/
 

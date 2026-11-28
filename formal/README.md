@@ -48,6 +48,7 @@ It fails if a ranking no longer exists (a weakly fair run that starves, the sear
 | `CpuqModel/Served.lean` | Waiters and drains served, proved for the configurations certified |
 | `CpuqModel/Contest.lean` | 0.40.0, contested CPUs: the admission rules; the five properties proved for every configuration with two rule changes, and the gaps of the design as written as reachable states |
 | `CpuqModel/Stream.lean` | 0.40: runs and drains that leave and arrive again, so arrivals never stop; `run_starts`, no-starvation's strongest true form |
+| `CpuqModel/DrainFill.lean` | 0.41: drain cores and backfill; the invariant, `older_unhindered`, `drain_starts`, `backfill_delays` |
 | `CpuqModel/StreamCex.lean` | 0.40: renamed states look alike to the rules (`Sh`); a cycle repeated forever is a run (`cycle_run`); the two infinite runs where a run waits forever while arrivals go on |
 | `CpuqModel/Contest035.lean` | The slot rules before 0.40.0 hold a CPU idle while a task waits (a reachable state of `moveX` under `Rules.released`) |
 
@@ -510,15 +511,61 @@ run the counterexamples' moves on the fixed rules (in `race_fixed`, with `r` arr
 `r` starts. The tickets invariant (present runs' tickets distinct, below `next`) is
 `reachS_tickets`.
 
-Not proved with arrivals that never stop: a waiting drain starts. A drain waits for older drains,
-the `drainMax` bound and (`drainFifo`) older runs that hold nothing; the first two are finitely many
-and end, but an older run that waits holding nothing can be starved as above, and the drain behind
-it waits with it.
+### Drain cores and backfill (`DrainFill.lean`)
+
+A drain's cores are modelled: a core is a CPU with its SMT siblings. `DrainCfg.cpus` names cores
+(`--cpus`, possibly outside the pool); empty means `-c size`. `DrainSt.held` is what a started drain
+isolates, chosen when it starts (`pickCpus`). A `-c` drain takes the first `size` cores of the pool
+(0 … pool−1 in the model) that no started drain isolates and no older waiting drain names.
+`Cfg.dsize` is the cores it asks. Every start needs `fits`: those cores are free, none is named by
+an older waiting drain, and there are `dsize` of them. This is the shipped `taken` wait. Before,
+the model's drains were sizes only, so a drain never waited on another drain's cores.
+
+`Rules.backfill` (on in `Rules.drainfill`, with the two fixes): a drain also starts while older
+drains wait if `iso + dsize + olderSum ≤ drainMax`, where `olderSum` is the cores of every older
+waiting drain. The other conditions stay: waiting, gates, `iso + dsize ≤ drainMax`, `fits`, and
+(`drainFifo`) no older run waiting holding nothing. The proposal's "disjoint from the cores an
+older `-c` drain would pick" is not needed. With the budget counted, such a drain always has
+enough free cores (`fits_count`). A `-c` drain that backfills picks around older drains' named
+cores, so it never takes a core such a drain names.
+
+| Property | Theorem | Holds |
+|---|---|---|
+| Invariant: started drains hold disjoint cores, each `dsize` of them; no started drain holds a core an older waiting drain names; for every started drain, `iso + olderSum ≤ drainMax`; drain tickets distinct, below `next` | `reachS_fill` | any rules |
+| A younger drain never stands in an older one's way: if a waiting drain could start with every younger started drain over, it can start now | `older_unhindered` | any rules; `drainMax` ≤ pool |
+| Drains are served with arrivals that never stop: a waiting drain starts if no urgent run arrives, every task ends, ticks keep coming, the gates reopen, `drainMax` < pool and every drain asks at most `drainMax` cores | `drain_starts` | `arrivalKey`, `oneLine`, with or without `backfill` |
+| "No older drain starts later than it would without backfill" fails, through runs | `backfill_delays` | (two traces) |
+| A drain passes no older run that waits holding nothing | `drain_no_pass` (first half) | `drainFifo`, any `backfill` |
+| … nor an older waiting drain | `drain_no_pass` (second half) | `backfill` off |
+
+`backfill_delays` runs the same moves with and without backfill (6 cores, `drainMax` 5):
+1. `D` backfills on cores 2 and 3, while `O`, which names cores 0 and 1, waits for core 0.
+2. `D`'s isolation lowers T, so `R`, older than `O`, finds its project over share with no room
+   when its task ends, and waits holding nothing.
+3. When core 0 frees, `O` starts without backfill, but with it `O` waits behind `R` (`drainFifo`).
+
+So backfill can delay an older drain through runs, not by cores or by `drain_max`. Only while
+`D`'s isolation keeps `R` from its start, which is argued, not proved.
+
+`drain_starts` closes what was open: drains are served while arrivals never stop. The proof, by
+induction on how many older drains wait:
+- the older waiting drains start;
+- the older started drains end within their limit (`started_ends`);
+- the older runs start all their tasks (`run_starts_fixed`);
+- none comes back with its old ticket;
+- at the next open gates the drain could start with younger drains over, so it can start
+  (`older_unhindered`).
+
+It needs the fixed rules, because on the rules as shipped an older run can starve and the drain
+waits behind it.
+
+`no_starvation` and `no_starvation_all` (arrivals that stop) now also assume `drainMax` ≤ pool, so
+that a `-c` drain finds its cores.
 
 What it does not cover: CPU time between running tasks (the kernel's part); measurement noise
 and multi-threaded tasks (busy is exactly the computing tasks); separate cpuq processes racing
 (the pass is atomic: each waiter's check is assumed to see the others' starts, as `starting`
-provides); which CPUs a drain isolates (`--cpus`; its size counts the SMT siblings); retries; outside processes on isolated CPUs; the TERM before KILL (one end at
+provides); the pool's order for `-c` (the model takes 0 … pool−1; argued, not proved, any order works); retries; outside processes on isolated CPUs; the TERM before KILL (one end at
 limit + grace); the idle stop's 0.25-CPU average (idle here is the command blocked for whole
 ticks).
 
