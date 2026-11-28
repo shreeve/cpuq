@@ -2,6 +2,20 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.42.1 — 2026-11-28
+
+- **The reserve takes the slowest whole cores.** It sets aside low-power and efficiency cores
+  before performance cores (by `cpu_core`, `cpu_capacity` and top clock, the inverse of
+  `--prefer fast`), whole cores at a time, so no core is split between a token and the reserve;
+  among equals, from the pool's end. On pup the reserve was two performance cores' second
+  threads (9 and 11), and a drain naming those cores failed: their twins were no tokens. A core
+  that would take the reserve past N is taken whole (a reserve of 3 on two-thread cores is 4
+  CPUs); `cpuq reserve` and status show the reserve as it is.
+- **A `--driver`'s own CPU counts only its own processes' time since the last look.** It took
+  the tree's total less the runs' trees, and the runs come and go between looks, so a process
+  moving out of a run's tree brought its whole past CPU time along. On the Mac, Rig's swarm read
+  "3.9 busy itself" with its runner idle, which counted against Rig's share of the tokens.
+
 ## 0.42.0 — 2026-11-28
 
 A strict token pool. A machine has N tokens, one per CPU of the pool less the reserve. A task

@@ -186,9 +186,10 @@ const Run = struct {
     freed: bool = false,
     /// When the next look is due (monotonic ms).
     next_look: i64 = 0,
-    /// The machine's tokens as last seen: the pool's first CPUs less the reserve, which the config
-    /// may change while it runs.
+    /// The machine's tokens as last seen: the pool less the reserve (cpus.tokens), and the reserve
+    /// they were worked out for, which the config may change while it runs.
     toks: []const u32 = &.{},
+    toks_reserve: u32 = 0,
     /// Tasks ended when it last wrote its progress.
     last_progress: u32 = std.math.maxInt(u32),
     /// Its history: the record, when it entered the line, and the most tasks run at once.
@@ -329,7 +330,7 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
     const dir = main.stateDir(ctx);
     const pool = Pool.open(ctx.io, a, dir) catch |err| main.fail("pool {s}/v3: {t}", .{ dir, err });
     const pool_cpus = poolCpus(ctx);
-    const toks = pool_mod.tokens(pool_cpus, ctx.cfg.reserve);
+    const toks = cpus_mod.tokens(ctx.io, a, pool_cpus, ctx.cfg.reserve);
     const ntok: u32 = @intCast(toks.len);
     const single = o.tasks == 0;
     const total: u32 = if (single) 1 else o.tasks;
@@ -348,6 +349,7 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
         .pool = pool,
         .pool_cpus = pool_cpus,
         .toks = toks,
+        .toks_reserve = ctx.cfg.reserve,
         .ncpu = onlineCpus(ctx.io),
         .total = total,
         .single = single,
@@ -807,7 +809,10 @@ fn look(r: *Run) void {
     const a = arena.allocator();
     // A change to the config (the reserve, drain_max) is in force at once.
     main.reloadConfig(r.ctx);
-    r.toks = pool_mod.tokens(r.pool_cpus, r.ctx.cfg.reserve);
+    if (r.ctx.cfg.reserve != r.toks_reserve) {
+        r.toks = cpus_mod.tokens(r.ctx.io, r.a, r.pool_cpus, r.ctx.cfg.reserve);
+        r.toks_reserve = r.ctx.cfg.reserve;
+    }
     // The sample (for the outside-load gate) is renewed outside the pool's lock, by one cpuq at a
     // time.
     if (r.waitingNow() > 0 and r.ctx.cfg.outside_check) {
@@ -1272,7 +1277,10 @@ pub fn watchDriver(ctx: *Ctx, label: []const u8, cmd: []const u8, child: c.pid_t
     };
     pool.unlock();
     var last_ms: i64 = 0;
-    var last_ns: u64 = 0;
+    // The runner's tree at the last look: each process's own CPU time, and whether it counted
+    // (outside every run in it).
+    var prev: std.ArrayList(Seen) = .empty;
+    defer prev.deinit(std.heap.page_allocator);
     while (true) {
         if (sys.reapChild(child)) |w| {
             pool.lock();
@@ -1288,29 +1296,34 @@ pub fn watchDriver(ctx: *Ctx, label: []const u8, cmd: []const u8, child: c.pid_t
             pool.lock();
             const ops = pool.scan(sa);
             pool.unlock();
-            const own = driverCpu(sa, sys.processes(ctx.io, sa), child, ops);
+            const seen = driverTree(sa, sys.processes(ctx.io, sa), child, ops);
             if (last_ms != 0) {
-                rec.dbusy = @as(f64, @floatFromInt(own -| last_ns)) / 1e6 / @as(f64, @floatFromInt(@max(now - last_ms, 1)));
+                const used = driverDelta(prev.items, seen);
+                rec.dbusy = @as(f64, @floatFromInt(used)) / 1e6 / @as(f64, @floatFromInt(@max(now - last_ms, 1)));
                 pool.lock();
                 pool.write(file, rec) catch {};
                 pool.unlock();
             }
             last_ms = now;
-            last_ns = own;
+            prev.clearRetainingCapacity();
+            prev.appendSlice(std.heap.page_allocator, seen) catch {};
         }
         var ts: c.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
         _ = c.nanosleep(&ts, null);
     }
 }
 
-/// The CPU time (ns, each process's own) of the runner's process tree, less the trees of the runs
-/// in it (`cpuq run`s it started, each a record in the pool). A process that ends between two
-/// looks counts until it ends.
-fn driverCpu(a: std.mem.Allocator, procs: []const sys.Proc, runner: c.pid_t, ops: []const Op) u64 {
-    const in_tree = a.alloc(bool, procs.len) catch return 0;
+/// A process of a driver's tree at one look: its own CPU time so far, and whether it counts
+/// (outside every run in the tree).
+pub const Seen = struct { pid: i32, own: u64, counts: bool };
+
+/// The runner's process tree, each process with its own CPU time and whether it counts: not in
+/// the tree of a run in it (a `cpuq run` it started, each a record in the pool).
+fn driverTree(a: std.mem.Allocator, procs: []const sys.Proc, runner: c.pid_t, ops: []const Op) []const Seen {
+    const in_tree = a.alloc(bool, procs.len) catch return &.{};
     @memset(in_tree, false);
     sys.markTree(procs, runner, in_tree);
-    const runs = a.alloc(bool, procs.len) catch return 0;
+    const runs = a.alloc(bool, procs.len) catch return &.{};
     @memset(runs, false);
     for (ops) |o| if (!o.driver) {
         const at = for (procs, 0..) |p, i| {
@@ -1318,11 +1331,61 @@ fn driverCpu(a: std.mem.Allocator, procs: []const sys.Proc, runner: c.pid_t, ops
         } else continue;
         if (in_tree[at]) sys.markTree(procs, o.pid, runs);
     };
-    var total: u64 = 0;
-    for (procs, in_tree, runs) |p, mine, theirs| if (mine and !theirs) {
-        total += p.own_ns;
+    var out: std.ArrayList(Seen) = .empty;
+    for (procs, in_tree, runs) |p, mine, theirs| if (mine) {
+        out.append(a, .{ .pid = p.pid, .own = p.own_ns, .counts = !theirs }) catch break;
     };
+    return out.items;
+}
+
+/// The CPU time (ns) a driver's own processes used between two looks: for each process that
+/// counts now, what it used since the last look if it counted then too; all it has used if it is
+/// new since then (or its pid was reused: its time went down); nothing if it was in the tree but
+/// in a run's then. So a process moving in and out of the runs' trees as runs start and end never
+/// brings its whole past along. A process that ended since counts no more.
+pub fn driverDelta(prev: []const Seen, now: []const Seen) u64 {
+    var total: u64 = 0;
+    for (now) |p| {
+        if (!p.counts) continue;
+        const was = for (prev) |q| {
+            if (q.pid == p.pid) break q;
+        } else {
+            total += p.own;
+            continue;
+        };
+        if (p.own < was.own) {
+            total += p.own;
+        } else if (was.counts) {
+            total += p.own - was.own;
+        }
+    }
     return total;
+}
+
+test "a driver's own CPU: what its processes used since the last look, none of a run's past" {
+    // 10: the runner's shell, counted at both looks: 5 ms. 20: a run's cpuq then, out of the
+    // runs now (its record gone first): nothing of its 900 ms. 30: new since: all its 3 ms. 40:
+    // in a run's tree now: nothing. 50: a reused pid (its time went down): all its 2 ms.
+    const prev = [_]Seen{
+        .{ .pid = 10, .own = 100_000_000, .counts = true },
+        .{ .pid = 20, .own = 900_000_000, .counts = false },
+        .{ .pid = 40, .own = 10_000_000, .counts = true },
+        .{ .pid = 50, .own = 70_000_000, .counts = true },
+    };
+    const now = [_]Seen{
+        .{ .pid = 10, .own = 105_000_000, .counts = true },
+        .{ .pid = 20, .own = 900_000_000, .counts = true },
+        .{ .pid = 30, .own = 3_000_000, .counts = true },
+        .{ .pid = 40, .own = 500_000_000, .counts = false },
+        .{ .pid = 50, .own = 2_000_000, .counts = true },
+    };
+    try std.testing.expectEqual(10_000_000, driverDelta(&prev, &now));
+    // Runs that come and go every look add nothing of their past.
+    const back = [_]Seen{
+        .{ .pid = 10, .own = 106_000_000, .counts = true },
+        .{ .pid = 20, .own = 900_000_000, .counts = false },
+    };
+    try std.testing.expectEqual(1_000_000, driverDelta(&now, &back));
 }
 
 // --- Nested runs ---------------------------------------------------------------------------
@@ -1472,7 +1535,7 @@ pub fn cmdDrain(ctx: *Ctx, args: []const [:0]const u8) u8 {
     if (o.cmd.len == 0) return main.usageError("drain needs a command", .{});
     main.loadConfig(ctx);
     const pool_cpus = poolCpus(ctx);
-    const toks = pool_mod.tokens(pool_cpus, ctx.cfg.reserve);
+    const toks = cpus_mod.tokens(ctx.io, ctx.arena, pool_cpus, ctx.cfg.reserve);
     if (named_text) |text| {
         o.drain_cpus = policy.cpuList(ctx.arena, text) catch return main.usageError("--cpus needs a CPU list such as 0-3 or 2,4, not '{s}'", .{text});
         if (o.drain_cpus.len == 0) return main.usageError("--cpus needs at least one CPU", .{});
@@ -1547,7 +1610,7 @@ pub fn cmdLimit(ctx: *Ctx, args: []const [:0]const u8) u8 {
         std.debug.print("cpuq: {d} ({s}) is a drain: its CPUs are fixed when it starts\n", .{ o.ticket, o.label });
         return 1;
     }
-    const ntok: u32 = @intCast(pool_mod.tokens(pool_cpus, ctx.cfg.reserve).len);
+    const ntok: u32 = @intCast(cpus_mod.tokens(ctx.io, a, pool_cpus, ctx.cfg.reserve).len);
     const n = @max(1, if (pct) @as(u32, @intCast(@max(1, (@as(u64, ntok) * count) / 100))) else count);
     pool.askLimit(o.pid, n) catch |err| main.fail("pool: {t}", .{err});
     pool.wakeOp(o.ticket);
@@ -1575,23 +1638,27 @@ pub fn cmdReserve(ctx: *Ctx, args: []const [:0]const u8) u8 {
     }
     if (host) |h| return @import("records.zig").onHost(ctx, h, if (want) |w| ctx.arena.print("cpuq reserve {s}", .{w}) catch return 125 else "cpuq reserve");
     main.loadConfig(ctx);
-    const pool_n: u32 = @intCast(poolCpus(ctx).len);
-    const was = ctx.cfg.reserve;
+    const pool_cpus = poolCpus(ctx);
+    const pool_n: u32 = @intCast(pool_cpus.len);
+    // The tokens a reserve of r leaves (whole cores: perhaps a CPU fewer than asked).
+    const left = struct {
+        fn of(cx: *Ctx, pool: []const u32, r: u32) u32 {
+            return @intCast(cpus_mod.tokens(cx.io, cx.arena, pool, r).len);
+        }
+    };
     const show = struct {
-        fn line(cx: *Ctx, n: u32, r: u32, before: ?u32) void {
-            cx.out.print("{d} token{s}, {d} reserved", .{ n, if (n == 1) "" else "s", r }) catch {};
+        fn line(cx: *Ctx, pn: u32, n: u32, asked: u32, before: ?u32) void {
+            cx.out.print("{d} token{s}, {d} reserved", .{ n, if (n == 1) "" else "s", pn - n }) catch {};
+            if (pn - n != asked) cx.out.print(" ({d} asked: whole cores)", .{asked}) catch {};
             if (before) |b| cx.out.print(" (was {d} reserved)", .{b}) catch {};
             cx.out.writeAll("\n") catch {};
             cx.out.flush() catch {};
         }
     };
-    const pool_tokens = struct {
-        fn of(pn: u32, r: u32) u32 {
-            return @max(1, pn -| r);
-        }
-    };
+    const was = ctx.cfg.reserve;
+    const was_n = left.of(ctx, pool_cpus, was);
     const text = want orelse {
-        show.line(ctx, pool_tokens.of(pool_n, was), @min(was, pool_n -| 1), null);
+        show.line(ctx, pool_n, was_n, @min(was, pool_n -| 1), null);
         return 0;
     };
     const n = policy.parseWhole(u32, text) orelse return main.usageError("reserve needs a whole number of CPUs, such as 2, not '{s}'", .{text});
@@ -1615,7 +1682,7 @@ pub fn cmdReserve(ctx: *Ctx, args: []const [:0]const u8) u8 {
     pool.lock();
     for (pool.scan(ctx.arena)) |o| pool.wakeOp(o.ticket);
     pool.unlock();
-    show.line(ctx, pool_tokens.of(pool_n, n), n, was);
+    show.line(ctx, pool_n, left.of(ctx, pool_cpus, n), n, pool_n - was_n);
     return 0;
 }
 

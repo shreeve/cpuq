@@ -10,8 +10,8 @@ const builtin = @import("builtin");
 pub const Qos = enum { unchanged, utility, background, niced };
 
 pub const Config = struct {
-    /// The CPUs of the pool cpuq never hands out (`reserve`): its last ones in its order. The
-    /// rest are the machine's tokens, at least one. `cpuq reserve N` sets it.
+    /// The CPUs of the pool cpuq never hands out (`reserve`): the slowest whole cores (cpus.zig).
+    /// The rest are the machine's tokens, at least one. `cpuq reserve N` sets it.
     reserve: u32 = 2,
     /// Start no task while the OS reports memory pressure.
     pressure_check: bool = true,
@@ -200,7 +200,7 @@ const keys = [_]Key{
 /// that line, so whoever wrote it learns what to write instead.
 pub const removed_keys = [_][2][]const u8{
     .{ "admit", "admit is gone: the pool hands out one CPU per task" },
-    .{ "budget", "budget is gone: reserve = N sets aside the pool's last N CPUs (cpuq reserve N); the rest are its tokens" },
+    .{ "budget", "budget is gone: reserve = N sets aside N CPUs, the slowest whole cores (cpuq reserve N); the rest are its tokens" },
     .{ "target", "target is gone: the pool hands out one CPU per task; reserve or cpus sizes the pool" },
     .{ "settle", "settle is gone: the pool hands out one CPU per task, never by measured use" },
     .{ "right_size", "right_size is gone: a run holds one CPU per running task" },

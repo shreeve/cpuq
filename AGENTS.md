@@ -212,6 +212,6 @@ tasks one at a time.
 
     cpuq reserve [N] [--host HOST]
 
-Sets aside the pool's last N CPUs, never handed out (default 2), in the machine's config, in force
-at once. Alone, it prints "N tokens, R reserved"; `cpuq budget` prints N, to size a script's
+Sets aside N CPUs, never handed out (default 2): the slowest whole cores (efficiency cores
+first). Kept in the machine's config, in force at once. Alone, it prints "N tokens, R reserved"; `cpuq budget` prints N, to size a script's
 load. The owner's call: don't change the reserve unasked. More: [README.md](README.md).

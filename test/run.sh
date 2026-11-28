@@ -87,8 +87,8 @@ setup() {
   unset CPUQ_CPU CPUQ_OP CPUQ_SCOPE CPUQ_TASK CPUQ_TASKS CPUQ_ATTEMPT CPUQ_ATTEMPTS CPUQ_PROGRESS \
     CPUQ_PROGRESS_AT CPUQ_LEASES CPUQ_TOKEN CPUQ_CORES CPUQ_HISTORY MAKEFLAGS XDG_STATE_HOME
   # Each key at most once: a line given here replaces the default for its key. `tokens = N` is
-  # the suite's own: the pool's first N CPUs as the pool (all of it when it has fewer), no reserve,
-  # so no test depends on the machine's size.
+  # the suite's own: the pool's last N CPUs as the pool (all of it when it has fewer), no reserve,
+  # so no test depends on the machine's size, nor sits on the CPUs its own cpuq pins tasks to.
   local line keys=" " toks=2 lines=()
   for line in "$@"; do
     case $line in "tokens = "*) toks=${line#tokens = } ;; *) keys="$keys${line%% *} "; lines+=("$line") ;; esac
@@ -104,8 +104,9 @@ setup() {
     *" cpus "*) { cat "$T/config.base"; echo "reserve = 0"; } >"$CPUQ_CONFIG" ;;
     *)
       { cat "$T/config.base"; echo "reserve = 0"; } >"$CPUQ_CONFIG"
-      local first; first=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print(",".join(map(str, json.load(sys.stdin)["pool"][:int(sys.argv[1])])))' "$toks")
-      { cat "$T/config.base"; echo "reserve = 0"; echo "cpus = $first"; } >"$CPUQ_CONFIG" ;;
+      # The pool's last N: a machine's own cpuq pins its tasks to its first CPUs.
+      local last; last=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; p = json.load(sys.stdin)["pool"]; print(",".join(map(str, p[max(0, len(p) - int(sys.argv[1])):])))' "$toks")
+      { cat "$T/config.base"; echo "reserve = 0"; echo "cpus = $last"; } >"$CPUQ_CONFIG" ;;
   esac
   cd "$T" || exit 2
   echo "== $CUR"
@@ -200,29 +201,33 @@ t_tokens() {
 }
 
 t_reserve() {
-  # cpuq reserve N sets aside the pool's last N CPUs, in the config, in force at once: 4 sleepers
-  # hold 4 tokens; raised to leave 2, the running finish and no more than 2 run; lowered again,
-  # more start at once. At least one token always; the old budget points to reserve.
-  setup reserve "tokens = 4"
+  # cpuq reserve N sets aside N CPUs (the slowest whole cores), in the config, in force at once:
+  # sleepers hold 4 tokens; raised to leave 2 (or 1, whole cores), the running finish and no more
+  # than that run; lowered again, more start at once. At least one token always; the old budget
+  # key points to reserve.
+  setup reserve "reserve = 0"
   local pool; pool=$(poolcpus | wc -w | tr -d ' ')
   if [ "$pool" -lt 4 ]; then echo "  skipped: needs a pool of 4"; return; fi
+  "$CPUQ" reserve $((pool - 4)) >/dev/null
+  local four; four=$("$CPUQ" budget)
   "$CPUQ" run -n 12 --label r:sleep -- sleep 1.5 2>/dev/null & local r=$!
-  wait_running 4
+  wait_running "$four"
   local out; out=$("$CPUQ" reserve $((pool - 2)))
+  local two; two=$("$CPUQ" budget)
   local conf; conf=$(grep -c "^reserve = $((pool - 2))\$" "$CPUQ_CONFIG")
   sleep 1.8
   local max=0 h k
   for k in $(seq 20); do h=$(running); [ "$h" -gt "$max" ] && max=$h; sleep 0.1; done
   "$CPUQ" reserve $((pool - 4)) >/dev/null
-  local up=no; wait_running 4 5 && up=yes
+  local up=no; wait_running "$four" 5 && up=yes
   wait $r; local rr=$?
   local none; "$CPUQ" reserve "$pool" 2>/dev/null; none=$?
-  local tj; tj=$(sj '"%d %d" % (s["tokens"], s["reserve"])')
+  local tj; tj=$(sj '"%d %d" % (s["tokens"], s["tokens"] + s["reserve"])')
   local old=no; echo "budget = 2" >"$T/c.old"; CPUQ_CONFIG=$T/c.old "$CPUQ" run -- true 2>&1 | grep -q 'budget is gone: reserve = N' && old=yes
-  check "reserve $((pool - 2)) ($out; in the config: $conf) leaves 2 tokens: once the running finish, at most 2 run (most $max); lowered, 4 run again ($up); all passed (rc $rr)" \
-    "[ '$out' = '2 tokens, $((pool - 2)) reserved (was $((pool - 4)) reserved)' ] && [ $conf = 1 ] && [ $max = 2 ] && [ $up = yes ] && [ $rr = 0 ]"
-  check "a reserve of the whole pool is refused (rc $none); status says the tokens and reserve ($tj); budget is gone, saying reserve ($old)" \
-    "[ $none = 2 ] && [ '$tj' = '4 $((pool - 4))' ] && [ $old = yes ]"
+  check "reserve $((pool - 2)) ($out; in the config: $conf) leaves $two tokens: once the running finish, at most that many run (most $max); lowered, $four run again ($up); all passed (rc $rr)" \
+    "[[ '$out' == '$two tokens, '* ]] && [ '$two' -ge 1 ] && [ '$two' -le 2 ] && [ $conf = 1 ] && [ $max = $two ] && [ $up = yes ] && [ $rr = 0 ]"
+  check "a reserve of the whole pool is refused (rc $none); status says the tokens and the pool ($tj); budget is gone, saying reserve ($old)" \
+    "[ $none = 2 ] && [ '$tj' = '$four $pool' ] && [ $old = yes ]"
 }
 
 t_tasks() {
@@ -957,6 +962,19 @@ t_driver() {
   local inner; inner=$(CPUQ_OP=1 "$CPUQ" run --driver -- sh -c 'echo "${CPUQ_OP:-none}"')
   check "a driver is no task, its runs are their own, its exit is its command's (got '$out', rc $rc); CPUQ_OP stays out ($inner)" \
     "[ '$out' = 'running 0 case op ' ] && [ $rc = 3 ] && [ '$inner' = 'none' ]"
+  # A runner that only starts runs computes nothing itself, however its runs come and go: four
+  # loops of short runs at once (as swarm -w 4), each a burner and its cpuq, never read as the
+  # runner's. (driverDelta's unit test holds the rule exactly: a process moving out of a run's tree
+  # brings none of its past.)
+  setup driver-churn "tokens = 4"
+  "$CPUQ" run --driver --label dc:runner -- sh -c 'for w in 1 2 3 4; do (i=0; while [ $i -lt 12 ]; do "$1" run --label dc:case -- "$2" 0.2; i=$((i + 1)); done) & done; wait' sh "$CPUQ" "$BURN" & local dc=$!
+  local most=0 b k=0
+  while kill -0 $dc 2>/dev/null && [ $k -lt 200 ]; do
+    b=$(sj '"%.2f" % max([h["driver_busy"] for h in s["runs"] if h["driver"]] or [0])' 2>/dev/null)
+    most=$(python3 -c "print(max($most, ${b:-0}))"); k=$((k + 1)); sleep 0.2
+  done
+  wait $dc; local rdc=$?
+  check "a runner whose runs churn reads no CPU of its own (most $most over $k looks; rc $rdc)" "[ $rdc = 0 ] && fl '$most < 0.3'"
   # A driver that computes itself counts against its project's share: on 2 tokens held by q
   # (weight 3), with dr's runner keeping CPUs busy itself (flagged), dr's run and another project's
   # wait; the first token q frees goes to the other project's run, under its share, not to dr's,

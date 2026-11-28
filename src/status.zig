@@ -363,7 +363,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
     const pool_cpus = op_mod.poolCpus(ctx);
     const ncpu = op_mod.onlineCpus(io);
     var pool = Pool.open(io, a, dir) catch |err| main.fail("pool {s}/v4: {t}", .{ dir, err });
-    const toks = pool_mod.tokens(pool_cpus, ctx.cfg.reserve);
+    const toks = @import("cpus.zig").tokens(io, a, pool_cpus, ctx.cfg.reserve);
     const n: u32 = @intCast(toks.len);
 
     if (!pool.lockWithin(5000)) lockStuck(ctx, &pool);
