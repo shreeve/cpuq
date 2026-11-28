@@ -211,12 +211,13 @@ fn runDriver(ctx: *Ctx, o: RunOptions) u8 {
         return exit_notfound;
     };
     _ = ctx.env.swapRemove("CPUQ_OP");
-    const envp = ctx.env.createPosixBlock(ctx.arena, .{}) catch fail("out of memory", .{});
     const argv = ctx.arena.allocSentinel(?[*:0]const u8, o.cmd.len, null) catch fail("out of memory", .{});
     for (o.cmd, 0..) |a, i| argv[i] = a.ptr;
     const unit = ctx.arena.print("cpuq-driver-{d}", .{sys.getpid()}) catch fail("out of memory", .{});
     const slice = sliceUnit(ctx.arena, op.projectOf(ctx, .{ .label = o.label }));
     const scoped = if (ctx.cfg.cgroups) scopedArgv(ctx, exe, argv, unit, slice) else null;
+    // After scopedArgv, which may give the environment the user's XDG_RUNTIME_DIR.
+    const envp = ctx.env.createPosixBlock(ctx.arena, .{}) catch fail("out of memory", .{});
     // Where that scope's cgroup is: when the runner ends, whatever it left in it is stopped.
     const kill_path: ?[:0]const u8 = if (scoped != null) unitCgroup(ctx.arena, slice, ctx.arena.print("{s}.scope/cgroup.kill", .{unit}) catch "") else null;
     sys.installForwarding();
@@ -350,6 +351,15 @@ const Scopes = enum {
 /// "plain").
 fn scopesWork(ctx: *Ctx, run: [:0]const u8) Scopes {
     const io = ctx.io;
+    // systemd-run --user reaches the user's systemd through XDG_RUNTIME_DIR. A cleaned
+    // environment (a kit's ssh, a cron job) lacks it: take the user's own runtime directory when
+    // its bus is there, else no scopes, whatever another environment found and kept.
+    if (ctx.env.get("XDG_RUNTIME_DIR") == null) {
+        const dir = ctx.arena.print("/run/user/{d}", .{std.c.getuid()}) catch return .none;
+        const bus = ctx.arena.print("{s}/bus", .{dir}) catch return .none;
+        Io.Dir.cwd().access(io, bus, .{}) catch return .none;
+        ctx.env.put("XDG_RUNTIME_DIR", dir) catch return .none;
+    }
     const path = std.mem.concat(ctx.arena, u8, &.{ stateDir(ctx), "/scopes-ok" }) catch return .none;
     const cwd = Io.Dir.cwd();
     if (cwd.statFile(io, path, .{})) |st| {
