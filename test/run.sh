@@ -1388,13 +1388,13 @@ t_hook() {
   driver=$(call driver Bash 'cpuq run --driver --label app:test -- test/run.sh')
   drvbuild=$(call drvbuild Bash 'cpuq run --driver --label app:build -- zig build -j1')
   drvother=$(call drvother Bash 'cpuq run --driver --label app:x -- ./foo')
-  check "--driver passes for a test runner (rc $driver), not for a build (rc $drvbuild) or anything else (rc $drvother)" \
-    "[ $driver = 0 ] && [ $drvbuild = 2 ] && grep -q 'under --driver' '$T/drvbuild' && [ $drvother = 2 ] && grep -q '(one task)' '$T/drvother'"
+  check "--driver passes for a test runner (rc $driver) and any other command (rc $drvother), not around a bare build (rc $drvbuild)" \
+    "[ $driver = 0 ] && [ $drvbuild = 2 ] && grep -q 'directly under --driver' '$T/drvbuild' && [ $drvother = 0 ]"
   local rigl rigbare
   rigl=$(call rigl Bash "cpuq run --driver --label rig:build -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build --units=8 a.rig")
   rigbare=$(call rigbare Bash 'cpuq run --driver --label rig:build -- rig build --units=8 a.rig')
-  check "--driver passes rig build whose units are cpuq runs (rc $rigl), not without the launcher (rc $rigbare)" \
-    "[ $rigl = 0 ] && [ $rigbare = 2 ] && grep -q 'RIG_UNIT_LAUNCHER' '$T/rigbare'"
+  check "--driver passes rig build, its units cpuq runs or not (what it computes counts against rig's share): rc $rigl $rigbare" \
+    "[ $rigl = 0 ] && [ $rigbare = 0 ]"
 }
 
 # --- Leases ----------------------------------------------------------------------------------

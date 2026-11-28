@@ -170,7 +170,7 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, advisor: 
     if (inner.len == 0) return null;
     const cmds = innerCommands(a, inner, cmd.heredoc) orelse return null;
     if (driver) {
-        if (checkDriver(a, w, cmds, cmd.text)) |r| return r;
+        if (checkDriver(a, w, inner)) |r| return r;
     } else for (cmds) |ic| {
         const iw = stripWrappers(ic.words);
         if (iw.len == 0 or heavyName(iw) == null) continue;
@@ -232,101 +232,19 @@ fn innerCommands(a: std.mem.Allocator, inner: []const []const u8, heredoc: ?[]co
     return one;
 }
 
-/// `--driver`: a test runner that starts its own `cpuq run`s, and is no task itself. A build
-/// under it would go unseen by the line, except `rig build` with RIG_UNIT_LAUNCHER a `cpuq run`:
-/// each unit's compile is then a run of its own, admitted on its own.
-fn checkDriver(a: std.mem.Allocator, w: []const []const u8, cmds: []const Simple, text: []const u8) ?Refusal {
-    var runner = false;
-    for (cmds) |ic| {
-        const iw = stripWrappers(ic.words);
-        if (iw.len == 0) continue;
-        if (isRigBuild(iw)) {
-            if (launchesUnits(ic.words, text)) {
-                runner = true;
-                continue;
-            }
-            return .{
-                .reason = a.print("`rig {s}` under --driver: it is no task, so its compiles go unseen unless each unit's compile is a `cpuq run` (RIG_UNIT_LAUNCHER)", .{iw[1]}) catch "rig build under --driver: set RIG_UNIT_LAUNCHER",
-                .instead = launcherFix(a, w, iw),
-            };
-        }
-        if (isBuildTool(iw) or heavyName(iw) != null) return .{
-            .reason = a.print("`{s}` under --driver: --driver is no task, so the build goes unseen; run builds as tasks", .{toolLabel(a, iw)}) catch "--driver is no task; run builds as tasks",
-            .instead = fixRun(a, w, true).text,
-        };
-        if (isRunner(iw)) runner = true;
-    }
-    if (runner) return null;
+/// `--driver`: a runner that starts its own `cpuq run`s, and is no task itself. Any command may
+/// be one: what it computes itself counts against its project's share (status flags it). Only a
+/// bare build directly under it is refused: a build is a task, and belongs in the line as one.
+fn checkDriver(a: std.mem.Allocator, w: []const []const u8, inner: []const []const u8) ?Refusal {
+    const prog = std.fs.path.basename(inner[0]);
+    const builds = for ([_][]const u8{ "zig", "cargo", "make", "gmake", "go", "swift", "xcodebuild" }) |b| {
+        if (std.mem.eql(u8, prog, b)) break true;
+    } else false;
+    if (!builds or heavyName(inner) == null) return null;
     return .{
-        .reason = "--driver is for a test runner that starts its own `cpuq run`s (swarm, rip, a script under test/, run, run.sh, run-tests…), and is no task itself",
-        .instead = a.print("{s} (one task)", .{fixRun(a, w, true).text}) catch "cpuq run --label P:T -- CMD",
+        .reason = a.print("`{s}` directly under --driver: a build is a task, not a runner, so run it as one", .{toolLabel(a, inner)}) catch "a build under --driver: run it as a task",
+        .instead = fixRun(a, w, true).text,
     };
-}
-
-/// `rig build` or `rig run` (rig itself, or a checkout's bin/rig).
-fn isRigBuild(w: []const []const u8) bool {
-    if (!std.mem.eql(u8, std.fs.path.basename(w[0]), "rig") or w.len < 2) return false;
-    return std.mem.eql(u8, w[1], "build") or std.mem.eql(u8, w[1], "run");
-}
-
-/// Whether the command sets RIG_UNIT_LAUNCHER to a `cpuq run`, on the rig command itself
-/// (`RIG_UNIT_LAUNCHER='cpuq run --' rig build`, `env RIG_UNIT_LAUNCHER=…`) or earlier in its
-/// script (`export RIG_UNIT_LAUNCHER=…`).
-fn launchesUnits(words: []const []const u8, text: []const u8) bool {
-    const key = "RIG_UNIT_LAUNCHER=";
-    for (words) |x| if (std.mem.startsWith(u8, x, key) and isCpuqRun(x[key.len..])) return true;
-    var rest = text;
-    while (std.mem.find(u8, rest, key)) |at| {
-        rest = rest[at + key.len ..];
-        if (isCpuqRun(std.mem.trimStart(u8, rest, "'\"$"))) return true;
-    }
-    return false;
-}
-
-fn isCpuqRun(v: []const u8) bool {
-    var it = std.mem.tokenizeAny(u8, v, " \t'\"");
-    const prog = it.next() orelse return false;
-    if (!std.mem.eql(u8, std.fs.path.basename(prog), "cpuq")) return false;
-    const sub = it.next() orelse return false;
-    return std.mem.eql(u8, sub, "run");
-}
-
-/// The run with RIG_UNIT_LAUNCHER set on its rig command.
-fn launcherFix(a: std.mem.Allocator, w: []const []const u8, iw: []const []const u8) []const u8 {
-    const at = for (w, 0..) |x, k| {
-        if (x.ptr == iw[0].ptr) break k;
-    } else return "cpuq run --driver --label rig:build -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build ...";
-    return a.print("{s} env RIG_UNIT_LAUNCHER='cpuq run --' {s}", .{ joinQuoted(a, w[0..at]), joinQuoted(a, w[at..]) }) catch "env RIG_UNIT_LAUNCHER='cpuq run --' rig build";
-}
-
-/// A program that builds: never a driver.
-fn isBuildTool(w: []const []const u8) bool {
-    const prog = std.fs.path.basename(w[0]);
-    for ([_][]const u8{ "zig", "make", "gmake", "cargo", "go", "swift", "xcodebuild", "ninja", "cmake", "cc", "c++", "gcc", "g++", "clang", "clang++", "rustc" }) |p| {
-        if (std.mem.eql(u8, prog, p)) return true;
-    }
-    return false;
-}
-
-/// A known test runner: swarm or rip, or a script under a test/ folder or named run, run.sh or
-/// run-tests…, run directly or by its interpreter (`bash test/run.sh`).
-fn isRunner(w: []const []const u8) bool {
-    const prog = std.fs.path.basename(w[0]);
-    var path = w[0];
-    if (isShell(prog) or isPython(prog) or std.mem.eql(u8, prog, "node") or std.mem.eql(u8, prog, "ruby") or std.mem.eql(u8, prog, "perl")) {
-        path = for (w[1..]) |x| {
-            if (x.len != 0 and x[0] != '-') break x;
-        } else return false;
-    }
-    const base = std.fs.path.basename(path);
-    for ([_][]const u8{ "swarm", "rip", "run", "run.sh" }) |r| if (std.mem.eql(u8, base, r)) return true;
-    if (std.mem.startsWith(u8, base, "run-tests")) return true;
-    var dirs = std.mem.splitScalar(u8, path, '/');
-    while (dirs.next()) |d| {
-        if (dirs.peek() == null) break;
-        if (std.mem.eql(u8, d, "test") or std.mem.eql(u8, d, "tests")) return true;
-    }
-    return false;
 }
 
 /// How a heavy command runs more than one job at once, or null when it runs one (or sets a count
@@ -1311,43 +1229,25 @@ test "removed options are refused as cpuq refuses them, with the run they become
     try std.testing.expect(!refused("cpuq run --label a:b -- ./x --cores 4"));
 }
 
-test "--driver takes `rig build` whose units are `cpuq run`s, and only those" {
+test "--driver takes any command but a bare build directly under it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expect(!refused("cpuq run --driver --label rig:build -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build --units=8 app.rig"));
-    try std.testing.expect(!refused("cpuq run --driver --label rig:build -- env 'RIG_UNIT_LAUNCHER=cpuq run --label rig:unit --' bin/rig build x.rig"));
-    try std.testing.expect(!refused("cpuq run --driver -- sh -c 'export RIG_UNIT_LAUNCHER=\"cpuq run --\"; ./bin/rig build --units=4 a.rig'"));
-    // Without the launcher, each unit's compile would run on no CPU.
-    const r = refusal(a, "cpuq run --driver --label rig:build -- rig build --units=8 app.rig");
-    try std.testing.expect(std.mem.startsWith(u8, r.reason, "`rig build` under --driver: it is no task"));
-    try std.testing.expectEqualStrings("cpuq run --driver --label rig:build -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build --units=8 app.rig", r.instead);
-    // A launcher that isn't cpuq doesn't count.
-    try std.testing.expect(refused("cpuq run --driver -- env RIG_UNIT_LAUNCHER=nice rig build a.rig"));
-}
-
-test "--driver runs only a test runner, never a build" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expect(!refused("cpuq run --driver --label rig:test -- swarm test/rig.rip"));
-    try std.testing.expect(!refused("cpuq run --driver -- rip test/all.rip"));
-    try std.testing.expect(!refused("cpuq run --driver -- ./test/run -j 8"));
-    try std.testing.expect(!refused("cpuq run --driver -- bash test/run.sh t_hook"));
-    try std.testing.expect(!refused("cpuq run --driver -- ./scripts/run-tests.sh"));
-    try std.testing.expect(!refused("cpuq run --driver -- ./run"));
-    try std.testing.expect(!refused("cpuq run --driver -- sh -c 'cd sub && ./tests/check.py'"));
-    // A build under --driver would go unseen by the line.
-    var r = refusal(a, "cpuq run --driver --label a:b -- zig build test");
-    try std.testing.expectEqualStrings("`zig build` under --driver: --driver is no task, so the build goes unseen; run builds as tasks", r.reason);
+    for ([_][]const u8{
+        "cpuq run --driver --label rig:test -- swarm test/rig.rip",
+        "cpuq run --driver -- ./test/run -j 8",
+        "cpuq run --driver --label rig:light -- rig/tools/light",
+        "cpuq run --driver --label a:b -- ./bench",
+        "cpuq run --driver -- cc -O2 x.c",
+        "cpuq run --driver -- sh -c './test/run && cargo test'",
+        "cpuq run --driver --label rig:build -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build --units=8 app.rig",
+        "cpuq run --driver -- zig version",
+    }) |cmd| try std.testing.expect(!refused(cmd));
+    const r = refusal(a, "cpuq run --driver --label a:b -- zig build test");
+    try std.testing.expectEqualStrings("`zig build` directly under --driver: a build is a task, not a runner, so run it as one", r.reason);
     try std.testing.expectEqualStrings("cpuq run --label a:b -- zig build test -j1", r.instead);
-    try std.testing.expect(refused("cpuq run --driver -- make test"));
-    try std.testing.expect(refused("cpuq run --driver -- cc -O2 x.c"));
-    try std.testing.expect(refused("cpuq run --driver -- sh -c './test/run && cargo test'"));
-    // Anything else is a task.
-    r = refusal(a, "cpuq run --driver --label a:b -- ./bench");
-    try std.testing.expect(std.mem.startsWith(u8, r.reason, "--driver is for a test runner"));
-    try std.testing.expectEqualStrings("cpuq run --label a:b -- ./bench (one task)", r.instead);
+    for ([_][]const u8{ "cpuq run --driver -- make test", "cpuq run --driver -- cargo build", "cpuq run --driver -- go test ./...", "cpuq run --driver -- swift build", "cpuq run --driver -- xcodebuild -scheme App" }) |cmd|
+        try std.testing.expect(refused(cmd));
 }
 
 test "a run here is put to the advisor, with its command; one sent elsewhere never is" {

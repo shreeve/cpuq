@@ -197,10 +197,10 @@ its runner's own process tree keeps busy, the runs it starts left out. From 0.5 
 against its project's share, and status flags it (`driver_cpu`: the driver computes
 N CPUs itself; run its work as tasks).
 
-`cpuq hook` accepts `--driver` only for a test runner (swarm, rip, a script named `run`, `run.sh`
-or `run-tests*`, or one under `test/` or `tests/`): a build under it would be no task of its own.
-One build is a driver too: Rig's split build with `RIG_UNIT_LAUNCHER` a `cpuq run`, which makes
-each unit's compile a run of its own, admitted on its own (the link runs in the driver):
+`cpuq hook` accepts `--driver` for any command but a bare build directly under it (zig, cargo,
+make, go, swift, xcodebuild): a build is a task, and belongs in the line as one. Rig's split build
+is a runner: with `RIG_UNIT_LAUNCHER` a `cpuq run`, each unit's compile is a run of its own,
+admitted on its own (the link runs in the driver):
 
     cpuq run --driver --label rig:build -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build --units=8 app.rig
 
@@ -937,7 +937,7 @@ instead, and exits 2, which refuses the command and shows the agent the fix. It 
 - a benchmark outside cpuq (`hyperfine`, `cargo bench`, `zig build bench`, `node`, `bun`, `deno`
   or `python` running a script with "bench" in its path), with `cpuq drain -c 1 -t 20m --label
   PROJECT:bench -- CMD` (`-c` as many CPUs as it times on; `-t` about ten times its run);
-- `--driver` on anything but a test runner.
+- `--driver` directly around a bare build (zig, cargo, make, go, swift, xcodebuild).
 
 Help, version, dry-run and listing invocations pass, as does any command marked `# cpuq: skip`,
 everything inside a task, and everything when `CPUQ_HOOK=off`. It reads only the command's text;

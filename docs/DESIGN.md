@@ -468,8 +468,9 @@ command:
    `cpuq drain -c 1 -t 20m --label PROJECT:bench -- CMD`.
 4. `$CPUQ_CORES` in a run is refused, with the variable made 1, a one-command `sh -c` unwrapped,
    and the command at one job.
-5. `--driver` passes for swarm, rip, or a script named `run`, `run.sh` or `run-tests*`, or under
-   `test/` or `tests/`; a build under it is refused (it would be no task of its own).
+5. `--driver` passes for any command but a bare build directly under it (zig, cargo, make, go,
+   swift, xcodebuild with work to do): a build is a task. What a runner computes itself counts
+   against its project's share, so no list of runners guards it.
 6. Inside `cpuq run` or `cpuq lease`, a jobs count above 1, no limit (`make -j`, `-j0`,
    `-n auto`), or a tool whose default is every CPU without its one-job option, is refused, with
    the fix at one job "or split the work into tasks with -n M". A count it can't read passes.

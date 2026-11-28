@@ -43,6 +43,8 @@ and a drain no longer gathers any.
   machine.
 - **`cpuq limit RUN -c C`** changes the running-task cap: raised, it starts more as the line
   allows; lowered, it starts none until fewer run. Up to 4 × the pool.
+- **`--driver` takes any command** but a bare build directly under it (zig, cargo, make, go, swift,
+  xcodebuild): no list of runner names. `rig/tools/light` hit the old list.
 - **A `--driver` that computes counts.** Its record notes what its runner's own process tree
   keeps busy, the runs it starts left out; from 0.5 CPUs that counts against its project's share,
   and status flags it `driver_cpu`. On the Mac, `rig/tools/light` under `--driver`

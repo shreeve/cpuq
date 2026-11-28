@@ -145,9 +145,10 @@ a watchdog that lists every process (`ps`):
     cpuq run --label proj:test --driver -- ./test/run
     cpuq run --label proj:case -- cpuq cap --mem 2G --time 120s --output 1M --pids 512 -- PROGRAM ARGS...   # in the runner
 
-- **`--driver` is for a test runner only.** A build under it is no task; the hook refuses it.
-  One exception: `rig build` with `RIG_UNIT_LAUNCHER='cpuq run --'` set on it, so each unit's
-  compile is a run of its own (`cpuq run --driver -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build …`).
+- **`--driver` is for a runner.** Any command may be one; what it computes itself counts against
+  its project's share, and status flags it. A bare build directly under it (zig, cargo, make, go,
+  swift, xcodebuild) is refused: a build is a task. Rig's split build is a runner:
+  `cpuq run --driver -- env RIG_UNIT_LAUNCHER='cpuq run --' rig build …` makes each unit a run.
 - **cap is a limit, not a queue:** it takes no turn, and the hook judges what it runs as if typed
   alone.
 - **Put it inside `cpuq run`, never around it:** its `--time` would count the time spent waiting.
