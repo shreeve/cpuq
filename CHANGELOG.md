@@ -2,7 +2,7 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
-## 0.40.0 — unreleased
+## 0.40.0 — 2026-11-27
 
 CPUs are contested, not owned. cpuq bounds how many tasks run; the kernel shares CPU time among
 them; nothing holds an idle CPU. On 2026-11-27 drains collected CPUs and held them idle for hours,
