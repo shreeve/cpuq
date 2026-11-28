@@ -620,14 +620,17 @@ t_drain_cap() {
   wait_line "$g" first-start
   # The first isolates k (its core's threads); the second takes whole cores of k, enough to pass
   # the cap of half the pool beside the first but fit under p - 1.
-  local k cap c2 j; k=$(sj 'len(set(s["isolated"]) & set(s["pool"]))'); cap=$((p / 2))
+  local k cap c2 j n1 n2; k=$(sj 'len(set(s["isolated"]) & set(s["pool"]))'); cap=$((p / 2))
+  n1=$(sj 'len(s["isolated"])')
   c2=$(((cap - k) / k + 1)); j=$((c2 * k))
   if [ $j -gt $cap ] || [ $((k + j)) -gt $((p - 1)) ]; then kill $d1; wait $d1; echo "  skipped: no second drain fits (pool $p, $k a core)"; return; fi
-  "$CPUQ" drain -c $c2 --max 20s --label c:second -- sh -c "echo second-start >>$g" & local d2=$!
+  "$CPUQ" drain -c $c2 --max 20s --label c:second -- sh -c "echo second-start >>$g; sleep 1" & local d2=$!
   poll 10 '"$CPUQ" status --no-usage | grep c:second | grep -q drain_max'
   local held; held=$("$CPUQ" status --no-usage | grep c:second | grep -o 'drain_max' | head -1)
   sleep 1.5
   echo "drain_max = $((p - 1))" >>"$CPUQ_CONFIG"
+  wait_line "$g" second-start
+  n2=$(($(sj 'len(s["isolated"])') - n1))
   local r1 r2; wait $d2; r2=$?; wait $d1; r1=$?
   local got; got=$(tr '\n' ' ' <"$g")
   check "a drain waiting at drain_max (${held:-not shown}) starts once it is raised, beside the first (rc $r1 $r2: $got)" \
@@ -635,7 +638,8 @@ t_drain_cap() {
   local cores; cores=$("$CPUQ" history --json | python3 -c 'import json, sys
 j = {x["label"]: x for x in json.load(sys.stdin)}
 print(j["c:first"]["cores"], j["c:second"]["cores"])')
-  check "history counts a drain as the CPUs it isolated (want $k $j, got $cores)" "[ '$cores' = '$k $j' ]"
+  # Every CPU a drain isolates counts, its SMT siblings outside the pool too: they are kept free.
+  check "history counts a drain as the CPUs it isolated (want $n1 $n2, got $cores)" "[ '$cores' = '$n1 $n2' ]"
 }
 
 t_drain_part() {
