@@ -4,6 +4,10 @@ User-visible changes to cpuq. Each version's section is its release notes.
 
 ## 0.40.1 — 2026-11-27
 
+- **A run from a cleaned environment runs.** On Linux, a run started without `XDG_RUNTIME_DIR`
+  (a kit's ssh with a scrubbed environment) took another environment's word that systemd user
+  scopes work, and failed in `systemd-run` ("Failed to connect to user scope bus"). It now takes
+  the user's own `/run/user/UID` when its bus is there, and runs without a scope when it isn't.
 - **`cpuq drain --cpus` takes both threads of a core.** A named list holding a CPU and its SMT
   sibling (pup's `--cpus 0-11,13`) was refused as "too few whole cores": the sibling, already
   taken for the first CPU, read as taken by someone else.
