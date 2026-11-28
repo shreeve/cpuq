@@ -357,7 +357,8 @@ or there is room (`busy + starting + 1 ≤ T`, which is `< T − 0.5` in whole C
 in line among the projects' first waiters (an urgent run's first task, then project running ÷
 weight, then fewer tasks running, then ticket: `head`). A drain starts when no older drain waits, at
 most half the pool is then isolated, the gates are open, and (`drainFifo`) no older run waits
-holding nothing. A tick measures every started task (starting → computing) and ages every
+holding nothing. Drains are `-c N` only (0.40.0 has no `--all`), N a fixed size with the chosen
+CPUs' SMT siblings counted, and no theorem depends on which CPUs they are. A tick measures every started task (starting → computing) and ages every
 started drain; past limit + grace, or idle more than `idleMax` ticks in a row while something
 waits, it is over.
 
@@ -400,7 +401,7 @@ them in no order the design fixes, so a stream could take every opening ahead of
 What it does not cover: CPU time between running tasks (the kernel's part); measurement noise
 and multi-threaded tasks (busy is exactly the computing tasks); separate cpuq processes racing
 (the pass is atomic: each waiter's check is assumed to see the others' starts, as `starting`
-provides); `--all`; retries; outside processes on isolated CPUs; the TERM before KILL (one end at
+provides); which CPUs a drain isolates (`--cpus`; its size counts the SMT siblings); retries; outside processes on isolated CPUs; the TERM before KILL (one end at
 limit + grace); the idle stop's 0.25-CPU average (idle here is the command blocked for whole
 ticks).
 

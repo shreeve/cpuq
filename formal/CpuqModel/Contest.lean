@@ -156,7 +156,8 @@ structure RunCfg where
   deriving Repr
 
 structure DrainCfg where
-  /-- `-c N`: the CPUs it isolates. -/
+  /-- `-c N`: the CPUs it isolates, SMT siblings of the chosen CPUs included; which CPUs
+  (`--cpus`) is left abstract. 0.40.0 has no `--all`. -/
   size : Nat := 1
   /-- `-t`, in ticks (at most `Cfg.ceil`). -/
   limit : Nat := 1
