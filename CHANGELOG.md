@@ -2,7 +2,7 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
-## 0.42.1 — unreleased
+## 0.42.1 — 2026-11-28
 
 - **The reserve takes the slowest whole cores.** It sets aside low-power and efficiency cores
   before performance cores (by `cpu_core`, `cpu_capacity` and top clock, the inverse of
