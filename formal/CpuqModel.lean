@@ -9,3 +9,7 @@ import CpuqModel.Line
 import CpuqModel.Backfill
 import CpuqModel.DrainCap
 import CpuqModel.Checks
+import CpuqModel.Fifo
+import CpuqModel.Cert
+import CpuqModel.CertGen
+import CpuqModel.Served
