@@ -309,7 +309,7 @@ t_share() {
   # first task starts within a second of b coming. Then each keeps its share of 1: b never runs a
   # second task while a runs.
   setup share
-  "$CPUQ" run -n 8 --label a:work -- "$BURN" -2 0.5 2>/dev/null & local a=$!
+  "$CPUQ" run -n 4 --label a:work -- "$BURN" -2 3 2>/dev/null & local a=$!
   wait_running 2
   sleep 0.5
   local t0; t0=$(now)
