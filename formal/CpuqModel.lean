@@ -13,3 +13,5 @@ import CpuqModel.Fifo
 import CpuqModel.Cert
 import CpuqModel.CertGen
 import CpuqModel.Served
+import CpuqModel.Contest
+import CpuqModel.Contest035
