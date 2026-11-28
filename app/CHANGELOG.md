@@ -3,6 +3,11 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.29.0 — unreleased
+
+- **A task of `-j K` holds all its CPUs:** a run's tasks tint every CPU whose token they hold
+  (cpuq 0.43's `cpus`), not only the first.
+
 ## 0.28.0 — 2026-11-28
 
 - **Reads cpuq 0.42's status (schema 4),** a strict token pool: the pool's CPUs less the reserve

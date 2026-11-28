@@ -15,12 +15,14 @@ pub const JsonRun = struct {
     /// The project it counts for, and that project's weight.
     project: []const u8 = "",
     weight: u32 = 1,
-    /// The most tokens it holds at once (-c, worked out); a drain's CPUs.
+    /// The most tasks it runs at once (-c, worked out); a drain's CPUs.
     limit: u32 = 1,
+    /// `-j K`: the tokens each of its tasks holds, all at once.
+    width: u32 = 1,
     tasks: u32 = 0,
     done: u32 = 0,
     failed: u32 = 0,
-    /// Its tasks running, each holding a token (a drain: its command).
+    /// Its tasks running, each holding its `width` tokens (a drain: its command).
     running: u32 = 0,
     /// Its tasks cpuq has stopped, holding no token: after a Ctrl-Z, until each holds one again
     /// (a drain's command, until its drain's turn comes again).
@@ -72,7 +74,10 @@ pub const JsonRun = struct {
     since: i64 = 0,
 };
 
-pub const JsonTask = struct { task: u32 = 0, attempt: u32 = 1, pid: i32 = 0, since: i64 = 0, paused: bool = false, cpu: u32 = 0 };
+/// A running task: its number, its try, its pid, when it started (Unix seconds), whether cpuq has
+/// it stopped, and the CPUs whose tokens it holds (`cpus`: its run's `width` of them; `cpu`: the
+/// first).
+pub const JsonTask = struct { task: u32 = 0, attempt: u32 = 1, pid: i32 = 0, since: i64 = 0, paused: bool = false, cpu: u32 = 0, cpus: []const u32 = &.{} };
 
 pub const JsonProgress = struct { done: u64 = 0, total: u64 = 0, failing: u64 = 0 };
 

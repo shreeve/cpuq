@@ -141,7 +141,17 @@ starts, or continues, one more task now. The caller has checked the gates and th
   without division), an urgent operation that has not yet started a task, the project running the
   fewest tasks for its weight, the operation running the fewest, the older ticket. A token freed
   goes to it, not to whichever waiter looks first.
-- **Hard limits:** the operation's `-c`, and the gates.
+- **Wide tasks** (`-j K`, the operation's `width`): each task takes K tokens in one step when K
+  are free, and gives all K back as it ends; it never holds part of them while it waits. Its K
+  count toward its project's load and its own running (`Op.held`). First in line with fewer than K
+  free, `mayStart` says `full`, and everyone behind it `behind`: the tokens freed wait for it, at
+  most K − 1 of them idle, and only while it heads the line (DESIGN-0.43 rule 4(a)). K is at most
+  `drain_max` of the tokens; a run wider than that once the reserve or `drain_max` changes waits
+  with nothing waiting in its record, so it heads no line. Its CPUs (`freeCpus`): whole free cores
+  from the tokens' end when K is a multiple of the cores' width (K = 2 on two-thread cores is a
+  sibling pair), else the free tokens packed into the fewest cores; its process group is pinned to
+  them (Linux), and `CPUQ_CPUS` lists them, as it does for every task.
+- **Hard limits:** the operation's `-c` (tasks, not tokens), and the gates.
 
 Each look takes tokens one at a time, asking `mayStart` again after each, since a start changes
 the count. `Wait` says why not (`full`, `project`: another run of its project goes first,

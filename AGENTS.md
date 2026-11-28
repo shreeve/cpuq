@@ -41,7 +41,10 @@ them for CMD, not for your shell: use `sh -c` with SINGLE quotes.
 - `-t T`: each task's time limit (wall time), about ten times its usual time (`-t 30s`; default 1h).
   A task holds its token while it waits (network, sleep, a server): keep waits out of tasks.
 - `-r N`: try a failed task up to N more times (`CPUQ_ATTEMPT` says which try). Flaky work only.
-- `-c C`: hold at most C tokens at once, or `-c 25%` of them. Usually leave it out. `cpuq limit LABEL -c C` changes it while
+- `-j K`: each task holds K tokens (CPUs) at once, pinned to them on Linux (`$CPUQ_CPUS` lists
+  them; K = 2 on burst is one core's sibling pair), for a task that truly runs K threads: then
+  its command may run K jobs (`zig build -jK`). At most `drain_max`, half the tokens by default.
+- `-c C`: run at most C tasks at once, or `-c 25%` of the tokens. Usually leave it out. `cpuq limit LABEL -c C` changes it while
   the run runs (raised: it starts more as the line allows; lowered: none start until fewer run).
 - One run per phase: build with one task, then test with `-n M`.
 

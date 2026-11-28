@@ -2,6 +2,21 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.43.0 — unreleased
+
+- **`cpuq run -j K`: tasks that hold K tokens.** Each task takes K tokens in one step when K are
+  free, never holds part of them while it waits, and gives all K back as it ends. On Linux it is
+  pinned to its K CPUs, whole free cores when K is a multiple of a core's threads (`-j 2` on burst
+  is one core's sibling pair), else the free tokens packed into the fewest cores; `$CPUQ_CPUS`
+  lists them (as it does for every task). K counts toward the project's share and the run's
+  running; `-c` still counts tasks. K is at most `drain_max` of the tokens.
+- **A wide task first in line holds the line.** With fewer than K tokens free, the tokens freed
+  go to no one behind it: at most K − 1 stay idle, and only while it heads the line, so no run,
+  wide or not, starves.
+- **The hook lets a run of `-j K` run K jobs** (`cpuq run -j 2 -- zig build -j2`), and no more.
+- **Status:** a run of `-j 2` shows "2 on 41,89 · -j 2". JSON stays schema 4: each run has
+  `width`, each task `cpus` (all its CPUs) beside `cpu` (the first).
+
 ## 0.42.1 — 2026-11-28
 
 - **The reserve takes the slowest whole cores.** It sets aside low-power and efficiency cores

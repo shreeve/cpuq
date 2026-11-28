@@ -30,6 +30,8 @@ pub const Opts = struct {
     /// of its own (as the line allows).
     cpus: u32 = 0,
     cpus_percent: bool = false,
+    /// -j: the tokens each task holds, all at once (at most config `drain_max` of the tokens).
+    width: u32 = 1,
     /// -t: each task's time limit, in seconds of running; null takes the machine's (`timeout`).
     timeout_s: ?u32 = null,
     /// -r: how many times a failed task is tried again.
@@ -68,8 +70,9 @@ const Task = struct {
     /// When cpuq stopped it (monotonic ms): after a Ctrl-Z, until it holds a token again (a
     /// drain's command, until its drain's turn comes again); 0 while it runs. It holds none.
     paused_ms: i64 = 0,
-    /// The CPU whose token it holds (pinned there on Linux); a drain's command, its first CPU.
-    cpu: u32 = 0,
+    /// The CPUs whose tokens it holds (pinned there on Linux): its run's -j of them; a drain's
+    /// command, its drain's.
+    cpus: []const u32 = &.{},
     /// When TERM was sent for its time limit (0: not yet).
     term_ms: i64 = 0,
     /// When it started, in Unix seconds (for status).
@@ -190,6 +193,9 @@ const Run = struct {
     /// they were worked out for, which the config may change while it runs.
     toks: []const u32 = &.{},
     toks_reserve: u32 = 0,
+    /// Its -j is more than config `drain_max` of the tokens as they are now (the reserve or
+    /// drain_max changed while it ran): it starts nothing, and holds up no one, until it fits.
+    too_wide: bool = false,
     /// Tasks ended when it last wrote its progress.
     last_progress: u32 = std.math.maxInt(u32),
     /// Its history: the record, when it entered the line, and the most tasks run at once.
@@ -248,7 +254,7 @@ const Run = struct {
     /// Tasks it could start or continue now, each taking a token: none while stopped; a drain,
     /// its one command until its turn comes.
     fn waitingNow(r: *const Run) u32 {
-        if (r.stopped) return 0;
+        if (r.stopped or r.too_wide) return 0;
         if (r.rec.drain) return if (r.rec.dstart == 0 and (r.pending() > 0 or r.running.items.len > 0)) 1 else 0;
         return @min(r.pending() + r.pausedCount(), r.limit -| r.holding());
     }
@@ -281,7 +287,7 @@ const Run = struct {
             .since = t.since_s,
             .fresh = t.fresh_ms,
             .paused = t.paused_ms != 0,
-            .cpu = t.cpu,
+            .cpus = t.cpus,
         }) catch break;
         r.rec.tasks_now = r.now_buf.items;
     }
@@ -339,6 +345,10 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
         (if (o.drain_cpus.len != 0) @as(u32, @intCast(o.drain_cpus.len)) else @max(1, @min(o.cpus, ntok)))
     else
         @max(1, @min(asked, total));
+    if (!o.drain and o.width > 1) {
+        const dmax = policy.drainMax(ctx.cfg, ntok);
+        if (o.width > dmax) return main.usageError("-j {d}: each task would hold {d} tokens, more than drain_max of the tokens ({d} here)", .{ o.width, o.width, dmax });
+    }
     const timeout_s = o.timeout_s orelse ctx.cfg.timeout_s;
     const timeout_ms: i64 = if (timeout_s == 0) std.math.maxInt(i64) / 2 else @as(i64, timeout_s) * 1000;
 
@@ -361,6 +371,7 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
             .urgent = o.urgent,
             .drain = o.drain,
             .single = single,
+            .width = if (o.drain) 1 else o.width,
             .pid = sys.getpid(),
             .project = projectOf(ctx, o),
             .label = if (o.label.len != 0) o.label else std.fs.path.basename(o.cmd[0]),
@@ -375,7 +386,7 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
         },
     };
     if (!single) r.out_dir = outDir(ctx, r.rec.project) catch |err| main.fail("output folder: {t}", .{err});
-    if (o.drain) r.topo = cpus_mod.cores(ctx.io, a, pool_cpus);
+    if (o.drain or o.width > 1) r.topo = cpus_mod.cores(ctx.io, a, pool_cpus);
 
     installHandlers(!single);
     if (single) sys.installForwarding();
@@ -423,7 +434,7 @@ fn logEnd(r: *Run) void {
     if (held) {
         joblog.logEvent(ctx, r.job, "started", .{ .t = r.iso_t, .cores = r.iso_n });
     } else if (r.first_start_ms != 0) joblog.logEvent(ctx, r.job, "started", .{ .t = r.first_start_t });
-    var extra: joblog.EventExtra = .{ .cores = if (held) r.iso_n else r.peak_running, .cpu = sys.childrenCpu(), .done = r.rec.done, .failed = r.rec.failed };
+    var extra: joblog.EventExtra = .{ .cores = if (held) r.iso_n else r.peak_running * r.rec.width, .cpu = sys.childrenCpu(), .done = r.rec.done, .failed = r.rec.failed };
     if (r.noise_max >= noisy_min) extra.noisy = .{ .cpus = r.noise_sum / @as(f64, @floatFromInt(@max(r.noise_n, 1))), .max = r.noise_max, .top = r.noise_top };
     if (r.single) {
         const last: ?Outcome = if (r.outcomes.items.len != 0) r.outcomes.items[r.outcomes.items.len - 1] else null;
@@ -701,10 +712,10 @@ fn cpuListText(a: std.mem.Allocator, cpus: []const u32) []const u8 {
     return out.items;
 }
 
-/// Starts the next task (a retry goes behind the tasks not yet started), holding the token of
-/// `cpu` (pinned there on Linux). A drain's command runs on its CPUs (pinned on Linux), with
-/// CPUQ_CPUS naming them.
-fn startTask(r: *Run, a: std.mem.Allocator, cpu: u32) void {
+/// Starts the next task (a retry goes behind the tasks not yet started), holding the tokens of
+/// `cpus` (pinned there on Linux), with CPUQ_CPUS naming them. A drain's command runs on its
+/// drain's CPUs.
+fn startTask(r: *Run, a: std.mem.Allocator, cpus: []const u32) void {
     const t_in: Task = if (r.next_index <= r.total) blk: {
         defer r.next_index += 1;
         break :blk .{ .index = r.next_index, .attempt = 1 };
@@ -719,7 +730,7 @@ fn startTask(r: *Run, a: std.mem.Allocator, cpu: u32) void {
     ctx.env.put("CPUQ_ATTEMPTS", std.fmt.bufPrint(&att[1], "{d}", .{r.o.retries + 1}) catch "1") catch {};
     var opn: [24]u8 = undefined;
     ctx.env.put("CPUQ_OP", std.fmt.bufPrint(&opn, "{d}", .{r.rec.ticket}) catch "") catch {};
-    if (r.rec.drain) ctx.env.put("CPUQ_CPUS", cpuListText(a, r.rec.pin)) catch {};
+    ctx.env.put("CPUQ_CPUS", cpuListText(a, cpus)) catch {};
     const envp = ctx.env.createPosixBlock(a, .{}) catch main.fail("out of memory", .{});
     const argv = a.allocSentinel(?[*:0]const u8, r.o.cmd.len, null) catch main.fail("out of memory", .{});
     for (r.o.cmd, 0..) |arg, k| argv[k] = arg.ptr;
@@ -739,8 +750,7 @@ fn startTask(r: *Run, a: std.mem.Allocator, cpu: u32) void {
             dups.append(a, .{ out_fd, 2 }) catch {};
         }
     }
-    const one = [_]u32{cpu};
-    const pin: []const u32 = if (!is_linux) &.{} else if (r.rec.drain) r.rec.pin else &one;
+    const pin: []const u32 = if (!is_linux) &.{} else cpus;
     const spawned = sys.spawn(r.exe, argv.ptr, @ptrCast(envp.slice.ptr), .unchanged, .{
         .cpus = pin,
         .dups = dups.items,
@@ -759,7 +769,7 @@ fn startTask(r: *Run, a: std.mem.Allocator, cpu: u32) void {
     if (r.single) sys.setChild(pid);
     const now = sys.monoMs();
     t.pid = pid;
-    t.cpu = cpu;
+    t.cpus = r.a.dupe(u32, cpus) catch cpus;
     t.pstart = sys.procStart(pid) orelse 0;
     t.start_ms = now;
     t.fresh_ms = now;
@@ -813,6 +823,8 @@ fn look(r: *Run) void {
         r.toks = cpus_mod.tokens(r.ctx.io, r.a, r.pool_cpus, r.ctx.cfg.reserve);
         r.toks_reserve = r.ctx.cfg.reserve;
     }
+    const wide_max = policy.drainMax(r.ctx.cfg, @intCast(r.toks.len));
+    r.too_wide = !r.rec.drain and r.rec.width > 1 and r.rec.width > wide_max;
     // The sample (for the outside-load gate) is renewed outside the pool's lock, by one cpuq at a
     // time.
     if (r.waitingNow() > 0 and r.ctx.cfg.outside_check) {
@@ -848,21 +860,23 @@ fn look(r: *Run) void {
     } else if (!r.stopped) {
         r.refresh();
         ops[me] = r.rec;
-        // Start (or continue) what the line allows, each on a free token's CPU.
+        // Start (or continue) what the line allows, each on its free tokens' CPUs.
         r.setWhy("");
-        if (why.len != 0) {
+        if (r.too_wide) {
+            r.setWhy(a.print("its -j {d} is more than drain_max of the tokens ({d} now); it starts once that fits", .{ r.rec.width, wide_max }) catch "its -j is more than drain_max");
+        } else if (why.len != 0) {
             r.setWhy(why);
             blocked = r.waitingNow() > 0;
         } else while (r.waitingNow() > 0) {
             const w = pool_mod.mayStart(a, ops, r.rec.ticket, cx);
             if (w != .go) {
-                r.setWhy(whyText(w, cx));
+                r.setWhy(whyText(a, w, cx, r.rec.width));
                 // Held back for outside work, which changes without a word: look each second.
                 blocked = w == .full and cx.held_back != 0;
                 break;
             }
-            const cpu = pool_mod.freeCpu(a, r.toks, ops, now) orelse break;
-            takeToken(r, a, cpu, now);
+            const cpus = pool_mod.freeCpus(a, r.toks, ops, now, r.rec.width, r.topo) orelse break;
+            takeToken(r, a, cpus, now);
             started = true;
             r.refresh();
             ops[me] = r.rec;
@@ -898,16 +912,16 @@ fn context(r: *Run, a: std.mem.Allocator, ops: []const Op, sample: ?pool_mod.Sam
     return .{ .n = n, .held_back = pool_mod.heldBack(a, ops, sample, r.ctx.cfg.outside_check, r.ncpu, n, now), .now_ms = now };
 }
 
-/// Takes the token of `cpu`: continues a task cpuq stopped (after a Ctrl-Z) on that CPU, else
+/// Takes the tokens of `cpus`: continues a task cpuq stopped (after a Ctrl-Z) on those CPUs, else
 /// starts the next task there.
-fn takeToken(r: *Run, a: std.mem.Allocator, cpu: u32, now: i64) void {
+fn takeToken(r: *Run, a: std.mem.Allocator, cpus: []const u32, now: i64) void {
     for (r.running.items) |*t| if (t.paused_ms != 0) {
-        t.cpu = cpu;
-        if (is_linux) repinTree(r, a, t.pid, &.{cpu});
+        t.cpus = r.a.dupe(u32, cpus) catch cpus;
+        if (is_linux) repinTree(r, a, t.pid, cpus);
         resumeTask(r, t, now);
         return;
     };
-    startTask(r, a, cpu);
+    startTask(r, a, cpus);
 }
 
 /// Wakes every other run that may take a token now, and every drain whose turn has come. Under
@@ -937,7 +951,7 @@ fn drainStep(r: *Run, a: std.mem.Allocator, ops: []Op, why: []const u8, cx: pool
         if (r.o.quiet_max) |q| if (r.running.items.len == 0 and r.pending() > 0 and r.noise_measured) {
             if (r.rec.noise <= q) {
                 r.setWhy("");
-                startTask(r, a, r.rec.pin[0]);
+                startTask(r, a, r.rec.pin);
                 // Its time limit counts from the isolation, the quiet wait included.
                 for (r.running.items) |*t| t.start_ms = r.rec.dstart;
                 r.syncRecord();
@@ -995,7 +1009,7 @@ fn drainStep(r: *Run, a: std.mem.Allocator, ops: []Op, why: []const u8, cx: pool
     r.rec.noisy_top = "";
     r.noise_measured = false;
     if (r.running.items.len == 0) {
-        if (r.o.quiet_max == null) startTask(r, a, r.rec.pin[0]) else r.setWhy("measures its CPUs for --quiet-max");
+        if (r.o.quiet_max == null) startTask(r, a, r.rec.pin) else r.setWhy("measures its CPUs for --quiet-max");
     } else {
         // Continued after a Ctrl-Z: onto its CPUs (perhaps others than before), then on.
         for (r.running.items) |*t| {
@@ -1110,10 +1124,12 @@ fn repinTree(r: *Run, a: std.mem.Allocator, root: c.pid_t, cpus: []const u32) vo
 }
 
 /// Why a run waits, in words, for status.
-fn whyText(w: pool_mod.Wait, cx: pool_mod.Cx) []const u8 {
+fn whyText(a: std.mem.Allocator, w: pool_mod.Wait, cx: pool_mod.Cx, width: u32) []const u8 {
     return switch (w) {
         .go, .idle => "",
-        .full => if (cx.held_back != 0) "every token is held (some held back for work outside cpuq)" else "every token is held",
+        .full => if (width > 1)
+            a.print("its tasks take {d} tokens at once; freed tokens wait for it", .{width}) catch "freed tokens wait for it"
+        else if (cx.held_back != 0) "every token is held (some held back for work outside cpuq)" else "every token is held",
         .behind => "another run is first in line",
         .project => "another run of its project goes first",
     };

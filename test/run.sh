@@ -463,6 +463,85 @@ t_first() {
     "[[ '$got' == 'x-end e-start '[bc]-end' '*x2-start* ]]"
 }
 
+t_wide() {
+  # -j K: each task holds K tokens, all at once. On 4 tokens, 6 tasks of -j 2 hold at most 4 (two
+  # tasks at a time); each task's CPUQ_CPUS names its 2 CPUs, as status does.
+  setup wide "tokens = 4"
+  if [ "$(tokcpus | wc -w | tr -d ' ')" -lt 4 ]; then echo "  skipped: needs 4 tokens"; return; fi
+  "$CPUQ" run -n 6 -j 2 --label w:pairs -- sh -c 'echo "$CPUQ_CPUS" >"$1.$CPUQ_TASK"; sleep 0.6' sh "$T/cpus" 2>/dev/null & local p=$!
+  local most=0 h tasks=0 k
+  while kill -0 $p 2>/dev/null; do
+    h=$(sj '"%d %d" % (s["held"], sum(h["running"] for h in s["runs"]))'); k=${h#* }; h=${h% *}
+    [ "${h:-0}" -gt "$most" ] && most=$h; [ "${k:-0}" -gt "$tasks" ] && tasks=$k
+  done
+  wait $p; local rp=$?
+  local pairs; pairs=$(cat "$T"/cpus.* | awk -F, '{print NF}' | sort -u | tr '\n' ' ')
+  check "6 tasks of -j 2 on 4 tokens hold at most 4 (most $most, $tasks tasks at once); each named its 2 CPUs ($pairs); rc $rp" \
+    "[ $most -le 4 ] && [ $tasks -le 2 ] && [ '$pairs' = '2 ' ] && [ $rp = 0 ]"
+  local bad=""
+  "$CPUQ" run -j 0 -- true 2>/dev/null; bad="$bad$? "
+  "$CPUQ" run -j 3 -- true 2>/dev/null; bad="$bad$? "
+  check "-j 0, and -j past drain_max (half of 4 tokens), are usage errors ($bad)" "[ '$bad' = '2 2 ' ]"
+  # A wide task never holds part of its tokens, and the line waits for it: on 3 tokens, a holds 2;
+  # w (-j 2) is first in line, b (-j 1) behind it. The free token stays idle (K - 1 = 1): b doesn't
+  # take it. When one of a's ends, w takes both at once; b goes once a token frees again.
+  setup wide-hold "tokens = 3" "drain_max = 2"
+  if [ "$(tokcpus | wc -w | tr -d ' ')" -lt 3 ]; then echo "  skipped: needs 3 tokens"; return; fi
+  local f=$T/log
+  "$CPUQ" run --label a:one -- sh -c "\"$BURN\" --until $T/go1 30; echo a1-end >>$f" & local a1=$!
+  "$CPUQ" run --label a:two -- sh -c "\"$BURN\" --until $T/go2 30; echo a2-end >>$f" & local a2=$!
+  wait_running 2
+  "$CPUQ" run -j 2 --label w:wide -- sh -c "echo w-start \$CPUQ_CPUS >>$f; sleep 1; echo w-end >>$f" & local w=$!
+  wait_waiters 1
+  "$CPUQ" run --label b:one -- sh -c "echo b-start >>$f" & local b=$!
+  wait_waiters 2
+  sleep 1.5
+  local held1 why_w why_b; held1=$(sj 's["held"]')
+  why_w=$("$CPUQ" status --no-usage | grep w:wide | grep -o 'take 2 tokens at once' | head -1)
+  why_b=$("$CPUQ" status --no-usage | grep b:one | grep -o 'another run is first in line' | head -1)
+  local early; early=$(cat "$f" 2>/dev/null | tr '\n' ' ')
+  touch "$T/go1"
+  wait_line "$f" w-end 15
+  local mid; mid=$(cat "$f" | tr '\n' ' ')
+  touch "$T/go2"
+  wait $a1 $a2 $w $b
+  local got; got=$(cut -d' ' -f1 <"$f" | tr '\n' ' ')
+  local wc; wc=$(grep '^w-start' "$f" | cut -d' ' -f2 | awk -F, '{print NF}')
+  check "on 3 tokens with 2 held, w (-j 2) holds none and b behind it doesn't take the idle one (held $held1; '$why_w'; '$why_b'; early '$early')" \
+    "[ '$held1' = 2 ] && [ -n '$why_w' ] && [ -n '$why_b' ] && [ -z '$early' ]"
+  check "when a token frees, w takes 2 at once ($wc CPUs) before b (got $got; mid $mid)" \
+    "[ '$wc' = 2 ] && [[ '$got' == 'a1-end w-start '* ]] && [[ '$mid' != *b-start* || '$mid' == *'w-start'*'b-start'* ]]"
+  # Linux with SMT: -j 2 on a pool of two whole cores takes one core's two threads, pinned there.
+  [ "$(uname)" = Linux ] || return
+  local cores; cores=$(python3 -c '
+import glob, re
+seen, out = set(), []
+def cpus(t):
+    s = []
+    for p in t.split(","):
+        a, _, b = p.partition("-"); s += range(int(a), int(b or a) + 1)
+    return s
+for f in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*/topology/thread_siblings_list"), key=lambda f: int(re.search(r"cpu(\d+)/", f).group(1))):
+    sib = tuple(cpus(open(f).read().strip()))
+    if len(sib) >= 2 and sib not in seen:
+        seen.add(sib); out.append(sib[:2])
+    if len(out) == 2: break
+if len(out) == 2: print(",".join(str(c) for c in (out[0][0], out[1][0], out[0][1], out[1][1])))')
+  if [ -z "$cores" ]; then echo "  skipped: no SMT here"; return; fi
+  setup wide-core "cpus = $cores" "reserve = 0"
+  local pin; pin=$("$CPUQ" run -n 1 -j 2 --label w:core -- sh -c 'echo "$CPUQ_CPUS $(sed -n "s/^Cpus_allowed_list:[[:space:]]*//p" /proc/self/status) $(cat /sys/devices/system/cpu/cpu${CPUQ_CPUS%%,*}/topology/thread_siblings_list)"' 2>/dev/null; cat "$(rundir w)/1")
+  local same; same=$(python3 -c "
+import sys
+def cpus(t):
+    s = set()
+    for p in t.split(','):
+        a, _, b = p.partition('-'); s.update(range(int(a), int(b or a) + 1))
+    return s
+named, allowed, sib = '$pin'.split()
+print('yes' if cpus(named) == cpus(allowed) == cpus(sib) and len(cpus(named)) == 2 else 'no')")
+  check "-j 2 takes one core's two threads, pinned there (CPUQ_CPUS, allowed, siblings: $pin)" "[ '$same' = yes ]"
+}
+
 t_drain() {
   # cpuq drain -c N: after the runs queued before it, once N whole cores' tokens are free, it takes
   # them at once for its command, and the rest of the machine keeps working; CPUQ_CPUS names them
@@ -2457,7 +2536,7 @@ f = open(sys.argv[1]); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$sp/p/held
 
 # --- cpuq jobs and the agent (until they go) -------------------------------------------------
 
-TESTS=${*:-tokens reserve tasks io cpus_limit timeout retry wait_max share fair order stream first drain drain_cpus drain_turn drain_cap drain_hold drain_part drain_long limit lock_stuck storm kill ctrl_z nested driver removed \
+TESTS=${*:-tokens reserve tasks io cpus_limit timeout retry wait_max share fair order stream first wide drain drain_cpus drain_turn drain_cap drain_hold drain_part drain_long limit lock_stuck storm kill ctrl_z nested driver removed \
   kill_holder leftovers leaked_descendant kill_waiter term_waiting lost_seq long_command waiters_cpu \
   exit_status direct_sigint terminal_sigint tasks_sigint ignored_signals stack_limit \
   status progress usage zombie outside status_host history project note wait record min_available min_disk hook \

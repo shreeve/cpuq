@@ -196,6 +196,7 @@ fn sendTo(ctx: *Ctx, o: RunOptions, host: []const u8, why: []const u8) u8 {
     if (o.cpus != 0) {
         if (o.cpus_percent) remote.print(a, " -c {d}%", .{o.cpus}) catch {} else remote.print(a, " -c {d}", .{o.cpus}) catch {};
     }
+    if (o.width > 1) remote.print(a, " -j {d}", .{o.width}) catch {};
     if (o.timeout_s) |t| remote.print(a, " -t {d}", .{t}) catch {};
     if (o.retries != 0) remote.print(a, " -r {d}", .{o.retries}) catch {};
     if (o.urgent) remote.print(a, " --urgent", .{}) catch {};

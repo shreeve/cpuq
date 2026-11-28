@@ -364,9 +364,9 @@ extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 /// A task running now: its number, its try, its pid and that process's start time (so a reused
 /// pid is never taken for it), when it started (Unix seconds), when it last started or continued
-/// (monotonic ms), whether cpuq has it stopped (after a Ctrl-Z, until it holds a token again),
-/// and the CPU whose token it holds (on Linux, the CPU it is pinned to). A stopped task holds no
-/// token.
+/// (monotonic ms), whether cpuq has it stopped (after a Ctrl-Z, until it holds tokens again),
+/// and the CPUs whose tokens it holds (its run's -j K of them; on Linux, the CPUs it is pinned
+/// to). A stopped task holds none.
 pub const TaskNow = struct {
     task: u32 = 0,
     attempt: u32 = 1,
@@ -375,7 +375,7 @@ pub const TaskNow = struct {
     since: i64 = 0,
     fresh: i64 = 0,
     paused: bool = false,
-    cpu: u32 = 0,
+    cpus: []const u32 = &.{},
 };
 
 /// One task's measure in the sample: its process tree's CPU time so far (ns) and its busy CPUs
@@ -480,6 +480,8 @@ pub const Op = struct {
     drain: bool = false,
     /// One task, sharing its cpuq's process group (`cpuq run -- CMD`).
     single: bool = false,
+    /// `-j K`: the tokens each of its tasks holds, all at once.
+    width: u32 = 1,
     /// `cpuq run --driver`: a test runner, no task of its own; `dbusy` is the CPUs its own process
     /// tree keeps busy, the runs it starts left out (measured by its cpuq once a second). It
     /// counts against its project's share.
@@ -496,8 +498,8 @@ pub const Op = struct {
     tasks: u32 = 1,
     done: u32 = 0,
     failed: u32 = 0,
-    /// Its tasks running, each holding a token (those cpuq has stopped left out); a drain: its
-    /// command.
+    /// Its tasks running, each holding its `width` tokens (those cpuq has stopped left out); a
+    /// drain: its command.
     running: u32 = 0,
     /// Tasks it could start now (none while stopped, or at its -c); a drain waiting: 1.
     waiting: u32 = 0,
@@ -523,16 +525,18 @@ pub const Op = struct {
     cmd: []const u8 = "",
 
     pub fn format(r: Op, w: *Io.Writer) Io.Writer.Error!void {
-        try w.print("pid={d}\nurgent={d}\nserved={d}\ndrain={d}\nsingle={d}\ndriver={d}\ndbusy={d:.3}\nstopped={d}\nproject={s}\nlabel={s}\nweight={d}\nlimit={d}\ntasks={d}\ndone={d}\nfailed={d}\nrunning={d}\nwaiting={d}\ncpus=", .{
-            r.pid,     @intFromBool(r.urgent), @intFromBool(r.served), @intFromBool(r.drain), @intFromBool(r.single), @intFromBool(r.driver), r.dbusy,  @intFromBool(r.stopped),
-            r.project, r.label,                r.weight,               r.limit,               r.tasks,                r.done,                 r.failed, r.running,
-            r.waiting,
+        try w.print("pid={d}\nurgent={d}\nserved={d}\ndrain={d}\nsingle={d}\nwidth={d}\ndriver={d}\ndbusy={d:.3}\nstopped={d}\nproject={s}\nlabel={s}\nweight={d}\nlimit={d}\ntasks={d}\ndone={d}\nfailed={d}\nrunning={d}\nwaiting={d}\ncpus=", .{
+            r.pid,     @intFromBool(r.urgent), @intFromBool(r.served), @intFromBool(r.drain), @intFromBool(r.single), r.width, @intFromBool(r.driver), r.dbusy,   @intFromBool(r.stopped),
+            r.project, r.label,                r.weight,               r.limit,               r.tasks,                r.done,  r.failed,               r.running, r.waiting,
         });
         for (r.cpus, 0..) |cpu, i| try w.print("{s}{d}", .{ if (i == 0) "" else ",", cpu });
         try w.writeAll("\npin=");
         for (r.pin, 0..) |cpu, i| try w.print("{s}{d}", .{ if (i == 0) "" else ",", cpu });
         try w.print("\nnpool={d}\nnoise={d:.3}\nnoisy_top={s}\nlast={d}\narrived={d}\ndstart={d}\nsince={d}\ntlimit={d}\nwhy={s}\nnow=", .{ r.npool, r.noise, r.noisy_top, r.last, r.arrived, r.dstart, r.since, r.tlimit, r.why });
-        for (r.tasks_now, 0..) |t, i| try w.print("{s}{d}:{d}:{d}:{d}:{d}:{d}:{d}:{d}", .{ if (i == 0) "" else ",", t.task, t.attempt, t.pid, t.start, t.since, t.fresh, @intFromBool(t.paused), t.cpu });
+        for (r.tasks_now, 0..) |t, i| {
+            try w.print("{s}{d}:{d}:{d}:{d}:{d}:{d}:{d}:", .{ if (i == 0) "" else ",", t.task, t.attempt, t.pid, t.start, t.since, t.fresh, @intFromBool(t.paused) });
+            for (t.cpus, 0..) |cpu, k| try w.print("{s}{d}", .{ if (k == 0) "" else "+", cpu });
+        }
         try w.writeAll("\ncmd=");
         // The command is for people reading status: its first 1,000 bytes are plenty.
         for (r.cmd[0..@min(r.cmd.len, 1000)]) |ch| try w.writeByte(if (ch == '\n' or ch == '\t') ' ' else ch);
@@ -550,6 +554,7 @@ pub const Op = struct {
             if (eq(k, "served")) r.served = eq(v, "1");
             if (eq(k, "drain")) r.drain = eq(v, "1");
             if (eq(k, "single")) r.single = eq(v, "1");
+            if (eq(k, "width")) r.width = @max(1, n);
             if (eq(k, "driver")) r.driver = eq(v, "1");
             if (eq(k, "dbusy")) r.dbusy = std.fmt.parseFloat(f64, v) catch 0;
             if (eq(k, "stopped")) r.stopped = eq(v, "1");
@@ -586,6 +591,11 @@ pub const Op = struct {
         return n;
     }
 
+    /// The tokens its tasks hold: `width` each.
+    pub fn held(r: Op) u32 {
+        return r.running * r.width;
+    }
+
     /// Whether it counts in the line: a run, not a drain, whose cpuq isn't stopped.
     pub fn counts(r: Op) bool {
         return !r.drain and !r.stopped;
@@ -609,9 +619,17 @@ fn parseTasks(a: std.mem.Allocator, v: []const u8) []const TaskNow {
             .since = std.fmt.parseInt(i64, f.next() orelse continue, 10) catch continue,
             .fresh = std.fmt.parseInt(i64, f.next() orelse continue, 10) catch continue,
             .paused = eq(f.next() orelse "0", "1"),
-            .cpu = std.fmt.parseInt(u32, f.next() orelse "0", 10) catch 0,
+            .cpus = parseCpus(a, f.next() orelse ""),
         }) catch break;
     }
+    return out.items;
+}
+
+/// A task's CPUs as its record writes them: "41+89".
+fn parseCpus(a: std.mem.Allocator, v: []const u8) []const u32 {
+    var out: std.ArrayList(u32) = .empty;
+    var it = std.mem.tokenizeScalar(u8, v, '+');
+    while (it.next()) |x| out.append(a, std.fmt.parseInt(u32, x, 10) catch continue) catch break;
     return out.items;
 }
 
@@ -643,18 +661,21 @@ pub fn isolated(a: std.mem.Allocator, ops: []const Op, now_ms: i64) []const u32 
 
 // --- Tokens ---------------------------------------------------------------------------------
 
-/// Whether task `t` of run `o` holds a token: a running task of a run, not stopped by cpuq. A
+/// Whether task `t` of run `o` holds tokens: a running task of a run, not stopped by cpuq. A
 /// drain's command holds none of its own: the drain holds its CPUs' tokens.
 fn holds(o: Op, t: TaskNow) bool {
     return !o.drain and !t.paused;
 }
 
-/// Tokens held: one per task running, and each isolating drain's (`npool`).
+/// Tokens held: each task's (its run's `width`: the CPUs it holds), and each isolating drain's
+/// (`npool`).
 pub fn heldCount(ops: []const Op, now_ms: i64) u32 {
     var n: u32 = 0;
     for (ops) |o| {
         if (isolating(o, now_ms)) n += o.npool;
-        for (o.tasks_now) |t| n += @intFromBool(holds(o, t));
+        for (o.tasks_now) |t| if (holds(o, t)) {
+            n += @max(1, @as(u32, @intCast(t.cpus.len)));
+        };
     }
     return n;
 }
@@ -664,7 +685,7 @@ pub fn heldCpus(a: std.mem.Allocator, ops: []const Op, now_ms: i64) []const u32 
     var out: std.ArrayList(u32) = .empty;
     out.appendSlice(a, isolated(a, ops, now_ms)) catch {};
     for (ops) |o| for (o.tasks_now) |t| if (holds(o, t)) {
-        out.append(a, t.cpu) catch break;
+        out.appendSlice(a, t.cpus) catch break;
     };
     return out.items;
 }
@@ -680,6 +701,65 @@ pub fn freeCpu(a: std.mem.Allocator, toks: []const u32, ops: []const Op, now_ms:
     const held = heldCpus(a, ops, now_ms);
     for (toks) |cpu| if (std.mem.findScalar(u32, held, cpu) == null) return cpu;
     return null;
+}
+
+/// The CPUs a task of `k` tokens takes, all free: one, the first free token (`freeCpu`); more,
+/// whole free cores when `k` is a multiple of the cores' width (two threads each: `k` = 2 takes a
+/// sibling pair), searched from the tokens' end (where tasks of one token reach last); else (or
+/// when no whole cores enough are free) the free tokens packed into the fewest cores. Null when
+/// fewer than `k` are free.
+pub fn freeCpus(a: std.mem.Allocator, toks: []const u32, ops: []const Op, now_ms: i64, k: u32, topo: []const @import("cpus.zig").Core) ?[]const u32 {
+    const held = heldCpus(a, ops, now_ms);
+    var free: std.ArrayList(u32) = .empty;
+    for (toks) |cpu| if (std.mem.findScalar(u32, held, cpu) == null) free.append(a, cpu) catch return null;
+    if (free.items.len < k) return null;
+    if (k == 1) return free.items[0..1];
+    // The free tokens by core, from the tokens' end: each core's free threads.
+    const Group = struct { cpus: []const u32, whole: bool };
+    var groups: std.ArrayList(Group) = .empty;
+    var seen: std.ArrayList(u32) = .empty;
+    var width: usize = 1;
+    var i = free.items.len;
+    while (i > 0) : (i -= 1) {
+        const c = free.items[i - 1];
+        if (std.mem.findScalar(u32, seen.items, c) != null) continue;
+        var g: std.ArrayList(u32) = .empty;
+        g.append(a, c) catch return null;
+        seen.append(a, c) catch return null;
+        const sibs = siblingsOf(topo, c);
+        width = @max(width, sibs.len + 1);
+        var whole = true;
+        for (sibs) |sib| {
+            if (std.mem.findScalar(u32, free.items, sib) != null) {
+                g.append(a, sib) catch return null;
+                seen.append(a, sib) catch return null;
+            } else whole = false;
+        }
+        std.mem.sort(u32, g.items, {}, std.sort.asc(u32));
+        groups.append(a, .{ .cpus = g.items, .whole = whole }) catch return null;
+    }
+    var out: std.ArrayList(u32) = .empty;
+    if (width > 1 and k % width == 0) {
+        for (groups.items) |g| if (g.whole and g.cpus.len == width and out.items.len < k) {
+            out.appendSlice(a, g.cpus) catch return null;
+        };
+        if (out.items.len == k) {
+            std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
+            return out.items;
+        }
+        out.clearRetainingCapacity();
+    }
+    // The fewest cores: the cores with the most free threads first, from the tokens' end.
+    std.mem.sort(Group, groups.items, {}, struct {
+        fn more(_: void, x: Group, y: Group) bool {
+            return x.cpus.len > y.cpus.len;
+        }
+    }.more);
+    for (groups.items) |g| for (g.cpus) |c| if (out.items.len < k) {
+        out.append(a, c) catch return null;
+    };
+    std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
+    return out.items;
 }
 
 pub const DrainWait = enum {
@@ -803,7 +883,8 @@ pub const Cx = struct {
 pub const Wait = enum {
     /// It takes a token and starts a task now.
     go,
-    /// No token is free.
+    /// No token is free; for a run of -j K first in line, fewer than K: freed tokens wait for it
+    /// (at most K − 1 idle, only while it heads the line).
     full,
     /// Another run is first in line for the next free token.
     behind,
@@ -829,7 +910,7 @@ fn projects(a: std.mem.Allocator, ops: []const Op) std.StringArrayHashMapUnmanag
         if (!o.counts() or (o.running == 0 and o.waiting == 0 and !computes)) continue;
         const gop = m.getOrPut(a, o.project) catch continue;
         if (!gop.found_existing) gop.value_ptr.* = .{ .weight = o.weight };
-        gop.value_ptr.running += o.running;
+        gop.value_ptr.running += o.held();
         if (computes) gop.value_ptr.extra += o.dbusy;
         gop.value_ptr.weight = @max(gop.value_ptr.weight, o.weight);
     }
@@ -878,7 +959,7 @@ fn urgentFirst(o: Op) bool {
 /// the older ticket.
 fn pbefore(x: Op, y: Op) bool {
     if (urgentFirst(x) != urgentFirst(y)) return urgentFirst(x);
-    if (x.running != y.running) return x.running < y.running;
+    if (x.held() != y.held()) return x.held() < y.held();
     if (turn(x) != turn(y)) return turn(x) < turn(y);
     return x.ticket < y.ticket;
 }
@@ -896,7 +977,7 @@ fn lineBefore(m: std.StringArrayHashMapUnmanaged(Proj), t: u32, x: Op, y: Op) bo
     const lx = loadOf(px) * @as(f64, @floatFromInt(py.weight));
     const ly = loadOf(py) * @as(f64, @floatFromInt(px.weight));
     if (lx != ly) return lx < ly;
-    if (x.running != y.running) return x.running < y.running;
+    if (x.held() != y.held()) return x.held() < y.held();
     return x.ticket < y.ticket;
 }
 
@@ -949,17 +1030,20 @@ pub fn lineOrder(a: std.mem.Allocator, ops: []const Op, t: u32) []const u64 {
     return out.items;
 }
 
-/// Whether run `me` may take a token and start (or continue) one more task now. The caller has
-/// checked the gates and its -c (`waiting` > 0). Every free token goes to the first in line
-/// (`lineFirst`), so no two runs race for one.
+/// Whether run `me` may take its tokens (its `width`, all at once) and start (or continue) one
+/// more task now. The caller has checked the gates and its -c (`waiting` > 0). Every free token
+/// goes to the first in line (`lineFirst`), so no two runs race for one; a run of -j K first in
+/// line with fewer than K free holds up those behind it, so the tokens freed wait for it.
 pub fn mayStart(a: std.mem.Allocator, ops: []const Op, me: u64, cx: Cx) Wait {
     const o = for (ops) |o| {
         if (o.ticket == me) break o;
     } else return .idle;
     if (!waits(o)) return .idle;
-    if (freeTokens(ops, cx.n, cx.held_back, cx.now_ms) == 0) return .full;
+    const free = freeTokens(ops, cx.n, cx.held_back, cx.now_ms);
+    if (free == 0) return .full;
     if (projectFirst(ops, o.project) != me) return .project;
     if (lineFirst(a, ops, cx.n) != me) return .behind;
+    if (free < o.width) return .full;
     return .go;
 }
 
@@ -1013,7 +1097,7 @@ test "an op record round trip" {
     defer arena.deinit();
     var buf: [2048]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
-    const now = [_]TaskNow{.{ .task = 17, .attempt = 2, .pid = 4242, .start = 99, .since = 1700000000, .fresh = 12345, .paused = true, .cpu = 5 }};
+    const now = [_]TaskNow{.{ .task = 17, .attempt = 2, .pid = 4242, .start = 99, .since = 1700000000, .fresh = 12345, .paused = true, .cpus = &.{ 5, 53 } }};
     const r: Op = .{ .tasks_now = &now, .pid = 7, .project = "rig", .label = "rig:test", .weight = 2, .waiting = 3, .cpus = &.{ 4, 9 }, .pin = &.{4}, .npool = 2, .noise = 0.25, .noisy_top = "dd (77)", .dstart = 77, .arrived = 66, .limit = 8, .tasks = 100, .done = 5, .single = true, .cmd = "a\tb\nc" };
     try r.format(&w);
     const p = Op.parse(arena.allocator(), w.buffered());
@@ -1034,7 +1118,7 @@ test "an op record round trip" {
     try std.testing.expectEqual(99, p.tasks_now[0].start);
     try std.testing.expectEqual(12345, p.tasks_now[0].fresh);
     try std.testing.expect(p.tasks_now[0].paused);
-    try std.testing.expectEqual(5, p.tasks_now[0].cpu);
+    try std.testing.expectEqualSlices(u32, &.{ 5, 53 }, p.tasks_now[0].cpus);
     try std.testing.expectEqual(1, p.paused());
 }
 
@@ -1055,8 +1139,69 @@ test "a sample round trip" {
 /// Tasks running on `cpus`, one each (pids from 100), for tests.
 fn on(a: std.mem.Allocator, cpus: []const u32) []TaskNow {
     const out = a.alloc(TaskNow, cpus.len) catch unreachable;
-    for (out, cpus, 0..) |*t, cpu, i| t.* = .{ .task = @intCast(i + 1), .pid = @intCast(100 + cpu), .start = 1, .since = 1, .cpu = cpu };
+    for (out, cpus, 0..) |*t, cpu, i| t.* = .{ .task = @intCast(i + 1), .pid = @intCast(100 + cpu), .start = 1, .since = 1, .cpus = a.dupe(u32, &.{cpu}) catch unreachable };
     return out;
+}
+
+test "wide tasks: K tokens all at once, the line held for one at its head, whole cores" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // N = 3. a holds 2 tokens (CPUs 0, 1); w (-j 2) waits first in line, older than b (-j 1).
+    // One token is free: w may not take part of its 2, and b, behind it, may not take the one:
+    // it stays idle (K − 1 = 1) while w heads the line.
+    var ops = [_]Op{
+        .{ .ticket = 1, .project = "a", .running = 2, .tasks = 9, .tasks_now = on(a, &.{ 0, 1 }) },
+        .{ .ticket = 2, .project = "w", .width = 2, .waiting = 1 },
+        .{ .ticket = 3, .project = "b", .waiting = 1 },
+    };
+    const cx: Cx = .{ .n = 3, .now_ms = 1 };
+    try std.testing.expectEqual(1, freeTokens(&ops, 3, 0, 1));
+    try std.testing.expectEqual(2, lineFirst(a, &ops, 3).?);
+    try std.testing.expectEqual(Wait.full, mayStart(a, &ops, 2, cx));
+    try std.testing.expectEqual(Wait.behind, mayStart(a, &ops, 3, cx));
+    // a's task on CPU 1 ends: 2 free; w takes both at once.
+    ops[0].running = 1;
+    ops[0].tasks_now = on(a, &.{0});
+    try std.testing.expectEqual(Wait.go, mayStart(a, &ops, 2, cx));
+    const got = freeCpus(a, &.{ 0, 1, 2 }, &ops, 1, 2, &.{}).?;
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, got);
+    // Holding them, w's task counts 2 tokens, and 2 toward its project's load.
+    ops[1].running = 1;
+    ops[1].waiting = 0;
+    ops[1].tasks_now = &.{.{ .task = 1, .pid = 200, .start = 1, .since = 1, .cpus = got }};
+    try std.testing.expectEqual(3, heldCount(&ops, 1));
+    try std.testing.expectEqual(Wait.full, mayStart(a, &ops, 3, cx));
+    try std.testing.expectEqual(2, ops[1].held());
+}
+
+test "wide tasks: whole free cores from the tokens' end, else the fewest cores" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Core = @import("cpus.zig").Core;
+    // 4 cores of 2 threads: 0+4, 1+5, 2+6, 3+7; tokens in the pool's order.
+    const topo = [_]Core{
+        .{ .cpu = 0, .siblings = &.{4} }, .{ .cpu = 1, .siblings = &.{5} }, .{ .cpu = 2, .siblings = &.{6} }, .{ .cpu = 3, .siblings = &.{7} },
+        .{ .cpu = 4, .siblings = &.{0} }, .{ .cpu = 5, .siblings = &.{1} }, .{ .cpu = 6, .siblings = &.{2} }, .{ .cpu = 7, .siblings = &.{3} },
+    };
+    const toks = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    // Tasks of one token on 0 and 1: -j 2 takes a whole free core, from the end: 3 and 7.
+    const busy = [_]Op{.{ .ticket = 1, .project = "a", .running = 2, .tasks_now = on(a, &.{ 0, 1 }) }};
+    try std.testing.expectEqualSlices(u32, &.{ 3, 7 }, freeCpus(a, &toks, &busy, 1, 2, &topo).?);
+    // -j 4: two whole cores.
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3, 6, 7 }, freeCpus(a, &toks, &busy, 1, 4, &topo).?);
+    // -j 3 (no multiple of 2): the fewest cores, whole ones first.
+    const three = freeCpus(a, &toks, &busy, 1, 3, &topo).?;
+    try std.testing.expectEqual(3, three.len);
+    // Every core split (0-3 busy): no whole core; -j 2 packs what is free.
+    const split = [_]Op{.{ .ticket = 1, .project = "a", .running = 4, .tasks_now = on(a, &.{ 0, 1, 2, 3 }) }};
+    try std.testing.expectEqual(2, freeCpus(a, &toks, &split, 1, 2, &topo).?.len);
+    // Fewer free than K: none.
+    const full = [_]Op{.{ .ticket = 1, .project = "a", .running = 7, .tasks_now = on(a, &.{ 0, 1, 2, 3, 4, 5, 6 }) }};
+    try std.testing.expectEqual(null, freeCpus(a, &toks, &full, 1, 2, &topo));
+    // No SMT (macOS): the first free tokens from the end.
+    try std.testing.expectEqual(2, freeCpus(a, &toks, &busy, 1, 2, &.{}).?.len);
 }
 
 test "tokens: at most N run, and a freed token goes to the first in line" {

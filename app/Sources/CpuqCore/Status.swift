@@ -132,7 +132,7 @@ public struct Status: Decodable, Sendable, Equatable {
         /// The CPUs whose tokens its tasks hold (a paused task holds none), and a drain's CPUs
         /// its command runs on.
         public var heldCPUs: [Int] {
-            Array(Set(runningTasks.filter { !$0.paused }.map(\.cpu) + (drain ? pin : []))).sorted()
+            Array(Set(runningTasks.filter { !$0.paused }.flatMap(\.cpus) + (drain ? pin : []))).sorted()
         }
     }
 
@@ -144,7 +144,9 @@ public struct Status: Decodable, Sendable, Equatable {
         public var pid = 0
         public var since = 0
         public var paused = false
+        /// The first CPU whose token it holds, and all of them (its run's -j K).
         public var cpu = 0
+        public var cpus: [Int] = []
     }
 
     /// A job's own count: `DONE TOTAL FAILING`.
@@ -385,7 +387,7 @@ extension Status.Run {
 }
 
 extension Status.Task {
-    private enum Keys: String, CodingKey { case task, attempt, pid, since, paused, cpu }
+    private enum Keys: String, CodingKey { case task, attempt, pid, since, paused, cpu, cpus }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         task = try c.decodeIfPresent(Int.self, forKey: .task) ?? 0
@@ -394,6 +396,8 @@ extension Status.Task {
         since = try c.decodeIfPresent(Int.self, forKey: .since) ?? 0
         paused = try c.decodeIfPresent(Bool.self, forKey: .paused) ?? false
         cpu = try c.decodeIfPresent(Int.self, forKey: .cpu) ?? 0
+        // A task of -j K holds K CPUs; `cpu` is the first.
+        cpus = try c.decodeIfPresent([Int].self, forKey: .cpus) ?? [cpu]
     }
 }
 

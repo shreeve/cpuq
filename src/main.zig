@@ -78,6 +78,8 @@ const usage =
     \\first:
     \\  -n M                  M tasks; each gets CPUQ_TASK (1..M) and CPUQ_TASKS, and its
     \\                        output goes to a file of its own
+    \\  -j K                  each task holds K tokens at once, pinned to K CPUs on Linux
+    \\                        (whole cores when it can; $CPUQ_CPUS lists them); at most drain_max
     \\  -c C | -c P%          run at most C tasks at once, or P% of the tokens (default: as the
     \\                        line allows)
     \\  -t T                  each task's time limit, wall time (30s, 10m, 2h; config
