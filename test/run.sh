@@ -87,7 +87,8 @@ setup() {
   unset CPUQ_CPU CPUQ_OP CPUQ_SCOPE CPUQ_TASK CPUQ_TASKS CPUQ_ATTEMPT CPUQ_ATTEMPTS CPUQ_PROGRESS \
     CPUQ_PROGRESS_AT CPUQ_LEASES CPUQ_TOKEN CPUQ_CORES CPUQ_HISTORY MAKEFLAGS XDG_STATE_HOME
   # Each key at most once: a line given here replaces the default for its key. `tokens = N` is
-  # the suite's own: the reserve that leaves N tokens of the pool (all of it when it has fewer).
+  # the suite's own: the pool's first N CPUs as the pool (all of it when it has fewer), no reserve,
+  # so no test depends on the machine's size.
   local line keys=" " toks=2 lines=()
   for line in "$@"; do
     case $line in "tokens = "*) toks=${line#tokens = } ;; *) keys="$keys${line%% *} "; lines+=("$line") ;; esac
@@ -100,10 +101,11 @@ setup() {
   } >"$T/config.base"
   case $keys in
     *" reserve "*) cp "$T/config.base" "$CPUQ_CONFIG" ;;
+    *" cpus "*) { cat "$T/config.base"; echo "reserve = 0"; } >"$CPUQ_CONFIG" ;;
     *)
       { cat "$T/config.base"; echo "reserve = 0"; } >"$CPUQ_CONFIG"
-      local pool; pool=$("$CPUQ" reserve | cut -d' ' -f1)
-      { cat "$T/config.base"; echo "reserve = $(( pool > toks ? pool - toks : 0 ))"; } >"$CPUQ_CONFIG" ;;
+      local first; first=$("$CPUQ" status --json --no-usage | python3 -c 'import json, sys; print(",".join(map(str, json.load(sys.stdin)["pool"][:int(sys.argv[1])])))' "$toks")
+      { cat "$T/config.base"; echo "reserve = 0"; echo "cpus = $first"; } >"$CPUQ_CONFIG" ;;
   esac
   cd "$T" || exit 2
   echo "== $CUR"
@@ -123,6 +125,8 @@ waiting() { sj 'len(s["waiters"])'; }
 # The pool's CPUs, and its tokens' CPUs, by the machine's numbers, space-separated.
 poolcpus() { sj '" ".join(map(str, s["pool"]))'; }
 tokcpus() { sj '" ".join(map(str, s["token_cpus"]))'; }
+# tokcores: how many cores the tokens' CPUs are on (Linux: by thread_siblings_list; else each CPU).
+tokcores() { sj 'len({open("/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list" % c).read().strip() if __import__("os").path.exists("/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list" % c) else str(c) for c in s["token_cpus"]})'; }
 now() { python3 -c 'import time; print("%.3f" % time.time())'; }
 since() { python3 -c "import time; print('%.2f' % (time.time() - $1))"; }
 # fl EXPR: 0 when the Python expression is true (float comparisons).
@@ -369,22 +373,25 @@ t_share() {
 t_fair() {
   # The fair line: on 2 tokens held by h, a1, a2, a3 and b1 all wait (nothing runs beside h); as
   # tokens free, a1 goes first (the oldest, both projects at 0), then b1 (b under its share, a at
-  # it), then a2 and a3.
+  # it), then a2 and a3. Judged by history's start times: h's two tasks end together, and two runs
+  # started in the same instant may write in either order.
   setup fair
   local f=$T/order n
   "$CPUQ" run -n 2 --label h:x -- "$BURN" -2 --until "$T/go" 2>/dev/null & local h=$!
   wait_running 2
   local k=0
   for n in a1 a2 a3 b1; do
-    "$CPUQ" run --label "${n:0:1}:x" -- sh -c "echo $n >>$f; sleep 0.5" &
+    "$CPUQ" run --label "${n:0:1}:$n" -- sh -c "echo $n >>$f; sleep 0.5" &
     k=$((k + 1)); wait_waiters $k
   done
   sleep 0.5
   local early; early=$(sort "$f" 2>/dev/null | tr '\n' ' ')
   touch "$T/go"
   wait
-  local got; got=$(tr '\n' ' ' <"$f")
-  check "nothing starts beside h's tokens (early: '$early'); then a1, b1 (under its share), a2, a3 (got $got)" "[ -z '$early' ] && [ '$got' = 'a1 b1 a2 a3 ' ]"
+  local got; got=$("$CPUQ" history --json | python3 -c 'import json, sys
+j = [x for x in json.load(sys.stdin) if x["label"][:2] in ("a:", "b:")]
+print(" ".join(x["label"][2:] for x in sorted(j, key=lambda x: (x["started"], x["label"]))))')
+  check "nothing starts beside h's tokens (early: '$early'); then a1, b1 (under its share), a2, a3, by history (got $got)" "[ -z '$early' ] && [[ '$got' == 'a1 b1 a2 a3' || '$got' == 'a1 b1 a3 a2' ]]"
 }
 
 t_order() {
@@ -456,7 +463,7 @@ t_drain() {
   # them at once for its command, and the rest of the machine keeps working; CPUQ_CPUS names them
   # (the last of the tokens). Its -t, its idle stop and --max hold.
   setup drain "tokens = 3"
-  if [ "$(tokcpus | wc -w | tr -d ' ')" -lt 3 ]; then echo "  skipped: needs 3 tokens"; return; fi
+  if [ "$(tokcores)" -lt 3 ]; then echo "  skipped: needs 3 tokens on 3 cores (here $(tokcpus))"; return; fi
   local f=$T/log
   "$CPUQ" run -n 2 --label d:a -- sh -c "echo a\$CPUQ_TASK-start >>$f; \"$BURN\" -2 3; echo a\$CPUQ_TASK-end >>$f" 2>/dev/null & local a=$!
   wait_running 2
@@ -706,7 +713,7 @@ t_drain_part() {
   # pinning its command there, and moves no task: the task stays on its CPU throughout.
   setup drain_part "tokens = 3"
   if [ "$(uname)" != Linux ]; then echo "  skipped: Linux only"; return; fi
-  if [ "$(tokcpus | wc -w | tr -d ' ')" -lt 3 ]; then echo "  skipped: needs 3 tokens"; return; fi
+  if [ "$(tokcores)" -lt 2 ]; then echo "  skipped: needs tokens on 2 cores (here $(tokcpus))"; return; fi
   local list='sed -n "s/^Cpus_allowed_list:[[:space:]]*//p" /proc/self/status'
   "$CPUQ" run -n 1 --label p:watch -- sh -c "while [ ! -e $T/stop ]; do $list >$T/cpu.new; mv $T/cpu.new $T/cpu; sleep 0.05; done" 2>/dev/null & local w=$!
   wait_file "$T/cpu"

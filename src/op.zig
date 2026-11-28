@@ -961,7 +961,7 @@ fn drainStep(r: *Run, a: std.mem.Allocator, ops: []Op, why: []const u8, cx: pool
         return false;
     }
     // Then whole cores whose tokens are all free: every task holds its own CPU's.
-    const order = drainOrder(r.ctx, r.toks, r.o.prefer_fast);
+    const order = drainOrder(r.ctx, r.toks, r.o.prefer_fast, r.topo);
     const pick = pool_mod.pickDrain(a, order, r.topo, pool_mod.heldCpus(a, ops, now), r.limit, r.o.drain_cpus) orelse {
         r.setWhy(if (r.o.drain_cpus.len != 0)
             "waits for the CPUs it names (and their siblings) to be free"
@@ -1397,10 +1397,25 @@ pub const drain_idle_busy: f64 = 0.25;
 
 /// The order a drain takes its CPUs in: fastest first (`--prefer fast`), else from the pool's
 /// end (on a machine with SMT, the second threads, whose cores are whole either way).
-fn drainOrder(ctx: *Ctx, pool_cpus: []const u32, fast: bool) []const u32 {
-    if (fast) return cpus_mod.fastFirst(ctx.io, ctx.arena, pool_cpus);
-    const out = ctx.arena.dupe(u32, pool_cpus) catch return pool_cpus;
+fn drainOrder(ctx: *Ctx, toks: []const u32, fast: bool, topo: []const cpus_mod.Core) []const u32 {
+    if (fast) return cpus_mod.fastFirst(ctx.io, ctx.arena, toks);
+    const out = ctx.arena.dupe(u32, toks) catch return toks;
     std.mem.reverse(u32, out);
+    // The cores holding the fewest tokens first (a core whose twin is in the reserve before one
+    // whose twins are both tokens), so a drain takes as few tokens as its CPUs allow.
+    const Cx = struct { toks: []const u32, topo: []const cpus_mod.Core };
+    std.mem.sort(u32, out, Cx{ .toks = toks, .topo = topo }, struct {
+        fn held(k: Cx, cpu: u32) usize {
+            var n: usize = 1;
+            for (k.topo) |t| if (t.cpu == cpu) for (t.siblings) |s| {
+                n += @intFromBool(std.mem.findScalar(u32, k.toks, s) != null);
+            };
+            return n;
+        }
+        fn less(k: Cx, x: u32, y: u32) bool {
+            return held(k, x) < held(k, y);
+        }
+    }.less);
     return out;
 }
 
@@ -1470,7 +1485,8 @@ pub fn cmdDrain(ctx: *Ctx, args: []const [:0]const u8) u8 {
     o.cpus_percent = false;
     // N whole cores, siblings included, must fit in drain_max (half the tokens by default).
     const room = policy.drainMax(ctx.cfg, @intCast(toks.len));
-    const pick = pool_mod.pickDrain(ctx.arena, drainOrder(ctx, toks, o.prefer_fast), cpus_mod.cores(ctx.io, ctx.arena, pool_cpus), &.{}, o.cpus, o.drain_cpus) orelse
+    const topo = cpus_mod.cores(ctx.io, ctx.arena, pool_cpus);
+    const pick = pool_mod.pickDrain(ctx.arena, drainOrder(ctx, toks, o.prefer_fast, topo), topo, &.{}, o.cpus, o.drain_cpus) orelse
         return main.usageError("the tokens have too few whole cores for a drain of {d}", .{o.cpus});
     const need = pool_mod.inPool(pick.cpus, toks);
     if (need > room) {
