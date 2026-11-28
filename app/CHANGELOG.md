@@ -3,7 +3,7 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
-## 0.26.0 — unreleased
+## 0.26.0 — 2026-11-27
 
 - **Reads cpuq 0.40's status,** where no task holds a CPU: cpuq bounds how many tasks run and the
   kernel shares the CPUs among them. Needs cpuq 0.40.0 or later; a machine still on cpuq 0.35
