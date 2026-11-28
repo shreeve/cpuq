@@ -677,7 +677,7 @@ fn isAssignment(x: []const u8) bool {
 }
 
 /// A benchmark, named as the hook refuses it outside cpuq: `hyperfine`, `cargo bench`, `zig build
-/// bench`, or a script with "bench" in its path run by node, bun, deno or python; else null.
+/// bench`, or a script with "bench" in its name run by node, bun, deno or python; else null.
 fn benchName(a: std.mem.Allocator, w: []const []const u8) ?[]const u8 {
     const prog = std.fs.path.basename(w[0]);
     for (w[1..]) |x| for ([_][]const u8{ "--help", "-h", "--version" }) |q| if (std.mem.eql(u8, x, q)) return null;
@@ -698,7 +698,8 @@ fn benchName(a: std.mem.Allocator, w: []const []const u8) ?[]const u8 {
     for (w[1..]) |x| {
         if (x.len == 0 or x[0] == '-') continue;
         if (std.mem.eql(u8, x, "run") and !isPython(prog) and !std.mem.eql(u8, prog, "node")) continue;
-        if (std.mem.indexOf(u8, x, "bench") == null) return null;
+        // The script's own name, not its folder: tools/bench/score only reads results.
+        if (std.mem.indexOf(u8, std.fs.path.basename(x), "bench") == null) return null;
         return a.print("{s} {s}", .{ prog, x }) catch prog;
     }
     return null;
@@ -1189,9 +1190,9 @@ test "a benchmark outside cpuq is refused, with a drain to time it in" {
     try std.testing.expect(std.mem.startsWith(u8, r.reason, "`hyperfine` is a benchmark run outside cpuq"));
     try std.testing.expect(std.mem.startsWith(u8, r.instead, "cpuq drain -c 1 -t 20m --label "));
     try std.testing.expect(std.mem.endsWith(u8, r.instead, ":bench -- hyperfine \"zig-out/bin/app x\" (-c as many CPUs as it times on; -t about ten times its run)"));
-    for ([_][]const u8{ "cargo bench", "cargo +nightly bench --bench x", "zig build bench -Doptimize=fast", "node scripts/bench.mjs", "bun run bench/render.ts", "python3 tools/microbench.py -n 3", "deno run -A bench.ts" }) |cmd|
+    for ([_][]const u8{ "cargo bench", "cargo +nightly bench --bench x", "zig build bench -Doptimize=fast", "node scripts/bench.mjs", "bun run bench/render-bench.ts", "python3 tools/microbench.py -n 3", "deno run -A bench.ts" }) |cmd|
         try std.testing.expect(refused(cmd));
-    for ([_][]const u8{ "node scripts/build.mjs", "python3 -m benchmark_lib --help", "hyperfine --version", "cpuq drain -c 1 -t 20m -- hyperfine x", "zig build test" }) |cmd| {
+    for ([_][]const u8{ "node scripts/build.mjs", "python3 -m benchmark_lib --help", "hyperfine --version", "cpuq drain -c 1 -t 20m -- hyperfine x", "zig build test", "python3 tools/bench/score x.runs", "python3 tools/bench/race-score x.runs" }) |cmd| {
         const got = refusal(a, cmd);
         try std.testing.expect(!std.mem.startsWith(u8, got.reason, "`hyperfine`") and std.mem.indexOf(u8, got.reason, "benchmark") == null);
     }

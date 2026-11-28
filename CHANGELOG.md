@@ -2,6 +2,12 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.40.2 — 2026-11-27
+
+- **The hook judges a script by its own name.** A script run by node, bun, deno or python is a
+  benchmark when its name holds "bench", not its folder: Trig's `tools/bench/score`, which only
+  reads a results file, was refused.
+
 ## 0.40.1 — 2026-11-27
 
 - **A run from a cleaned environment runs.** On Linux, a run started without `XDG_RUNTIME_DIR`
