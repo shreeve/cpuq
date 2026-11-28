@@ -16,7 +16,14 @@ cd formal && cpuq run --label cpuq:lean -- lake build
 
 `lake build` checks every proof and runs every search in `Checks.lean` (the searches take about
 a minute and a half; a clean build checks the proofs first, several minutes more). Every warning is an error. A search whose result changes
-fails the build.
+fails the build. The certificates (`CpuqModel/Certs/`) are checked by the kernel, which takes
+about six minutes more (one to two minutes each, up to 3 GB; they check one at a time). After a change to the model or the rules, write them again:
+
+```bash
+cd formal && cpuq run --label cpuq:lean -t 20m -- lake env lean --run scripts/GenCerts.lean
+```
+
+It fails if a ranking no longer exists (a weakly fair run that starves, the search's `L3 fair`).
 
 ## Layout
 
@@ -34,6 +41,11 @@ fails the build.
 | `CpuqModel/Line.lean` | Every holder has been served; a head holding nothing is never blocked |
 | `CpuqModel/Backfill.lean` | Backfill: the rules' arithmetic in real time (the shadow never grows), the window closes, a gathering drain is served, no CPU runs two operations |
 | `CpuqModel/DrainCap.lean` | A drain's time limit: under 0.32.0 nothing bounds a drain's run; with the limit it holds CPUs at most limit + grace; FIFO lets no drain pass an older waiter holding nothing |
+| `CpuqModel/Fifo.lean` | How a step changes the tickets; while a waiter holds nothing, a drain that queued after it never takes a CPU ahead of it (every configuration) |
+| `CpuqModel/Cert.lean` | Certificates: the search's graph and a ranking, checked by the kernel; `served_of_cert`, what one proves (the response rule under weak fairness); no action outside `actsAll` is ever enabled |
+| `CpuqModel/CertGen.lean`, `scripts/GenCerts.lean` | Writes the certificates from the search (compiled code; nothing it does is trusted) |
+| `CpuqModel/Certs/*.lean` | The certificates, written by `scripts/GenCerts.lean`, each with the theorems the kernel checks |
+| `CpuqModel/Served.lean` | Waiters and drains served, proved for the configurations certified |
 
 ## The model
 
@@ -137,7 +149,10 @@ No `sorry`. `#print axioms` of `Reach.inv`, `lock_released`, `drain_served`, `Re
 `Timed.ends_by` lists only `propext`, `Classical.choice`, `Quot.sound` (`Reach.servedOk` and
 `Timed.ends_by` not even `Classical.choice`). The same for `hold_bound`, `released_hold_bound`,
 `released_holds_forever`, `code0305_holds_forever`, `code0320_stream_starves`,
-`code0305_stream_starves`, `fifo_no_pass` and `released_fifo_no_pass`.
+`code0305_stream_starves`, `fifo_no_pass` and `released_fifo_no_pass`, and for
+`released_no_younger_pass`, `served_of_cert` and the theorems of `Served.lean` (pinned in
+`Served.lean` by `#print axioms`). The certificates are checked by `decide +kernel`, which adds no
+axiom (no `native_decide`).
 
 **Safety** (`Safety.lean`). `Inv` holds initially and every move keeps it, crashes, kills, stops,
 drains and the pool lock included, for any rules with the three safety switches on (`Safe`:
@@ -226,13 +241,55 @@ starts only if it ends by the shadow, so the shadow never grows and the drain st
 first `S` it had. In the step function time is the window only, and a task may outlast it; that
 over-approximation only widens what the search covers.
 
-**Liveness, searched, not proved.** "Every waiter is eventually served" (L3) for ordinary
+**Liveness for fixed configurations, proved** (`Cert.lean`, `Served.lean`, `CpuqModel/Certs/`).
+The search's `L3 fair` and `D fair` become proofs for the configuration they search. A certificate
+is the search's whole graph over every action that can be enabled (`actsAll`: the search's actions
+and a failing exit for every task; `moveX_acts` shows no other action is ever enabled) and, for a
+waiting condition, a rank and a helpful action of a weakly fair class for each waiting state. The
+kernel checks it (`decide +kernel`): every state's successors under every action are what `moveX`
+gives (`graphOk`, so every reachable state is in the graph: `reach_in`), and every step between
+waiting states lowers the rank, or keeps it, keeps the helpful action enabled and is not of its
+class (`rankOk`). `served_of_cert` proves what that means: in every weakly fair run of `moveX`
+(`RunX.Fair`: `Run.Fair` for `moveX`), the condition never holds forever. This is the standard
+proof rule for a response property under weak fairness; `scripts/GenCerts.lean` writes the
+certificates from the search (`CertGen.lean`), and nothing it does is trusted.
+
+| Statement | Theorem |
+|---|---|
+| A certificate that checks proves the waiting condition never holds forever, in every weakly fair run | `served_of_cert` |
+| No action outside `actsAll` is ever enabled (from a state of the configuration's shape) | `moveX_acts` |
+| 0.34.0, 1 CPU, a one-task run and two `-c 1` drains that come back after each finish (the configuration where 0.31 and 0.32.0 starve the run, `code0320_stream_starves`): the run never waits holding nothing forever | `released_stream_served` |
+| … and each drain never gathers forever | `released_stream_drains_served` |
+| 0.34.0, 1 CPU, a run with endless work and two `--all` drains in a stream: the run and each drain are served | `released_stream_all_served` |
+| 0.34.0, 1 CPU, a `-c 1` drain against one-task runs that come back after each finish: the drain starts, and each run is served | `released_waiter_stream_served` |
+| 0.34.0, no drain, 2 CPUs, Finding 7's configuration (an urgent operation with endless work; 0.30.2 starves P's second operation there): no operation waits holding nothing forever (L3 without drains, for this configuration) | `released_urgent_holds_served` |
+
+The certificates are the searches' graphs over `actsAll`, so they cover more runs than the pinned
+searches (a task of an operation without `-r` may also fail): 3788, 2686, 3314 and 3683 states.
+Under 0.32.0 the stream configuration has no ranking for the run (`CertGen` finds the weakly fair
+run that starves it, as `code0320_stream_starves` proves), and under 0.30.2 Finding 7's has none for
+P's second operation.
+
+**Drains that queued after a waiter never pass it, proved in general** (`Fifo.lean`). While a
+waiter `w` (no drain) waits holding nothing, the tickets keep their order around it: an arrival
+queues behind it, a give-back moves only the one giving back to the back, a finished drain of a
+stream leaves the line and comes back behind it (`moveX_order`, `behind_step`, `behind_run`). With
+`fifo_no_pass`: at any time while `w` waits holding nothing, a free CPU goes to a drain only while
+some drain that held a ticket ahead of `w`'s when `w` started waiting gathers
+(`released_no_younger_pass`), for every configuration. A stream of drains that come back after `w`
+queued never takes a CPU ahead of it on its own. This is not liveness: it says nothing of the
+drains that queued before `w` (finitely many, each bounded once its command starts by
+`released_hold_bound`, but not proved to start), or of the line's own order among waiters (L3).
+
+**Liveness, searched, not proved in general.** "Every waiter is eventually served" (L3) for ordinary
 waiters is checked by the search, in two forms, for every scenario: `L3 never` (no state from
 which no run serves a waiter that holds nothing) and `L3 fair` (no weakly fair run, with no more
 crashes, kills or Ctrl-Z, that never serves one). The search finds counterexamples to FINAL-PLAN
 (Findings 1 and 2) and to the code (Findings 4, 5, 7 and 10). On `released` every scenario
 passes. For each `cpuq drain`, the search checks the same two forms over the states where it
-gathers, whatever it holds: `D never` and `D fair`.
+gathers, whatever it holds: `D never` and `D fair`. `L3 fair` and `D fair` are proved for the
+configurations certified (above); for every other scenario they are searched, and for
+configurations past the search's sizes nothing is proved.
 
 **L3 for ordinary waiters: what is proved, and what is left.** Up to 0.30.2, L3 was false for
 the code (Finding 7). The proof of `zero_head_unblocked` shows what `urgentOnce` changes: a
@@ -242,7 +299,9 @@ the head's project holds nothing. Such a giver always exists once every CPU is a
 emptied, and `giverOf` then picks one. So the line never stalls with a waiter holding nothing at
 its head and nothing under way for it.
 
-What a proof of L3 still needs, under `released` with no drain living, no Ctrl-Z and no
+L3 for `released` with no drain is proved for one configuration, Finding 7's
+(`released_urgent_holds_served`, by certificate), and searched for the others. What a proof of L3
+for every configuration still needs, under `released` with no drain living, no Ctrl-Z and no
 `cpuq kill`, from a time after which no operation arrives or crashes:
 
 1. The head is served. If `h` is the head and holds nothing at every step from some time on,
@@ -268,6 +327,12 @@ not bound it as it stands: a head that holds nothing may take a CPU from any hol
 whatever the shares, so a drain for it is not always a share-clause transfer, and Φ can rise.
 A measure for item 2 must use what `giverOf` picks (the giver whose project holds the most for
 its weight) and the ticket order among holders of nothing together.
+
+With drains, a general proof needs these and two more pieces: that a drain that queued before
+`w` starts (`drain_served` covers the rules up to 0.32.0; under 0.34.0 it is proved only by
+certificate), and that each finishes in bounded time once started (`released_hold_bound`); a drain
+that queued after `w` never passes it (`released_no_younger_pass`). A certificate does not help
+past the search's sizes: the kernel checks one in minutes and gigabytes for a few thousand states.
 
 The timed bound (L4) is not done.
 
@@ -500,9 +565,14 @@ CPU, and a drain that takes its turn behind older runs that have yet to start a 
 passed by every later drain (`L3 fair`, "drain stream, 2087ebe"). Fix (0.34.0, `drainFifo`): no
 drain passes an older waiter that holds nothing, the CPU it takes runs a task first, and its
 give-back renews its ticket, so after its turn it queues behind the drains that came meanwhile.
-Proved: the hand-out never passes such a waiter (`released_fifo_no_pass`) and each drain's hold is
-bounded (`released_hold_bound`). Searched: every scenario passes on `released`, streams of `--all`
-and `-c N` drains against one-task and endless-work waiters included, and a drain is served
-against a stream of new runs ("waiter stream": `D never`, `D fair`). Not proved: that the waiter
-is served (L3), or a bound on its wait (the drains older than it, each gather + limit + grace,
-plus the line's own wait), which needs ticket order through the wait and L3's open frame.
+Proved: the hand-out never passes such a waiter (`released_fifo_no_pass`); in every
+configuration, while it waits holding nothing, a drain that queued after it never takes a CPU
+ahead of it (`released_no_younger_pass`: ticket order holds through the wait); each drain's hold is
+bounded (`released_hold_bound`); and for the stream configurations certified (1 CPU, `-c 1` and
+`--all` streams against a one-task and an endless-work run, and a `-c 1` drain against a stream of
+new runs) the waiter is served and so is every drain, in every weakly fair run
+(`released_stream_served`, `released_stream_drains_served`, `released_stream_all_served`,
+`released_waiter_stream_served`). Searched only: the larger stream scenarios (2 CPUs, "waiter
+stream" on 2 CPUs). Not proved in general: that the waiter is served (L3) in every configuration,
+or a bound on its wait: the drains that queued before it (finitely many, each bounded once its
+command starts, but not proved to start in general), plus the line's own wait (L3's open frame).
