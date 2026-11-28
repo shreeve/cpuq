@@ -111,15 +111,18 @@ private func progressOnly(_ r: Status.Run) -> Text? {
     }
     if r.driver { return Text(String(format: "driver · its own tree %.1f busy", r.driverBusy)).foregroundStyle(Alive.ink2) }
     if let p = r.progress, p.total > 0 {
-        var t = Text("\(p.done.formatted()) of \(p.total.formatted())").foregroundStyle(Alive.ink)
-        if p.failing > 0 { t = t + Text(" · \(p.failing.formatted()) failing").foregroundStyle(.red) }
+        // Done, then failed always (none failed says so), so "206 of 208" never reads as two lost.
+        var t = Text("\(p.done.formatted()) of \(p.total.formatted()) done").foregroundStyle(Alive.ink)
+        t = t + (p.failing > 0 ? Text(" · \(p.failing.formatted()) failing").foregroundStyle(.red) : Text(" · none failed").foregroundStyle(Alive.ink3))
         if r.tasks > 1, r.running > 0, !r.tail { t = t + Text(" · \(r.running) running").foregroundStyle(Alive.ink2) }
-        if let left = r.left, r.leftFrom == "progress" { t = t + Text(" · ~\(roughly(left)) left").foregroundStyle(Alive.ink2) }
+        // Once only the last tasks run, the quick ones' rate says nothing of them: the tail says
+        // how long they've run instead.
+        if let left = r.left, r.leftFrom == "progress", !r.tail { t = t + Text(" · ~\(roughly(left)) left").foregroundStyle(Alive.ink2) }
         return t
     }
     if r.tasks > 1 {
-        var t = Text("\(r.done + r.failed) of \(r.tasks) tasks").foregroundStyle(Alive.ink)
-        if r.failed > 0 { t = t + Text(" · \(r.failed) failed").foregroundStyle(.red) }
+        var t = Text("\(r.done + r.failed) of \(r.tasks) tasks done").foregroundStyle(Alive.ink)
+        t = t + (r.failed > 0 ? Text(" · \(r.failed) failed").foregroundStyle(.red) : Text(" · none failed").foregroundStyle(Alive.ink3))
         if r.running > 0, !r.tail { t = t + Text(" · \(r.running) running").foregroundStyle(Alive.ink2) }
         return t
     }
@@ -1451,7 +1454,7 @@ struct JobsCard: View {
             Text("JOB").frame(width: 230, alignment: .leading)
             Text("PROGRESS").frame(maxWidth: 362, alignment: .leading)
             Text("").frame(minWidth: 0, maxWidth: .infinity)
-            Text("WEIGHT").frame(width: 56, alignment: .trailing)
+            if showWeights { Text("WEIGHT").frame(width: 56, alignment: .trailing) }
             Text("BUSY · TASKS").frame(width: 100, alignment: .trailing)
             Text("RUNNING").frame(width: 64, alignment: .trailing)
         }
@@ -1501,7 +1504,7 @@ struct JobsCard: View {
             }
             progressText(h).lineLimit(1).truncationMode(.tail)
                 .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading).padding(.leading, 6)
-            weight(h)
+            if showWeights { weight(h) }
             reserved(h)
             Text(duration(Date().timeIntervalSince1970 - Double(h.since))).foregroundStyle(Alive.ink2).frame(width: 64, alignment: .trailing)
         }
@@ -1543,6 +1546,12 @@ struct JobsCard: View {
         .font(.system(size: 12)).monospacedDigit()
         .frame(height: 21)
         .help("Not under cpuq: started by \(o.via.isEmpty ? "an unknown parent" : o.via) (pid \(o.pid)), in \(o.cwd.isEmpty ? "?" : o.cwd)\n\(o.command)\n\nIt takes CPUs cpuq can't see or share; run it with cpuq run.")
+    }
+
+    /// Whether any project here has a weight other than 1 (the config's `weights`): else the column
+    /// says nothing and gives its room to the others.
+    private var showWeights: Bool {
+        (model.status?.runs ?? []).contains { $0.weight != 1 }
     }
 
     /// Its project's weight (the config's `weights`): its share of the machine against the other

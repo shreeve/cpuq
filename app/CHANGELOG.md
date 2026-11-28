@@ -3,6 +3,14 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.27.0 — 2026-11-28
+
+- **A run says what's done and what failed:** "206 of 208 done · none failed", so its last tasks
+  never read as lost. Once only the last tasks run, the row shows how long they've run, and no
+  longer a time left from the quick tasks' rate.
+- **The Weight column shows only when some project's weight isn't 1** (the config's `weights`);
+  otherwise its room goes to the other columns.
+
 ## 0.26.0 — 2026-11-27
 
 - **Reads cpuq 0.40's status,** where no task holds a CPU: cpuq bounds how many tasks run and the
