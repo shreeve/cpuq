@@ -769,7 +769,7 @@ on `drain_max`, on drains, or on other projects' tasks ending. Over share, `r` w
 its project holds tasks: they end, a run of its project that may still go first starts at most
 once more, and then its project, holding nothing, is under share. `StreamCex.lean`: without the
 first or the last assumption, a run waits forever. -/
-theorem run_starts {cfg : Cfg} (ρ : RunS cfg) {n r : Nat} (hr : r < cfg.nr)
+theorem run_starts {cfg : Cfg} (htk : cfg.rules.tokens = false) (ρ : RunS cfg) {n r : Nat} (hr : r < cfg.nr)
     (hh : ((ρ.st n).run r).here = true) (hp : 0 < ((ρ.st n).run r).pend)
     (noNew : ∀ m ≥ n, ∀ b, ρ.mv m = .act (.arrive b) → (cfg.run b).proj ≠ (cfg.run r).proj)
     (ends : ∀ m b, b < cfg.nr → (cfg.run b).proj = (cfg.run r).proj → 0 < ((ρ.st m).run b).running →
@@ -793,24 +793,24 @@ theorem run_starts {cfg : Cfg} (ρ : RunS cfg) {n r : Nat} (hr : r < cfg.nr)
     simp only [eligible, hs.1, Bool.true_and, Bool.and_eq_true, decide_eq_true_eq]
     exact ⟨by omega, by omega⟩
   have hu : under cfg (ρ.st m) r := by
-    unfold under; rw [(hz m hm).1, Nat.zero_mul]
+    unfold under; rw [(hz m hm).1, Nat.zero_mul, shareCap_old htk]
     exact Nat.mul_pos (by omega) (Cfg.w_pos _ _)
   obtain ⟨f, hf, hpf, hff⟩ := first_exists hr hel
   have hc := reachS_start (ρ.reach m) hf
   have huf : under cfg (ρ.st m) f := (under_proj hpf).2 hu
   cases ho : cfg.rules.oneLine
   · simp only [front, Bool.and_eq_true] at hff
-    simp [canStart, hff.1, hff.2, hg, htot, huf, ho] at hc
+    simp [canStart, hff.1, hff.2, hg, htot, huf, ho, htk] at hc
   · obtain ⟨x, hx⟩ := Option.isSome_iff_exists.1 (head2_isSome hr hel)
     obtain ⟨hxn, hxe⟩ := head2_some hx
     have hxu := head2_under hx hf hff huf
     have hc' := reachS_start (ρ.reach m) hxn
     simp only [front, Bool.and_eq_true] at hxe
-    simp [canStart, hxe.1, hxe.2, hg, htot, hxu, ho, hx] at hc'
+    simp [canStart, hxe.1, hxe.2, hg, htot, hxu, ho, hx, htk] at hc'
 
 /-- The backstop condition of `run_starts` from a bound: if fewer than `4 × (pool − drain_max)`
 tasks ever run at once, the backstop never holds a task, and gates open again and again suffice. -/
-theorem run_starts_gates {cfg : Cfg} (ρ : RunS cfg) {n r : Nat} (hr : r < cfg.nr)
+theorem run_starts_gates {cfg : Cfg} (htk : cfg.rules.tokens = false) (ρ : RunS cfg) {n r : Nat} (hr : r < cfg.nr)
     (hh : ((ρ.st n).run r).here = true) (hp : 0 < ((ρ.st n).run r).pend)
     (noNew : ∀ m ≥ n, ∀ b, ρ.mv m = .act (.arrive b) → (cfg.run b).proj ≠ (cfg.run r).proj)
     (ends : ∀ m b, b < cfg.nr → (cfg.run b).proj = (cfg.run r).proj → 0 < ((ρ.st m).run b).running →
@@ -819,7 +819,7 @@ theorem run_starts_gates {cfg : Cfg} (ρ : RunS cfg) {n r : Nat} (hr : r < cfg.n
     (hbound : ∀ m, total cfg (ρ.st m) < 4 * (cfg.pool - cfg.drainMax))
     (gates : ∀ m, ∃ m' ≥ m, (ρ.st m').gate = true) :
     ∃ m ≥ n, ((ρ.st m).run r).pend < ((ρ.st n).run r).pend := by
-  refine run_starts ρ hr hh hp noNew ends htime (fun m => ?_)
+  refine run_starts htk ρ hr hh hp noNew ends htime (fun m => ?_)
   obtain ⟨m', hm', hg⟩ := gates m
   refine ⟨m', hm', hg, ?_⟩
   have := (reachS_inv (ρ.reach m')).1.half
@@ -971,11 +971,20 @@ theorem pass_psi {cfg : Cfg} (hol : cfg.rules.oneLine = true) {u t : St} (p : Pa
         simp only [eligible, hh, Bool.true_and, Bool.and_eq_true, decide_eq_true_eq]
         exact ⟨hp, by omega⟩
       obtain ⟨F, hF, hpF, hfF⟩ := first_exists hr hel
-      have lo := (line_order hs).2.2 hol
-      have hcap : 0 < capT cfg s := by
-        rcases lo.1 with hu | hroom
-        · unfold under at hu; apply Nat.pos_of_ne_zero; intro h; rw [h, Nat.zero_mul] at hu; omega
-        · unfold room at hroom; omega
+      have lo : 0 < shareCap cfg s ∧ ∀ i < cfg.nr, front cfg s i = true → before2 cfg s i x = false := by
+        cases htk : cfg.rules.tokens
+        · have l := (line_order hs).2.2.1 htk hol
+          refine ⟨?_, l.2⟩
+          rcases l.1 with hu | hroom
+          · unfold under at hu; apply Nat.pos_of_ne_zero; intro h; rw [h, Nat.zero_mul] at hu; omega
+          · rw [shareCap_old htk]; unfold room at hroom; omega
+        · have l := (line_order hs).2.2.2 htk
+          refine ⟨?_, l.2⟩
+          rw [shareCap_tok htk]
+          have h1 := l.1
+          have h2 : capTok cfg s ≤ capN cfg s := Nat.sub_le _ _
+          omega
+      have hcap := lo.1
       have huF : under cfg s F := by
         unfold under; rw [hpF, hzs, Nat.zero_mul]; exact Nat.mul_pos hcap (Cfg.w_pos _ _)
       have hFx : before2 cfg s F x = false := lo.2 F hF hfF
@@ -1157,7 +1166,8 @@ theorem run_starts_fixed {cfg : Cfg} (hak : cfg.rules.arrivalKey = true) (hol : 
     (noUrgent : ∀ m ≥ n, ∀ b, ρ.mv m = .act (.arrive b) → (cfg.run b).urgent = false)
     (ends : ∀ m b, b < cfg.nr → 0 < ((ρ.st m).run b).running → ∃ m' ≥ m, finOfM b (ρ.mv m'))
     (htime : ∃ m ≥ n, ρ.mv m = .act .tick)
-    (gates : ∀ m, ∃ m' ≥ m, (ρ.st m').gate = true) :
+    (gates : ∀ m, ∃ m' ≥ m, (ρ.st m').gate = true ∧ (cfg.rules.tokens = true →
+      (ρ.st m').outside ≤ (ρ.st m').reserve ∧ cfg.drainMax < cfg.pool - (ρ.st m').reserve)) :
     ∃ m ≥ n, ((ρ.st m).run r).pend < ((ρ.st n).run r).pend := by
   apply Classical.byContradiction
   intro hno
@@ -1254,11 +1264,14 @@ theorem run_starts_fixed {cfg : Cfg} (hak : cfg.rules.arrivalKey = true) (hol : 
     have e1 := hc5 k (by omega); have e2 := hc5 (k + 1) (by omega)
     omega
   -- at open gates the first in the one line, under share, starts
-  obtain ⟨m, hm, hg⟩ := gates n5
+  obtain ⟨m, hm, hg, htokg⟩ := gates n5
   have hs := W m (by omega)
   have i := (reachS_inv (ρ.reach m)).1
   have htot : total cfg (ρ.st m) = 0 := rsum_eq_zero.2 (fun b hb => tz m hm b hb)
-  have hcap : 0 < capT cfg (ρ.st m) := by have := i.half; unfold capT; omega
+  have hcap : 0 < shareCap cfg (ρ.st m) := by
+    cases htk : cfg.rules.tokens
+    · rw [shareCap_old htk]; have := i.half; unfold capT; omega
+    · rw [shareCap_tok htk]; have := htokg htk; unfold capN; omega
   have hel : eligible (ρ.st m) r = true := by
     have h1 := i.cap r hs.1; have h2 := (hz m (by omega)).2
     simp only [eligible, hs.1, Bool.true_and, Bool.and_eq_true, decide_eq_true_eq]
@@ -1272,9 +1285,15 @@ theorem run_starts_fixed {cfg : Cfg} (hak : cfg.rules.arrivalKey = true) (hol : 
   obtain ⟨hxn, hxe⟩ := head2_some hx
   have hxu := head2_under hx hf hff huf
   have hc := reachS_start (ρ.reach m) hxn
-  have h4 : total cfg (ρ.st m) < 4 * capT cfg (ρ.st m) := by omega
   simp only [front, Bool.and_eq_true] at hxe
-  simp [canStart, hxe.1, hxe.2, hg, h4, hxu, hol, hx] at hc
+  cases htk : cfg.rules.tokens
+  · have hc4 : 0 < capT cfg (ρ.st m) := by rw [← shareCap_old htk]; exact hcap
+    have h4 : total cfg (ρ.st m) < 4 * capT cfg (ρ.st m) := by omega
+    simp [canStart, hxe.1, hxe.2, hg, h4, hxu, hol, hx, htk] at hc
+  · have h5 : used cfg (ρ.st m) + 1 ≤ capTok cfg (ρ.st m) := by
+      have := htokg htk; have := i.half
+      unfold used capTok capN; omega
+    simp [canStart, hxe.1, hxe.2, hg, h5, hx, htk] at hc
 
 /-- info: 'Cpuq.Contest.run_starts_fixed' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs in #print axioms run_starts_fixed

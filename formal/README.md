@@ -48,6 +48,7 @@ It fails if a ranking no longer exists (a weakly fair run that starves, the sear
 | `CpuqModel/Served.lean` | Waiters and drains served, proved for the configurations certified |
 | `CpuqModel/Contest.lean` | 0.40.0, contested CPUs: the admission rules; the five properties proved for every configuration with two rule changes, and the gaps of the design as written as reachable states |
 | `CpuqModel/Stream.lean` | 0.40: runs and drains that leave and arrive again, so arrivals never stop; `run_starts`, no-starvation's strongest true form |
+| `CpuqModel/Token.lean` | 0.42.0, the token pool: properties 1–7 |
 | `CpuqModel/StreamCex.lean` | 0.40: renamed states look alike to the rules (`Sh`); a cycle repeated forever is a run (`cycle_run`); the two infinite runs where a run waits forever while arrivals go on |
 | `CpuqModel/Contest035.lean` | The slot rules before 0.40.0 hold a CPU idle while a task waits (a reachable state of `moveX` under `Rules.released`) |
 
@@ -509,6 +510,37 @@ and in the one line, so a stream of urgent runs passes `r` forever. `same_fixed`
 run the counterexamples' moves on the fixed rules (in `race_fixed`, with `r` arriving last):
 `r` starts. The tickets invariant (present runs' tickets distinct, below `next`) is
 `reachS_tickets`.
+
+### 0.42.0: the token pool (`Token.lean`)
+
+`Rules.tokens` (on in `Rules.tokens042`, with the two fixes) replaces admission by measured busy:
+- `N = pool − reserve` tokens (`capN`); `St.reserve` changes by `cpuq reserve k` (`Act.reserve`,
+  `k < pool`, so at least one token).
+- Tokens handed out: `capTok = N − (outside − reserve)`, the outside gate.
+- `used` = tasks running + started drains' cores.
+- A task starts only on a free token (`used + 1 ≤ capTok`), only as first in the one line (0.41's
+  order; the share is of `N`). There is no 4T backstop and no room.
+- A drain starts on 0.41's turn when its `k` tokens are free (`used + k ≤ capTok`), within
+  `drain_max`, in one step.
+
+Tokens are counted, not named. "No token has two holders" is that the holders never outnumber the
+tokens. Which CPU a task gets, and whole-core placement, are not modelled.
+
+| Design property | Theorem | Status |
+|---|---|---|
+| 1 At most N tokens held | `tok_le_pool` (≤ pool always), `tok_start_within` (every start leaves ≤ `capTok` ≤ N), `tok_within` (kept by every move but a reserve raise or an outside rise), `tok_over_no_start` (above `capTok`, nothing starts) | Proved; "at most N, ever" fails across a reserve raise by design (`reserve_shrinks`) |
+| 2 Work-conserving over tokens | `tok_work_conserving` | Proved |
+| 3 No starvation of runs, endless arrivals | `tok_run_starts` | Proved: no urgent arrivals, tasks end, one tick, and again and again gates open with outside load ≤ reserve and `drain_max` < N |
+| 4 A waiting drain holds no token | `tok_waiting_drain_holds_none` | Proved (by construction: a drain takes its tokens in the step it starts) |
+| 5 A drain's hold ≤ limit + grace | `tok_hold` | Proved |
+| 6 Drains may wait without bound | `drain_waits_forever` | Counterexample: an infinite run, tasks ending, ticks, gates open, runs holding all 3 tokens, the 2-token drain never starts. `--max` bounds it in practice |
+| 7 Changing N keeps 1–5 | `reserve_shrinks` + the above | 2–5 in every reachable state with reserve changes; 3 needs `drain_max` < N at the open-gate times; 1 as above |
+
+Rules shared with 0.40/0.41 now say which they hold for:
+- `no_wait_under`, `work_conserving`, `no_starvation`, `no_starvation_all`, `run_starts` and
+  `run_starts_gates` assume `tokens` off. Their token counterparts are above.
+- `line_order` gains the token case.
+- `run_starts_fixed` covers both, its gates hypothesis carrying the token condition.
 
 Not proved with arrivals that never stop: a waiting drain starts. A drain waits for older drains,
 the `drainMax` bound and (`drainFifo`) older runs that hold nothing; the first two are finitely many
