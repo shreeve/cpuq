@@ -72,9 +72,12 @@ The pool's CPUs, and their order, come from src/cpus.zig, which every cpuq on th
 out the same way: the config's `cpus` list; else on Linux the CPUs online, less those in
 `/sys/devices/system/cpu/isolated`, within pid 1's `Cpus_allowed_list` (a container's CPU set),
 the lowest thread of each core first, then their siblings; else 0 to the active count less one
-(macOS). The **tokens** are the pool's first N CPUs, N = the pool less `reserve` (config; 2 by
-default; `cpuq reserve N` sets it), at least one (`pool.tokens`). The reserve, the pool's last
-CPUs, is never handed out. `cpuq budget` prints N. A drain takes its CPUs from the tokens' end.
+(macOS). The **reserve** (config `reserve`, 2 by default; `cpuq reserve N` sets it) is never
+handed out: the slowest of the pool's CPUs first (by `cpu_core`, `cpu_capacity`, top clock, the
+inverse of `--prefer fast`), whole cores at a time so no core is split between a token and the
+reserve, among equals from the pool's end (`cpus.reserveOf`). A core that would take it past R is
+taken whole; it splits a core only to leave the last token. The **tokens** are the rest, in the
+pool's order, at least one (`cpus.tokens`). `cpuq budget` prints N. A drain takes its CPUs from the tokens' end.
 
 ## An operation's loop
 

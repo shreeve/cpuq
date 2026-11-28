@@ -1,8 +1,9 @@
 //! The pool: the machine's tokens, and the line that decides which run takes a freed one. A
 //! machine has N tokens, one per CPU of the pool less the reserve (config `reserve`, 2 by
-//! default; at least one token). A task holds one token while it runs, on Linux pinned to that
-//! token's CPU, and gives it back the moment it ends: at most N tasks run at once, ever. A drain
-//! takes the tokens of the whole cores it isolates, all at once, and holds none while it waits.
+//! default: the slowest whole cores, cpus.zig; at least one token). A task holds one token while
+//! it runs, on Linux pinned to that token's CPU, and gives it back the moment it ends: at most N
+//! tasks run at once, ever. A drain takes the tokens of the whole cores it isolates, all at once,
+//! and holds none while it waits.
 //! Everything lives under a versioned folder in the state directory, so a cpuq of another version
 //! never reads these files as its own:
 //!
@@ -642,13 +643,6 @@ pub fn isolated(a: std.mem.Allocator, ops: []const Op, now_ms: i64) []const u32 
 
 // --- Tokens ---------------------------------------------------------------------------------
 
-/// The machine's tokens: the pool's first N CPUs in its order, N = the pool less `reserve`, at
-/// least one. The reserve is the pool's last CPUs, never handed out.
-pub fn tokens(pool: []const u32, reserve: u32) []const u32 {
-    if (pool.len == 0) return pool;
-    return pool[0..@max(1, pool.len -| reserve)];
-}
-
 /// Whether task `t` of run `o` holds a token: a running task of a run, not stopped by cpuq. A
 /// drain's command holds none of its own: the drain holds its CPUs' tokens.
 fn holds(o: Op, t: TaskNow) bool {
@@ -1063,14 +1057,6 @@ fn on(a: std.mem.Allocator, cpus: []const u32) []TaskNow {
     const out = a.alloc(TaskNow, cpus.len) catch unreachable;
     for (out, cpus, 0..) |*t, cpu, i| t.* = .{ .task = @intCast(i + 1), .pid = @intCast(100 + cpu), .start = 1, .since = 1, .cpu = cpu };
     return out;
-}
-
-test "tokens: N is the pool less the reserve, at least one, the reserve its last CPUs" {
-    const pool = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
-    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, tokens(&pool, 2));
-    try std.testing.expectEqual(10, tokens(&pool, 0).len);
-    try std.testing.expectEqualSlices(u32, &.{0}, tokens(&pool, 10));
-    try std.testing.expectEqualSlices(u32, &.{0}, tokens(&pool, 99));
 }
 
 test "tokens: at most N run, and a freed token goes to the first in line" {

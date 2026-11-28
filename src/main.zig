@@ -126,7 +126,7 @@ const usage =
     \\                        of its own; elsewhere its process tree read once a second
     \\  hook                  Claude Code PreToolUse hook: refuses heavy commands
     \\                        outside cpuq or misusing it (exit 2, fix on stderr)
-    \\  reserve               set aside the pool's last N CPUs, never handed out (default 2;
+    \\  reserve               set aside N CPUs, the slowest whole cores, never handed out (default 2;
     \\                        kept in the config, in force at once); alone, print
     \\                        "N tokens, R reserved"; --host HOST on HOST
     \\  budget                print N, the machine's tokens
@@ -240,7 +240,7 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
     if (std.mem.eql(u8, cmd, "clean")) return records.cmdClean(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "reserve")) return @import("op.zig").cmdReserve(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "budget")) {
-        ctx.out.print("{d}\n", .{@import("pool.zig").tokens(poolCpus(ctx), ctx.cfg.reserve).len}) catch {};
+        ctx.out.print("{d}\n", .{cpus.tokens(ctx.io, ctx.arena, poolCpus(ctx), ctx.cfg.reserve).len}) catch {};
         ctx.out.flush() catch {};
         return 0;
     }

@@ -186,9 +186,10 @@ const Run = struct {
     freed: bool = false,
     /// When the next look is due (monotonic ms).
     next_look: i64 = 0,
-    /// The machine's tokens as last seen: the pool's first CPUs less the reserve, which the config
-    /// may change while it runs.
+    /// The machine's tokens as last seen: the pool less the reserve (cpus.tokens), and the reserve
+    /// they were worked out for, which the config may change while it runs.
     toks: []const u32 = &.{},
+    toks_reserve: u32 = 0,
     /// Tasks ended when it last wrote its progress.
     last_progress: u32 = std.math.maxInt(u32),
     /// Its history: the record, when it entered the line, and the most tasks run at once.
@@ -329,7 +330,7 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
     const dir = main.stateDir(ctx);
     const pool = Pool.open(ctx.io, a, dir) catch |err| main.fail("pool {s}/v3: {t}", .{ dir, err });
     const pool_cpus = poolCpus(ctx);
-    const toks = pool_mod.tokens(pool_cpus, ctx.cfg.reserve);
+    const toks = cpus_mod.tokens(ctx.io, a, pool_cpus, ctx.cfg.reserve);
     const ntok: u32 = @intCast(toks.len);
     const single = o.tasks == 0;
     const total: u32 = if (single) 1 else o.tasks;
@@ -348,6 +349,7 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
         .pool = pool,
         .pool_cpus = pool_cpus,
         .toks = toks,
+        .toks_reserve = ctx.cfg.reserve,
         .ncpu = onlineCpus(ctx.io),
         .total = total,
         .single = single,
@@ -807,7 +809,10 @@ fn look(r: *Run) void {
     const a = arena.allocator();
     // A change to the config (the reserve, drain_max) is in force at once.
     main.reloadConfig(r.ctx);
-    r.toks = pool_mod.tokens(r.pool_cpus, r.ctx.cfg.reserve);
+    if (r.ctx.cfg.reserve != r.toks_reserve) {
+        r.toks = cpus_mod.tokens(r.ctx.io, r.a, r.pool_cpus, r.ctx.cfg.reserve);
+        r.toks_reserve = r.ctx.cfg.reserve;
+    }
     // The sample (for the outside-load gate) is renewed outside the pool's lock, by one cpuq at a
     // time.
     if (r.waitingNow() > 0 and r.ctx.cfg.outside_check) {
@@ -1472,7 +1477,7 @@ pub fn cmdDrain(ctx: *Ctx, args: []const [:0]const u8) u8 {
     if (o.cmd.len == 0) return main.usageError("drain needs a command", .{});
     main.loadConfig(ctx);
     const pool_cpus = poolCpus(ctx);
-    const toks = pool_mod.tokens(pool_cpus, ctx.cfg.reserve);
+    const toks = cpus_mod.tokens(ctx.io, ctx.arena, pool_cpus, ctx.cfg.reserve);
     if (named_text) |text| {
         o.drain_cpus = policy.cpuList(ctx.arena, text) catch return main.usageError("--cpus needs a CPU list such as 0-3 or 2,4, not '{s}'", .{text});
         if (o.drain_cpus.len == 0) return main.usageError("--cpus needs at least one CPU", .{});
@@ -1547,7 +1552,7 @@ pub fn cmdLimit(ctx: *Ctx, args: []const [:0]const u8) u8 {
         std.debug.print("cpuq: {d} ({s}) is a drain: its CPUs are fixed when it starts\n", .{ o.ticket, o.label });
         return 1;
     }
-    const ntok: u32 = @intCast(pool_mod.tokens(pool_cpus, ctx.cfg.reserve).len);
+    const ntok: u32 = @intCast(cpus_mod.tokens(ctx.io, a, pool_cpus, ctx.cfg.reserve).len);
     const n = @max(1, if (pct) @as(u32, @intCast(@max(1, (@as(u64, ntok) * count) / 100))) else count);
     pool.askLimit(o.pid, n) catch |err| main.fail("pool: {t}", .{err});
     pool.wakeOp(o.ticket);
@@ -1575,23 +1580,27 @@ pub fn cmdReserve(ctx: *Ctx, args: []const [:0]const u8) u8 {
     }
     if (host) |h| return @import("records.zig").onHost(ctx, h, if (want) |w| ctx.arena.print("cpuq reserve {s}", .{w}) catch return 125 else "cpuq reserve");
     main.loadConfig(ctx);
-    const pool_n: u32 = @intCast(poolCpus(ctx).len);
-    const was = ctx.cfg.reserve;
+    const pool_cpus = poolCpus(ctx);
+    const pool_n: u32 = @intCast(pool_cpus.len);
+    // The tokens a reserve of r leaves (whole cores: perhaps a CPU fewer than asked).
+    const left = struct {
+        fn of(cx: *Ctx, pool: []const u32, r: u32) u32 {
+            return @intCast(cpus_mod.tokens(cx.io, cx.arena, pool, r).len);
+        }
+    };
     const show = struct {
-        fn line(cx: *Ctx, n: u32, r: u32, before: ?u32) void {
-            cx.out.print("{d} token{s}, {d} reserved", .{ n, if (n == 1) "" else "s", r }) catch {};
+        fn line(cx: *Ctx, pn: u32, n: u32, asked: u32, before: ?u32) void {
+            cx.out.print("{d} token{s}, {d} reserved", .{ n, if (n == 1) "" else "s", pn - n }) catch {};
+            if (pn - n != asked) cx.out.print(" ({d} asked: whole cores)", .{asked}) catch {};
             if (before) |b| cx.out.print(" (was {d} reserved)", .{b}) catch {};
             cx.out.writeAll("\n") catch {};
             cx.out.flush() catch {};
         }
     };
-    const pool_tokens = struct {
-        fn of(pn: u32, r: u32) u32 {
-            return @max(1, pn -| r);
-        }
-    };
+    const was = ctx.cfg.reserve;
+    const was_n = left.of(ctx, pool_cpus, was);
     const text = want orelse {
-        show.line(ctx, pool_tokens.of(pool_n, was), @min(was, pool_n -| 1), null);
+        show.line(ctx, pool_n, was_n, @min(was, pool_n -| 1), null);
         return 0;
     };
     const n = policy.parseWhole(u32, text) orelse return main.usageError("reserve needs a whole number of CPUs, such as 2, not '{s}'", .{text});
@@ -1615,7 +1624,7 @@ pub fn cmdReserve(ctx: *Ctx, args: []const [:0]const u8) u8 {
     pool.lock();
     for (pool.scan(ctx.arena)) |o| pool.wakeOp(o.ticket);
     pool.unlock();
-    show.line(ctx, pool_tokens.of(pool_n, n), n, was);
+    show.line(ctx, pool_n, left.of(ctx, pool_cpus, n), n, pool_n - was_n);
     return 0;
 }
 

@@ -2,6 +2,16 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.42.1 — unreleased
+
+- **The reserve takes the slowest whole cores.** It sets aside low-power and efficiency cores
+  before performance cores (by `cpu_core`, `cpu_capacity` and top clock, the inverse of
+  `--prefer fast`), whole cores at a time, so no core is split between a token and the reserve;
+  among equals, from the pool's end. On pup the reserve was two performance cores' second
+  threads (9 and 11), and a drain naming those cores failed: their twins were no tokens. A core
+  that would take the reserve past N is taken whole (a reserve of 3 on two-thread cores is 4
+  CPUs); `cpuq reserve` and status show the reserve as it is.
+
 ## 0.42.0 — 2026-11-28
 
 A strict token pool. A machine has N tokens, one per CPU of the pool less the reserve. A task

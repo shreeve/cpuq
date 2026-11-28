@@ -76,7 +76,7 @@ borrows, and what is new here.
 |---|---|
 | CPU | a logical processor, as the OS counts them |
 | pool | the CPUs cpuq counts: by default every CPU online (see [The pool](#the-pool)) |
-| reserve | the pool's last CPUs, never handed out (config `reserve`, 2 by default) |
+| reserve | the pool's slowest whole cores, never handed out (config `reserve`, 2 CPUs by default) |
 | token | one CPU of the pool less the reserve, held by one task at a time: the machine has N of them |
 | run | one `cpuq run` (status calls it an operation, `OP`): M tasks of one command |
 | task | one process of a run, which holds one token while it runs |
@@ -239,8 +239,13 @@ same way:
   machine's init may use (a container's CPU set); one hyperthread of each physical core first,
   then their siblings. On macOS: CPU 0 to the active count less one.
 
-The **reserve** is the pool's last R CPUs in that order, never handed out (config `reserve`,
-default 2). The rest are the tokens: N = the pool less R, at least 1. A 10-CPU Mac has 8 tokens.
+The **reserve** is R of the pool's CPUs, never handed out (config `reserve`, default 2): the
+slowest first (low-power and efficiency cores before performance cores, by `cpu_core`,
+`cpu_capacity` and top clock), whole cores at a time, so no core is split between a token and the
+reserve; among equals, from the pool's end. A core that would take it past R is taken whole (on a
+machine of two-thread cores, a reserve of 3 is 4 CPUs), and status shows the reserve as it is.
+The rest are the tokens, in the pool's order: N = the pool less the reserve, at least 1. A 10-CPU
+Mac has 8 tokens.
 `cpuq reserve` prints them (`8 tokens, 2 reserved`), `cpuq reserve 4` sets the reserve (`--host
 HOST`: on HOST), and `cpuq budget` prints N alone, for a script that sizes its load by it
 (`-n $(( $(cpuq budget) / 2 ))`). A new reserve is kept in the config and is in force at once:
@@ -437,7 +442,7 @@ lines.
 | field | meaning |
 |---|---|
 | `schema`, `version`, `dir`, `admit` | 4, cpuq's version, the pool's directory, and `tokens` |
-| `pool`, `tokens`, `token_cpus`, `reserve` | the pool's CPUs; the number of tokens (N: at most N tasks run at once); their CPUs (the pool's first N); the reserve (the pool's last CPUs, never handed out) |
+| `pool`, `tokens`, `token_cpus`, `reserve` | the pool's CPUs; the number of tokens (N: at most N tasks run at once); their CPUs (the pool less the reserve, in its order); the reserve's size (the slowest whole cores, never handed out) |
 | `held`, `held_back`, `free` | tokens held (by tasks running and by drains), held back while work outside cpuq keeps more than the CPUs cpuq leaves it busy, and free |
 | `isolated` | the CPUs drains isolate |
 | `running`, `paused`, `waiting` | cpuq's tasks running (each holding a token), tasks cpuq has stopped (holding none: after a Ctrl-Z, until each holds a token again; a drain's command waiting for its turn again), and tasks waiting to start |
@@ -967,7 +972,7 @@ says so.
 
 | key | default | meaning |
 |---|---|---|
-| `reserve` | 2 | the pool's last this many CPUs are never handed out; the rest are the tokens, at least 1 (`cpuq reserve N` sets it, in force at once) |
+| `reserve` | 2 | this many of the pool's CPUs, the slowest whole cores, are never handed out; the rest are the tokens, at least 1 (`cpuq reserve N` sets it, in force at once) |
 | `cpus` | worked out | the pool's CPUs, in order, as a Linux CPU list (`12-19,2`) |
 | `timeout` | 1h | each task's time limit when a run gives no `-t`; off: none |
 | `drain_timeout` | 20m | a drain's time limit when it gives no `-t`; at most 2h |
@@ -1051,7 +1056,7 @@ instead. The removed variables are simply not set; `cpuq hook` rewrites a `cpuq 
 | config `exclusive`, `window_gap`, `window_lend` | `cpuq drain` |
 | config `cpu_weights`, `affinity` | each task holds a token, pinned to its CPU on Linux; `weights` for shares |
 | config `load_check`, `load_margin` | outside load is measured |
-| config `budget`, `$CPUQ_BUDGET` | `reserve = N` sets aside the pool's last N CPUs (`cpuq reserve N`); the rest are the tokens, which `cpuq budget` prints |
+| config `budget`, `$CPUQ_BUDGET` | `reserve = N` sets aside N of the pool's CPUs, the slowest whole cores (`cpuq reserve N`); the rest are the tokens, which `cpuq budget` prints |
 | config `active_cap` | the pool is the CPUs online; `reserve` or `cpus` narrows it |
 | config `qos` | tasks run as they are |
 | config `max_memory` | `cpuq cap --mem` |
