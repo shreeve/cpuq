@@ -287,7 +287,9 @@ final class HourCache {
                 let cpu: Double?
                 // A job already running when the app started has no average yet: before its
                 // first reading, count it at that reading rather than at nothing.
-                if let s = sum[i], let k = n[i] { cpu = s / Double(k) } else if firstReading == nil || c.to <= firstReading! { cpu = b.average ?? b.active.first?.cores } else { cpu = nil }
+                // A column between two polls (the app was busy or napping, or the newest column
+                // has no poll yet) has the latest reading before it: the job ran on, it wasn't idle.
+                if let s = sum[i], let k = n[i] { cpu = s / Double(k) } else if firstReading == nil || c.to <= firstReading! { cpu = b.average ?? b.active.first?.cores } else { cpu = b.active.last(where: { $0.at < c.to })?.cores ?? b.average }
                 if let cpu { cols[i].shares[b.project, default: 0] += cpu * o }
             }
         }
@@ -305,10 +307,20 @@ final class HourCache {
                 per[i] = e
             }
         }
+        // A column with no machine reading carries the last one, up to `carry` columns: a gap
+        // between polls is not an idle machine.
+        let carry = max(Int((300 / step).rounded()), 1)
+        var lastOutside: Double?, lastPer: [Double]?, lastAt = -1
         for i in 0..<total {
             if let (b, k) = busy[i] { cols[i].watched = true; cols[i].outside = max(b / Double(k) * m.cpus - cols[i].shares.values.reduce(0, +), 0) }
             if let (s, k) = shut[i] { cols[i].gateShut = s * 2 >= k }
             if let (p, k) = per[i], k > 0 { cols[i].perCPU = p.map { $0 / Double(k) } }
+            if cols[i].watched {
+                lastOutside = cols[i].outside; lastPer = cols[i].perCPU; lastAt = i
+            } else if lastAt >= 0 && i - lastAt <= carry {
+                cols[i].outside = lastOutside ?? 0
+                if cols[i].perCPU == nil { cols[i].perCPU = lastPer }
+            }
             // Never more than the CPUs.
             let t = cols[i].total
             if t > m.cpus { let f = m.cpus / t; cols[i].shares = cols[i].shares.mapValues { $0 * f }; cols[i].outside *= f }

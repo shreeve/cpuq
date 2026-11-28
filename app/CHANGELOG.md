@@ -3,6 +3,15 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
+## 0.25.0 — 2026-11-27
+
+- **The last hour no longer shows drops to zero that never happened.** A column of the chart
+  that fell between two polls was drawn as nothing running: behind other windows, macOS's App
+  Nap stretched the 3-second poll to a minute or more, so a steady machine looked like a
+  sawtooth, and the newest column fell to zero until its first poll. Such a column now carries
+  the latest reading before it (up to 5 minutes for the machine's own readings), and the app
+  keeps App Nap from slowing its polls while its window is open.
+
 ## 0.24.0 — 2026-11-27
 
 - **Work outside cpuq, by who started it.** With cpuq 0.31 on, the jobs list starts with each
