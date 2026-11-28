@@ -2,114 +2,112 @@ import Foundation
 import Testing
 @testable import CpuqCore
 
-@Test func meterFillsAQuarterOfTheCapacityBusyPerCellRoundingUp() {
-    #expect(meterLevel(busy: 0, capacity: 8) == 0)
-    #expect(meterLevel(busy: 0.4, capacity: 8) == 0)
-    #expect(meterLevel(busy: 0.5, capacity: 8) == 1)
-    #expect(meterLevel(busy: 2, capacity: 8) == 1)
-    #expect(meterLevel(busy: 2.1, capacity: 8) == 2)
-    #expect(meterLevel(busy: 5.9, capacity: 8) == 3)
-    #expect(meterLevel(busy: 6.5, capacity: 8) == 4)
-    #expect(meterLevel(busy: 9.1, capacity: 8) == 4)
-    #expect(meterLevel(busy: 3, capacity: 0) == 0)
+@Test func meterFillsAQuarterOfTheCPUsBusyPerCellRoundingUp() {
+    #expect(meterLevel(busy: 0, cpus: 8) == 0)
+    #expect(meterLevel(busy: 0.4, cpus: 8) == 0)
+    #expect(meterLevel(busy: 0.5, cpus: 8) == 1)
+    #expect(meterLevel(busy: 2, cpus: 8) == 1)
+    #expect(meterLevel(busy: 2.1, cpus: 8) == 2)
+    #expect(meterLevel(busy: 5.9, cpus: 8) == 3)
+    #expect(meterLevel(busy: 6.5, cpus: 8) == 4)
+    #expect(meterLevel(busy: 9.1, cpus: 8) == 4)
+    #expect(meterLevel(busy: 3, cpus: 0) == 0)
 }
 
-@Test func decodesStatus() throws {
-    let json = """
-    {"schema": 3, "version": "0.40.0", "admit": "contested", "budget": 10, "pool": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
-     "capacity": 8, "isolated": [9, 8], "cores": 10, "active_cores": 10, "running": 12, "paused": 0, "waiting": 7,
-     "busy": 9.1, "tasks_busy": 7.4, "room": -0.04, "load": [7.5, 6, 5], "memory_pressure": "normal",
-     "gate": {"state": "open", "available": null, "disk_free": null, "disk_path": null, "text": "open"},
-     "runs": [{"ticket": 2, "pid": 48589, "project": "rig", "weight": 2, "limit": 14, "tasks": 14, "done": 3, "failed": 1,
-               "running": 7, "paused": 0, "demoted": 4, "demoted_for": "drain", "io_wait": 2, "tail": false, "oldest": 1795839407,
-               "waiting": 3, "running_tasks": [{"task": 5, "attempt": 2, "pid": 9, "since": 1795839410, "paused": false}],
-               "stopped": false, "driver": false, "driver_busy": 0, "drain": false, "pin": [], "cpus": [], "noise": 0, "noisy_top": "",
-               "urgent": false, "using": 6.5, "flags": ["capped"], "progress": {"done": 4, "total": 14, "failing": 1},
-               "left": 540, "left_from": "progress", "label": "rig:matrix", "command": "./test/one", "since": 1795839407},
-              {"ticket": 3, "pid": 48593, "project": "cpuq", "limit": 2, "tasks": 1, "running": 1, "drain": true,
-               "pin": [9, 8], "cpus": [9, 8], "noise": 0.12, "noisy_top": "mds (88)", "flags": ["noisy"], "using": 1.0,
-               "label": "cpuq:bench", "command": "./bench", "since": 1795839407},
-              {"ticket": 4, "pid": 48600, "project": "rig", "tasks": 0, "running": 0, "driver": true, "driver_busy": 0.7,
-               "flags": ["driver_cpu"], "using": 0, "label": "rig:suite", "command": "./test/run", "since": 1795839400}],
-     "waiters": [{"order": 1, "ticket": 2, "pid": 48589, "project": "rig", "waiting": 3, "running": 7, "max": 14, "drain": false,
-                  "urgent": false, "why": "1st in line; over its share (8.0 of 8); the machine is busy (7.5 of 8 CPUs)",
-                  "label": "rig:matrix", "command": "./test/one", "since": 1795839407}],
-     "projects": [{"name": "rig", "weight": 2, "runs": 2, "running": 7, "waiting": 3, "fair": 5.3},
-                  {"name": "nexis", "weight": 1, "runs": 1, "running": 4, "waiting": 0, "fair": 2.7}],
-     "outside": [{"pid": 77, "name": "Python", "using": 1.2}], "outside_total": 1.2, "outside_work": [], "recorder": true}
-    """
-    let s = try Status.decode(Data(json.utf8))
-    #expect(s.schema == 3 && s.admit == "contested" && s.budget == 10 && s.pool.count == 10)
-    #expect(s.capacity == 8 && s.isolated == [9, 8] && s.cores == 10 && s.activeCores == 10)
-    #expect(s.running == 12 && s.waiting == 7 && s.busy == 9.1 && s.tasksBusy == 7.4 && s.room == -0.04)
-    #expect(s.busyNow == 9.1 && !s.waitsBesideRoom && s.recorder)
-    let r = s.runs[0]
-    #expect(r.ticket == 2 && r.pid == 48589 && r.project == "rig" && r.weight == 2 && r.limit == 14)
-    #expect(r.tasks == 14 && r.done == 3 && r.failed == 1 && r.running == 7 && r.paused == 0 && !r.stopped)
-    #expect(r.demoted == 4 && r.demotedFor == "drain" && r.ioWait == 2 && !r.tail && r.oldest == 1795839407 && r.waiting == 3)
-    #expect(r.runningTasks == [Status.Task(task: 5, attempt: 2, pid: 9, since: 1795839410, paused: false, demoted: false)])
-    #expect(r.using == 6.5 && r.flags == ["capped"] && r.progress == Status.Progress(done: 4, total: 14, failing: 1))
-    #expect(r.left == 540 && r.leftFrom == "progress" && r.label == "rig:matrix")
-    let d = s.runs[1]
-    #expect(d.drain && d.pin == [9, 8] && d.cpus == [9, 8] && d.noise == 0.12 && d.noisyTop == "mds (88)" && d.flags == ["noisy"])
-    let v = s.runs[2]
-    #expect(v.driver && v.driverBusy == 0.7 && v.flags == ["driver_cpu"] && v.weight == 1)
+/// `cpuq status --json` from cpuq 0.42 on 10 CPUs, reserve 2: a run of 12 tasks with 7 holding
+/// tokens on CPUs 0–6 and one paused, and a drain timing on CPU 7 (its outside work cut short).
+let schema4 = """
+{"schema": 4, "version": "0.42.0", "dir": "/tmp/cq/v4", "admit": "tokens", "pool": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+ "tokens": 8, "token_cpus": [0, 1, 2, 3, 4, 5, 6, 7], "reserve": 2, "held": 8, "held_back": 3, "free": 0,
+ "isolated": [7], "cores": 10, "active_cores": 10, "running": 8, "paused": 1, "waiting": 5,
+ "busy": 6.686507936507936, "tasks_busy": 0, "load": [9.32470703125, 13.47802734375, 14.15576171875],
+ "memory_pressure": "normal",
+ "memory": {"total": 34359738368, "used": 22806134784, "swap_total": 7516192768, "swap_used": 6269435904},
+ "gate": {"state": "open", "available": null, "disk_free": null, "disk_path": null, "text": "open"},
+ "runs": [{"ticket": 1, "pid": 67220, "project": "cpuq", "weight": 1, "limit": 1, "tasks": 1, "done": 0, "failed": 0,
+           "running": 1, "paused": 0, "io_wait": null, "tail": false, "oldest": 1795854704, "waiting": 0,
+           "running_tasks": [{"task": 1, "attempt": 1, "pid": 67222, "since": 1795854704, "paused": false, "cpu": 7}],
+           "stopped": false, "driver": false, "driver_busy": 0, "drain": true, "pin": [7], "cpus": [7], "noise": 0,
+           "noisy_top": "", "urgent": false, "using": 0, "flags": [], "progress": null, "left": null, "left_from": "",
+           "label": "demo:bench", "command": "sleep 5", "since": 1795854704},
+          {"ticket": 2, "pid": 67218, "project": "cpuq", "weight": 1, "limit": 12, "tasks": 12, "done": 0, "failed": 0,
+           "running": 7, "paused": 1, "io_wait": null, "tail": false, "oldest": 1795854704, "waiting": 5,
+           "running_tasks": [{"task": 1, "attempt": 1, "pid": 67223, "since": 1795854704, "paused": false, "cpu": 0},
+                             {"task": 2, "attempt": 1, "pid": 67224, "since": 1795854704, "paused": false, "cpu": 1},
+                             {"task": 3, "attempt": 1, "pid": 67225, "since": 1795854704, "paused": false, "cpu": 2},
+                             {"task": 4, "attempt": 1, "pid": 67226, "since": 1795854704, "paused": false, "cpu": 3},
+                             {"task": 5, "attempt": 1, "pid": 67227, "since": 1795854704, "paused": false, "cpu": 4},
+                             {"task": 6, "attempt": 1, "pid": 67228, "since": 1795854704, "paused": false, "cpu": 5},
+                             {"task": 7, "attempt": 2, "pid": 67229, "since": 1795854705, "paused": false, "cpu": 6},
+                             {"task": 8, "attempt": 1, "pid": 67230, "since": 1795854704, "paused": true, "cpu": 0}],
+           "stopped": false, "driver": false, "driver_busy": 0, "drain": false, "pin": [], "cpus": [], "noise": 0,
+           "noisy_top": "", "urgent": false, "using": 0, "flags": ["capped"], "progress": null, "left": null,
+           "left_from": "", "label": "demo:sleep", "command": "sleep 6", "since": 1795854704}],
+ "waiters": [{"order": 1, "ticket": 2, "pid": 67218, "project": "cpuq", "waiting": 5, "running": 7, "max": 12,
+              "drain": false, "urgent": false, "why": "1st in line; every token is held (some held back for work outside cpuq)",
+              "label": "demo:sleep", "command": "sleep 6", "since": 1795854704}],
+ "projects": [{"name": "cpuq", "weight": 1, "runs": 1, "running": 7, "waiting": 5, "fair": 8}],
+ "outside": [{"pid": 77, "name": "Python", "using": 1.2}], "outside_total": 3.9, "outside_work": [],
+ "cpu_ticks": [[10, 100], [30, 100]], "boot_time": 1795597898, "recorder": false}
+"""
+
+@Test func decodesASchema4Status() throws {
+    let s = try Status.decode(Data(schema4.utf8))
+    #expect(s.schema == 4 && s.admit == "tokens" && s.pool == Array(0...9))
+    #expect(s.tokens == 8 && s.tokenCpus == Array(0...7) && s.reserve == 2)
+    #expect(s.held == 8 && s.heldBack == 3 && s.free == 0 && s.isolated == [7])
+    #expect(s.cores == 10 && s.activeCores == 10 && s.running == 8 && s.paused == 1 && s.waiting == 5)
+    #expect(s.busy == 6.686507936507936 && s.tasksBusy == 0 && s.busyNow == 6.686507936507936)
+    #expect(s.memory?.total == 34359738368 && s.gate.state == "open" && s.bootTime == 1795597898 && !s.recorder)
+    #expect(s.tokensText == "8 tokens, 2 reserved" && s.reserveCPUs == [8, 9])
+    let d = s.runs[0]
+    #expect(d.drain && d.pin == [7] && d.cpus == [7] && d.running == 1 && d.heldCPUs == [7])
+    let r = s.runs[1]
+    #expect(r.ticket == 2 && r.pid == 67218 && r.limit == 12 && r.tasks == 12 && r.running == 7 && r.paused == 1)
+    #expect(r.ioWait == nil && !r.tail && r.oldest == 1795854704 && r.waiting == 5 && r.flags == ["capped"])
+    #expect(r.runningTasks[6] == Status.Task(task: 7, attempt: 2, pid: 67229, since: 1795854705, paused: false, cpu: 6))
+    // A paused task holds no token: its CPU is the token of another task's.
+    #expect(r.heldCPUs == Array(0...6))
+    #expect(s.holders == [0: 1, 1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1, 7: 0])
     let w = try #require(s.waiters.first)
-    #expect(w.order == 1 && w.ticket == 2 && w.waiting == 3 && w.running == 7 && w.max == 14 && !w.drain)
-    #expect(w.why.hasPrefix("1st in line; over its share"))
-    #expect(s.projects.map(\.name) == ["rig", "nexis"] && s.projects[0].fair == 5.3)
-    #expect(s.projects[0].runs == 2 && s.projects[0].running == 7 && s.projects[0].waiting == 3)
-    #expect(s.outside.first?.name == "Python" && s.outsideTotal == 1.2)
+    #expect(w.order == 1 && w.ticket == 2 && w.waiting == 5 && w.running == 7 && w.max == 12 && !w.drain)
+    #expect(w.why == "1st in line; every token is held (some held back for work outside cpuq)")
+    #expect(s.projects.first == Status.Project(name: "cpuq", weight: 1, runs: 1, running: 7, waiting: 5, fair: 8))
+    #expect(s.outside.first?.name == "Python" && s.outsideTotal == 3.9)
+    #expect(s.ticks?.all == CPUTicks(busy: 40, total: 200))
+    #expect(!s.waitsBesideFree)
 }
 
-@Test func waitsBesideRoomOnlyWithTheGateOpenAndNoDrainWaiting() throws {
-    let base = #"{"schema": 3, "capacity": 8, "room": 1.5, "waiters": [{"order": 1, "waiting": 3}]}"#
-    #expect(try Status.decode(Data(base.utf8)).waitsBesideRoom)
-    #expect(try !Status.decode(Data(#"{"schema": 3, "room": 1.5, "waiters": []}"#.utf8)).waitsBesideRoom)
-    #expect(try !Status.decode(Data(#"{"schema": 3, "room": 0, "waiters": [{"order": 1, "waiting": 3}]}"#.utf8)).waitsBesideRoom)
-    #expect(try !Status.decode(Data(#"{"schema": 3, "room": 1.5, "gate": {"state": "pressure"}, "waiters": [{"order": 1, "waiting": 3}]}"#.utf8)).waitsBesideRoom)
-    #expect(try !Status.decode(Data(#"{"schema": 3, "room": 1.5, "waiters": [{"order": 1, "waiting": 3}, {"order": 2, "drain": true, "max": 2}]}"#.utf8)).waitsBesideRoom)
+@Test func refusesEveryOtherSchema() throws {
+    for json in [#"{}"#, #"{"schema": 3, "capacity": 8, "room": 1.5}"#, #"{"schema": 2, "holders": []}"#, #"{"schema": 5}"#] {
+        #expect(throws: Status.UnreadableSchema.self) { try Status.decode(Data(json.utf8)) }
+    }
+    do {
+        _ = try Status.decode(Data(#"{"schema": 3}"#.utf8))
+    } catch let e as Status.UnreadableSchema {
+        #expect(e.schema == 3 && e.localizedDescription.contains("reads schema 4"))
+    }
 }
 
-@Test func readsASchema2StatusAsRuns() throws {
-    // cpuq before 0.40 (other machines during the cut-over): its holders are runs, the CPUs each
-    // held its tasks running, its free CPUs the room.
-    let json = """
-    {"schema": 2, "version": "0.35.0", "admit": "pool", "budget": 8, "pool": [10, 11, 12, 13, 14, 15, 16, 17],
-     "held": 5, "free": 3, "load": [7.5, 6, 5],
-     "memory_pressure": "normal", "gate": {"state": "outside_load", "load": 9.1, "text": "outside load leaves 1 of 3 free CPUs idle"},
-     "holders": [{"ticket": 4, "pid": 10, "project": "rig", "weight": 2, "cores": 3, "slots": [0, 1, 2], "cpus": [10, 11, 12], "using": 2.5,
-                  "tasks": 40, "done": 12, "failed": 2, "running": 3, "urgent": false, "flags": [], "note": "#88",
-                  "label": "rig:matrix", "command": "./test/one", "since": 100},
-                 {"ticket": 5, "pid": 12, "cores": 2, "slots": [6, 7], "exclusive": true, "paused": true, "label": "rig:bench"}],
-     "waiters": [{"order": 1, "ticket": 6, "pid": 11, "project": "nexis", "cores": 2, "max": 4, "holds": 1,
-                  "why": "behind rig: 3 of its fair 5.3", "label": "nexis:build", "command": "zig build -j1", "since": 120},
-                 {"order": 2, "ticket": 7, "pid": 13, "cores": 8, "exclusive": true, "label": "x:bench"}],
-     "projects": [{"name": "rig", "weight": 2, "ops": 1, "held": 3, "want": 3, "fair": 5.3},
-                  {"name": "nexis", "weight": 1, "ops": 1, "held": 0, "want": 2, "fair": 2.7}]}
-    """
-    let s = try Status.decode(Data(json.utf8))
-    #expect(s.schema == 2 && s.running == 5 && s.room == 3 && s.capacity == 8 && s.waiting == 2)
-    #expect(s.gate.state == "outside_load" && s.gate.load == 9.1)
-    let h = try #require(s.runs.first)
-    #expect(h.label == "rig:matrix" && h.note == "#88" && h.using == 2.5 && h.ticket == 4 && h.project == "rig" && h.weight == 2)
-    #expect(h.tasks == 40 && h.done == 12 && h.failed == 2 && h.running == 3 && h.limit == 3 && !h.drain && h.cpus.isEmpty && !h.stopped)
-    // An exclusive holder is a drain on the pool's CPUs it held; its `paused` is its cpuq stopped.
-    let d = s.runs[1]
-    #expect(d.drain && d.cpus == [16, 17] && d.pin == [16, 17] && d.stopped && d.paused == 0 && d.running == 2)
-    // One naming its CPUs by the machine's numbers.
-    let named = try Status.decode(Data(#"{"schema": 2, "pool": [10, 11], "holders": [{"cores": 2, "slots": [0, 1], "cpus": [10, 11], "exclusive": true}]}"#.utf8))
-    #expect(named.runs[0].cpus == [10, 11])
-    let w = s.waiters[0]
-    #expect(w.waiting == 2 && w.running == 1 && w.max == 4 && w.ticket == 6 && w.project == "nexis" && !w.drain)
-    #expect(s.waiters[1].drain && s.waiters[1].max == 8)
-    #expect(s.projects[0].runs == 1 && s.projects[0].running == 3 && s.projects[0].waiting == 3 && s.projects[0].fair == 5.3)
-    #expect(s.busyNow == 5)
+@Test func waitsBesideFreeTokensOnlyWithTheGateOpenAndNoDrainWaiting() throws {
+    let base = #"{"schema": 4, "tokens": 8, "free": 2, "waiters": [{"order": 1, "waiting": 3}]}"#
+    #expect(try Status.decode(Data(base.utf8)).waitsBesideFree)
+    #expect(try !Status.decode(Data(#"{"schema": 4, "free": 2, "waiters": []}"#.utf8)).waitsBesideFree)
+    #expect(try !Status.decode(Data(#"{"schema": 4, "free": 0, "held_back": 2, "waiters": [{"order": 1, "waiting": 3}]}"#.utf8)).waitsBesideFree)
+    #expect(try !Status.decode(Data(#"{"schema": 4, "free": 2, "gate": {"state": "pressure"}, "waiters": [{"order": 1, "waiting": 3}]}"#.utf8)).waitsBesideFree)
+    #expect(try !Status.decode(Data(#"{"schema": 4, "free": 2, "waiters": [{"order": 1, "waiting": 3}, {"order": 2, "drain": true, "max": 2}]}"#.utf8)).waitsBesideFree)
+}
+
+@Test func saysTheTokensAndTheReserve() throws {
+    let one = try Status.decode(Data(#"{"schema": 4, "pool": [4, 5, 6], "tokens": 1, "token_cpus": [4], "reserve": 2}"#.utf8))
+    #expect(one.tokensText == "1 token, 2 reserved" && one.reserveCPUs == [5, 6])
+    let none = try Status.decode(Data(#"{"schema": 4, "pool": [0, 1], "tokens": 2, "token_cpus": [0, 1], "reserve": 0}"#.utf8))
+    #expect(none.tokensText == "2 tokens, 0 reserved" && none.reserveCPUs.isEmpty && none.holders.isEmpty)
 }
 
 @Test func keepsARunsFlagsAndStop() throws {
     let json = """
-    {"runs": [{"ticket": 80, "pid": 3675197, "project": "trig", "running": 22, "paused": 3, "stopped": true,
+    {"schema": 4, "runs": [{"ticket": 80, "pid": 3675197, "project": "trig", "running": 22, "paused": 3, "stopped": true,
                "flags": ["stopped", "over_cpu"], "label": "trig:slot766"}]}
     """
     let r = try #require(try Status.decode(Data(json.utf8)).runs.first)
@@ -120,15 +118,18 @@ import Testing
 @Test func decodesAStatusWithFieldsMissing() throws {
     // Each field left out keeps its default.
     let json = """
-    {"capacity": 8, "runs": [{"pid": 1, "running": 2, "label": "x"}], "waiters": [{"order": 1, "waiting": 3}]}
+    {"schema": 4, "runs": [{"pid": 1, "running": 2, "label": "x", "running_tasks": [{"task": 1}]}], "waiters": [{"order": 1, "waiting": 3}]}
     """
     let s = try Status.decode(Data(json.utf8))
-    #expect(s.running == 2 && s.waiting == 3 && s.room == 0 && s.busy == nil)
+    #expect(s.running == 0 && s.waiting == 0 && s.free == 0 && s.tokens == 0 && s.busy == nil)
     #expect(s.runs.first?.using == nil && s.runs.first?.ioWait == nil && s.runs.first?.limit == 2)
+    #expect(s.runs.first?.runningTasks == [Status.Task(task: 1, attempt: 1, pid: 0, since: 0, paused: false, cpu: 0)])
     #expect(s.waiters.first?.max == 3)
     #expect(s.outside.isEmpty && !s.recorder && s.isolated.isEmpty)
     #expect(s.gate.state == "open")
-    #expect(try Status.decode(Data("{}".utf8)) == Status())
+    var empty = Status()
+    empty.schema = 4
+    #expect(try Status.decode(Data(#"{"schema": 4}"#.utf8)) == empty)
 }
 
 @Test func writesCPUsInRuns() {
@@ -158,8 +159,8 @@ import Testing
 }
 
 @Test func saysWhetherTheRecorderRuns() throws {
-    #expect(try Status.decode(Data(#"{"recorder": true}"#.utf8)).recorder)
-    #expect(try !Status.decode(Data(#"{"recorder": false}"#.utf8)).recorder)
+    #expect(try Status.decode(Data(#"{"schema": 4, "recorder": true}"#.utf8)).recorder)
+    #expect(try !Status.decode(Data(#"{"schema": 4, "recorder": false}"#.utf8)).recorder)
 }
 
 @Test func busyShareBetweenTwoReadings() {
@@ -175,32 +176,20 @@ import Testing
     #expect(all?.allSatisfy { $0.total >= $0.busy } == true)
 }
 
-@Test func capacityIsCpuqsOrASchema2PoolsSize() throws {
-    // Schema 3 says it: the pool less the CPUs drains isolate.
-    #expect(try Status.decode(Data(#"{"schema": 3, "budget": 10, "capacity": 8, "active_cores": 10}"#.utf8)).capacity == 8)
-    // Schema 2 under measured admission: the CPUs online (`budget = 14` kept for drains).
-    let measured = try Status.decode(Data(#"{"budget": 14, "held": 8, "admit": "measured", "target": 11, "active_cores": 10}"#.utf8))
-    #expect(measured.capacity == 10)
-    let cores = try Status.decode(Data(#"{"budget": 8, "held": 8, "admit": "cores", "active_cores": 10}"#.utf8))
-    #expect(cores.capacity == 8)
-    let older = try Status.decode(Data(#"{"budget": 8, "held": 2}"#.utf8))
-    #expect(older.capacity == 8)
-}
-
 @Test func readsRemotesFromTheConfig() {
     let hosts = remoteHosts(config: """
-    admit = measured
+    reserve = 2
     remotes = pup, burst   # in order
     remote_start.burst = ~/runbooks/host-gcp-burst/start
     """)
     #expect(hosts.map(\.host) == ["pup", "burst"])
     #expect(hosts[0].start == nil && hosts[1].start == "~/runbooks/host-gcp-burst/start")
-    #expect(remoteHosts(config: "budget = 8\nload_check = on\n").isEmpty)
+    #expect(remoteHosts(config: "reserve = 2\nload_check = on\n").isEmpty)
     #expect(remoteHosts(config: "remotes = -oProxyCommand=touch, pup").map(\.host) == ["pup"])
 }
 
 @Test func decodesAnotherMachinesCPUTicks() throws {
-    let s = try Status.decode(Data(#"{"schema": 3, "capacity": 20, "running": 4, "active_cores": 2, "cpu_ticks": [[10, 100], [30, 100]]}"#.utf8))
+    let s = try Status.decode(Data(#"{"schema": 4, "tokens": 20, "running": 4, "active_cores": 2, "cpu_ticks": [[10, 100], [30, 100]]}"#.utf8))
     #expect(s.ticks?.each.count == 2)
     #expect(s.ticks?.all == CPUTicks(busy: 40, total: 200))
 }
@@ -220,11 +209,10 @@ import Testing
 }
 
 @Test func decodesRecordedSamples() {
-    // cpuq 0.40's recorder writes `running` (tasks); one before it, `held` (a CPU per task).
     let text = """
     {"t":1792038868,"cpu":[46,35],"load":2.24,"running":7,"wait":1,"gate":"open"}
     not a sample
-    {"t":1792038871,"cpu":[0,100],"load":2.5,"held":2,"wait":0,"gate":"low_disk"}
+    {"t":1792038871,"cpu":[0,100],"load":2.5,"running":2,"wait":0,"gate":"low_disk"}
     {"t":1792038874,"cpu":[0,100],"load":2.5,"gate":"open"}
     """
     let s = RecordedSample.decodeLines(Data(text.utf8))
@@ -235,17 +223,17 @@ import Testing
 }
 
 @Test func decodesMemory() throws {
-    let json = #"{"schema":1,"memory":{"total":137438953472,"used":104152956928,"swap_total":34359738368,"swap_used":25769803776}}"#
+    let json = #"{"schema":4,"memory":{"total":137438953472,"used":104152956928,"swap_total":34359738368,"swap_used":25769803776}}"#
     let s = try Status.decode(Data(json.utf8))
     let m = try #require(s.memory)
     #expect(Status.Memory.ofGB(m.used, m.total) == "97 of 128 GB")
     #expect(Status.Memory.ofGB(m.swapUsed, m.swapTotal) == "24 of 32 GB")
     #expect(Status.Memory.ofGB(1_395_864_371, 2_147_483_648) == "1.3 of 2.0 GB")
-    #expect(try Status.decode(Data(#"{"schema":1}"#.utf8)).memory == nil)
+    #expect(try Status.decode(Data(#"{"schema":4}"#.utf8)).memory == nil)
 }
 
 @Test func decodesProgress() throws {
-    let json = #"{"schema":3,"runs":[{"pid":7,"label":"rig:matrix","progress":{"done":4210,"total":12629,"failing":3},"left":540,"left_from":"progress","typical":2760},{"pid":8,"label":"rig:probe","progress":null,"left":null}]}"#
+    let json = #"{"schema":4,"runs":[{"pid":7,"label":"rig:matrix","progress":{"done":4210,"total":12629,"failing":3},"left":540,"left_from":"progress","typical":2760},{"pid":8,"label":"rig:probe","progress":null,"left":null}]}"#
     let s = try Status.decode(Data(json.utf8))
     #expect(s.runs[0].progress == Status.Progress(done: 4210, total: 12629, failing: 3))
     #expect(s.runs[0].left == 540 && s.runs[0].leftFrom == "progress" && s.runs[0].typical == 2760)
@@ -253,18 +241,18 @@ import Testing
 }
 
 @Test func decodesOutsideWork() throws {
-    let json = #"{"schema":1,"outside_total":9.8,"outside":[{"pid":7,"name":"Python","using":0.69,"command":"/opt/homebrew/bin/python3 -I model.py 4 p2on","cwd":"/tmp/x"},{"pid":8,"name":"zig","using":0.5}]}"#
+    let json = #"{"schema":4,"outside_total":9.8,"outside":[{"pid":7,"name":"Python","using":0.69,"command":"/opt/homebrew/bin/python3 -I model.py 4 p2on","cwd":"/tmp/x"},{"pid":8,"name":"zig","using":0.5}]}"#
     let s = try Status.decode(Data(json.utf8))
     #expect(s.outsideTotal == 9.8)
     #expect(s.outside[0].shortCommand == "python3 -I model.py 4 p2on", "got \(s.outside[0].shortCommand) from \(String(describing: s.outside[0].command))")
     #expect(s.outside[0].cwd == "/tmp/x")
     #expect(s.outside[1].shortCommand == "zig" && s.outside[1].command == nil)
-    #expect(try Status.decode(Data(#"{"schema":1}"#.utf8)).outsideTotal == nil)
+    #expect(try Status.decode(Data(#"{"schema":4}"#.utf8)).outsideTotal == nil)
 }
 
 @Test func decodesOutsideWorkByStarter() throws {
     let json = """
-    {"schema": 2, "budget": 4, "outside_total": 3.1,
+    {"schema": 4, "tokens": 4, "outside_total": 3.1,
      "outside_work": [{"pid": 77, "command": "/bin/bash -c for n in 4 9; do python3 r5mut.py $n & done", "cwd": "/home/s/emdb",
                        "via": "sshd-session", "procs": 9, "using": 3.0}]}
     """
@@ -280,6 +268,6 @@ import Testing
     #expect(!svc.ranBySomeone)
     svc.cwd = "/home/s/emdb"
     #expect(svc.ranBySomeone)
-    // Older cpuq: no outside_work.
-    #expect(try Status.decode(Data(#"{"schema": 2}"#.utf8)).outsideWork.isEmpty)
+    // None outside: an empty list.
+    #expect(try Status.decode(Data(#"{"schema": 4}"#.utf8)).outsideWork.isEmpty)
 }

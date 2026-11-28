@@ -1,35 +1,42 @@
 import Foundation
 
-/// `cpuq status --json`, schema 3: no task holds a CPU; cpuq bounds how many tasks run and the
-/// kernel shares the CPUs among them. Every field has a default, so a cpuq that leaves one out
-/// still decodes, and a schema-2 cpuq (one CPU per task) reads as the same shapes: its holders as
-/// runs, the CPUs each held as its tasks running.
+/// `cpuq status --json`, schema 4: a strict token pool. The pool's CPUs less the reserve are N
+/// tokens; a task holds one while it runs (pinned to that token's CPU on Linux), so at most N
+/// tasks run at once. Every field has a default, so a cpuq that leaves one out still decodes; a
+/// status of any other schema is refused.
 public struct Status: Decodable, Sendable, Equatable {
-    /// 3; 2 from a cpuq before 0.40, whose fields are read into these.
+    /// The one schema the app reads.
+    public static let readable = 4
+
     public var schema = 0
     public var version = ""
-    /// How cpuq shares CPUs: "contested" (cpuq bounds the tasks, the kernel shares the CPUs).
+    /// How cpuq shares CPUs: "tokens", one per CPU of the pool less the reserve.
     public var admit = ""
-    /// The pool's size, and its CPUs by the machine's numbers.
-    public var budget = 0
+    /// The pool's CPUs by the machine's numbers, in its order.
     public var pool: [Int] = []
-    /// The CPUs the line shares: the pool less the CPUs drains isolate.
-    public var capacity = 0
+    /// The tokens (N: at most N tasks run at once), their CPUs (the pool's first N), and the
+    /// reserve (the pool's last CPUs, never handed out).
+    public var tokens = 0
+    public var tokenCpus: [Int] = []
+    public var reserve = 0
+    /// Tokens held (by tasks running and by drains), held back while work outside cpuq keeps
+    /// more than the CPUs cpuq leaves it busy, and free.
+    public var held = 0
+    public var heldBack = 0
+    public var free = 0
     /// The CPUs drains isolate, by the machine's numbers.
     public var isolated: [Int] = []
     /// The machine's CPUs, and those online (`active_cores`).
     public var cores = 0
     public var activeCores = 0
-    /// cpuq's tasks running (those it has stopped included), stopped by it, and waiting to start.
+    /// cpuq's tasks running (each holding a token), stopped by it (holding none), and waiting to
+    /// start.
     public var running = 0
     public var paused = 0
     public var waiting = 0
     /// CPUs the machine kept busy over the sample, all of them, and those of cpuq's tasks.
     public var busy: Double?
     public var tasksBusy: Double?
-    /// Spare room for a run over its share: positive, the first such waiter starts a task at its
-    /// next look.
-    public var room = 0.0
     public var load: [Double] = [0, 0, 0]
     public var memoryPressure = ""
     /// Each CPU's time so far, `[busy, total]`, cumulative (`cpu_ticks`):
@@ -46,12 +53,12 @@ public struct Status: Decodable, Sendable, Equatable {
     public var runs: [Run] = []
     /// The line: runs with tasks waiting to start, and drains waiting for their turn, in order.
     public var waiters: [Waiter] = []
-    /// Each project's tasks against its fair share of the capacity by weight.
+    /// Each project's tasks against its fair share of the tokens by weight.
     public var projects: [Project] = []
     public var outside: [Outside] = []
     /// CPUs busy outside every cpuq job, in all.
     public var outsideTotal: Double?
-    /// The same load by what started it, busiest first (cpuq 0.31 on).
+    /// The same load by what started it, busiest first.
     public var outsideWork: [Work] = []
     /// `cpuq record` is sampling the machine: `cpuq samples` has its past.
     public var recorder = false
@@ -59,7 +66,6 @@ public struct Status: Decodable, Sendable, Equatable {
     public struct Gate: Decodable, Sendable, Equatable {
         /// open, pressure, low_memory or low_disk.
         public var state = "open"
-        public var load: Double?
         public var text = "open"
     }
 
@@ -71,19 +77,16 @@ public struct Status: Decodable, Sendable, Equatable {
         public var project = ""
         /// The project's weight (the config's `weights`).
         public var weight = 1
-        /// The most tasks it runs at once (-c); a drain's CPUs.
+        /// The most tokens it holds at once (-c); a drain's CPUs.
         public var limit = 1
-        /// Its tasks (`-n`): all of them, how many ended well or not, and how many run now (those
-        /// cpuq has stopped included).
+        /// Its tasks (`-n`): all of them, how many ended well or not, and how many run now, each
+        /// holding a token.
         public var tasks = 0
         public var done = 0
         public var failed = 0
         public var running = 0
-        /// Its tasks cpuq has stopped.
+        /// Its tasks cpuq has stopped, holding no token: after a Ctrl-Z, until each holds one again.
         public var paused = 0
-        /// macOS: its tasks run in the background, and why: "over share" or "drain".
-        public var demoted = 0
-        public var demotedFor = ""
         /// Linux: its tasks waiting on a disk or other device; nil when not measured.
         public var ioWait: Int?
         /// Only its running tasks are left, and when the oldest of them started (Unix seconds).
@@ -98,8 +101,9 @@ public struct Status: Decodable, Sendable, Equatable {
         /// process tree keeps busy.
         public var driver = false
         public var driverBusy = 0.0
-        /// `cpuq drain`: the CPUs its command runs on, the CPUs it isolates, and the busy CPUs
-        /// work from outside it keeps on them, with the busiest such process.
+        /// `cpuq drain`: the CPUs its command runs on, the CPUs it isolates (holding their
+        /// tokens), and the busy CPUs work from outside it keeps on them, with the busiest such
+        /// process.
         public var drain = false
         public var pin: [Int] = []
         public var cpus: [Int] = []
@@ -124,17 +128,23 @@ public struct Status: Decodable, Sendable, Equatable {
         public var leftFrom = ""
         /// Its label's usual run time, in seconds, from history.
         public var typical: Double?
+
+        /// The CPUs whose tokens its tasks hold (a paused task holds none), and a drain's CPUs
+        /// its command runs on.
+        public var heldCPUs: [Int] {
+            Array(Set(runningTasks.filter { !$0.paused }.map(\.cpu) + (drain ? pin : []))).sorted()
+        }
     }
 
     /// One task running: its number, its try, its pid, when it started, whether cpuq has it
-    /// stopped or in the background.
+    /// stopped, and the CPU whose token it holds.
     public struct Task: Decodable, Sendable, Equatable {
         public var task = 0
         public var attempt = 1
         public var pid = 0
         public var since = 0
         public var paused = false
-        public var demoted = false
+        public var cpu = 0
     }
 
     /// A job's own count: `DONE TOTAL FAILING`.
@@ -157,7 +167,7 @@ public struct Status: Decodable, Sendable, Equatable {
         /// `cpuq drain` waiting for its turn.
         public var drain = false
         public var urgent = false
-        /// Why it waits, in cpuq's words.
+        /// Why it waits, in cpuq's words: "1st in line; every token is held".
         public var why = ""
         public var label = ""
         /// What the job is for (`--note`): shown beside the label, a band of its own in the charts.
@@ -173,7 +183,7 @@ public struct Status: Decodable, Sendable, Equatable {
         public var runs = 0
         public var running = 0
         public var waiting = 0
-        /// Its share of the capacity by weight, among the projects running or waiting.
+        /// Its share of the tokens by weight, among the projects running or waiting.
         public var fair = 0.0
     }
 
@@ -234,12 +244,23 @@ public struct Status: Decodable, Sendable, Equatable {
         }
     }
 
+    /// A status of a schema other than the one the app reads.
+    public struct UnreadableSchema: Error, LocalizedError, Equatable {
+        public let schema: Int
+        public var errorDescription: String? {
+            "its status is schema \(schema); this app reads schema \(Status.readable) (cpuq 0.42.0 or later)"
+        }
+    }
+
     public init() {}
 
+    /// Decodes a status, refusing any schema but 4.
     public static func decode(_ data: Data) throws -> Status {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-        return try decoder.decode(Status.self, from: data)
+        let s = try decoder.decode(Status.self, from: data)
+        guard s.schema == readable else { throw UnreadableSchema(schema: s.schema) }
+        return s
     }
 }
 
@@ -265,14 +286,12 @@ extension Status {
     }
 }
 
-// Decoding with defaults: a missing key keeps the property's default. A schema-2 status's own
-// keys (held, free, holders, a holder's cores and slots, a waiter's cores and holds, a project's
-// ops, held and want) are read into schema 3's.
+// Decoding with defaults: a missing key keeps the property's default.
 extension Status {
     private enum Keys: String, CodingKey {
-        case schema, version, admit, budget, pool, capacity, isolated, cores, activeCores, running, paused, waiting, busy, tasksBusy, room
-        case load, memoryPressure, cpuTicks, bootTime, memory, gate, runs, waiters, projects, outside, outsideTotal, outsideWork, recorder
-        case held, free, holders
+        case schema, version, admit, pool, tokens, tokenCpus, reserve, held, heldBack, free, isolated, cores, activeCores
+        case running, paused, waiting, busy, tasksBusy, load, memoryPressure, cpuTicks, bootTime, memory, gate
+        case runs, waiters, projects, outside, outsideTotal, outsideWork, recorder
     }
 
     public init(from decoder: any Decoder) throws {
@@ -280,12 +299,19 @@ extension Status {
         schema = try c.decodeIfPresent(Int.self, forKey: .schema) ?? 0
         version = try c.decodeIfPresent(String.self, forKey: .version) ?? ""
         admit = try c.decodeIfPresent(String.self, forKey: .admit) ?? ""
-        budget = try c.decodeIfPresent(Int.self, forKey: .budget) ?? 0
         pool = try c.decodeIfPresent([Int].self, forKey: .pool) ?? []
+        tokens = try c.decodeIfPresent(Int.self, forKey: .tokens) ?? 0
+        tokenCpus = try c.decodeIfPresent([Int].self, forKey: .tokenCpus) ?? []
+        reserve = try c.decodeIfPresent(Int.self, forKey: .reserve) ?? 0
+        held = try c.decodeIfPresent(Int.self, forKey: .held) ?? 0
+        heldBack = try c.decodeIfPresent(Int.self, forKey: .heldBack) ?? 0
+        free = try c.decodeIfPresent(Int.self, forKey: .free) ?? 0
         isolated = try c.decodeIfPresent([Int].self, forKey: .isolated) ?? []
         cores = try c.decodeIfPresent(Int.self, forKey: .cores) ?? 0
         activeCores = try c.decodeIfPresent(Int.self, forKey: .activeCores) ?? 0
+        running = try c.decodeIfPresent(Int.self, forKey: .running) ?? 0
         paused = try c.decodeIfPresent(Int.self, forKey: .paused) ?? 0
+        waiting = try c.decodeIfPresent(Int.self, forKey: .waiting) ?? 0
         busy = try c.decodeIfPresent(Double.self, forKey: .busy)
         tasksBusy = try c.decodeIfPresent(Double.self, forKey: .tasksBusy)
         load = try c.decodeIfPresent([Double].self, forKey: .load) ?? [0, 0, 0]
@@ -294,53 +320,30 @@ extension Status {
         bootTime = try c.decodeIfPresent(Double.self, forKey: .bootTime)
         memory = try c.decodeIfPresent(Memory.self, forKey: .memory)
         gate = try c.decodeIfPresent(Gate.self, forKey: .gate) ?? Gate()
+        runs = try c.decodeIfPresent([Run].self, forKey: .runs) ?? []
         waiters = try c.decodeIfPresent([Waiter].self, forKey: .waiters) ?? []
         projects = try c.decodeIfPresent([Project].self, forKey: .projects) ?? []
         outside = try c.decodeIfPresent([Outside].self, forKey: .outside) ?? []
         outsideTotal = try c.decodeIfPresent(Double.self, forKey: .outsideTotal)
         outsideWork = try c.decodeIfPresent([Work].self, forKey: .outsideWork) ?? []
         recorder = try c.decodeIfPresent(Bool.self, forKey: .recorder) ?? false
-        // Schema 2: its holders are the runs, and a drain (an exclusive holder) isolates the CPUs
-        // it held: `cpus` by the machine's numbers, or else its `slots`, places in the pool.
-        if let r = try c.decodeIfPresent([Run].self, forKey: .runs) {
-            runs = r
-        } else {
-            struct Held: Decodable { var cpus: [Int]?; var slots: [Int]? }
-            runs = try c.decodeIfPresent([Run].self, forKey: .holders) ?? []
-            let held = (try? c.decodeIfPresent([Held].self, forKey: .holders)) ?? []
-            for i in runs.indices {
-                let h = i < held.count ? held[i] : Held()
-                let cpus = h.cpus ?? (h.slots ?? []).map { $0 >= 0 && $0 < pool.count ? pool[$0] : $0 }
-                runs[i].cpus = runs[i].drain ? cpus : []
-                runs[i].pin = runs[i].cpus
-            }
-        }
-        running = try c.decodeIfPresent(Int.self, forKey: .running) ?? c.decodeIfPresent(Int.self, forKey: .held) ?? runs.reduce(0) { $0 + $1.running }
-        waiting = try c.decodeIfPresent(Int.self, forKey: .waiting) ?? waiters.reduce(0) { $0 + ($1.drain ? 0 : $1.waiting) }
-        // Schema 2's free CPUs are its room: a waiter beside them starts at once.
-        room = try c.decodeIfPresent(Double.self, forKey: .room) ?? c.decodeIfPresent(Int.self, forKey: .free).map(Double.init) ?? 0
-        // Schema 2 names no capacity: under measured admission the CPUs online (its budget there
-        // is only a drain's size), else the budget.
-        capacity = try c.decodeIfPresent(Int.self, forKey: .capacity) ?? (admit == "measured" && activeCores > 0 ? activeCores : budget)
     }
 }
 
 extension Status.Gate {
-    private enum Keys: String, CodingKey { case state, load, text }
+    private enum Keys: String, CodingKey { case state, text }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         state = try c.decodeIfPresent(String.self, forKey: .state) ?? "open"
-        load = try c.decodeIfPresent(Double.self, forKey: .load)
         text = try c.decodeIfPresent(String.self, forKey: .text) ?? state
     }
 }
 
 extension Status.Run {
     private enum Keys: String, CodingKey {
-        case ticket, pid, project, weight, limit, tasks, done, failed, running, paused, demoted, demotedFor, ioWait, tail, oldest, waiting
+        case ticket, pid, project, weight, limit, tasks, done, failed, running, paused, ioWait, tail, oldest, waiting
         case runningTasks, stopped, driver, driverBusy, drain, pin, cpus, noise, noisyTop, urgent, using, flags
         case label, note, command, since, progress, left, leftFrom, typical
-        case cores, exclusive
     }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
@@ -351,20 +354,10 @@ extension Status.Run {
         tasks = try c.decodeIfPresent(Int.self, forKey: .tasks) ?? 0
         done = try c.decodeIfPresent(Int.self, forKey: .done) ?? 0
         failed = try c.decodeIfPresent(Int.self, forKey: .failed) ?? 0
-        // Schema 2: the CPUs a holder held, one per running task.
-        let cores = try c.decodeIfPresent(Int.self, forKey: .cores)
-        running = try cores ?? c.decodeIfPresent(Int.self, forKey: .running) ?? 0
+        running = try c.decodeIfPresent(Int.self, forKey: .running) ?? 0
         limit = try c.decodeIfPresent(Int.self, forKey: .limit) ?? Swift.max(running, 1)
-        // Schema 3's `paused` counts the tasks cpuq stopped; schema 2's is its cpuq stopped.
-        if let n = try? c.decodeIfPresent(Int.self, forKey: .paused) {
-            paused = n
-            stopped = try c.decodeIfPresent(Bool.self, forKey: .stopped) ?? false
-        } else {
-            let was = (try? c.decodeIfPresent(Bool.self, forKey: .paused)) ?? false
-            stopped = try c.decodeIfPresent(Bool.self, forKey: .stopped) ?? was
-        }
-        demoted = try c.decodeIfPresent(Int.self, forKey: .demoted) ?? 0
-        demotedFor = try c.decodeIfPresent(String.self, forKey: .demotedFor) ?? ""
+        paused = try c.decodeIfPresent(Int.self, forKey: .paused) ?? 0
+        stopped = try c.decodeIfPresent(Bool.self, forKey: .stopped) ?? false
         ioWait = try c.decodeIfPresent(Int.self, forKey: .ioWait)
         tail = try c.decodeIfPresent(Bool.self, forKey: .tail) ?? false
         oldest = try c.decodeIfPresent(Int.self, forKey: .oldest) ?? 0
@@ -372,8 +365,7 @@ extension Status.Run {
         runningTasks = try c.decodeIfPresent([Status.Task].self, forKey: .runningTasks) ?? []
         driver = try c.decodeIfPresent(Bool.self, forKey: .driver) ?? false
         driverBusy = try c.decodeIfPresent(Double.self, forKey: .driverBusy) ?? 0
-        // Schema 2: an exclusive holder is a drain (Status gives it its CPUs).
-        drain = try c.decodeIfPresent(Bool.self, forKey: .drain) ?? c.decodeIfPresent(Bool.self, forKey: .exclusive) ?? false
+        drain = try c.decodeIfPresent(Bool.self, forKey: .drain) ?? false
         pin = try c.decodeIfPresent([Int].self, forKey: .pin) ?? []
         cpus = try c.decodeIfPresent([Int].self, forKey: .cpus) ?? []
         noise = try c.decodeIfPresent(Double.self, forKey: .noise) ?? 0
@@ -393,7 +385,7 @@ extension Status.Run {
 }
 
 extension Status.Task {
-    private enum Keys: String, CodingKey { case task, attempt, pid, since, paused, demoted }
+    private enum Keys: String, CodingKey { case task, attempt, pid, since, paused, cpu }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         task = try c.decodeIfPresent(Int.self, forKey: .task) ?? 0
@@ -401,23 +393,22 @@ extension Status.Task {
         pid = try c.decodeIfPresent(Int.self, forKey: .pid) ?? 0
         since = try c.decodeIfPresent(Int.self, forKey: .since) ?? 0
         paused = try c.decodeIfPresent(Bool.self, forKey: .paused) ?? false
-        demoted = try c.decodeIfPresent(Bool.self, forKey: .demoted) ?? false
+        cpu = try c.decodeIfPresent(Int.self, forKey: .cpu) ?? 0
     }
 }
 
 extension Status.Waiter {
-    private enum Keys: String, CodingKey { case order, ticket, pid, project, waiting, running, max, drain, urgent, why, label, note, command, since, cores, holds, exclusive }
+    private enum Keys: String, CodingKey { case order, ticket, pid, project, waiting, running, max, drain, urgent, why, label, note, command, since }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         order = try c.decodeIfPresent(Int.self, forKey: .order) ?? 0
         ticket = try c.decodeIfPresent(Int.self, forKey: .ticket) ?? 0
         pid = try c.decodeIfPresent(Int.self, forKey: .pid) ?? 0
         project = try c.decodeIfPresent(String.self, forKey: .project) ?? ""
-        // Schema 2: the CPUs it asked for and those it held already.
-        waiting = try c.decodeIfPresent(Int.self, forKey: .waiting) ?? c.decodeIfPresent(Int.self, forKey: .cores) ?? 0
-        running = try c.decodeIfPresent(Int.self, forKey: .running) ?? c.decodeIfPresent(Int.self, forKey: .holds) ?? 0
+        waiting = try c.decodeIfPresent(Int.self, forKey: .waiting) ?? 0
+        running = try c.decodeIfPresent(Int.self, forKey: .running) ?? 0
         max = try c.decodeIfPresent(Int.self, forKey: .max) ?? waiting
-        drain = try c.decodeIfPresent(Bool.self, forKey: .drain) ?? c.decodeIfPresent(Bool.self, forKey: .exclusive) ?? false
+        drain = try c.decodeIfPresent(Bool.self, forKey: .drain) ?? false
         urgent = try c.decodeIfPresent(Bool.self, forKey: .urgent) ?? false
         why = try c.decodeIfPresent(String.self, forKey: .why) ?? ""
         label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
@@ -428,15 +419,14 @@ extension Status.Waiter {
 }
 
 extension Status.Project {
-    private enum Keys: String, CodingKey { case name, weight, runs, running, waiting, fair, ops, held, want }
+    private enum Keys: String, CodingKey { case name, weight, runs, running, waiting, fair }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
         weight = try c.decodeIfPresent(Int.self, forKey: .weight) ?? 1
-        // Schema 2: its runs, the CPUs they held and those they wanted.
-        runs = try c.decodeIfPresent(Int.self, forKey: .runs) ?? c.decodeIfPresent(Int.self, forKey: .ops) ?? 0
-        running = try c.decodeIfPresent(Int.self, forKey: .running) ?? c.decodeIfPresent(Int.self, forKey: .held) ?? 0
-        waiting = try c.decodeIfPresent(Int.self, forKey: .waiting) ?? c.decodeIfPresent(Int.self, forKey: .want) ?? 0
+        runs = try c.decodeIfPresent(Int.self, forKey: .runs) ?? 0
+        running = try c.decodeIfPresent(Int.self, forKey: .running) ?? 0
+        waiting = try c.decodeIfPresent(Int.self, forKey: .waiting) ?? 0
         fair = try c.decodeIfPresent(Double.self, forKey: .fair) ?? 0
     }
 }
@@ -477,18 +467,34 @@ extension Status {
     /// CPUs busy: the machine's, else its tasks', else (a cpuq with no reading) its tasks running.
     public var busyNow: Double { busy ?? tasksBusy ?? Double(running) }
 
-    /// Runs wait beside room: tasks waiting, room for more, and the gate open. cpuq starts the
-    /// first waiter's next task at its next look, so this lasting is the case to fix.
-    /// A drain waiting for its turn holds the line on purpose.
-    public var waitsBesideRoom: Bool { !waiters.isEmpty && room > 0 && gate.state == "open" && !waiters.contains(where: \.drain) }
+    /// "8 tokens, 2 reserved": the pool as cpuq shares it.
+    public var tokensText: String {
+        (tokens == 1 ? "1 token" : "\(tokens) tokens") + ", \(reserve) reserved"
+    }
+
+    /// The reserve's CPUs: the pool's past its tokens, never handed out.
+    public var reserveCPUs: [Int] { Array(pool.dropFirst(tokenCpus.count)) }
+
+    /// Each CPU whose token a run's task holds (or a drain's command runs on), with that run's
+    /// index in `runs`.
+    public var holders: [Int: Int] {
+        var out: [Int: Int] = [:]
+        for (i, r) in runs.enumerated() { for c in r.heldCPUs { out[c] = i } }
+        return out
+    }
+
+    /// Runs wait beside free tokens: tasks waiting, a token free, and the gate open. cpuq hands
+    /// a free token to the line at once, so this lasting is the case to fix. A drain waiting for
+    /// its turn holds the line on purpose.
+    public var waitsBesideFree: Bool { !waiters.isEmpty && free > 0 && gate.state == "open" && !waiters.contains(where: \.drain) }
 }
 
 /// The menu-bar meter: how many of the chip's four cells to fill. None while under half a CPU is
-/// busy; otherwise the share of the capacity busy, in quarters, rounded up, so any work at all
-/// shows a cell and 4 means every CPU is busy.
-public func meterLevel(busy: Double, capacity: Int) -> Int {
-    guard busy >= 0.5, capacity > 0 else { return 0 }
-    return min(4, Int((4 * busy / Double(capacity)).rounded(.up)))
+/// busy; otherwise the share of the machine's CPUs busy, in quarters, rounded up, so any work at
+/// all shows a cell and 4 means every CPU is busy.
+public func meterLevel(busy: Double, cpus: Int) -> Int {
+    guard busy >= 0.5, cpus > 0 else { return 0 }
+    return min(4, Int((4 * busy / Double(cpus)).rounded(.up)))
 }
 
 /// CPUs by number, in runs: "8, 9", "0, 2, 4–7".
@@ -602,8 +608,8 @@ public func runningSeconds(boots data: Data, since: Date, now: Date = Date()) ->
 }
 
 /// One of `cpuq record`'s samples, as `cpuq samples` prints them: when, each
-/// CPU's busy share since the sample before (percent), the 1-minute load, cpuq's tasks running
-/// (a schema-2 recorder's `held`, its CPUs held, one per task), and the gate.
+/// CPU's busy share since the sample before (percent), the 1-minute load, cpuq's tasks running,
+/// and the gate.
 public struct RecordedSample: Decodable, Sendable, Equatable {
     public let t: Double
     public let cpu: [Double]
@@ -611,14 +617,14 @@ public struct RecordedSample: Decodable, Sendable, Equatable {
     public let running: Int?
     public let gate: String
 
-    private enum Keys: String, CodingKey { case t, cpu, load, running, held, gate }
+    private enum Keys: String, CodingKey { case t, cpu, load, running, gate }
 
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         t = try c.decode(Double.self, forKey: .t)
         cpu = try c.decode([Double].self, forKey: .cpu)
         load = try c.decode(Double.self, forKey: .load)
-        running = try c.decodeIfPresent(Int.self, forKey: .running) ?? c.decodeIfPresent(Int.self, forKey: .held)
+        running = try c.decodeIfPresent(Int.self, forKey: .running)
         gate = try c.decode(String.self, forKey: .gate)
     }
 

@@ -344,9 +344,10 @@ t_share() {
   # a has a task waiting: the line gives b a second token only once a waits for none.
   setup share
   local f=$T/starts
-  "$CPUQ" run -n 4 --label a:work -- sh -c 'echo "a$CPUQ_TASK" >>"$1"; "$2" -2 2' sh "$f" "$BURN" 2>/dev/null & local a=$!
+  # a's first two tasks end 1.5 s apart, so a freed token's taker is never a race.
+  "$CPUQ" run -n 4 --label a:work -- sh -c 'echo "a$CPUQ_TASK" >>"$1"; "$2" "$(( CPUQ_TASK == 2 ? 3 : 1 ))"' sh "$f" "$BURN" 2>/dev/null & local a=$!
   wait_running 2
-  "$CPUQ" run -n 6 --label b:work -- sh -c 'echo "b$CPUQ_TASK" >>"$1"; "$2" -2 0.5' sh "$f" "$BURN" 2>/dev/null & local b=$!
+  "$CPUQ" run -n 6 --label b:work -- sh -c 'echo "b$CPUQ_TASK" >>"$1"; "$2" 0.5' sh "$f" "$BURN" 2>/dev/null & local b=$!
   wait_waiters 2
   local bad=0 both=0 looks=0 line
   while kill -0 $b 2>/dev/null && kill -0 $a 2>/dev/null && [ $looks -lt 300 ]; do
@@ -566,7 +567,8 @@ print(','.join(map(str, sorted(s))))")
   # any core holds), the command starts once measured.
   local rq2; "$CPUQ" drain --cpus "$last" --quiet-max 8 --max 20s --label n:quiet2 -- touch "$T/ran-quiet"; rq2=$?
   local hist; hist=$("$CPUQ" history --label n:noisy --json | python3 -c 'import json,sys; n = json.load(sys.stdin)[0].get("noisy") or {}; print("%.1f %s" % (n.get("max", 0), n.get("top", "-")))')
-  check "outside work on its CPU: status flags the drain noisy ($(cat "$T/flags"); rc $rn) and history records it ($hist)" "[ $rn = 0 ] && grep -qw noisy '$T/flags' && fl \"${hist%% *} >= 0.5\" && [[ '$hist' == *python* ]]"
+  # The busiest process named is the burner, or on a shared host another one on that CPU.
+  check "outside work on its CPU: status flags the drain noisy ($(cat "$T/flags"); rc $rn) and history records it ($hist)" "[ $rn = 0 ] && grep -qw noisy '$T/flags' && fl \"${hist%% *} >= 0.5\" && [[ '$hist' == *'('*')'* ]]"
   check "--quiet-max waits for a quiet CPU and gives up at --max (rc $rq after ${dq}s: $(cat "$T/quiet.err"), ran: $([ -e "$T/ran-loud" ] && echo yes || echo no)); under a bound it meets it runs (rc $rq2)" \
     "[ $rq = 75 ] && [ ! -e '$T/ran-loud' ] && fl '2.5 < $dq < 6' && grep -q 'never quieted' '$T/quiet.err' && [ $rq2 = 0 ] && [ -e '$T/ran-quiet' ]"
 }
@@ -1051,9 +1053,10 @@ t_leaked_descendant() {
 }
 
 t_kill_waiter() {
-  # A SIGKILLed waiter doesn't hold up the line.
+  # A SIGKILLed waiter doesn't hold up the line. (One burner: on Linux the task is pinned to its
+  # token's CPU, so two would share it.)
   setup kill-waiter "tokens = 1"
-  "$CPUQ" run --label w:hold -- "$BURN" -2 1.5 & local holder=$!
+  "$CPUQ" run --label w:hold -- "$BURN" 1.5 & local holder=$!
   wait_running 1
   "$CPUQ" run --label w:one -- true & local w1=$!
   wait_waiters 1

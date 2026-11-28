@@ -2,8 +2,8 @@ import Charts
 import CpuqCore
 import SwiftUI
 
-/// The Now tab: the Mac's ten CPUs as glass cells, each filled to how busy its CPU is, the jobs
-/// waiting for room beside them, the last hour on the same 0-to-10 scale, and the jobs. Empty
+/// The Now tab: the Mac's ten CPUs as glass cells, each filled to how busy its CPU is and tinted
+/// with the project whose task holds its token, the jobs waiting for a token beside them, the last hour on the same 0-to-10 scale, and the jobs. Empty
 /// glass is calm; empty glass while someone waits glows rose, the one case worth hunting.
 /// Pointing at the hour replays that moment in the cells.
 struct NowView: View {
@@ -61,7 +61,7 @@ func flagWords(_ r: Status.Run) -> [String] {
     return r.flags.compactMap { f in
         switch f {
         case "over_cpu": String(format: "%.2f CPUs busy per task: a task runs more than one job", per)
-        case "capped": "\(GraphModel.tasks(max(r.tasks - r.done - r.failed - r.running, 0))) held back by its own -c \(r.limit) while there is room"
+        case "capped": "\(GraphModel.tasks(max(r.tasks - r.done - r.failed - r.running, 0))) held back by its own -c \(r.limit) while tokens are free"
         case "idle_drain": String(format: "a drain keeping only %.2f CPUs busy", r.using ?? 0)
         case "long_drain": "a drain past the config's drain_timeout"
         case "noisy": String(format: "other work keeps %.2f CPUs busy on its CPUs", r.noise) + (r.noisyTop.isEmpty ? "" : ", most \(r.noisyTop)") + ": its timing is noisy"
@@ -73,14 +73,12 @@ func flagWords(_ r: Status.Run) -> [String] {
     }
 }
 
-/// How its tasks run, in grey: in the background (and why), on I/O, and its tail ("last task,
-/// running 32m").
+/// How its tasks run, in grey: stopped by cpuq until they hold a token again, on I/O, and its
+/// tail ("last task, running 32m").
 func stateWords(_ r: Status.Run, now: Double = Date().timeIntervalSince1970) -> [String] {
     var out: [String] = []
-    if r.demoted > 0 {
-        let why = r.demotedFor.isEmpty ? "" : " (\(r.demotedFor))"
-        out.append((r.demoted >= r.running ? "background" : "\(r.demoted) in background") + why)
-    }
+    // A stopped run's tasks are all paused, and its stop shows on its own.
+    if r.paused > 0, !r.stopped { out.append("\(r.paused) paused for a token") }
     if let io = r.ioWait, io > 0 { out.append("\(io) on I/O") }
     if r.tail, r.oldest > 0 {
         out.append((r.running == 1 ? "last task" : "last \(r.running) tasks") + ", running " + roughly(now - Double(r.oldest)))
@@ -158,10 +156,13 @@ struct Moment {
     var drains: [(label: String, cpus: [Int], noise: Double)] = []
     /// Each CPU's busy share then, 0 to 1, in the kernel's order: the cells draw these.
     var perCPU: [Double]?
-    /// The CPUs drains run on, by the project each counts for: the one place a CPU's work is known.
-    var pinned: [Int: String] = [:]
+    /// The CPUs whose tokens runs' tasks hold (and those drains' commands run on), by the
+    /// project each counts for.
+    var holders: [Int: String] = [:]
     /// The CPUs drains isolate.
     var isolated: Set<Int> = []
+    /// The reserve's CPUs: never handed out, so never anyone's to take.
+    var reserve: Set<Int> = []
     /// The 1-minute load: threads running or ready to run, the demand on the CPUs.
     var load: Double?
     /// The machine's CPUs.
@@ -172,13 +173,13 @@ struct Moment {
     /// The app was running then and measured the CPUs; before it was, jobs and waits are known
     /// from cpuq but how busy the CPUs were is not.
     var watched = true
-    /// Room for more of cpuq's tasks (cpuq's `room`): CPUs outside the line, or busy with other
-    /// work, are no one's to take, and room counts them out. Nil when unknown.
-    var room: Double?
-    /// Jobs waited beside room with the gate open: the case to fix, since cpuq starts the first
-    /// waiter's next task at its next look. Never judged from a moment the app did not watch, nor
-    /// without cpuq's room: unknown is not idle.
-    var needless: Bool { watched && !waiters.isEmpty && (room ?? 0) > 0 && gateShut == nil && window == nil }
+    /// cpuq's tokens free: the reserve, and tokens held back for work outside cpuq, are no one's
+    /// to take, and free counts them out. Nil when unknown.
+    var tokensFree: Int?
+    /// Jobs waited beside a free token with the gate open: the case to fix, since cpuq hands a
+    /// free token to the line at once. Never judged from a moment the app did not watch, nor
+    /// without cpuq's count: unknown is not idle.
+    var needless: Bool { watched && !waiters.isEmpty && (tokensFree ?? 0) > 0 && gateShut == nil && window == nil }
 
     /// No more than the CPUs, whatever the readings say.
     mutating func fit() {
@@ -204,13 +205,13 @@ struct Moment {
                    asks: GraphModel.wants($0), since: Date(timeIntervalSince1970: Double($0.since)))
         }
         out.gateShut = s.gate.state == "open" ? nil : s.gate.text
-        out.room = s.room
+        out.tokensFree = s.free
         out.load = s.load.first
         out.perCPU = m.samples.last?.perCPU
         out.isolated = Set(s.isolated)
+        out.reserve = Set(s.reserveCPUs)
+        out.holders = GraphModel.holders(s)
         for r in s.runs where r.drain {
-            let project = GraphModel.group(r.label, r.note)
-            for c in r.pin { out.pinned[c] = project }
             out.isolated.formUnion(r.cpus)
             out.drains.append((GraphModel.label(r.label, r.command), r.cpus.isEmpty ? r.pin : r.cpus, r.noise))
         }
@@ -237,13 +238,15 @@ struct Moment {
         out.watched = sample != nil
         if let sample {
             out.load = sample.load
-            out.room = sample.room
+            out.tokensFree = sample.free
             out.perCPU = sample.perCPU
+            out.holders = sample.holders
             out.outside = sample.busy.map { max($0 * m.cpus - jobs, 0) } ?? sample.outside
             if !sample.gateOpen { out.gateShut = sample.gateText }
         }
+        out.reserve = Set(m.status?.reserveCPUs ?? [])
         for b in m.blocks where b.drain && b.from <= t && (b.to ?? .distantFuture) >= t {
-            for c in b.pin { out.pinned[c] = b.project }
+            for c in b.pin { out.holders[c] = b.project }
             out.isolated.formUnion(b.isolated)
             out.drains.append((b.label, b.isolated.isEmpty ? b.pin : b.isolated, 0))
         }
@@ -274,12 +277,14 @@ final class HourCache {
         /// A drain waited for its turn: the line waiting behind it then was on purpose.
         var window = false
         var perCPU: [Double]?
+        /// Each CPU whose token a run's task held at the column's last sample, by project.
+        var holders: [Int: String] = [:]
         /// The machine's CPUs.
         var cpus = 1.0
         var total: Double { shares.values.reduce(0, +) + outside }
-        /// The least room in the column's samples (cpuq's `room`); nil when unknown.
-        var room: Double?
-        var needless: Bool { watched && waiting > 0 && (room ?? 0) > 0 && !gateShut && !window }
+        /// The fewest tokens free in the column's samples (cpuq's `free`); nil when unknown.
+        var free: Int?
+        var needless: Bool { watched && waiting > 0 && (free ?? 0) > 0 && !gateShut && !window }
     }
 
     struct Hour {
@@ -350,7 +355,8 @@ final class HourCache {
             guard i >= 0 && i < total else { continue }
             if let b = s.busy { let e = busy[i] ?? (0, 0); busy[i] = (e.0 + b, e.1 + 1) }
             let g = shut[i] ?? (0, 0); shut[i] = (g.0 + (s.gateOpen ? 0 : 1), g.1 + 1)
-            if let r = s.room { cols[i].room = min(cols[i].room ?? r, r) }
+            if let f = s.free { cols[i].free = min(cols[i].free ?? f, f) }
+            if s.perCPU != nil { cols[i].holders = s.holders }
             if let p = s.perCPU {
                 var e = per[i] ?? (Array(repeating: 0, count: p.count), 0)
                 if e.0.count == p.count { for j in p.indices { e.0[j] += p[j] }; e.1 += 1 }
@@ -360,16 +366,16 @@ final class HourCache {
         // A column with no machine reading carries the last one, up to `carry` columns: a gap
         // between polls is not an idle machine.
         let carry = max(Int((300 / step).rounded()), 1)
-        var lastOutside: Double?, lastPer: [Double]?, lastAt = -1
+        var lastOutside: Double?, lastPer: [Double]?, lastHolders: [Int: String] = [:], lastAt = -1
         for i in 0..<total {
             if let (b, k) = busy[i] { cols[i].watched = true; cols[i].outside = max(b / Double(k) * m.cpus - cols[i].shares.values.reduce(0, +), 0) }
             if let (s, k) = shut[i] { cols[i].gateShut = s * 2 >= k }
             if let (p, k) = per[i], k > 0 { cols[i].perCPU = p.map { $0 / Double(k) } }
             if cols[i].watched {
-                lastOutside = cols[i].outside; lastPer = cols[i].perCPU; lastAt = i
+                lastOutside = cols[i].outside; lastPer = cols[i].perCPU; lastHolders = cols[i].holders; lastAt = i
             } else if lastAt >= 0 && i - lastAt <= carry {
                 cols[i].outside = lastOutside ?? 0
-                if cols[i].perCPU == nil { cols[i].perCPU = lastPer }
+                if cols[i].perCPU == nil { cols[i].perCPU = lastPer; cols[i].holders = lastHolders }
             }
             // Never more than the CPUs.
             let t = cols[i].total
@@ -487,6 +493,11 @@ struct HeroCard: View {
                         .font(.caption).padding(.horizontal, 7).padding(.vertical, 1)
                         .background(Capsule().fill(Alive.glass)).overlay(Capsule().strokeBorder(Alive.glassEdge))
                 }
+                // The pool as cpuq shares it: "8 tokens, 2 reserved".
+                if let s = model.status {
+                    Text(s.tokensText).font(.caption).foregroundStyle(Alive.ink3).lineLimit(1).minimumScaleFactor(0.8)
+                        .help("cpuq's pool: \(s.tokensText). A task holds a token while it runs, so at most \(s.tokens) run at once; the reserve's \(s.reserve) CPU\(s.reserve == 1 ? "" : "s") are never handed out.")
+                }
             }
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 Text(String(format: "%.1f", moment.total)).font(.system(size: 66, weight: .semibold)).tracking(-2.3).monospacedDigit()
@@ -532,8 +543,9 @@ struct HeroCard: View {
         } else if !moment.watched {
             verdict("eye.slash", "Not watched", "The app wasn't running then: how busy the CPUs were is unknown")
         } else if moment.needless {
-            verdict("exclamationmark.triangle.fill", "\(moment.waiters.count) waiting with room for " + String(format: "%.1f", moment.room ?? 0) + " CPUs",
-                    "Waiting with room to spare", tint: Alive.rose)
+            let n = moment.tokensFree ?? 0
+            verdict("exclamationmark.triangle.fill", "\(moment.waiters.count) waiting with \(n) token\(n == 1 ? "" : "s") free",
+                    "Waiting beside a free token", tint: Alive.rose)
         } else if let shut = moment.gateShut {
             verdict("pause.circle.fill", "cpuq's gate is shut", shut.hasPrefix("closed: ") ? String(shut.dropFirst(8)) : shut, tint: .orange)
         } else if let d = moment.drains.first {
@@ -556,13 +568,13 @@ struct HeroCard: View {
             if moment.window != nil {
                 verdict("clock", "\(moment.waiters.count) waiting \(duration(longest))", "The line waits while the drain gathers its CPUs")
             } else if !moment.watched {
-                verdict("clock", "\(moment.waiters.count) waiting \(duration(longest))", "Whether there was room is unknown")
+                verdict("clock", "\(moment.waiters.count) waiting \(duration(longest))", "Whether a token was free is unknown")
             } else if moment.needless {
                 verdict("clock.fill", "Longest wait \(duration(longest))", "This is the case to fix", tint: Alive.rose)
             } else if moment.gateShut != nil {
                 verdict("clock", "\(moment.waiters.count) waiting \(duration(longest))", "They start when the gate opens")
             } else {
-                verdict("clock", "\(moment.waiters.count) waiting \(duration(longest)) · fair", "The machine is busy: each starts when room opens")
+                verdict("clock", "\(moment.waiters.count) waiting \(duration(longest)) · fair", "Every token is held: each starts when one frees")
             }
         } else {
             verdict("checkmark.circle", "Nobody waiting", moment.total < 1.5 ? "Queue empty" : "Every job that asked is running")
@@ -612,7 +624,7 @@ struct HeroCard: View {
     }
 }
 
-/// The jobs waiting for room, beside the cells they will pour into.
+/// The jobs waiting for a token, beside the cells they will pour into.
 struct WaitingTray: View {
     let model: GraphModel
     let moment: Moment
@@ -655,7 +667,7 @@ struct WaitingTray: View {
                     .foregroundStyle(bad ? Alive.rose : Alive.ink2).fontWeight(bad ? .semibold : .regular)
             }
             .font(.caption)
-            Text(moment.window != nil ? "\(w.asks) · behind the drain" : bad ? "\(w.asks) · room to spare" : "\(w.asks) · machine busy")
+            Text(moment.window != nil ? "\(w.asks) · behind the drain" : bad ? "\(w.asks) · tokens free" : "\(w.asks) · every token held")
                 .font(.system(size: 10.5)).foregroundStyle(Alive.ink2).lineLimit(1).padding(.leading, 14)
         }
         .padding(.horizontal, 8).padding(.vertical, 5)
@@ -767,11 +779,12 @@ final class CellMotion {
     }
 }
 
-/// Ten glass cells, one per CPU, each filled to how busy that CPU is: in the color of the project
-/// whose drain runs there, else plain busy. A CPU a drain isolates has a rim of the drain's color
-/// and a lock. Before the first reading of each CPU, the cells fill left to right with each
-/// project's CPU in palette order, then other work. A gentle wave on the surface. Drawn with
-/// Canvas and paused when motion is reduced.
+/// Ten glass cells, one per CPU, each filled to how busy that CPU is: a CPU whose token a run's
+/// task holds (or a drain's command runs on) is tinted and filled in that run's project color,
+/// any other in plain busy. A CPU a drain isolates has a rim of the drain's color and a lock; the
+/// reserve's CPUs, never handed out, a dashed rim and "R". Before the first reading of each CPU,
+/// the cells fill left to right with each project's CPU in palette order, then other work. A
+/// gentle wave on the surface. Drawn with Canvas and paused when motion is reduced.
 struct CellsCanvas: View {
     let model: GraphModel
     private var cpus: Double { model.cpus }
@@ -805,9 +818,21 @@ struct CellsCanvas: View {
         moment.perCPU.flatMap { $0.count == n ? $0 : nil }
     }
 
-    /// The color a CPU's busy is drawn in: its drain's project's, else plain busy.
+    /// The color a CPU's busy is drawn in: the project's whose task holds its token (or whose
+    /// drain runs there), else plain busy.
     private func color(ofCPU c: Int) -> Color {
-        moment.pinned[c].map { model.color($0) } ?? Alive.busy
+        moment.holders[c].map { model.color($0) } ?? Alive.busy
+    }
+
+    /// The glass behind a CPU: a drain's tint where one isolates it, a pale wash of the project
+    /// whose task holds its token, else clear glass.
+    private func glass(ofCPU c: Int) -> Color {
+        moment.isolated.contains(c) ? Alive.windowTint.opacity(0.08) : moment.holders[c].map { model.color($0).opacity(0.13) } ?? Alive.glass
+    }
+
+    /// A token no one holds: the only CPU a waiter could take, so the only one that glows rose.
+    private func freeToken(_ c: Int) -> Bool {
+        moment.holders[c] == nil && !moment.isolated.contains(c) && !moment.reserve.contains(c)
     }
 
     /// The layers in each cell, as ranges from 0 (empty) to 1 (full): the CPU's own busy when
@@ -885,12 +910,14 @@ struct CellsCanvas: View {
             let shape = Path(roundedRect: cell, cornerRadius: min(10, w / 3))
             let level = levels[c]
             let isolated = moment.isolated.contains(c)
-            gc.fill(shape, with: .color(isolated ? Alive.windowTint.opacity(0.08) : Alive.glass))
+            let reserved = moment.reserve.contains(c)
+            let free = freeToken(c)
+            gc.fill(shape, with: .color(glass(ofCPU: c)))
             var inner = gc
             inner.clip(to: shape)
-            // Empty glass while someone waits needlessly glows rose; a drain's own CPUs are no
-            // one else's to take.
-            if motion.rose > 0.01 && level < 1 && !isolated {
+            // A free token's empty glass glows rose while someone waits needlessly; a held token,
+            // a drain's CPUs and the reserve are no waiter's to take.
+            if motion.rose > 0.01 && level < 1 && free {
                 let yTop = bottom - level * h
                 inner.fill(Path(CGRect(x: x, y: top, width: w, height: yTop - top + 2)),
                            with: .linearGradient(Gradient(colors: [Alive.rose.opacity((0.30 + 0.14 * pulse) * motion.rose),
@@ -926,12 +953,15 @@ struct CellsCanvas: View {
             inner.fill(Path(cell), with: .linearGradient(Gradient(stops: [.init(color: .white.opacity(dark ? 0.10 : 0.28), location: 0),
                                                                         .init(color: .white.opacity(0), location: 0.3)]),
                                                         startPoint: CGPoint(x: x, y: 0), endPoint: CGPoint(x: x + w, y: 0)))
-            let rimRose = motion.rose > 0.5 && level < 1 && !isolated
+            let rimRose = motion.rose > 0.5 && level < 1 && free
+            let rim = moment.holders[c].map { model.color($0).opacity(0.7) }
             gc.stroke(Path(roundedRect: cell.insetBy(dx: 0.5, dy: 0.5), cornerRadius: min(9.5, w / 3)),
-                      with: .color(isolated ? Alive.windowTint.opacity(0.8) : rimRose ? Alive.rose.opacity(0.55 + 0.3 * pulse) : Alive.glassEdge),
-                      lineWidth: isolated ? 1.5 : 1)
+                      with: .color(isolated ? Alive.windowTint.opacity(0.8) : rimRose ? Alive.rose.opacity(0.55 + 0.3 * pulse) : rim ?? Alive.glassEdge),
+                      style: StrokeStyle(lineWidth: isolated ? 1.5 : 1, dash: reserved && !isolated ? [3, 3] : []))
             if isolated {
                 gc.draw(Text(Image(systemName: "lock.fill")).font(.system(size: 9)).foregroundColor(Alive.windowTint), at: CGPoint(x: x + w / 2, y: top + 12))
+            } else if reserved {
+                gc.draw(Text("R").font(.system(size: 9, weight: .semibold)).foregroundColor(Alive.ink3), at: CGPoint(x: x + w / 2, y: top + 12))
             } else if motion.rose > 0.4 && level < 0.35 && w >= 24 {
                 gc.draw(Text("idle").font(.system(size: 10, weight: .semibold)).foregroundColor(Alive.rose.opacity(motion.rose)),
                         at: CGPoint(x: x + w / 2, y: top + 18))
@@ -978,17 +1008,22 @@ extension CellsCanvas {
             let cell = CGRect(x: x, y: y, width: w, height: h)
             let shape = Path(roundedRect: cell, cornerRadius: min(4, w / 4))
             let isolated = moment.isolated.contains(c)
-            gc.fill(shape, with: .color(isolated ? Alive.windowTint.opacity(0.08) : Alive.glass))
+            let reserved = moment.reserve.contains(c)
+            gc.fill(shape, with: .color(glass(ofCPU: c)))
             var inner = gc
             inner.clip(to: shape)
             for (color, lo, hi) in cells[c] {
                 inner.fill(Path(CGRect(x: x, y: y + h - hi * h, width: w, height: (hi - lo) * h)), with: .color(color))
             }
+            let rim = moment.holders[c].map { model.color($0).opacity(0.7) }
             gc.stroke(Path(roundedRect: cell.insetBy(dx: 0.5, dy: 0.5), cornerRadius: min(4, w / 4)),
-                      with: .color(isolated ? Alive.windowTint.opacity(0.8) : Alive.glassEdge), lineWidth: isolated ? 1.5 : 1)
+                      with: .color(isolated ? Alive.windowTint.opacity(0.8) : rim ?? Alive.glassEdge),
+                      style: StrokeStyle(lineWidth: isolated ? 1.5 : 1, dash: reserved && !isolated ? [2, 2] : []))
         }
+        // "22 CPUs · 20 tokens, 2 reserved · 1 isolated by a drain"
         let drained = moment.isolated.count
-        gc.draw(Text("\(n) CPUs" + (drained > 0 ? " · \(drained) isolated by a drain" : "")).font(.system(size: 10)).foregroundColor(Alive.ink3),
+        let pool = model.status.map { " · " + $0.tokensText } ?? ""
+        gc.draw(Text("\(n) CPUs" + pool + (drained > 0 ? " · \(drained) isolated by a drain" : "")).font(.system(size: 10)).foregroundColor(Alive.ink3),
                 at: CGPoint(x: x0 + width / 2, y: bottom + 9))
     }
 }
@@ -1083,7 +1118,7 @@ struct HourCard: View {
             let end = hour.columns.last?.to ?? Date()
             let a = Int((end.timeIntervalSince(hour.columns[last.lowerBound].from) / 60).rounded())
             let b = Int((end.timeIntervalSince(hour.columns[last.upperBound].to) / 60).rounded())
-            t = t + Text(" · waited with room to spare ").foregroundColor(.secondary)
+            t = t + Text(" · waited beside free tokens ").foregroundColor(.secondary)
                 + Text(minutes < 1 ? "<1 min" : "\(Int(minutes.rounded())) min").foregroundColor(Alive.rose).bold()
                 + Text(b < 1 ? ", ending \(a) min ago" : a == b ? ", \(a) min ago" : ", \(a)–\(b) min ago").foregroundColor(.secondary)
                 + Text(" · otherwise waits were seconds").foregroundColor(.secondary)
@@ -1132,7 +1167,7 @@ struct HourCard: View {
             ForEach([0, cpus / 2, cpus], id: \.self) { v in
                 RuleMark(y: .value("CPU", v)).foregroundStyle(Color.primary.opacity(0.06)).lineStyle(StrokeStyle(lineWidth: 1))
             }
-            // Waiting while CPUs sat idle: rose from the floor to the ceiling, under the stack, so
+            // Waiting beside free tokens: rose from the floor to the ceiling, under the stack, so
             // it shows wherever the stack is low and is never cut off by the stack's curves. From
             // the start of its first column to the end of its last, so a run of one column fills too.
             ForEach(Array(bad.enumerated()), id: \.offset) { _, run in
@@ -1180,13 +1215,13 @@ struct HourCard: View {
             if let run = bad.max(by: { $0.count < $1.count }) {
                 let mid = cols[(run.lowerBound + run.upperBound) / 2].mid
                 let peak = run.map { cols[$0].waiting }.max() ?? 0
-                let idle = run.map { cpus - cols[$0].total }.reduce(0, +) / Double(run.count)
+                let free = Int((Double(run.map { cols[$0].free ?? 0 }.reduce(0, +)) / Double(run.count)).rounded())
                 PointMark(x: .value("Time", mid), y: .value("CPUs", cpus * 0.78))
                     .opacity(0)
                     .annotation(position: .overlay, overflowResolution: .init(x: .fit(to: .chart), y: .disabled)) {
                         VStack(spacing: 0) {
                             Text("\(peak) waiting").font(.system(size: 12, weight: .semibold))
-                            Text("\(Int(idle.rounded())) CPUs idle").font(.system(size: 10.5)).opacity(0.85)
+                            Text("\(free) token\(free == 1 ? "" : "s") free").font(.system(size: 10.5)).opacity(0.85)
                         }
                         .fixedSize()
                         .halo()
@@ -1218,7 +1253,8 @@ struct HourCard: View {
         layer == "~outside" ? c.outside : c.shares[layer] ?? 0
     }
 
-    /// A lane per CPU, darker the busier: the performance cores on top, the efficiency cores
+    /// A lane per CPU, darker the busier, in the color of the project whose task held its token
+    /// (pale while held, solid while busy): the performance cores on top, the efficiency cores
     /// under them; stretches of needless waiting shaded rose behind.
     private var cores: some View {
         let cols = hour.columns
@@ -1255,26 +1291,29 @@ struct HourCard: View {
         }
         .chartOverlay { scrubber($0) }
         .padding(.leading, labelColumn)
-        .help(p > 0 ? "A row per CPU, darker the busier: the \(p) performance cores (bolt) on top, the \(e) efficiency cores (leaf) below." : "A row per CPU, darker the busier.")
+        .help((p > 0 ? "A row per CPU, darker the busier: the \(p) performance cores (bolt) on top, the \(e) efficiency cores (leaf) below." : "A row per CPU, darker the busier.")
+              + " A CPU whose token a run's task held is in that run's project color: pale while held, solid while busy.")
     }
 
-    /// Per Core's cells, a row per CPU, darker the busier, painted in one pass on the chart's own
-    /// time scale, so they line up with its axis and the scrubber.
+    /// Per Core's cells, a row per CPU, darker the busier, in the color of the project whose task
+    /// held the CPU's token (pale while held, solid while busy), painted in one pass on the chart's
+    /// own time scale, so they line up with its axis and the scrubber.
     private func heat(_ proxy: ChartProxy, _ cols: [HourCache.Column], rowOf: [Int: Double], top: Double) -> some View {
         GeometryReader { geo in
             if let frame = proxy.plotFrame {
                 let plot = geo[frame]
                 let rowHeight = plot.height / top
-                let cells: [(CGRect, Double)] = cols.flatMap { c -> [(CGRect, Double)] in
+                let cells: [(CGRect, Color)] = cols.flatMap { c -> [(CGRect, Color)] in
                     guard let per = c.perCPU, let x0 = proxy.position(forX: c.from), let x1 = proxy.position(forX: c.to) else { return [] }
                     return per.enumerated().map { cpu, busy in
                         let r = rowOf[cpu] ?? 0
+                        let color = c.holders[cpu].map { model.color($0).opacity(0.25 + 0.75 * busy) } ?? Color.primary.opacity(0.05 + 0.8 * busy)
                         return (CGRect(x: plot.minX + x0, y: plot.minY + plot.height - (r + 0.9) * rowHeight,
-                                       width: max(x1 - x0, 0.5), height: max(0.8 * rowHeight, 0.5)), busy)
+                                       width: max(x1 - x0, 0.5), height: max(0.8 * rowHeight, 0.5)), color)
                     }
                 }
                 Canvas { gc, _ in
-                    for (rect, busy) in cells { gc.fill(Path(rect), with: .color(Color.primary.opacity(0.05 + 0.8 * busy))) }
+                    for (rect, color) in cells { gc.fill(Path(rect), with: .color(color)) }
                 }
             }
         }
@@ -1300,7 +1339,7 @@ struct HourCard: View {
         .chartYAxis(.hidden)
         .chartBackground { yLabels($0, [(4.5, "wait")]) }
         .padding(.leading, labelColumn)
-        .help("Jobs waiting: grey while the CPUs were full, a fair wait; rose while there was room to spare.")
+        .help("Jobs waiting: grey while every token was held, a fair wait; rose while a token was free.")
     }
 
     private func scrubber(_ proxy: ChartProxy) -> some View {
@@ -1376,10 +1415,14 @@ struct JobsCard: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline) {
                 Text("JOBS").eyebrow()
-                // "· 3 runs · 12 tasks on 8 CPUs · 7 waiting": tasks, as cpuq counts them.
-                (Text("· \(runs.count) run\(runs.count == 1 ? "" : "s") · \(GraphModel.tasks(s?.running ?? 0)) on \(s?.capacity ?? 0) CPUs · \(s?.waiting ?? 0) waiting").foregroundStyle(Alive.ink)
+                // "· 3 runs · 8 tokens, 2 reserved · 7 held, 1 free · 7 waiting": tokens, as cpuq
+                // counts them.
+                (Text("· \(runs.count) run\(runs.count == 1 ? "" : "s") · \(s?.tokensText ?? "") · \(s?.held ?? 0) held, \(s?.free ?? 0) free").foregroundStyle(Alive.ink)
+                    + Text((s?.heldBack ?? 0) > 0 ? " (\(s?.heldBack ?? 0) held back)" : "").foregroundStyle(Alive.ink2)
+                    + Text(" · \(s?.waiting ?? 0) waiting").foregroundStyle(Alive.ink)
                     + Text(outside.isEmpty ? "" : " · \(outside.count) outside cpuq").foregroundStyle(.orange))
                     .font(.system(size: 13, weight: .medium))
+                    .help("cpuq's pool: \(s?.tokensText ?? ""). A task holds a token while it runs; \(s?.held ?? 0) are held (by tasks and drains), \(s?.free ?? 0) free" + ((s?.heldBack ?? 0) > 0 ? ", and \(s?.heldBack ?? 0) held back while work outside cpuq keeps more than the CPUs cpuq leaves it busy." : "."))
                 Picker("Order", selection: $order) {
                     ForEach(JobOrder.allCases) { Text($0.rawValue).tag($0) }
                 }
@@ -1405,7 +1448,7 @@ struct JobsCard: View {
                             Text("\(p.running) running" + (p.waiting > 0 ? " · \(p.waiting) waiting" : "") + " · fair \(String(format: "%.1f", p.fair))" + (p.weight == 1 ? "" : " · weight \(p.weight)"))
                                 .foregroundStyle(Double(p.running) > p.fair && p.fair > 0 ? Alive.ink : Alive.ink2)
                         }
-                        .help("\(p.name): \(p.runs) run\(p.runs == 1 ? "" : "s") with \(GraphModel.tasks(p.running)) running and \(p.waiting) waiting; its fair share by weight is \(String(format: "%.1f", p.fair)) tasks. Under it, its next task starts at once; over it, its tasks wait for room.")
+                        .help("\(p.name): \(p.runs) run\(p.runs == 1 ? "" : "s") with \(GraphModel.tasks(p.running)) running and \(p.waiting) waiting; its fair share by weight is \(String(format: "%.1f", p.fair)) tokens. Under it, it is first in line for a freed token; over it, its tasks wait.")
                     }
                 }
                 .font(.system(size: 11.5)).monospacedDigit().lineLimit(1)
@@ -1520,7 +1563,14 @@ struct JobsCard: View {
                 if h.ticket > 0 { Button("Stop \(name)…") { control("stop", h.ticket, name) } }
             }
         }
-        .help((stateWords(h) + flagWords(h)).joined(separator: "\n"))
+        .help((tokenWords(h) + stateWords(h) + flagWords(h)).joined(separator: "\n"))
+    }
+
+    /// The CPUs whose tokens its tasks hold: "holds the tokens of CPUs 0–6".
+    private func tokenWords(_ h: Status.Run) -> [String] {
+        let cpus = h.heldCPUs
+        guard !cpus.isEmpty else { return [] }
+        return [(h.drain ? "runs on CPU" : cpus.count == 1 ? "holds the token of CPU" : "holds the tokens of CPU") + (cpus.count == 1 ? " " : "s ") + cpuRanges(cpus)]
     }
 
     /// Work outside cpuq: what started it and its command, where it runs, and the CPUs it keeps
@@ -1580,9 +1630,10 @@ struct JobsCard: View {
         let s = model.status
         let gate = s?.gate.state ?? "open"
         let window = Moment.now(model).window
-        let needless = s?.waitsBesideRoom ?? false
-        let guess = w.drain ? "a drain: waits for \(w.max) CPU\(w.max == 1 ? "" : "s") of its own" : window != nil ? "waits behind the drain" : gate != "open" ? "the gate is shut" : needless ? "room to spare" : "the machine is busy"
-        // cpuq's own reason when it gives one; room beside a waiter is the app's alarm, in rose.
+        let needless = s?.waitsBesideFree ?? false
+        let guess = w.drain ? "a drain: waits for \(w.max) CPU\(w.max == 1 ? "" : "s") of its own" : window != nil ? "waits behind the drain" : gate != "open" ? "the gate is shut" : needless ? "tokens free" : "every token is held"
+        // cpuq's own reason when it gives one; a free token beside a waiter is the app's alarm,
+        // in rose.
         let why = w.why.isEmpty ? guess : w.why
         return HStack(spacing: 10) {
             Circle().strokeBorder(model.color(project), lineWidth: 2).frame(width: 8, height: 8)
