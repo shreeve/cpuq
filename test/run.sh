@@ -1486,6 +1486,18 @@ sys.exit(0 if ok else 1)'"
   check "history prints a summary with the lost run" "[[ '$text' == *'6 runs; waited'* && '$text' == *'1 lost'* && '$text' == *'4/4 · 1 failed'* ]]"
 }
 
+t_project() {
+  # A run's project is its label's, before the repository it runs in: a run labelled x:y inside a
+  # repository named z is project x; with no label it is the repository's, z.
+  setup project
+  mkdir -p "$T/z" && git -C "$T/z" init -q
+  local q='"$1" status --json --no-usage | python3 -c "import json, sys; print([h[\"project\"] for h in json.load(sys.stdin)[\"runs\"]][0])"'
+  local labelled bare
+  labelled=$(cd "$T/z" && "$CPUQ" run --label x:y -- sh -c "$q" sh "$CPUQ")
+  bare=$(cd "$T/z" && "$CPUQ" run -- sh -c "$q" sh "$CPUQ")
+  check "a run labelled x:y in repository z is project x ($labelled); unlabelled, z ($bare)" "[ '$labelled' = x ] && [ '$bare' = z ]"
+}
+
 t_note() {
   # --note travels beside the label into history.
   setup note
@@ -2419,7 +2431,7 @@ f = open(sys.argv[1]); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$sp/p/held
 TESTS=${*:-tokens reserve tasks io cpus_limit timeout retry wait_max share fair order stream first drain drain_cpus drain_turn drain_cap drain_hold drain_part drain_long limit lock_stuck storm kill ctrl_z nested driver removed \
   kill_holder leftovers leaked_descendant kill_waiter term_waiting lost_seq long_command waiters_cpu \
   exit_status direct_sigint terminal_sigint tasks_sigint ignored_signals stack_limit \
-  status progress usage zombie outside status_host history note wait record min_available min_disk hook \
+  status progress usage zombie outside status_host history project note wait record min_available min_disk hook \
   lease lease_host lease_host_hold hold_gone last_words on include_git on_check on_gitignore tethered \
   cap cap_quiet_crash cap_link cgroups submit test test_pool submit_moved submit_abandon submit_slots submit_on \
   submit_needs submit_mem submit_tmp submit_cancel_running submit_progress packs clean}
