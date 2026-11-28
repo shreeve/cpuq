@@ -31,7 +31,7 @@ The rules as admission (`canStart`, `canDrain`):
   projects' first waiters (an urgent run's first task, then project running ÷ weight, then fewer
   tasks running, then ticket: `head`) takes it;
 - hard limits: the gates, a run's `-c`, and running tasks machine-wide < 4T at each start;
-- a drain starts when no older drain waits, at most half the pool is then isolated, the gates are
+- a drain starts when no older drain waits, at most `drainMax` CPUs are then isolated, the gates are
   open and (with `Rules.drainFifo`) no older run that holds nothing waits; its N CPUs are
   isolated at once, with no collecting; it ends at its limit plus grace (`tick`), when its
   command ends or when it idles while others wait (`idleMax` ticks).
@@ -168,7 +168,7 @@ structure Rules where
   design as written). Off: busy counts only the CPUs no drain isolates. -/
   busyAll : Bool
   /-- A drain also waits for every older run that holds nothing and waits (0.34.0's FIFO).
-  Off: it waits only for older drains, the half-pool bound and the gates (the design as
+  Off: it waits only for older drains, the `drainMax` bound and the gates (the design as
   written, property 4). -/
   drainFifo : Bool
   deriving Repr
@@ -181,6 +181,9 @@ def Rules.fixed : Rules := { busyAll := false, drainFifo := true }
 structure Cfg where
   /-- The pool's CPUs (the budget). -/
   pool : Nat
+  /-- `drain_max`: the most CPUs drains may isolate at once (default half the pool). With
+  `drainMax < pool` the other tasks always keep at least one CPU (`capT_pos`). -/
+  drainMax : Nat := pool / 2
   /-- Project weights; a missing or zero weight is 1. -/
   weights : List Nat := []
   runs : List RunCfg := []
@@ -387,10 +390,10 @@ def emptyWaiter (s : St) (r : Nat) : Bool :=
 def olderEmptyWaits (s : St) (d : Nat) : Bool :=
   anyLT cfg.nr (fun r => emptyWaiter s r && decide ((s.run r).ticket < (s.drain d).ticket))
 
-/-- A drain may start: it waits, no older drain waits, at most half the pool is then isolated,
+/-- A drain may start: it waits, no older drain waits, at most `drainMax` CPUs are then isolated,
 the gates are open, and (with `drainFifo`) no older run that holds nothing waits. -/
 def canDrain (s : St) (d : Nat) : Bool :=
-  decide ((s.drain d).ph = .waiting) && s.gate && decide (2 * (iso cfg s + (cfg.drain d).size) ≤ cfg.pool) &&
+  decide ((s.drain d).ph = .waiting) && s.gate && decide (iso cfg s + (cfg.drain d).size ≤ cfg.drainMax) &&
     !olderDrainWaits cfg s d && !(cfg.rules.drainFifo && olderEmptyWaits cfg s d)
 
 def admitR (t : Nat) (x : RunSt) : RunSt := { x with pend := x.pend - 1, start := x.start + 1, ran := true, last := t }
@@ -678,8 +681,8 @@ theorem total_admit {cfg : Cfg} {s : St} {r : Nat} (hr : r < cfg.nr) : total cfg
 structure Inv (cfg : Cfg) (s : St) : Prop where
   here : ∀ r, (s.run r).here = false → (s.run r).pend = 0 ∧ (s.run r).running = 0
   cap : ∀ r, (s.run r).here = true → 1 ≤ (s.run r).cap
-  /-- At most half the pool is isolated. -/
-  half : 2 * iso cfg s ≤ cfg.pool
+  /-- At most `drainMax` CPUs are isolated. -/
+  half : iso cfg s ≤ cfg.drainMax
   /-- A started drain has run at most its limit plus grace, and idled at most `idleMax`. -/
   clock : ∀ d, (s.drain d).ph = .started → (s.drain d).age ≤ cfg.limitOf d + cfg.grace ∧ (s.drain d).idle ≤ cfg.idleMax
   /-- The backstop: never more than 4 × the pool running. -/
@@ -769,7 +772,7 @@ theorem inv_act {cfg : Cfg} {s u : St} {a : Act} (i : Inv cfg s) (h : act cfg s 
           by_cases hed : e = d
           · subst hed; simp at he
           · simpa [hed] using he)
-      refine ⟨i.here, i.cap, Nat.le_trans (Nat.mul_le_mul_left 2 hle) i.half, fun e he => ?_, i.tot⟩
+      refine ⟨i.here, i.cap, Nat.le_trans hle i.half, fun e he => ?_, i.tot⟩
       by_cases hed : e = d
       · subst hed; simp at he
       · simp only [setDrain_drain, hed, ite_false] at he ⊢; exact i.clock e he
@@ -802,7 +805,7 @@ theorem inv_act {cfg : Cfg} {s u : St} {a : Act} (i : Inv cfg s) (h : act cfg s 
           by_cases hed : e = d
           · subst hed; simp at he; exact hy he
           · simpa [hed] using he)
-      refine ⟨i.here, i.cap, Nat.le_trans (Nat.mul_le_mul_left 2 (hle _ (fun _ => hc.2))) i.half,
+      refine ⟨i.here, i.cap, Nat.le_trans (hle _ (fun _ => hc.2)) i.half,
         fun e he => ?_, i.tot⟩
       by_cases hed : e = d
       · subst hed; simp at he ⊢ <;> exact i.clock e hc.2
@@ -816,7 +819,7 @@ theorem inv_act {cfg : Cfg} {s u : St} {a : Act} (i : Inv cfg s) (h : act cfg s 
       split at hd
       · assumption
       · exact hd
-    refine ⟨fun j hj => ?_, fun j hj => i.cap j hj, Nat.le_trans (Nat.mul_le_mul_left 2 (iso_le hst)) i.half,
+    refine ⟨fun j hj => ?_, fun j hj => i.cap j hj, Nat.le_trans (iso_le hst) i.half,
       fun d hd => ?_, ?_⟩
     · have := i.here j hj
       simp only [tickSt, RunSt.running] at this ⊢
@@ -1102,17 +1105,17 @@ theorem project_turn {cfg : Cfg} {s : St} {r : Nat} (hc : canStart cfg s r = tru
   simpa [he, hp] using this
 
 /-- **Property 4, what a drain waits for.** A waiting drain waits only on the gates, the
-half-pool bound, an older drain that waits, or (with `drainFifo`) an older run that waits holding
+`drainMax` bound, an older drain that waits, or (with `drainFifo`) an older run that waits holding
 nothing. -/
 theorem drain_waits_for {cfg : Cfg} {s : St} (h : Reach cfg s) {d : Nat} (hd : d < cfg.nd)
     (hw : (s.drain d).ph = .waiting) :
-    s.gate = false ∨ cfg.pool < 2 * (iso cfg s + (cfg.drain d).size) ∨ olderDrainWaits cfg s d = true ∨
+    s.gate = false ∨ cfg.drainMax < iso cfg s + (cfg.drain d).size ∨ olderDrainWaits cfg s d = true ∨
       (cfg.rules.drainFifo = true ∧ olderEmptyWaits cfg s d = true) := by
   have hc := reach_drain h hd
   cases hg : s.gate
   · exact Or.inl rfl
   · right
-    by_cases hp : cfg.pool < 2 * (iso cfg s + (cfg.drain d).size)
+    by_cases hp : cfg.drainMax < iso cfg s + (cfg.drain d).size
     · exact Or.inl hp
     · right
       cases ho : olderDrainWaits cfg s d
@@ -1123,10 +1126,16 @@ theorem drain_waits_for {cfg : Cfg} {s : St} (h : Reach cfg s) {d : Nat} (hd : d
 /-! ## Property 5: what is withheld from tasks -/
 
 /-- **Property 5, no idle hold.** The CPUs withheld from tasks are exactly those the started
-drains isolate: nothing waiting (a drain or a task) holds a CPU, and at most half the pool is
+drains isolate: nothing waiting (a drain or a task) holds a CPU, and at most `drainMax` are
 isolated. -/
-theorem withheld {cfg : Cfg} {s : St} (h : Reach cfg s) :
-    cfg.pool - capT cfg s = iso cfg s ∧ 2 * iso cfg s ≤ cfg.pool := by
+theorem withheld {cfg : Cfg} {s : St} (h : Reach cfg s) (hD : cfg.drainMax ≤ cfg.pool) :
+    cfg.pool - capT cfg s = iso cfg s ∧ iso cfg s ≤ cfg.drainMax := by
+  have := (reach_inv h).1.half
+  unfold capT; constructor <;> omega
+
+/-- With `drainMax < pool`, the other tasks always keep at least `pool − drainMax ≥ 1` CPUs. -/
+theorem capT_pos {cfg : Cfg} {s : St} (h : Reach cfg s) (hD : cfg.drainMax < cfg.pool) :
+    cfg.pool - cfg.drainMax ≤ capT cfg s ∧ 0 < capT cfg s := by
   have := (reach_inv h).1.half
   unfold capT; constructor <;> omega
 
@@ -1137,9 +1146,9 @@ theorem drain_clock {cfg : Cfg} {s : St} (h : Reach cfg s) {d : Nat} (hs : (s.dr
   have := (reach_inv h).1.clock d hs
   exact ⟨this.1, Nat.min_le_right _ _, this.2⟩
 
-/-- A drain larger than half the pool never starts: the rules must refuse it. -/
+/-- A drain larger than `drainMax` never starts: the rules must refuse it. -/
 theorem big_drain_never {cfg : Cfg} {s : St} (h : Reach cfg s) {d : Nat} (hd : d < cfg.nd)
-    (hb : cfg.pool < 2 * (cfg.drain d).size) : (s.drain d).ph ≠ .started := by
+    (hb : cfg.drainMax < (cfg.drain d).size) : (s.drain d).ph ≠ .started := by
   intro hs
   have h1 := (reach_inv h).1.half
   have h2 : isoF cfg d (s.drain d) ≤ iso cfg s := le_rsum (f := fun j => isoF cfg j (s.drain j)) hd
@@ -1517,9 +1526,9 @@ theorem step_keeps {cfg : Cfg} {s t : St} {a : Act} (ha : a.arrival = false) (hs
 /-- **Property 3, no starvation.** From a time after which nothing arrives, if every task ends
 (every run holding a running task later sees one of them end), the gates are open again and
 again, and time keeps passing, then from some time on nothing waits: every task and every
-drain has started. Drains no larger than half the pool. -/
+drain has started. Drains no larger than `drainMax`. -/
 theorem no_starvation {cfg : Cfg} (hp : 0 < cfg.pool)
-    (hsz : ∀ d < cfg.nd, 2 * (cfg.drain d).size ≤ cfg.pool)
+    (hsz : ∀ d < cfg.nd, (cfg.drain d).size ≤ cfg.drainMax)
     (ρ : Run cfg) (n0 : Nat) (calm : ∀ n ≥ n0, (ρ.act n).arrival = false)
     (ends : ∀ n r, r < cfg.nr → 0 < ((ρ.st n).run r).running → ∃ m ≥ n, finOf r (ρ.act m))
     (gates : ∀ n, ∃ m ≥ n, (ρ.st m).gate = true)
@@ -1854,7 +1863,7 @@ def fifoCfg (r : Rules) : Cfg :=
 
 def fifoTrace : List Act := [.arrive 0, .tick, .arrive 1, .arriveD 0]
 
-/-- **Property 4 fails as written.** A drain that waits only for older drains and the half-pool
+/-- **Property 4 fails as written.** A drain that waits only for older drains and the `drainMax`
 bound starts ahead of an older run that waits holding nothing. -/
 theorem design_drain_passes :
     ∃ s, Reach (fifoCfg .design) s ∧ (s.drain 0).ph = .started ∧ emptyWaiter s 1 = true ∧
@@ -1973,7 +1982,7 @@ theorem Run.calm {cfg : Cfg} (ρ : Run cfg) : ∃ n0, ∀ n ≥ n0, (ρ.act n).a
 configuration arrives at most once): if every task ends, the gates reopen and time passes, then
 from some time on nothing waits. -/
 theorem no_starvation_all {cfg : Cfg} (hp : 0 < cfg.pool)
-    (hsz : ∀ d < cfg.nd, 2 * (cfg.drain d).size ≤ cfg.pool) (ρ : Run cfg)
+    (hsz : ∀ d < cfg.nd, (cfg.drain d).size ≤ cfg.drainMax) (ρ : Run cfg)
     (ends : ∀ n r, r < cfg.nr → 0 < ((ρ.st n).run r).running → ∃ m ≥ n, finOf r (ρ.act m))
     (gates : ∀ n, ∃ m ≥ n, (ρ.st m).gate = true)
     (time : ∀ n, ∃ m ≥ n, ρ.act m = .tick) :
@@ -2036,6 +2045,9 @@ theorem newcomers_first :
 
 /-- info: 'Cpuq.Contest.withheld' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs in #print axioms withheld
+
+/-- info: 'Cpuq.Contest.capT_pos' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms capT_pos
 
 /-- info: 'Cpuq.Contest.big_drain_never' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs in #print axioms big_drain_never

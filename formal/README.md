@@ -356,7 +356,7 @@ first, then ticket: `projFirst`), and its project is under share (`running_p × 
 or there is room (`busy + starting + 1 ≤ T`, which is `< T − 0.5` in whole CPUs) and it is first
 in line among the projects' first waiters (an urgent run's first task, then project running ÷
 weight, then fewer tasks running, then ticket: `head`). A drain starts when no older drain waits, at
-most half the pool is then isolated, the gates are open, and (`drainFifo`) no older run waits
+most `drainMax` CPUs (`drain_max`, default half the pool) are then isolated, the gates are open, and (`drainFifo`) no older run waits
 holding nothing. Drains are `-c N` only (0.40.0 has no `--all`), N a fixed size with the chosen
 CPUs' SMT siblings counted, and no theorem depends on which CPUs they are. A tick measures every started task (starting → computing) and ages every
 started drain; past limit + grace, or idle more than `idleMax` ticks in a row while something
@@ -370,19 +370,19 @@ file).
 
 | Property | Theorem | Holds |
 |---|---|---|
-| Invariant: nothing that may start waits; ≤ half the pool isolated; a started drain's age ≤ limit + grace and idle ≤ `idleMax`; ≤ 4 × pool running | `reach_inv`, `pass_closed` | any rules |
+| Invariant: nothing that may start waits; ≤ `drainMax` isolated; a started drain's age ≤ limit + grace and idle ≤ `idleMax`; ≤ 4 × pool running | `reach_inv`, `pass_closed` | any rules |
 | 1 Work-conserving: a task that waits, not held by the gates, the backstop or its `-c`, is at or over share and busy + starting ≥ T − 0.5 | `work_conserving` | `busyAll` off |
 | 1 fails as written: busy over the whole machine counts a drain's own command against a T that already excludes its CPUs; a task waits beside an idle CPU | `design_not_work_conserving` | (counterexample) |
 | 2 No wait under share: under share, a waiting task waits only on the gates or the 4T backstop (and its `-c`) | `no_wait_under` | any rules |
 | 2 as written ("only a gate or its `-c`") fails: 4T blocked tasks hold an under-share run | `backstop_blocks_under` | (counterexample) |
-| 3 No starvation: after the last arrival, if every task ends, the gates reopen and time passes, every task and every drain starts | `no_starvation` | any rules, drains ≤ half the pool |
-| 3 … for every run of the model: each run and drain arrives at most once, so there is always a last arrival | `Run.calm`, `no_starvation_all` | any rules, drains ≤ half the pool |
+| 3 No starvation: after the last arrival, if every task ends, the gates reopen and time passes, every task and every drain starts | `no_starvation` | any rules, drains ≤ `drainMax` |
+| 3 … for every run of the model: each run and drain arrives at most once, so there is always a last arrival | `Run.calm`, `no_starvation_all` | any rules, drains ≤ `drainMax` |
 | 4 Isolation bounded: through any stretch a drain stays started, ≤ limit + grace ticks pass, limit ≤ ceiling | `hold_bound` | any rules |
 | 4 FIFO: a drain starts only after every older run that waited holding nothing has a task running, and every older waiting drain has started | `drain_no_pass` | `drainFifo` |
-| 4 A waiting drain waits only on the gates, the half-pool bound, an older drain, or (`drainFifo`) an older run holding nothing | `drain_waits_for` | any rules |
+| 4 A waiting drain waits only on the gates, the `drainMax` bound, an older drain, or (`drainFifo`) an older run holding nothing | `drain_waits_for` | any rules |
 | 4 as written ("waits only for older drains and the half-pool bound") passes an older waiter | `design_drain_passes` | (counterexample) |
-| 4 A drain larger than half the pool never starts | `big_drain_never` | any rules |
-| 5 No idle hold: the CPUs withheld from tasks are exactly the started drains' sizes, ≤ half the pool; nothing waiting holds one | `withheld` | any rules |
+| 4 A drain larger than `drainMax` never starts | `big_drain_never` | any rules |
+| 5 No idle hold: the CPUs withheld from tasks are exactly the started drains' sizes, ≤ `drainMax`; nothing waiting holds one; with `drainMax < pool` the others keep ≥ pool − `drainMax` ≥ 1 | `withheld`, `capT_pos` | any rules |
 | 5 A started drain whose command idles while something waits keeps its CPUs ≤ `idleMax` ticks; a started task counts as starting until the next tick | `idle_bound`, `tick_settles` | any rules |
 | 5 fails under 0.35.0: a gathering drain holds a CPU, its command not started, while a run waits holding nothing | `Contest035.idle_hold_035` | (counterexample, slot model) |
 | The line: a run starts only as its project's first waiter; over share, only with room and first in line among the projects' first waiters | `line_order` | any rules |
