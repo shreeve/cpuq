@@ -362,6 +362,12 @@ CPUs' SMT siblings counted, and no theorem depends on which CPUs they are. A tic
 started drain; past limit + grace, or idle more than `idleMax` ticks in a row while something
 waits, it is over.
 
+cpuq 0.41.0 implements `Rules.nostarve` (`Stream.lean`): in src/pool.zig, `pbefore` is
+`pbefore` with `arrivalKey` (its `turn` is `lastKey`: a run's last start, or its arrival if it
+has started none), `lineBefore` is `before2`, `lineFirst` is `head2`, and `mayStart` is
+`canStart` with `oneLine` (the backstop, then its project's first waiter, then first in the one
+line, then under share or room).
+
 `Rules.design` is the design as written; `Rules.fixed` has the two rule changes the proofs need:
 busy counts only the CPUs no drain isolates (`busyAll` off), and a drain waits for older runs
 that hold nothing (`drainFifo`). Every theorem below holds for every configuration, by proof; no

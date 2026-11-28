@@ -36,7 +36,8 @@ pub const Event = struct {
     cmd: []const u8 = "",
     /// Its tasks (-n), when more than one.
     tasks: ?u32 = null,
-    /// The CPUs (or a lease's slots) it held: the most at once (ended).
+    /// The CPUs (or a lease's slots) it held: the most at once (ended); a drain's, the CPUs it
+    /// isolated.
     cores: ?u32 = null,
     /// How the command ended (ended): its exit status, or the signal that
     /// killed it.

@@ -99,7 +99,7 @@ CPU, and it never sleeps while the line would let it start a task. Each turn:
      come.
 6. **Sleep** in `poll()` on its self-pipe (SIGCHLD and the stop and terminal signals write a byte)
    and its wake FIFO, until the next look, the next time limit, or a wake. The next look is a
-   second away while the operation is first in line for spare room, held back by something that
+   second away while the operation is first in line, held back by something that
    can change without a word (the room, a gate, a drain), keeping its tasks off isolated CPUs, or
    (macOS) has tasks running, which the demote plan watches; else 10 s. A wake comes when room
    frees, so a long line costs little: a waiter wakes for its turn, not to look.
@@ -125,18 +125,21 @@ one more task now. The caller has checked the gates and the operation's `-c`.
 - **A project's fair share** is F = T × w ÷ Σw, over the projects with tasks running or waiting
   (a project's weight is the largest of its operations'; stopped operations and drains don't
   count).
-- **Within a project, its first waiter goes first** (`projectFirst`): an urgent operation that
-  has not yet started a task, then the operation running the fewest tasks, then the one whose last
-  task started longest ago (`last`; one that has started none first), then the older ticket.
-  Only it starts the project's next task, under the share or in spare room, so a long run that
-  ends a task never takes its project's share back before a newer run of the project starts one.
-- **Under its share** (running × Σw < T × w, compared without division), the project's first
-  waiter starts its next task at once, however busy the machine is. The kernel weights give its tasks
-  their share of CPU time; nobody's task is demoted for it.
-- **Over its share**, an operation starts a task only while `busy + starting < T − 0.5`, and
-  only the first such waiter in line takes it (`firstWaiter`). The line, in order: an urgent
-  operation that has not yet started a task, the project running the fewest tasks for its weight,
-  the operation running the fewest, the one whose last task started longest ago, the older ticket. 
+- **Within a project, its first waiter goes first** (`projectFirst`, `pbefore`): an urgent
+  operation that has not yet started a task, then the operation running the fewest tasks, then the
+  older turn (`turn`: when its last task started, `last`, or, if it has started none, when it
+  entered the line, `arrived`), then the older ticket. Only it may start the project's next task,
+  so a long run that ends a task never takes its project's share back before a newer run of the
+  project starts one, and a stream of newer runs never passes a run that started before they came.
+- **One line** (`lineFirst`, `lineBefore`): of the projects' first waiters, only the first in line
+  starts a task. The line, in order: a project under its share, an urgent operation that has not
+  yet started a task, the project running the fewest tasks for its weight, the operation running
+  the fewest, the older ticket. A place freed under the backstop goes to it, not to whichever
+  waiter looks first.
+- **Under its share** (running × Σw < T × w, compared without division), the first in line starts
+  its next task at once, however busy the machine is. The kernel weights give its tasks their share
+  of CPU time; nobody's task is demoted for it.
+- **Over its share**, it starts a task only while `busy + starting < T − 0.5`.
 - **Hard limits:** the operation's `-c`, the gates, and 4T tasks running machine-wide (the
   backstop, for when every waiting task wakes at once).
 
@@ -279,7 +282,8 @@ nothing and holds nothing while it waits; it takes its turn, and then isolates a
 - **`older_drain`:** an older drain waits too: drains go in their order.
 - **`half_pool`:** the pool's CPUs it would isolate (`npool`), added to those isolated already,
   pass `drain_max` (config: a count or a percentage of the pool, 50% by default; at least one,
-  always fewer than the pool: `policy.drainMax`).
+  always fewer than the pool: `policy.drainMax`). A drain that waits rereads the config at each
+  look, so a raised `drain_max` reaches it.
 - **`taken`** (`drainStep`): `pickDrain` found a CPU it needs, or a sibling, another drain's, or
   too few whole cores are free.
 
@@ -334,7 +338,7 @@ it starts aren't nested, and its exit status or signal is cpuq's. It has a recor
 (`driver`, no task, never waiting; `nested` passes over it), where its cpuq notes once a second
 `dbusy`: the CPU time of the runner's process tree (each process's own), the trees of the runs in
 it left out (`driverCpu`). From `driver_min` (0.5 CPUs) the line counts `dbusy` as its project's
-load beside its running tasks (`under`, `ahead`, the macOS plan); as busy it is already in the
+load beside its running tasks (`under`, `lineBefore`, the macOS plan); as busy it is already in the
 machine's ticks. Status flags it `driver_cpu`. A process that ends between two looks counts until it ends. On Linux with `cgroups` it runs as
 
     systemd-run --user --scope --quiet --collect --expand-environment=no
@@ -408,10 +412,11 @@ work is also put down to what started it: each busy process (0.02 of a CPU or mo
 the top of its tree just below a starter (`claude`, `sshd`, `sshd-session`, `launchd`, `systemd`,
 `init`, `tmux`, `screen`, `login`, `cron`, a terminal) or below a parent it can't see; trees at 0.3
 of a CPU or more are `outside_work`, with the top's command (an agent's own, out of Claude Code's
-`eval '...'` wrapper) and working directory. The line's order is `ahead` over the waiters' records;
+`eval '...'` wrapper) and working directory. The line's order is `lineOrder` over the waiters' records (the first in line, then the first of
+the rest, and so on);
 a waiter's `why` says what holds it (a gate, a drain, its share and the room, its place in line).
-`room` is T − 0.5 − busy (as admission counts it) − starting: positive, the first waiter over its
-share starts at its next look. A run's time left comes from its tasks ended so far. A project's
+`room` is T − 0.5 − busy (as admission counts it) − starting: positive, the first in line, over its
+share, starts at its next look. A run's time left comes from its tasks ended so far. A project's
 `fair` is its share of the capacity by weight, among the projects running or waiting. Flags come
 only after a run's first five seconds, and only when measured: `over_cpu` (over 1.2 CPUs busy per
 task running), `capped` (tasks queued under its own `-c` while there is room), `stopped`
@@ -420,8 +425,9 @@ task running), `capped` (tasks queued under its own `-c` while there is room), `
 `waiting`, `busy`, `tasks_busy`, `room` and `gate` (open, pressure, low_memory, low_disk).
 
 **History.** Each operation appends `queued` when it enters the line, then at its end `started`
-(dated at its first task's start) and `ended`, or `gave_up` for `--wait-max`. The end line holds
-the most tasks it ran at once, its tasks' CPU time (`wait4`'s figures summed over every child),
+(dated at its first task's start; a drain's at its isolation) and `ended`, or `gave_up` for
+`--wait-max`. The end line holds the most tasks it ran at once (a drain's: the CPUs it isolated,
+so its task-hours are those CPUs over the time it held them), its tasks' CPU time (`wait4`'s figures summed over every child),
 tasks done and failed, and its exit status or signal. A line under 4 KB written with `O_APPEND`
 lands whole, so no lock is needed. An operation with neither `ended` nor `gave_up` whose cpuq is
 gone, or which queued before the machine last booted, is `lost`.
@@ -437,7 +443,9 @@ src/pool.zig and the loop of src/op.zig as its rule sets. The properties it hold
    room.
 2. **No wait under share:** a project below its fair share never waits, except on a gate, its
    `-c`, or the 4T backstop.
-3. **No starvation:** every waiting task starts, given that tasks end (`-t`) and gates reopen.
+3. **No starvation:** every waiting task starts, given that tasks end (`-t`) and gates reopen,
+   even while new runs keep arriving, of its own project too, as long as no urgent run arrives
+   (`run_starts_fixed`, on `Rules.nostarve`, the rules of 0.41.0).
 4. **Drain bounded:** an isolation lasts at most its limit plus the grace. A drain waits only for
    older drains, older runs waiting with no task running, and the `drain_max` bound, and never
    passes such a waiter.

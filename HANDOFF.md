@@ -88,7 +88,7 @@ Run everything heavy under cpuq, even here:
 | Area | Files |
 |---|---|
 | Entry and options | `main.zig` (dispatch, usage, removed commands), `runopts.zig` (`cpuq run`'s options), `texts.zig`, `table.zig`, `layout.zig` |
-| The pool | `pool.zig` (the `v3/` files: records, wake FIFOs, limits, the sample; the pure rules: `mayStart`, `firstWaiter`, `fairShare`, `capacity`, `busyNow`, `drainMayStart`, `demotePlan`), `op.zig` (an operation's loop: `look`, the demote plan's steps, `drainStep` and `isolateOthers`, Ctrl-Z, nesting, `cpuq drain`, `cpuq limit`, `cpuq kill`), `cpus.zig` (the pool's CPUs and their order), `runner.zig` (`cpuq run`: removed options, the Linux slice and scope (`enterSlice`, `sliceWeight`), `--driver`, `--tethered`; `cpuq wait`; `cpuq hook`'s entry) |
+| The pool | `pool.zig` (the `v3/` files: records, wake FIFOs, limits, the sample; the pure rules: `mayStart`, `projectFirst`, `lineFirst`, `lineOrder`, `fairShare`, `capacity`, `busyNow`, `drainMayStart`, `demotePlan`), `op.zig` (an operation's loop: `look`, the demote plan's steps, `drainStep` and `isolateOthers`, Ctrl-Z, nesting, `cpuq drain`, `cpuq limit`, `cpuq kill`), `cpus.zig` (the pool's CPUs and their order), `runner.zig` (`cpuq run`: removed options, the Linux slice and scope (`enterSlice`, `sliceWeight`), `--driver`, `--tethered`; `cpuq wait`; `cpuq hook`'s entry) |
 | Config and gates | `policy.zig` (config keys, removed keys with their pointers, the gates, weights, CPU lists) |
 | Named leases | `leasing.zig`, `state.zig` (a lease's queue) |
 | Machine signals | `sys.zig` (CPU ticks, memory, spawning, affinity, `PR_SET_PDEATHSIG`), `records.zig` (record, samples, history, clean), `history.zig`, `joblog.zig`, `runtimes.zig` |

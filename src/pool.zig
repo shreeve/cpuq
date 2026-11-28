@@ -23,13 +23,16 @@
 //!   - Capacity T: the pool's CPUs less those drains isolate.
 //!   - A project's fair share: T × its weight ÷ the weights of the projects running or waiting.
 //!   - Within a project, its first waiter goes first: an urgent run's first task, then the run
-//!     running the fewest tasks, then the run whose last task started longest ago (one that has
-//!     started none first, by ticket).
-//!   - A project under its share starts its next task at once, however busy the machine.
-//!   - Over its share, a run starts a task only while the machine has room (busy + starting <
-//!     T − 0.5), and only the first such waiter in the line (the project running the fewest for
-//!     its weight, then as within a project) takes it.
+//!     running the fewest tasks, then the older turn (when its last task started, or, for a run
+//!     that has started none, when it arrived), then ticket.
+//!   - One line for every start, among the projects' first waiters: projects under their share
+//!     first, then an urgent run's first task, then the project running the fewest for its
+//!     weight, then the run running the fewest, then ticket. Only the first in line starts a task.
+//!   - It starts one at once while its project is under its share, however busy the machine;
+//!     over its share, only while the machine has room (busy + starting < T − 0.5).
 //!   - Hard limits: a run's -c, the memory, disk and pressure gates, and 4T tasks running.
+//!   - No stream of arrivals starves a waiting run (formal/, `run_starts_fixed`): new runs of its
+//!     project come after it, and a place freed under 4T goes to the first in line.
 const std = @import("std");
 const Io = std.Io;
 const sys = @import("sys.zig");
@@ -475,6 +478,9 @@ pub const Op = struct {
     /// that started longest ago goes first, so a run that ends a task and would start the next
     /// takes its turn behind the others.
     last: i64 = 0,
+    /// When it entered the line (monotonic ms): its turn within its project until it starts a
+    /// task.
+    arrived: i64 = 0,
     /// `cpuq drain`: isolates `limit` CPUs (with their SMT siblings) for its command, once its
     /// turn comes.
     drain: bool = false,
@@ -529,7 +535,7 @@ pub const Op = struct {
         for (r.cpus, 0..) |cpu, i| try w.print("{s}{d}", .{ if (i == 0) "" else ",", cpu });
         try w.writeAll("\npin=");
         for (r.pin, 0..) |cpu, i| try w.print("{s}{d}", .{ if (i == 0) "" else ",", cpu });
-        try w.print("\nnpool={d}\nnoise={d:.3}\nnoisy_top={s}\nlast={d}\ndstart={d}\nsince={d}\ntlimit={d}\nwhy={s}\nnow=", .{ r.npool, r.noise, r.noisy_top, r.last, r.dstart, r.since, r.tlimit, r.why });
+        try w.print("\nnpool={d}\nnoise={d:.3}\nnoisy_top={s}\nlast={d}\narrived={d}\ndstart={d}\nsince={d}\ntlimit={d}\nwhy={s}\nnow=", .{ r.npool, r.noise, r.noisy_top, r.last, r.arrived, r.dstart, r.since, r.tlimit, r.why });
         for (r.tasks_now, 0..) |t, i| try w.print("{s}{d}:{d}:{d}:{d}:{d}:{d}:{d}:{d}", .{ if (i == 0) "" else ",", t.task, t.attempt, t.pid, t.start, t.since, t.fresh, @intFromBool(t.paused), @intFromBool(t.demoted) });
         try w.writeAll("\ncmd=");
         // The command is for people reading status: its first 1,000 bytes are plenty.
@@ -566,6 +572,7 @@ pub const Op = struct {
             if (eq(k, "noise")) r.noise = std.fmt.parseFloat(f64, v) catch 0;
             if (eq(k, "noisy_top")) r.noisy_top = v;
             if (eq(k, "last")) r.last = std.fmt.parseInt(i64, v, 10) catch 0;
+            if (eq(k, "arrived")) r.arrived = std.fmt.parseInt(i64, v, 10) catch 0;
             if (eq(k, "dstart")) r.dstart = std.fmt.parseInt(i64, v, 10) catch 0;
             if (eq(k, "since")) r.since = std.fmt.parseInt(i64, v, 10) catch 0;
             if (eq(k, "tlimit")) r.tlimit = n;
@@ -835,69 +842,112 @@ pub fn starting(ops: []const Op, now_ms: i64) u32 {
     return n;
 }
 
-/// Whether `x` goes ahead of `y` for spare room: an urgent run's first task, then the project
-/// running the fewest tasks for its weight, then the run running the fewest, then the run whose
-/// last task started longest ago (one that has started none first), then the older ticket.
-fn ahead(m: std.StringArrayHashMapUnmanaged(Proj), x: Op, y: Op) bool {
-    const ux = x.urgent and !x.served;
-    const uy = y.urgent and !y.served;
+/// A run's turn within its project: when it last started a task, or, if it has started none,
+/// when it arrived. Of a project's runs running as many, the older turn goes first, so a stream
+/// of new runs goes behind a run that started before them and waits.
+fn turn(o: Op) i64 {
+    return if (o.last != 0) o.last else o.arrived;
+}
+
+fn urgentFirst(o: Op) bool {
+    return o.urgent and !o.served;
+}
+
+/// Within one project, whether `x` goes before `y`: an urgent run's first task, then the run
+/// running the fewest, then the older turn (last start, or arrival if it has started none), then
+/// the older ticket.
+fn pbefore(x: Op, y: Op) bool {
+    if (urgentFirst(x) != urgentFirst(y)) return urgentFirst(x);
+    if (x.running != y.running) return x.running < y.running;
+    if (turn(x) != turn(y)) return turn(x) < turn(y);
+    return x.ticket < y.ticket;
+}
+
+/// In the line among the projects' first waiters, whether `x` goes before `y`: a project under
+/// its share first, then an urgent run's first task, then the project running the fewest for its
+/// weight, then the run running the fewest, then the older ticket.
+fn lineBefore(m: std.StringArrayHashMapUnmanaged(Proj), t: u32, x: Op, y: Op) bool {
+    const ux = under(m, x.project, t);
+    const uy = under(m, y.project, t);
     if (ux != uy) return ux;
+    if (urgentFirst(x) != urgentFirst(y)) return urgentFirst(x);
     const px = m.get(x.project) orelse Proj{};
     const py = m.get(y.project) orelse Proj{};
     const lx = loadOf(px) * @as(f64, @floatFromInt(py.weight));
     const ly = loadOf(py) * @as(f64, @floatFromInt(px.weight));
     if (lx != ly) return lx < ly;
     if (x.running != y.running) return x.running < y.running;
-    if (x.last != y.last) return x.last < y.last;
     return x.ticket < y.ticket;
 }
 
-/// A project's first waiter: of its runs with tasks waiting and none of their own stopped by
-/// cpuq, the one `ahead` puts first (within one project: an urgent run's first task, the run
-/// running the fewest, the one whose last task started longest ago, the older ticket). Only it starts the project's next task.
-pub fn projectFirst(a: std.mem.Allocator, ops: []const Op, project: []const u8) ?u64 {
-    const m = projects(a, ops);
+/// Whether a run waits in the line: a run (not a drain) with tasks it could start, its cpuq not
+/// stopped.
+fn waits(o: Op) bool {
+    return o.counts() and o.waiting > 0;
+}
+
+/// A project's first waiter among `ops`: of its runs waiting in the line, the one `pbefore` puts
+/// first. Only it may start the project's next task.
+pub fn projectFirst(ops: []const Op, project: []const u8) ?u64 {
     var best: ?Op = null;
     for (ops) |o| {
-        if (!o.counts() or o.waiting == 0) continue;
-        if (!std.mem.eql(u8, o.project, project)) continue;
-        if (best == null or ahead(m, o, best.?)) best = o;
+        if (!waits(o) or !std.mem.eql(u8, o.project, project)) continue;
+        if (best == null or pbefore(o, best.?)) best = o;
     }
     return if (best) |b| b.ticket else null;
 }
 
-/// The first run in the line for spare room: of the runs with tasks waiting, over their share,
-/// none of their own stopped by cpuq. Null when there is none.
-pub fn firstWaiter(a: std.mem.Allocator, ops: []const Op, t: u32) ?u64 {
-    const m = projects(a, ops);
-    var best: ?Op = null;
-    for (ops) |o| {
-        if (!o.counts() or o.waiting == 0) continue;
-        if (under(m, o.project, t)) continue;
-        if (best == null or ahead(m, o, best.?)) best = o;
+/// The first in line among `cand` (runs that wait): of the projects' first waiters, the one
+/// `lineBefore` puts first, the projects' loads read from `ops`.
+fn firstOf(m: std.StringArrayHashMapUnmanaged(Proj), cand: []const Op, t: u32) ?usize {
+    var best: ?usize = null;
+    for (cand, 0..) |o, i| {
+        if (projectFirst(cand, o.project) != o.ticket) continue;
+        if (best == null or lineBefore(m, t, o, cand[best.?])) best = i;
     }
-    return if (best) |b| b.ticket else null;
+    return best;
+}
+
+/// The first in the line: of the projects' first waiters, the one `lineBefore` puts first. Every
+/// start is its: a run starts a task only when it is first here. Null when nothing waits.
+pub fn lineFirst(a: std.mem.Allocator, ops: []const Op, t: u32) ?u64 {
+    const i = firstOf(projects(a, ops), ops, t) orelse return null;
+    return ops[i].ticket;
+}
+
+/// The runs waiting, as tickets in the order the line serves them if nothing else changes: the
+/// first in line, then the first in line of the rest, and so on.
+pub fn lineOrder(a: std.mem.Allocator, ops: []const Op, t: u32) []const u64 {
+    const m = projects(a, ops);
+    var rest: std.ArrayList(Op) = .empty;
+    for (ops) |o| if (waits(o)) rest.append(a, o) catch {};
+    var out: std.ArrayList(u64) = .empty;
+    while (firstOf(m, rest.items, t)) |i| {
+        out.append(a, rest.items[i].ticket) catch {};
+        _ = rest.orderedRemove(i);
+    }
+    return out.items;
 }
 
 /// Whether run `me` may start one more task now. The caller has checked the gates and its -c
-/// (`waiting` > 0).
+/// (`waiting` > 0). Every start goes to the first in line (`lineFirst`), and it starts only under
+/// its project's share or with room, so no two runs race for a place freed under the backstop.
 pub fn mayStart(a: std.mem.Allocator, ops: []const Op, me: u64, cx: Cx) Wait {
     const o = for (ops) |o| {
         if (o.ticket == me) break o;
     } else return .idle;
-    if (!o.counts() or o.waiting == 0) return .idle;
+    if (!waits(o)) return .idle;
     const t = capacity(ops, cx.pool_n, cx.now_ms);
     var total: u32 = 0;
     for (ops) |x| if (x.counts()) {
         total += x.running;
     };
     if (total >= backstop * t) return .backstop;
-    if (projectFirst(a, ops, o.project) != me) return .project;
-    const m = projects(a, ops);
-    if (under(m, o.project, t)) return .go;
+    if (projectFirst(ops, o.project) != me) return .project;
+    if (lineFirst(a, ops, t) != me) return .behind;
+    if (under(projects(a, ops), o.project, t)) return .go;
     const room = @as(f64, @floatFromInt(t)) - headroom;
     if (cx.busy + @as(f64, @floatFromInt(starting(ops, cx.now_ms))) >= room) return .busy;
-    if (firstWaiter(a, ops, t) != me) return .behind;
     return .go;
 }
 
@@ -1048,7 +1098,7 @@ test "an op record round trip" {
     var buf: [2048]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     const now = [_]TaskNow{.{ .task = 17, .attempt = 2, .pid = 4242, .start = 99, .since = 1700000000, .fresh = 12345, .paused = true }};
-    const r: Op = .{ .tasks_now = &now, .pid = 7, .project = "rig", .label = "rig:test", .weight = 2, .waiting = 3, .cpus = &.{ 4, 9 }, .pin = &.{4}, .npool = 2, .noise = 0.25, .noisy_top = "dd (77)", .dstart = 77, .limit = 8, .tasks = 100, .done = 5, .single = true, .cmd = "a\tb\nc" };
+    const r: Op = .{ .tasks_now = &now, .pid = 7, .project = "rig", .label = "rig:test", .weight = 2, .waiting = 3, .cpus = &.{ 4, 9 }, .pin = &.{4}, .npool = 2, .noise = 0.25, .noisy_top = "dd (77)", .dstart = 77, .arrived = 66, .limit = 8, .tasks = 100, .done = 5, .single = true, .cmd = "a\tb\nc" };
     try r.format(&w);
     const p = Op.parse(arena.allocator(), w.buffered());
     try std.testing.expectEqualStrings("rig", p.project);
@@ -1058,6 +1108,7 @@ test "an op record round trip" {
     try std.testing.expectEqual(0.25, p.noise);
     try std.testing.expectEqualStrings("dd (77)", p.noisy_top);
     try std.testing.expectEqual(77, p.dstart);
+    try std.testing.expectEqual(66, p.arrived);
     try std.testing.expectEqual(3, p.waiting);
     try std.testing.expect(p.single);
     try std.testing.expectEqualStrings("a b c", p.cmd);
@@ -1095,7 +1146,8 @@ test "admission: under its share a project starts at once, however busy" {
     };
     const cx: Cx = .{ .pool_n = 4, .busy = 4, .now_ms = 100_000 };
     try std.testing.expectEqual(Wait.go, mayStart(a, &ops, 2, cx));
-    try std.testing.expectEqual(Wait.busy, mayStart(a, &ops, 1, cx));
+    // rig, over its share, is behind trig in the line.
+    try std.testing.expectEqual(Wait.behind, mayStart(a, &ops, 1, cx));
     // trig at 2 of its share of 2: no longer under it, and the machine is busy.
     var two = ops;
     two[1].running = 2;
@@ -1105,7 +1157,7 @@ test "admission: under its share a project starts at once, however busy" {
     try std.testing.expectEqual(Wait.go, mayStart(a, &two, 2, cx));
 }
 
-test "admission: spare room goes to the first waiter over its share" {
+test "admission: spare room goes to the first in line over its share" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1118,7 +1170,7 @@ test "admission: spare room goes to the first waiter over its share" {
     // trig runs fewer for its weight: it goes first; rig waits behind it.
     try std.testing.expectEqual(Wait.go, mayStart(a, &ops, 2, cx));
     try std.testing.expectEqual(Wait.behind, mayStart(a, &ops, 1, cx));
-    try std.testing.expectEqual(2, firstWaiter(a, &ops, 4).?);
+    try std.testing.expectEqual(2, lineFirst(a, &ops, 4).?);
     // Room is busy + starting < T - 0.5: three tasks just started fill it.
     var fresh = ops;
     fresh[0].tasks_now = &.{ tk(1, 99_000), tk(2, 99_500), tk(3, 99_900) };
@@ -1140,9 +1192,9 @@ test "admission: a driver that computes counts against its project's share" {
         .{ .ticket = 2, .project = "rig", .waiting = 4 },
         .{ .ticket = 3, .project = "trig", .waiting = 4 },
     };
-    // The machine busy (the driver's 2.5 and others'): rig waits; with room, rig would start.
+    // rig, over its share, waits behind trig, under its share.
     const cx: Cx = .{ .pool_n = 4, .busy = 3.5, .now_ms = 100_000 };
-    try std.testing.expectEqual(Wait.busy, mayStart(a, &ops, 2, cx));
+    try std.testing.expectEqual(Wait.behind, mayStart(a, &ops, 2, cx));
     try std.testing.expectEqual(Wait.go, mayStart(a, &ops, 3, cx));
     try std.testing.expectApproxEqAbs(2.0, fairShare(a, &ops, "rig", 4), 1e-9);
     // A driver under 0.5 CPUs is a runner that only waits: it counts for nothing.
@@ -1165,28 +1217,89 @@ test "admission: within a project, the run running the fewest goes first" {
     const cx: Cx = .{ .pool_n = 4, .busy = 4, .now_ms = 100_000 };
     try std.testing.expectEqual(Wait.go, mayStart(a, &ops, 3, cx));
     try std.testing.expectEqual(Wait.project, mayStart(a, &ops, 1, cx));
-    try std.testing.expectEqual(3, projectFirst(a, &ops, "rig").?);
+    try std.testing.expectEqual(3, projectFirst(&ops, "rig").?);
     // Running the same, the older ticket; an urgent run's first task before either.
     var even = ops;
     even[2].running = 1;
-    try std.testing.expectEqual(1, projectFirst(a, &even, "rig").?);
+    try std.testing.expectEqual(1, projectFirst(&even, "rig").?);
     even[2].urgent = true;
-    try std.testing.expectEqual(3, projectFirst(a, &even, "rig").?);
-    // The long run has just ended its task: running none, as the newer run, it takes its turn
-    // behind it (its last start is the newer).
+    try std.testing.expectEqual(3, projectFirst(&even, "rig").?);
+    // The long run has just ended its task, running none as the newer run does: the older turn
+    // goes first, its last start against the newer run's arrival.
     var tie = ops;
     tie[0].running = 0;
     tie[0].last = 90_000;
-    try std.testing.expectEqual(3, projectFirst(a, &tie, "rig").?);
-    tie[2].last = 95_000;
-    try std.testing.expectEqual(1, projectFirst(a, &tie, "rig").?);
+    tie[2].arrived = 80_000;
+    try std.testing.expectEqual(3, projectFirst(&tie, "rig").?);
+    tie[2].arrived = 95_000;
+    try std.testing.expectEqual(1, projectFirst(&tie, "rig").?);
+    // Once the newer run has started a task, its last start is its turn.
+    tie[2].last = 85_000;
+    try std.testing.expectEqual(3, projectFirst(&tie, "rig").?);
     // For spare room too: over their shares, the newer rig run (running 0) is first in line.
     const over = [_]Op{
         .{ .ticket = 1, .project = "rig", .running = 3, .waiting = 20 },
         .{ .ticket = 2, .project = "trig", .running = 3, .waiting = 5 },
         .{ .ticket = 3, .project = "rig", .waiting = 1 },
     };
-    try std.testing.expectEqual(3, firstWaiter(a, &over, 4).?);
+    try std.testing.expectEqual(3, lineFirst(a, &over, 4).?);
+}
+
+test "admission: a stream of new runs of a project never passes a run that started before" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Pool of 1, one project. Run 1 last started a task at 50 s and waits for its next. Each new
+    // run arrives while the last runs; when that one ends, run 1 is first, not the newcomer.
+    const cx: Cx = .{ .pool_n = 1, .busy = 0, .now_ms = 200_000 };
+    var arrived: i64 = 60_000;
+    while (arrived < 160_000) : (arrived += 10_000) {
+        const ops = [_]Op{
+            .{ .ticket = 1, .project = "rig", .last = 50_000, .arrived = 10_000, .waiting = 5 },
+            .{ .ticket = 2 + @as(u64, @intCast(arrived)), .project = "rig", .arrived = arrived, .waiting = 1 },
+        };
+        try std.testing.expectEqual(1, projectFirst(&ops, "rig").?);
+        try std.testing.expectEqual(Wait.go, mayStart(a, &ops, 1, cx));
+        try std.testing.expectEqual(Wait.project, mayStart(a, &ops, ops[1].ticket, cx));
+    }
+}
+
+test "admission: at the backstop, a freed place goes to the first in line" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Pool of 1 (4T = 4): projects b, c, d run a task each, so 3 run and a place is free. Two
+    // runs under their share want it: r (project e, waiting since ticket 1) and project f's new
+    // run (ticket 9). Both may not start: the older is first in line and takes it.
+    var ops = [_]Op{
+        .{ .ticket = 1, .project = "e", .arrived = 1_000, .waiting = 1 },
+        .{ .ticket = 2, .project = "b", .running = 1, .last = 2_000 },
+        .{ .ticket = 3, .project = "c", .running = 1, .last = 3_000 },
+        .{ .ticket = 4, .project = "d", .running = 1, .last = 4_000 },
+        .{ .ticket = 9, .project = "f", .arrived = 9_000, .waiting = 1 },
+    };
+    const cx: Cx = .{ .pool_n = 1, .busy = 3, .now_ms = 10_000 };
+    try std.testing.expectEqual(Wait.go, mayStart(a, &ops, 1, cx));
+    try std.testing.expectEqual(Wait.behind, mayStart(a, &ops, 9, cx));
+    // r has taken the place: 4 run, the backstop holds the other.
+    ops[0].running = 1;
+    ops[0].waiting = 0;
+    try std.testing.expectEqual(Wait.backstop, mayStart(a, &ops, 9, cx));
+}
+
+test "admission: the line's order, as status shows it" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Pool of 4: rig runs 3 (over its share of 2), trig 1 (under). trig's run goes first; then
+    // rig's runs, its newer run (running none) before the long run.
+    const ops = [_]Op{
+        .{ .ticket = 1, .project = "rig", .running = 3, .waiting = 5, .last = 5_000 },
+        .{ .ticket = 2, .project = "trig", .running = 1, .waiting = 2, .last = 6_000 },
+        .{ .ticket = 3, .project = "rig", .waiting = 1, .arrived = 7_000 },
+        .{ .ticket = 4, .project = "q", .drain = true, .waiting = 1 },
+    };
+    try std.testing.expectEqualSlices(u64, &.{ 2, 3, 1 }, lineOrder(a, &ops, 4));
 }
 
 test "admission: hard limits" {

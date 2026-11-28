@@ -305,51 +305,15 @@ fn measureOps(io: Io, a: std.mem.Allocator, ops: []const Op, ncpu: u32, measure:
     return m;
 }
 
-/// The runs waiting, as tickets in the line's order: runs over their project's share by
-/// `pool.ahead` (an urgent run's first task, the project running the fewest for its weight, the
-/// older ticket), those under it first (they start at their next look); then drains, by ticket.
+/// The runs waiting, as tickets in the line's order (`pool.lineOrder`: the first in line, then
+/// the first of the rest, and so on); then drains, by ticket.
 fn lineOrder(a: std.mem.Allocator, ops: []const Op, t: u32) []const u64 {
-    var runs: std.ArrayList(Op) = .empty;
-    var drains: std.ArrayList(u64) = .empty;
-    for (ops) |o| {
-        if (o.waiting == 0 or o.stopped) continue;
-        if (o.drain) drains.append(a, o.ticket) catch {} else runs.append(a, o) catch {};
-    }
-    const Ctx2 = struct { a: std.mem.Allocator, ops: []const Op, t: u32 };
-    const cx: Ctx2 = .{ .a = a, .ops = ops, .t = t };
-    std.mem.sort(Op, runs.items, cx, struct {
-        fn less(k: Ctx2, x: Op, y: Op) bool {
-            const ux = pool_mod.fairShare(k.a, k.ops, x.project, k.t);
-            const uy = pool_mod.fairShare(k.a, k.ops, y.project, k.t);
-            const rx = projectRunning(k.ops, x.project);
-            const ry = projectRunning(k.ops, y.project);
-            const xu = @as(f64, @floatFromInt(rx)) < ux;
-            const yu = @as(f64, @floatFromInt(ry)) < uy;
-            if (xu != yu) return xu;
-            const xg = x.urgent and !x.served;
-            const yg = y.urgent and !y.served;
-            if (xg != yg) return xg;
-            const lx = @as(u64, rx) * y.weight;
-            const ly = @as(u64, ry) * x.weight;
-            if (lx != ly) return lx < ly;
-            if (x.running != y.running) return x.running < y.running;
-            if (x.last != y.last) return x.last < y.last;
-            return x.ticket < y.ticket;
-        }
-    }.less);
     var out: std.ArrayList(u64) = .empty;
-    for (runs.items) |o| out.append(a, o.ticket) catch {};
-    out.appendSlice(a, drains.items) catch {};
-    return out.items;
-}
-
-/// A project's tasks running, over its runs that count in the line.
-fn projectRunning(ops: []const Op, project: []const u8) u32 {
-    var n: u32 = 0;
-    for (ops) |o| if (o.counts() and std.mem.eql(u8, o.project, project)) {
-        n += o.running;
+    out.appendSlice(a, pool_mod.lineOrder(a, ops, t)) catch {};
+    for (ops) |o| if (o.drain and o.waiting != 0 and !o.stopped) {
+        out.append(a, o.ticket) catch {};
     };
-    return n;
+    return out.items;
 }
 
 /// The gate as status shows it: the machine's memory and disk gates.

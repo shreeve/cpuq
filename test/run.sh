@@ -383,6 +383,41 @@ t_order() {
   check "a newer run of a busy project starts before that project's long run takes another (rc $rc after ${dt}s)" "[ $rc = 0 ] && fl '$dt < 4'"
 }
 
+t_stream() {
+  # No stream of arrivals starves a waiting run. Within a project, a run that has started goes
+  # before new runs that arrived after its last start: on a pool of 1, a's second task starts
+  # before b1, b2 and b3, which arrive while a's first runs (each new run once went first).
+  setup stream "budget = 1"
+  local f=$T/order n
+  "$CPUQ" run -n 2 --label p:a -- sh -c "echo a\$CPUQ_TASK >>$f; \"$BURN\" 1.5" 2>/dev/null & local a=$!
+  wait_line "$f" a1
+  for n in b1 b2 b3; do
+    "$CPUQ" run --label "p:$n" -- sh -c "echo $n >>$f; \"$BURN\" 0.2" &
+    sleep 0.2
+  done
+  wait
+  local got; got=$(tr '\n' ' ' <"$f")
+  check "a run that started goes before newer runs of its project that arrived after its last start (got $got)" "[ '$got' = 'a1 a2 b1 b2 b3 ' ]"
+}
+
+t_backstop() {
+  # At the 4T backstop a freed place goes to the first in line, not to whichever run looks
+  # first: on a pool of 1, sleepers of b, c, d and x fill 4T; e queues, then a new run of x. Both
+  # are under their share. When x's task ends, e (older in line) takes the place; x's new run
+  # waits for the next, when b, c or d ends.
+  setup backstop "budget = 1"
+  local f=$T/order n
+  for n in b c d; do "$CPUQ" run --label "$n:s" -- sh -c "sleep 6; echo $n-end >>$f" & done
+  "$CPUQ" run --label x:s -- sh -c "sleep 2; echo x-end >>$f" &
+  wait_running 4
+  "$CPUQ" run --label e:s -- sh -c "echo e-start >>$f; sleep 6" & wait_waiters 1
+  "$CPUQ" run --label x:new -- sh -c "echo x2-start >>$f" & wait_waiters 2
+  wait
+  local got; got=$(tr '\n' ' ' <"$f")
+  check "the place x's task frees goes to e, first in line; x's new run starts once b, c or d ends (got $got)" \
+    "[[ '$got' == 'x-end e-start '[bcd]-end' '*x2-start* ]]"
+}
+
 t_drain() {
   # cpuq drain -c N: after the runs queued before it, N CPUs are isolated for its command at once,
   # without waiting for any task to end, and the rest of the machine keeps working; CPUQ_CPUS
@@ -571,6 +606,36 @@ t = {l.split()[0]: float(l.split()[1]) for l in open('$g') if len(l.split()) > 1
 print('%.1f' % (t['second-start'] - t['first-end']) if len(t) == 2 else 'none')")
   check "drains isolate at most drain_max: the first isolates $k of the pool ($(poolcpus)), a second of -c $c2 waits for it, and starts ${gap}s after it ends (rc $r1 $r2: $order)" \
     "[ $r1 = 0 ] && [ $r2 = 0 ] && [ '$order' = 'first-start first-end second-start ' ] && fl '$gap < 2.5'"
+}
+
+t_drain_cap() {
+  # A waiting drain takes up a raised drain_max: a second drain waits at the cap beside a first,
+  # and starts once the cap is raised, the first still running. History counts each drain's
+  # task-hours as the CPUs it isolated.
+  local big="budget = 4"; [ "$(getconf _NPROCESSORS_ONLN)" -ge 8 ] && big="budget = 8"
+  setup drain_cap "$big"
+  local p g=$T/cap; p=$(poolcpus | wc -w | tr -d ' ')
+  if [ "$p" -lt 4 ]; then echo "  skipped: needs a pool of 4"; return; fi
+  "$CPUQ" drain -c 1 --max 20s --label c:first -- sh -c "echo first-start >>$g; sleep 6; echo first-end >>$g" & local d1=$!
+  wait_line "$g" first-start
+  # The first isolates k (its core's threads); the second takes whole cores of k, enough to pass
+  # the cap of half the pool beside the first but fit under p - 1.
+  local k cap c2 j; k=$(sj 'len(set(s["isolated"]) & set(s["pool"]))'); cap=$((p / 2))
+  c2=$(((cap - k) / k + 1)); j=$((c2 * k))
+  if [ $j -gt $cap ] || [ $((k + j)) -gt $((p - 1)) ]; then kill $d1; wait $d1; echo "  skipped: no second drain fits (pool $p, $k a core)"; return; fi
+  "$CPUQ" drain -c $c2 --max 20s --label c:second -- sh -c "echo second-start >>$g" & local d2=$!
+  poll 10 '"$CPUQ" status --no-usage | grep c:second | grep -q drain_max'
+  local held; held=$("$CPUQ" status --no-usage | grep c:second | grep -o 'drain_max' | head -1)
+  sleep 1.5
+  echo "drain_max = $((p - 1))" >>"$CPUQ_CONFIG"
+  local r1 r2; wait $d2; r2=$?; wait $d1; r1=$?
+  local got; got=$(tr '\n' ' ' <"$g")
+  check "a drain waiting at drain_max (${held:-not shown}) starts once it is raised, beside the first (rc $r1 $r2: $got)" \
+    "[ -n '$held' ] && [ $r1 = 0 ] && [ $r2 = 0 ] && [ '$got' = 'first-start second-start first-end ' ]"
+  local cores; cores=$("$CPUQ" history --json | python3 -c 'import json, sys
+j = {x["label"]: x for x in json.load(sys.stdin)}
+print(j["c:first"]["cores"], j["c:second"]["cores"])')
+  check "history counts a drain as the CPUs it isolated (want $k $j, got $cores)" "[ '$cores' = '$k $j' ]"
 }
 
 t_drain_part() {
@@ -2275,7 +2340,7 @@ f = open(sys.argv[1]); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$sp/p/held
 
 # --- cpuq jobs and the agent (until they go) -------------------------------------------------
 
-TESTS=${*:-budget tasks io cpus_limit timeout retry wait_max share fair order drain drain_cpus drain_turn drain_part limit lock_stuck storm kill ctrl_z nested driver removed \
+TESTS=${*:-budget tasks io cpus_limit timeout retry wait_max share fair order stream backstop drain drain_cpus drain_turn drain_cap drain_part limit lock_stuck storm kill ctrl_z nested driver removed \
   kill_holder leftovers leaked_descendant kill_waiter term_waiting lost_seq long_command waiters_cpu \
   exit_status direct_sigint terminal_sigint tasks_sigint ignored_signals stack_limit \
   status progress usage zombie outside status_host history note wait record min_available min_disk hook \
