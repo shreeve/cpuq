@@ -52,10 +52,10 @@ this would stop every cpuq on the machine, so `cpuq status` waits for the lock a
 names the holder from the lock file's note and exits 125.
 
 An operation's record is `key=value` lines: `pid`, `urgent`, `served` (it has started a task),
-`drain`, `all`, `single`, `stopped` (Ctrl-Z), `project`, `label`, `weight`, `limit` (`-c`, worked
+`drain`, `single`, `stopped` (Ctrl-Z), `project`, `label`, `weight`, `limit` (`-c`, worked
 out; a drain's CPUs), `tasks`, `done`, `failed`, `running` (its tasks running, those cpuq has
 stopped included), `waiting` (tasks it could start now: none while stopped or at its `-c`),
-`cpus` and `dstart` (a drain's isolated CPUs and when isolation began), `since`, `tlimit`, `why`
+`cpus`, `pin`, `npool` and `dstart` (a drain's isolated CPUs, those its command runs on, how many of the isolated are the pool's, and when isolation began), `noise` and `noisy_top`, `last` (when its last task started), `since`, `tlimit`, `why`
 (what holds it back, for status), `now` (its tasks running: number, try, pid, the process's
 start time, when it started, when it last started or continued, whether cpuq has it stopped) and
 `cmd`. Records are written in place and read only under the pool's lock, as they are written, so
@@ -91,7 +91,7 @@ CPU, and it never sleeps while the line would let it start a task. Each turn:
 5. **Look**, when something happened here (a task ended, a signal or a wake came) or when one is
    due (below): renew the sample if it is a second old, then, under the pool's lock, write the
    record, scan the operations, and
-   - follow the drains (below): stop its tasks for an `--all` drain, keep them off the CPUs a
+   - follow the drains (below): keep them off the CPUs a
      `-c` drain isolates;
    - on macOS, follow the pause plan for its own tasks;
    - start tasks while `mayStart` says go (retries behind the tasks not yet started), the gates
@@ -122,8 +122,7 @@ and exit 0 or 1. Tasks are never pinned, except a drain's command.
 (the pool's size, the machine's busy CPUs, the time). It answers whether operation `me` starts
 one more task now. The caller has checked the gates and the operation's `-c`.
 
-- **Capacity T** is the pool's CPUs less the CPUs `-c` drains isolate; 0 while an `--all` drain
-  runs.
+- **Capacity T** is the pool's CPUs less the pool's CPUs drains isolate.
 - **A project's fair share** is F = T × w ÷ Σw, over the projects with tasks running or waiting
   (a project's weight is the largest of its operations'; stopped operations and drains don't
   count).
@@ -143,7 +142,6 @@ one more task now. The caller has checked the gates and the operation's `-c`.
   backstop, for when every waiting task wakes at once).
 - **While any task is stopped for sharing** (macOS), no task starts in spare room: the stopped
   ones continue first.
-- **While an `--all` drain runs,** nothing starts.
 
 Each look starts tasks one at a time, asking `mayStart` again after each start, since a start
 changes the count and the room. `Wait` says why not (a drain, stopped tasks, the backstop, a busy
@@ -267,39 +265,52 @@ stopped drain ends its isolation; continued, it takes its turn again before its 
 
 ## cpuq drain
 
-`cpuq drain` is an operation with `drain` set, `limit` its CPUs (the pool for `--all`) and a time
-limit. It gathers nothing and holds nothing while it waits; it takes its turn, and then isolates
-at once. `drainMayStart` answers:
+`cpuq drain` is an operation with `drain` set, `limit` its CPUs and a time limit. It gathers
+nothing and holds nothing while it waits; it takes its turn, and then isolates at once.
+`drainMayStart` answers:
 
 - **`older_waiter`:** an operation queued before it waits with no task running: a drain passes
   no such waiter (an operation already running tasks takes the rest of its turn beside the
   drain, so a long run never holds a drain back).
 - **`older_drain`:** an older drain waits too: drains go in their order.
-- **`half_pool`:** its CPUs would take all `-c` drains' isolation past half the pool
-  (`drainRoom`: at least one). `cpuq drain -c N` with N above half the pool is a usage error.
-- **`other_drain`:** a drain isolates and either is `--all` or this one is.
+- **`half_pool`:** the pool's CPUs it would isolate (`npool`), added to those isolated already,
+  pass `drain_max` (config: a count or a percentage of the pool, 50% by default; at least one,
+  always fewer than the pool: `policy.drainMax`).
+- **`taken`** (`drainStep`): `pickDrain` found a CPU it needs, or a sibling, another drain's, or
+  too few whole cores are free.
 
-Otherwise it goes. Its CPUs are the first N free of the end of the pool's order (`pickDrainCpus`);
-its record names them with the start time. From then:
+Its CPUs are chosen at start (`cmdDrain` checks the same pick, so a drain that can never fit is a
+usage error): `pickDrain` takes N CPUs, whole cores, from an order (the pool's order from its end;
+`--prefer fast`: `fastFirst`, performance cores first by `/sys/devices/cpu_core/cpus`, then
+`cpu_capacity`, then `cpuinfo_max_freq`), or the CPUs `--cpus` names, each with its SMT siblings
+(`cores`, from `thread_siblings_list`), skipping a core another drain has any of. `pin` is the N
+CPUs (`CPUQ_CPUS`); `cpus` adds the siblings, which stay idle. `npool` counts those in the pool.
+Whole cores that would take more than `drain_max` of the pool are refused before the drain queues. From then:
 
-- **Capacity** drops by N for everyone (`capacity`).
-- **Linux:** its command is pinned to its CPUs (`CPUQ_CPUS` lists them), and every other cpuq
-  task's threads get an affinity without them. The drain does that at once (`isolateOthers`: it
-  reads the tasks from the records and re-pins every thread of each task's process tree), and
-  wakes every operation; each operation follows for its own tasks (`repinOwn`) whenever the
-  isolated set changes, and starts new tasks with that mask. When no drain isolates any CPU, an
-  operation's tasks return to cpuq's own CPU set.
+- **Capacity** drops by `npool` for everyone (`capacity`). A sibling outside the pool is kept free
+  of cpuq tasks but counts for neither capacity nor the bound.
+- **Linux:** its command is pinned to `pin`, and every other cpuq task's threads get an affinity
+  without `cpus`. The drain does that at once (`isolateOthers`: it reads the tasks from the
+  records and re-pins every thread of each task's process tree), and wakes every operation; each
+  operation follows for its own tasks (`repinOwn`) whenever the isolated set changes, and starts
+  new tasks with that mask. When no drain isolates any CPU, an operation's tasks return to cpuq's
+  own CPU set.
 - **macOS:** the capacity drop makes the pause plan stop others' tasks as needed.
-- **`--all`:** it waits for any other drain to end, then SIGSTOPs every other cpuq task (the
-  drain does it at once; each operation keeps its own stopped while the drain runs, continues
-  them when it ends, on macOS through the pause plan, as room allows). Capacity is 0 meanwhile.
+
+**Noise** (`noiseDrain`, Linux). Once a second while the drain isolates, it reads each CPU's
+kernel ticks; the busy share of `cpus` less its own command's process-tree CPU time is the work
+from outside there. It is written to the record (`noise`; `noisy_top`, at 0.1 CPUs or more: the
+busiest process last seen on those CPUs, by the CPU it last ran on), and summed while the command
+runs for history's ended line (`noisy`: mean, max, top, when the max reached 0.1). Status flags
+`noisy`. With `--quiet-max X` the command starts once a look at least 0.9 s after the isolation
+finds `noise` at X or less; the wait counts toward `-t`, and a drain that reaches `--max` or its
+limit before starting gives up with exit 75.
 
 A drain isolates at most its limit plus 60 s (`drain_grace_s`) whatever its record says, so a
-stuck or vanished drain never holds the machine. The 20-minute bound on `--all` is its `-t` limit.
-Its command's `-t` (default 20 m, at most 2 h; `--all` at most 20 m) and an idle stop (under 0.25
-CPUs busy for `drain_idle` while another run waits; its command's process tree's CPU time,
-sampled by the drain's own cpuq every few seconds) end it as before. `--max` gives up (exit 75)
-while its turn hasn't come.
+stuck or vanished drain never holds the machine. Its command's `-t` (default 20 m, at most 2 h,
+counted from the isolation) and an idle stop (under 0.25 CPUs busy for `drain_idle` while another
+run waits; its command's process tree's CPU time, sampled by the drain's own cpuq every few
+seconds) end it. `--max` gives up (exit 75) while its command hasn't started.
 
 Since nothing is gathered, a drain costs the machine only the CPUs it isolates, and only once its
 command runs.
@@ -397,7 +408,7 @@ only after a run's first five seconds, and only when measured: `over_cpu` (over 
 task running), `capped` (tasks queued under its own `-c` while there is room), `stopped`
 (Ctrl-Z); a drain's `idle_drain` and `long_drain`. `--json` is schema 3 (src/statusjson.zig):
 `runs[]`, `waiters[]` and `projects[]` with `capacity`, `isolated`, `running`, `paused`,
-`waiting`, `busy`, `tasks_busy`, `room` and `gate` (open, pressure, low_memory, low_disk, drain).
+`waiting`, `busy`, `tasks_busy`, `room` and `gate` (open, pressure, low_memory, low_disk).
 
 **History.** Each operation appends `queued` when it enters the line, then at its end `started`
 (dated at its first task's start) and `ended`, or `gave_up` for `--wait-max`. The end line holds
@@ -419,7 +430,7 @@ src/pool.zig and the loop of src/op.zig as its rule sets. The properties it hold
    `-c`, or the 4T backstop.
 3. **No starvation:** every waiting task starts, given that tasks end (`-t`) and gates reopen.
 4. **Drain bounded:** an isolation lasts at most its limit plus the grace. A drain waits only for
-   older drains, older runs waiting with no task running, and the half-pool bound, and never
+   older drains, older runs waiting with no task running, and the `drain_max` bound, and never
    passes such a waiter.
 5. **No idle hold:** no state where a CPU is reserved but unused while a task waits: nothing
    reserves one.
@@ -443,11 +454,14 @@ command:
 2. A removed option (`--cores`, `--priority`, `--max-wait`, `--exclusive`, `--no-load-check`,
    `--qos`, `--opaque`, `-x`) is refused with cpuq's own line for it (`hook.removed_options`, the
    list `cpuq run` and `cpuq lease` use) and the command rewritten.
-3. `$CPUQ_CORES` in a run is refused, with the variable made 1, a one-command `sh -c` unwrapped,
+3. A benchmark outside cpuq (`benchName`: `hyperfine`, `cargo bench`, `zig build bench`, or
+   `node`, `bun`, `deno`, `python` on a script with "bench" in its path) is refused with
+   `cpuq drain -c 1 -t 20m --label PROJECT:bench -- CMD`.
+4. `$CPUQ_CORES` in a run is refused, with the variable made 1, a one-command `sh -c` unwrapped,
    and the command at one job.
-4. `--driver` passes for swarm, rip, or a script named `run`, `run.sh` or `run-tests*`, or under
+5. `--driver` passes for swarm, rip, or a script named `run`, `run.sh` or `run-tests*`, or under
    `test/` or `tests/`; a build under it is refused (it would be no task of its own).
-5. Inside `cpuq run` or `cpuq lease`, a jobs count above 1, no limit (`make -j`, `-j0`,
+6. Inside `cpuq run` or `cpuq lease`, a jobs count above 1, no limit (`make -j`, `-j0`,
    `-n auto`), or a tool whose default is every CPU without its one-job option, is refused, with
    the fix at one job "or split the work into tasks with -n M". A count it can't read passes.
 

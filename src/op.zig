@@ -212,7 +212,7 @@ const Run = struct {
     /// its command ran (busy CPUs summed over the looks, the looks, the most, and the busiest
     /// outsider when it was most).
     noise_at_ms: i64 = 0,
-    noise_ticks: []const sys.NumberedTicks = &.{},
+    noise_ticks: std.ArrayList(sys.NumberedTicks) = .empty,
     noise_own_ns: u64 = 0,
     noise_procs: std.AutoHashMapUnmanaged(i32, u64) = .empty,
     noise_sum: f64 = 0,
@@ -221,8 +221,10 @@ const Run = struct {
     noise_top: []const u8 = "",
     top_buf: [160]u8 = undefined,
     max_top_buf: [160]u8 = undefined,
-    /// A drain that never found its CPUs quiet enough (--quiet-max) in time.
+    /// A drain that never found its CPUs quiet enough (--quiet-max) in time, and whether a look
+    /// has measured them (not only taken a first reading) since its isolation began.
     never_quiet: bool = false,
+    noise_measured: bool = false,
 
     fn setWhy(r: *Run, text: []const u8) void {
         const n = @min(text.len, r.why_buf.len);
@@ -907,20 +909,20 @@ fn wakeReady(r: *Run, a: std.mem.Allocator, ops: []const Op, sample: ?pool_mod.S
     for (ops) |o| {
         if (o.ticket == r.rec.ticket or o.waiting == 0 or o.stopped) continue;
         // A drain is woken when its turn may have come (it works out its CPUs itself).
-        const ready = if (o.drain) pool_mod.drainMayStart(ops, o.ticket, pool_n, now, 0) == .go else pool_mod.mayStart(a, ops, o.ticket, cx) == .go;
+        const ready = if (o.drain) pool_mod.drainMayStart(ops, o.ticket, policy.drainMax(r.ctx.cfg, pool_n), now, 0) == .go else pool_mod.mayStart(a, ops, o.ticket, cx) == .go;
         if (ready) r.pool.wakeOp(o.ticket);
     }
 }
 
-/// A drain's look: once its turn comes, it isolates its CPUs (or, with --all, the machine) and
-/// starts its command, or continues it after a Ctrl-Z. Returns whether it began isolating now.
+/// A drain's look: once its turn comes, it isolates its CPUs and starts its command (once they
+/// are quiet, with --quiet-max), or continues it after a Ctrl-Z. Returns whether it began isolating now.
 /// Under the lock.
 fn drainStep(r: *Run, a: std.mem.Allocator, ops: []Op, why: []const u8, now: i64) bool {
     if (r.stopped) return false;
     if (r.rec.dstart != 0) {
         // Isolating, and waiting for its CPUs to quiet (--quiet-max): the command starts once a
         // look since the isolation began found work from outside under the bound.
-        if (r.o.quiet_max) |q| if (r.running.items.len == 0 and r.pending() > 0 and r.noise_at_ms >= r.rec.dstart + 900) {
+        if (r.o.quiet_max) |q| if (r.running.items.len == 0 and r.pending() > 0 and r.noise_measured) {
             if (r.rec.noise <= q) {
                 r.setWhy("");
                 startTask(r, a);
@@ -938,18 +940,18 @@ fn drainStep(r: *Run, a: std.mem.Allocator, ops: []Op, why: []const u8, now: i64
         r.setWhy(why);
         return false;
     }
-    const pool_n: u32 = @intCast(r.pool_cpus.len);
+    const room = policy.drainMax(r.ctx.cfg, @intCast(r.pool_cpus.len));
     const pick = pool_mod.pickDrain(a, r.order, r.topo, pool_mod.isolated(a, ops, now), r.limit, r.o.drain_cpus) orelse {
         r.setWhy(if (r.o.drain_cpus.len != 0) "the CPUs it names (or their siblings) are another drain's" else "too few whole cores are free of other drains");
         return false;
     };
     const need = pool_mod.inPool(pick.cpus, r.pool_cpus);
-    const w = pool_mod.drainMayStart(ops, r.rec.ticket, pool_n, now, need);
+    const w = pool_mod.drainMayStart(ops, r.rec.ticket, room, now, need);
     if (w != .go) {
         r.setWhy(switch (w) {
             .older_waiter => "runs queued before it go first",
             .older_drain => "an older drain goes first",
-            .half_pool => "drains isolate half the pool already",
+            .half_pool => "drains isolate drain_max of the pool already",
             .taken => "its CPUs are another drain's",
             .go => "",
         });
@@ -962,6 +964,7 @@ fn drainStep(r: *Run, a: std.mem.Allocator, ops: []Op, why: []const u8, now: i64
     r.rec.dstart = now;
     r.rec.noise = 0;
     r.rec.noisy_top = "";
+    r.noise_measured = false;
     if (r.running.items.len == 0) {
         if (r.o.quiet_max == null) startTask(r, a) else r.setWhy("measures its CPUs for --quiet-max");
     } else {
@@ -1025,7 +1028,7 @@ fn noiseDrain(r: *Run) void {
     var busy_on: f64 = 0;
     if (!fresh) for (ticks) |t| {
         if (std.mem.findScalar(u32, r.rec.cpus, t.cpu) == null) continue;
-        for (r.noise_ticks) |q| if (q.cpu == t.cpu and t.total > q.total) {
+        for (r.noise_ticks.items) |q| if (q.cpu == t.cpu and t.total > q.total) {
             busy_on += @as(f64, @floatFromInt(t.busy -| q.busy)) / @as(f64, @floatFromInt(t.total - q.total));
         };
     };
@@ -1053,13 +1056,12 @@ fn noiseDrain(r: *Run) void {
         const cpu = p.last_cpu orelse continue;
         if (std.mem.findScalar(u32, r.rec.cpus, cpu) != null) r.noise_procs.put(r.a, p.pid, p.own_ns) catch {};
     };
-    var keep: std.ArrayList(sys.NumberedTicks) = .fromOwnedSlice(@constCast(r.noise_ticks));
-    keep.clearRetainingCapacity();
-    keep.appendSlice(r.a, ticks) catch {};
-    r.noise_ticks = keep.items;
+    r.noise_ticks.clearRetainingCapacity();
+    r.noise_ticks.appendSlice(r.a, ticks) catch {};
     r.noise_own_ns = own;
     r.noise_at_ms = now;
     if (fresh) return;
+    r.noise_measured = true;
     r.rec.noise = outside;
     r.rec.noisy_top = if (outside >= noisy_min) top else "";
     if (r.running.items.len != 0 and r.first_start_ms != 0) {
@@ -1384,14 +1386,14 @@ pub fn cmdDrain(ctx: *Ctx, args: []const [:0]const u8) u8 {
     }
     o.cpus = count orelse return main.usageError("a drain takes -c N, the CPUs it times on (or --cpus LIST, which names them); the rest of the machine keeps working", .{});
     o.cpus_percent = false;
-    // N whole cores, siblings included, must fit in half the pool.
-    const room = pool_mod.drainRoom(@intCast(pool_cpus.len));
+    // N whole cores, siblings included, must fit in drain_max (half the pool by default).
+    const room = policy.drainMax(ctx.cfg, @intCast(pool_cpus.len));
     const pick = pool_mod.pickDrain(ctx.arena, drainOrder(ctx, pool_cpus, o.prefer_fast), cpus_mod.cores(ctx.io, ctx.arena, pool_cpus), &.{}, o.cpus, o.drain_cpus) orelse
         return main.usageError("the pool has too few whole cores for a drain of {d}", .{o.cpus});
     const need = pool_mod.inPool(pick.cpus, pool_cpus);
     if (need > room) {
-        if (need > o.cpus) return main.usageError("a drain of {d} CPU{s} isolates {d} with their SMT siblings, more than half the pool ({d} here)", .{ o.cpus, if (o.cpus == 1) "" else "s", need, room });
-        return main.usageError("a drain's -c takes at most half the pool ({d} CPUs here)", .{room});
+        if (need > o.cpus) return main.usageError("a drain of {d} CPU{s} isolates {d} with their SMT siblings, more than drain_max ({d} CPUs here)", .{ o.cpus, if (o.cpus == 1) "" else "s", need, room });
+        return main.usageError("a drain takes at most drain_max of the pool ({d} CPUs here)", .{room});
     }
     if (o.timeout_s == null) o.timeout_s = @min(@max(ctx.cfg.drain_timeout_s, 1), drain_ceiling_s);
     return run(ctx, o);

@@ -38,18 +38,23 @@ for part in m.group(1).split(","):
     a, _, b = part.partition("-"); cpus.update(range(int(a), int(b or a) + 1))
 os.sched_setaffinity(int(os.environ["SUITE_PID"]), cpus)' 2>/dev/null
 fi
-# burn [-2] SECONDS: keeps a CPU busy for SECONDS of its own CPU time; burn [-2] --until PATH
-# [SECONDS]: busy until PATH exists (at most SECONDS, default 60). -2 burns in two processes, so a
+# burn [-K] SECONDS: keeps a CPU busy for SECONDS of its own CPU time; burn [-K] --until PATH
+# [SECONDS]: busy until PATH exists (at most SECONDS, default 60). -K burns in K processes, so a
 # task holding the pool busy shows busy even on a loaded machine that gives each less than a CPU.
 BURN=$ROOT/burn
 cat >"$BURN" <<'EOF'
 #!/usr/bin/env python3
 import os, sys, time
 args = sys.argv[1:]
-child = 0
-if args[0] == "-2":
+kids = []
+if args[0][:1] == "-" and args[0][1:].isdigit():
+    for _ in range(int(args[0][1:]) - 1):
+        pid = os.fork()
+        if pid == 0:
+            kids = []
+            break
+        kids.append(pid)
     args = args[1:]
-    child = os.fork()
 if args[0] == "--until":
     end = time.time() + float(args[2] if len(args) > 2 else 60)
     while not os.path.exists(args[1]) and time.time() < end:
@@ -57,8 +62,8 @@ if args[0] == "--until":
 else:
     t = time.process_time() + float(args[0])
     while time.process_time() < t: pass
-if child:
-    os.waitpid(child, 0)
+for pid in kids:
+    os.waitpid(pid, 0)
 EOF
 chmod +x "$BURN"
 PASS=0
@@ -410,6 +415,7 @@ t_drain() {
   "$CPUQ" drain -c 1 --max 20s --label d:idle -- sh -c "echo idle-start >>$w; sleep 30; echo idle-end >>$w" 2>"$T/idle.err" & local di=$!
   wait_line "$w" idle-start
   "$CPUQ" run --label q:hold -- "$BURN" -2 6 & local qh=$!
+  wait_run q:hold
   "$CPUQ" run --wait-max 30 --label q:waiter -- sh -c "echo waiter >>$w" & local dw=$!
   local ri rw; wait $di; ri=$?; wait $dw; rw=$?; wait $qh
   local hist; hist=$("$CPUQ" history --label d:idle --json | python3 -c 'import json,sys; print(json.load(sys.stdin)[0].get("stopped"))')
@@ -423,6 +429,7 @@ while time.time() < e: pass
 open('$u','a').write('busy-end\n')" & local db=$!
   wait_line "$u" busy-start
   "$CPUQ" run --label r:hold -- "$BURN" -2 7 & local rh=$!
+  wait_run r:hold
   "$CPUQ" run --wait-max 30 --label r:waiter2 -- sh -c "echo waiter2 >>$u" & local dw2=$!
   local rb rw2; wait $db; rb=$?; wait $dw2; rw2=$?; wait $rh
   check "a drain computing on one CPU runs on with a run waiting (rc $rb $rw2: $(tr '\n' ' ' <"$u"))" \
@@ -1082,7 +1089,7 @@ t_stack_limit() {
 
 t_status() {
   setup status
-  "$CPUQ" run -n 4 --label s:build -- "$BURN" -2 1.5 2>/dev/null & wait_running 2
+  "$CPUQ" run -n 4 --label s:build -- "$BURN" -4 1.5 2>/dev/null & wait_running 2
   "$CPUQ" run --label s:big -- true & wait_waiters 1
   local s; s=$("$CPUQ" status --no-usage)
   local j; j=$("$CPUQ" status --json | python3 -c 'import json, sys
@@ -1111,15 +1118,16 @@ t_progress() {
 }
 
 t_usage() {
-  # status measures what each run's tasks use: a 1-CPU spinner about 1, two spinners in one task
-  # about 2; after 5 s it flags the run whose tasks keep more than one CPU busy each.
+  # status measures what each run's tasks use: a 1-CPU spinner about 1, three spinners in one task
+  # about 3; after 5 s it flags the run whose tasks keep more than one CPU busy each. (A loaded
+  # machine gives each spinner less: the measure is judged against the other's.)
   setup usage
   "$CPUQ" run --label u:spin -- python3 -c 'import time
 e = time.time() + 9
 while time.time() < e: pass' &
-  "$CPUQ" run --label u:double -- sh -c 'spin() { python3 -c "import time
+  "$CPUQ" run --label u:triple -- sh -c 'spin() { python3 -c "import time
 e = time.time() + 9
-while time.time() < e: pass"; }; spin & spin; wait' &
+while time.time() < e: pass"; }; spin & spin & spin; wait' &
   wait_running 2
   sleep 1
   # Three looks, each run's busiest: a shared CI runner can starve a spinner for one half-second
@@ -1136,11 +1144,12 @@ s = json.load(sys.stdin)
 print(" ".join("%s:%s" % (h["label"], ",".join(h["flags"]) or "-") for h in sorted(s["runs"], key=lambda h: h["label"])))')
   wait
   echo "  measured use: $u; flags: $flags"
-  check "status measures use: a spinner about 1, two in one task about 2 ($u)" "python3 -c '
+  check "status measures use: a spinner about 1, three in one task about 3 ($u)" "python3 -c '
 import sys
 u = dict(p.split(\"=\") for p in \"$u\".split())
-sys.exit(0 if 0.6 < float(u[\"u:spin\"]) < 1.3 and 1.3 < float(u[\"u:double\"]) < 2.6 else 1)'"
-  check "status flags the run whose task keeps two CPUs busy, not the other ($flags)" "[ '$flags' = 'u:double:over_cpu u:spin:-' ]"
+s, t = float(u[\"u:spin\"]), float(u[\"u:triple\"])
+sys.exit(0 if 0.3 < s < 1.3 and 2.0 * s < t < 3.6 else 1)'"
+  check "status flags the run whose task keeps three CPUs busy, not the other ($flags)" "[ '$flags' = 'u:spin:- u:triple:over_cpu' ]"
 }
 
 t_zombie() {

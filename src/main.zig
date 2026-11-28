@@ -95,8 +95,8 @@ const usage =
     \\
     \\commands:
     \\  drain                 for timing: after the runs queued before it that run nothing yet,
-    \\                        N whole cores (-c N, their SMT siblings too, at most half the
-    \\                        pool) are isolated for CMD at once: pinned on Linux (CPUQ_CPUS
+    \\                        N whole cores (-c N, their SMT siblings too, at most drain_max,
+    \\                        half the pool by default) are isolated for CMD at once: pinned on Linux (CPUQ_CPUS
     \\                        lists them), others' tasks kept off them; macOS stops others'
     \\                        tasks while they would crowd the rest. --cpus LIST names them,
     \\                        --prefer fast takes performance cores first; --quiet-max X

@@ -22,12 +22,23 @@ and a drain no longer gathers any.
   cpuq stops the newest task of the project furthest over its share while its tasks keep more
   than T + 0.5 CPUs busy, and continues them when room returns. `-t` counts only time a task
   runs.
-- **A drain takes its turn, then isolates at once.** `cpuq drain -c N` waits only for older
-  runs waiting with no task running, older drains and the half-pool bound; then N CPUs are isolated: its
-  command is pinned to them (Linux), and others' tasks are kept off them (Linux) or stopped as
-  needed (macOS). Nothing is gathered or held while it waits. `--all` stops every other task, for
-  at most 20 minutes. Ctrl-Z on a drain ends its isolation. A drain isolates at most its limit
-  plus 60 s.
+- **A drain takes its turn, then isolates at once.** `cpuq drain -c N | --cpus LIST [--prefer
+  fast] [--quiet-max X]` waits only for older runs waiting with no task running, older drains, the
+  `drain_max` bound and (with `--cpus`, or too few whole cores) CPUs another drain holds; then it
+  isolates N whole cores, the CPUs and their SMT siblings: its command is pinned to the N CPUs
+  (`CPUQ_CPUS`; Linux), and others' tasks are kept off all of them (Linux) or stopped as needed
+  (macOS). Nothing is gathered or held while it waits. Siblings in the pool count toward the
+  capacity and `drain_max`. Ctrl-Z on a drain ends its isolation. A drain isolates at
+  most its limit plus 60 s, and its `-t` counts from its isolation.
+- **Noise.** On Linux a drain measures the work from outside on its CPUs once a second.
+  `cpuq status` flags `noisy` at 0.1 CPUs and names the busiest process; history's ended line
+  carries `noisy: {cpus, max, top}`. `--quiet-max X` starts the command once that work is X CPUs
+  or less, and gives up with exit 75 at `--max` or `-t`.
+- **The hook refuses benchmarks outside cpuq** (`hyperfine`, `cargo bench`, `zig build bench`, a
+  `node`, `bun`, `deno` or `python` script with "bench" in its path), naming `cpuq drain -c 1 -t
+  20m --label PROJECT:bench -- CMD`.
+- **`cpuq drain --all` is gone** and exits 2 naming `-c N`: a drain no longer stops the
+  machine.
 - **`cpuq limit RUN -c C`** changes the running-task cap: raised, it starts more as the line
   allows; lowered, it starts none until fewer run. Up to 4 × the pool.
 - **A run whose cpuq dies** has its tasks killed by whoever next scans the pool.
@@ -44,10 +55,10 @@ What each project changes:
   (I/O, sleep, a server); drop -x"). Tasks that wait leave room, and more start.
 - Stop reading `CPUQ_CPU`: it is not set; a task has no CPU of its own. `CPUQ_CPUS` still names a
   drain's CPUs.
-- `cpuq drain -c N` takes N at most half the pool (more is a usage error); use `--all` for more.
+- `cpuq drain -c N` takes N whole cores that fit in `drain_max` (config: a count or a percentage of the pool, default 50%, always fewer than the pool; more is a usage error); `drain --all` is gone, use `-c N`.
 - `cpuq status --json` is schema 3: top-level `budget`, `pool`, `capacity`, `isolated`,
   `running`, `paused`, `waiting`, `busy`, `tasks_busy`, `room`, `gate` (`open`, `pressure`,
-  `low_memory`, `low_disk`, `drain`), `runs[]`, `waiters[]`, `projects[]`. The fields `held`,
+  `low_memory`, `low_disk`), `runs[]`, `waiters[]`, `projects[]`. The fields `held`,
   `emptying`, `promised`, `free`, `next_free` and `holders[]` are gone.
 - Cpuq.app reads schema 2 and needs a release for schema 3.
 

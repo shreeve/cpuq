@@ -637,11 +637,6 @@ pub fn capacity(ops: []const Op, pool_n: u32, now_ms: i64) u32 {
     return pool_n -| iso;
 }
 
-/// The most of the pool's CPUs drains may isolate at once: half the pool, at least one.
-pub fn drainRoom(pool_n: u32) u32 {
-    return @max(1, pool_n / 2);
-}
-
 pub const DrainWait = enum {
     /// Its turn: it isolates now.
     go,
@@ -649,15 +644,15 @@ pub const DrainWait = enum {
     older_waiter,
     /// An older drain waits too: drains go in their order.
     older_drain,
-    /// Its CPUs would take the drains' isolation past half the pool.
+    /// Its CPUs would take the drains' isolation past `drain_max` (half the pool by default).
     half_pool,
     /// The CPUs it names, or enough whole cores for it, are another drain's.
     taken,
 };
 
 /// Whether drain `me` may begin isolating now, isolating `need` of the pool's CPUs (its own and
-/// their siblings).
-pub fn drainMayStart(ops: []const Op, me: u64, pool_n: u32, now_ms: i64, need: u32) DrainWait {
+/// their siblings), where drains together isolate at most `room` (config `drain_max`).
+pub fn drainMayStart(ops: []const Op, me: u64, room: u32, now_ms: i64, need: u32) DrainWait {
     var iso: u32 = 0;
     for (ops) |o| {
         if (o.ticket == me) continue;
@@ -667,7 +662,7 @@ pub fn drainMayStart(ops: []const Op, me: u64, pool_n: u32, now_ms: i64, need: u
         if (o.ticket < me and o.drain and !o.stopped and o.dstart == 0) return .older_drain;
         if (isolating(o, now_ms)) iso += o.npool;
     }
-    if (iso + need > drainRoom(pool_n)) return .half_pool;
+    if (iso + need > room) return .half_pool;
     return .go;
 }
 
@@ -1168,20 +1163,20 @@ test "drains: isolation, the half-pool bound, and the turn" {
     try std.testing.expectEqual(8, capacity(&.{d1}, 8, now + 700_000));
     // A second drain needing 3 would pass half the pool (4): it waits; one needing 2 goes.
     const d2: Op = .{ .ticket = 2, .drain = true, .limit = 3, .waiting = 1 };
-    try std.testing.expectEqual(DrainWait.half_pool, drainMayStart(&.{ d1, d2 }, 2, 8, now, 3));
-    try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{ d1, d2 }, 2, 8, now, 2));
+    try std.testing.expectEqual(DrainWait.half_pool, drainMayStart(&.{ d1, d2 }, 2, 4, now, 3));
+    try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{ d1, d2 }, 2, 4, now, 2));
     // A run older than the drain waiting with no task running goes first; one running tasks
     // already, or a newer one, doesn't hold it.
     const old: Op = .{ .ticket = 1, .project = "rig", .waiting = 1 };
     const young: Op = .{ .ticket = 3, .project = "rig", .waiting = 1 };
-    try std.testing.expectEqual(DrainWait.older_waiter, drainMayStart(&.{ old, d2 }, 2, 8, now, 1));
-    try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{ d2, young }, 2, 8, now, 1));
+    try std.testing.expectEqual(DrainWait.older_waiter, drainMayStart(&.{ old, d2 }, 2, 4, now, 1));
+    try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{ d2, young }, 2, 4, now, 1));
     var busy_old = old;
     busy_old.running = 3;
-    try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{ busy_old, d2 }, 2, 8, now, 1));
+    try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{ busy_old, d2 }, 2, 4, now, 1));
     // An older drain waiting goes first.
     const w1: Op = .{ .ticket = 1, .drain = true, .limit = 1, .waiting = 1 };
-    try std.testing.expectEqual(DrainWait.older_drain, drainMayStart(&.{ w1, d2 }, 2, 8, now, 1));
+    try std.testing.expectEqual(DrainWait.older_drain, drainMayStart(&.{ w1, d2 }, 2, 4, now, 1));
     // A stopped drain isolates nothing.
     var stopped = d1;
     stopped.stopped = true;

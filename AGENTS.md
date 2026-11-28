@@ -64,12 +64,16 @@ branch names: history is kept by label.
 
     cpuq drain -c 4 --label app:bench --max 10m -t 20m -- ./bench
 
-A drain takes its turn (runs queued before it that wait with no task running go first), then at once isolates N CPUs for CMD:
-pinned on Linux, others' tasks kept off them; the rest of the machine keeps working. Use
-`$CPUQ_CPUS`, never a `taskset` of your own. `-c` is as many CPUs as the measurement uses, at most
-half the pool. `--all` stops every other task, for at most 20 min: rarely. `-t` ends it (default 20m, at most 2h); one round of timing per drain. A
-drain whose command keeps under 0.25 CPUs busy for 5 min while others wait is stopped: time,
-don't sleep. `--max` gives up with exit 75. Only for real timing.
+A drain takes its turn (older runs that wait with no task running go first), then at once isolates
+N whole cores for CMD (its CPUs and their SMT siblings): CMD is pinned to the N CPUs on Linux,
+others' tasks are kept off; the rest of the machine keeps working. Use `$CPUQ_CPUS`, never a
+`taskset` of your own. `-c` is as many CPUs as the measurement uses (whole cores, at most the
+config's `drain_max`, half the pool by default); `--cpus LIST` names them, `--prefer fast` takes performance cores first. `-t` ends it
+(default 20m, at most 2h, counted from the isolation); one round of timing per drain. A drain whose
+command keeps under 0.25 CPUs busy for 5 min while others wait is stopped: time, don't sleep.
+`--max` gives up with exit 75. On Linux `cpuq status` flags a drain `noisy` (work from outside on
+its CPUs); `--quiet-max X` starts CMD only once that work is X CPUs or less (exit 75 if it never
+is). Only for real timing.
 
 ## Another machine
 
@@ -183,6 +187,11 @@ Where `cpuq hook` is installed (Claude Code's PreToolUse hook), a heavy command 
 a removed option, or a `cpuq run` whose command would start more than one job, is refused with
 the corrected command: run that instead. Mark a command `# cpuq: skip` only when it truly must
 run as it is.
+
+A benchmark outside cpuq (`hyperfine`, `cargo bench`, `zig build bench`, or `node`, `bun`,
+`deno`, `python` on a script with "bench" in its path) is refused too: time it with
+`cpuq drain -c 1 -t 20m --label PROJECT:bench -- CMD` (`-c` as many CPUs as it times on; `-t` about
+ten times its run).
 
 ## Don't
 
