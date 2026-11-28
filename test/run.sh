@@ -471,8 +471,10 @@ t_drain_cpus() {
   local order; order=$(tr '\n' ' ' <"$g")
   check "two drains of 1 CPU on a pool of 2 run one at a time (rc $r1 $r2: $order)" "[ $r1 = 0 ] && [ $r2 = 0 ] && [ '$order' = 'one-start one-end two-start two-end ' ]"
   if [ "$(uname)" != Linux ]; then
-    local q; "$CPUQ" drain -c 1 --quiet-max 0.1 -- true 2>/dev/null; q=$?
-    check "--quiet-max needs Linux (rc $q)" "[ $q = 2 ]"
+    # macOS measures the machine's work beyond what the drain leaves to it: under a bound it
+    # meets (8 CPUs past the rest of the machine), the command starts once measured.
+    local q; "$CPUQ" drain -c 1 --quiet-max 8 --max 20s -- touch "$T/ran-mac"; q=$?
+    check "--quiet-max on macOS starts the command under a bound it meets (rc $q)" "[ $q = 0 ] && [ -e '$T/ran-mac' ]"
     return
   fi
   # Linux: a drain of 1 isolates its CPU's SMT siblings too.
