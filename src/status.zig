@@ -585,18 +585,19 @@ fn cpuText(a: std.mem.Allocator, cpus: []const u32) []const u8 {
     return policy.cpuListText(a, cpus);
 }
 
-/// How far a run is: "12/20 · 1 failed"; with only its running tasks left, the tail: "last
+/// How far a run is: "12/20 done · 1 failed" ("none failed" too); with only its running tasks left, the tail: "last
 /// task, running 32m", "last 3 tasks, oldest running 32m"; a single task, "running 32m".
 fn tasksText(a: std.mem.Allocator, h: JsonRun, now: i64) []const u8 {
     var b: [16]u8 = undefined;
     const ran = if (h.oldest != 0) age(&b, now - h.oldest) else "";
     if (h.tasks <= 1) return if (h.running != 0) (a.print("running {s}", .{ran}) catch "running") else "starting";
-    const failed = if (h.failed != 0) a.print(" · {d} failed", .{h.failed}) catch "" else "";
+    // Failed always, "none" too: "206/208 done" with nothing after it reads as two lost.
+    const failed = if (h.failed != 0) a.print(" · {d} failed", .{h.failed}) catch "" else " · none failed";
     if (h.tail) {
         if (h.running == 1) return a.print("last task, running {s}{s}", .{ ran, failed }) catch "last task";
         return a.print("last {d} tasks, oldest running {s}{s}", .{ h.running, ran, failed }) catch "last tasks";
     }
-    return a.print("{d}/{d}{s}", .{ h.done + h.failed, h.tasks, failed }) catch "?";
+    return a.print("{d}/{d} done{s}", .{ h.done + h.failed, h.tasks, failed }) catch "?";
 }
 
 /// How many of a run's tasks are demoted (macOS: run in the background).
@@ -633,6 +634,9 @@ fn runText(a: std.mem.Allocator, h: JsonRun) []const u8 {
 fn sinceText(a: std.mem.Allocator, h: JsonRun, now: i64) []const u8 {
     var b: [16]u8 = undefined;
     const ran = a.dupe(u8, age(&b, now - h.since)) catch "?";
+    // Once only its last tasks run, the quick ones' rate says nothing of them: the tail says
+    // how long they've run instead.
+    if (h.tail) return ran;
     const l = h.left orelse return ran;
     var lb: [16]u8 = undefined;
     return a.print("{s} · ~{s} left", .{ ran, age(&lb, @intFromFloat(@ceil(l))) }) catch ran;

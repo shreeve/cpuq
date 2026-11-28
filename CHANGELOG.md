@@ -2,6 +2,12 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.40.3 — 2026-11-28
+
+- **`cpuq status` says what's done and what failed:** "206/208 done · none failed", so a run's
+  last tasks never read as lost. Once only the last tasks run, it shows how long they've run
+  and no longer a time left from the quick tasks' rate ("~<1m left" after 17 minutes).
+
 ## 0.40.2 — 2026-11-27
 
 - **The hook judges a script by its own name.** A script run by node, bun, deno or python is a
