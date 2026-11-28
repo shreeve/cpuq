@@ -181,6 +181,11 @@ structure Rules where
   projects' first waiters, projects under share first, then the line's order (no-starvation fix
   2). Off: a run under share starts without a turn, and only spare room is taken in line. -/
   oneLine : Bool := false
+  /-- 0.42's strict token pool: `N = pool − reserve` tokens; a task holds one while it runs, a
+  drain takes its cores' tokens at once; a start needs a free token (tokens handed out are `N` less
+  what outside load past the reserve keeps busy); the share is of `N`; every start goes to the
+  first in the one line. No admission by measured busy, no 4T backstop. -/
+  tokens : Bool := false
   deriving Repr
 
 /-- DESIGN-0.40.md as written. -/
@@ -189,6 +194,9 @@ def Rules.design : Rules := { busyAll := true, drainFifo := false }
 def Rules.fixed : Rules := { busyAll := false, drainFifo := true }
 /-- `fixed` with the two no-starvation fixes (`Stream.lean`). -/
 def Rules.nostarve : Rules := { busyAll := false, drainFifo := true, arrivalKey := true, oneLine := true }
+/-- cpuq 0.42.0: the token pool with 0.41's line (`Token.lean`). -/
+def Rules.tokens042 : Rules :=
+  { busyAll := false, drainFifo := true, arrivalKey := true, oneLine := true, tokens := true }
 
 structure Cfg where
   /-- The pool's CPUs (the budget). -/
@@ -271,6 +279,8 @@ structure St where
   next : Nat := 0
   /-- Ticks so far: the time a start is stamped with. -/
   now : Nat := 0
+  /-- `cpuq reserve`: the pool's CPUs cpuq never hands out (0.42). -/
+  reserve : Nat := 0
 
 def upd {α : Type} (f : Nat → α) (i : Nat) (x : α) : Nat → α := fun j => if j = i then x else f j
 
@@ -317,6 +327,14 @@ def drainLoad (s : St) : Nat :=
   rsum cfg.nd (fun d => if (s.drain d).ph = .started ∧ (s.drain d).busy = true then (cfg.drain d).size else 0)
 /-- Capacity T. -/
 def capT (s : St) : Nat := cfg.pool - iso cfg s
+/-- 0.42: the tokens, `N = pool − reserve`. -/
+def capN (s : St) : Nat := cfg.pool - s.reserve
+/-- 0.42: the tokens handed out, `N` less the outside load past the reserve. -/
+def capTok (s : St) : Nat := capN cfg s - (s.outside - s.reserve)
+/-- 0.42: the tokens held, by tasks and by started drains. -/
+def used (s : St) : Nat := total cfg s + iso cfg s
+/-- What the fair share divides: `T`, or with `tokens` `N`. -/
+def shareCap (s : St) : Nat := if cfg.rules.tokens then capN cfg s else capT cfg s
 /-- Busy as the rules measure it. -/
 def busyM (s : St) : Nat :=
   taskBusy cfg s + s.outside + (if cfg.rules.busyAll then drainLoad cfg s else 0)
@@ -330,7 +348,7 @@ def activeP (s : St) (p : Nat) : Bool :=
 def W (s : St) : Nat := rsum cfg.np (fun p => if activeP cfg s p then cfg.w p else 0)
 /-- Under its fair share `T × w_p / W`. -/
 def under (s : St) (r : Nat) : Prop :=
-  projRun cfg s (cfg.run r).proj * W cfg s < capT cfg s * cfg.w (cfg.run r).proj
+  projRun cfg s (cfg.run r).proj * W cfg s < shareCap cfg s * cfg.w (cfg.run r).proj
 
 instance (s : St) : Decidable (room cfg s) := by unfold room; infer_instance
 instance (s : St) (r : Nat) : Decidable (under cfg s r) := by unfold under; infer_instance
@@ -403,8 +421,10 @@ def head2 (s : St) : Option Nat := pick (front cfg s) (before2 cfg s) (List.rang
 and it is the first in line. With `oneLine`: it is the first in the one line, and under share or
 with room. -/
 def canStart (s : St) (r : Nat) : Bool :=
-  eligible s r && s.gate && decide (total cfg s < 4 * capT cfg s) &&
-    (projFirst cfg s r && (if cfg.rules.oneLine then head2 cfg s == some r && (decide (under cfg s r) || decide (room cfg s))
+  eligible s r && s.gate &&
+    (if cfg.rules.tokens then decide (used cfg s + 1 ≤ capTok cfg s) else decide (total cfg s < 4 * capT cfg s)) &&
+    (projFirst cfg s r && (if cfg.rules.tokens then head2 cfg s == some r
+      else if cfg.rules.oneLine then head2 cfg s == some r && (decide (under cfg s r) || decide (room cfg s))
       else decide (under cfg s r) || (decide (room cfg s) && head cfg s == some r)))
 
 def olderDrainWaits (s : St) (d : Nat) : Bool :=
@@ -421,7 +441,8 @@ def olderEmptyWaits (s : St) (d : Nat) : Bool :=
 the gates are open, and (with `drainFifo`) no older run that holds nothing waits. -/
 def canDrain (s : St) (d : Nat) : Bool :=
   decide ((s.drain d).ph = .waiting) && s.gate && decide (iso cfg s + (cfg.drain d).size ≤ cfg.drainMax) &&
-    !olderDrainWaits cfg s d && !(cfg.rules.drainFifo && olderEmptyWaits cfg s d)
+    !olderDrainWaits cfg s d && !(cfg.rules.drainFifo && olderEmptyWaits cfg s d) &&
+    (!cfg.rules.tokens || decide (used cfg s + (cfg.drain d).size ≤ capTok cfg s))
 
 def admitR (t : Nat) (x : RunSt) : RunSt := { x with pend := x.pend - 1, start := x.start + 1, ran := true, last := t }
 def startDr (y : DrainSt) : DrainSt := { y with ph := .started, age := 0, idle := 0, busy := true }
@@ -534,6 +555,8 @@ inductive Act where
   | load (k : Nat)
   /-- `cpuq limit`: a run's `-c` changes. -/
   | limit (r c : Nat)
+  /-- `cpuq reserve k` (0.42): set aside `k` of the pool's CPUs, always leaving one. -/
+  | reserve (k : Nat)
   deriving Repr
 
 def act (cfg : Cfg) (s : St) : Act → Option St
@@ -567,6 +590,7 @@ def act (cfg : Cfg) (s : St) : Act → Option St
   | .tick => some (tickSt cfg s)
   | .gate b => some { s with gate := b }
   | .load k => some { s with outside := k }
+  | .reserve k => if k < cfg.pool then some { s with reserve := k } else none
   | .limit r c =>
     if r < cfg.nr ∧ (s.run r).here = true ∧ 0 < c then some (setRun s r { s.run r with cap := c }) else none
 
@@ -613,7 +637,7 @@ theorem pass1_work {cfg : Cfg} {s t : St} (h : pass1 cfg s = some t) : work cfg 
     have hc := List.find?_some hd
     have hm := List.mem_range.1 (List.mem_of_find?_eq_some hd)
     simp only [canDrain, Bool.and_eq_true, decide_eq_true_eq] at hc
-    have hw := hc.1.1.1.1
+    have hw := hc.1.1.1.1.1
     have h1 := sum_setDrain (fun _ y => isWaiting y) s (startDr (s.drain d)) hm
     try dsimp only at h1
     have e1 : isWaiting (s.drain d) = 1 := by simp [isWaiting, hw]
@@ -734,8 +758,8 @@ theorem inv_pass1 {cfg : Cfg} {s t : St} (i : Inv cfg s) (h : pass1 cfg s = some
     have hc := List.find?_some hd
     have hm := List.mem_range.1 (List.mem_of_find?_eq_some hd)
     simp only [canDrain, Bool.and_eq_true, decide_eq_true_eq] at hc
-    have hw := hc.1.1.1.1
-    have hh := hc.1.1.2
+    have hw := hc.1.1.1.1.1
+    have hh := hc.1.1.1.2
     have hiso := iso_startD hm hw
     refine ⟨i.here, i.cap, by omega, fun e he => ?_, i.tot⟩
     by_cases hed : e = d
@@ -749,8 +773,13 @@ theorem inv_pass1 {cfg : Cfg} {s t : St} (i : Inv cfg s) (h : pass1 cfg s = some
       have hm := List.mem_range.1 (List.mem_of_find?_eq_some hf)
       simp only [canStart, eligible, Bool.and_eq_true, decide_eq_true_eq] at hc
       have hhere := hc.1.1.1.1.1
-      have htot := hc.1.2
-      have hcap : capT cfg s ≤ cfg.pool := Nat.sub_le _ _
+      have htot : total cfg s < 4 * cfg.pool := by
+        have h2 := hc.1.2
+        have hcap : capT cfg s ≤ cfg.pool := Nat.sub_le _ _
+        split at h2
+        · have h3 : used cfg s + 1 ≤ capTok cfg s := by simpa using h2
+          unfold used capTok capN at h3; omega
+        · simp only [decide_eq_true_eq] at h2; omega
       have ht := total_admit (s := s) hm
       refine ⟨fun j hj => ?_, fun j hj => ?_, i.half, i.clock, ?_⟩
       · by_cases hjr : j = r
@@ -858,6 +887,7 @@ theorem inv_act {cfg : Cfg} {s u : St} {a : Act} (i : Inv cfg s) (h : act cfg s 
       simp [tickSt, RunSt.running]; omega
   | gate b => simp only [act] at h; cases h; exact { i with }
   | load k => simp only [act] at h; cases h; exact { i with }
+  | reserve k => simp only [act] at h; split at h <;> cases h; exact { i with }
 
 theorem reach_inv {cfg : Cfg} {s : St} (r : Reach cfg s) : Inv cfg s ∧ pass1 cfg s = none := by
   induction r with
@@ -1054,6 +1084,12 @@ theorem head_first {cfg : Cfg} {s : St} {h : Nat} (e : head cfg s = some h) :
     ∀ i < cfg.nr, front cfg s i = true → before cfg s i h = false :=
   fun i hi he => (foldl_pick_min _ _ (before_irr cfg s) (before_trans cfg s) _ _ h e).2 i (List.mem_range.2 hi) he
 
+theorem shareCap_old {cfg : Cfg} {s : St} (h : cfg.rules.tokens = false) : shareCap cfg s = capT cfg s := by
+  simp [shareCap, h]
+
+theorem shareCap_tok {cfg : Cfg} {s : St} (h : cfg.rules.tokens = true) : shareCap cfg s = capN cfg s := by
+  simp [shareCap, h]
+
 /-- Under share depends only on the project. -/
 theorem under_proj {cfg : Cfg} {s : St} {r h : Nat} (hp : (cfg.run h).proj = (cfg.run r).proj) :
     under cfg s h ↔ under cfg s r := by
@@ -1101,7 +1137,7 @@ theorem reach_drain {cfg : Cfg} {s : St} (h : Reach cfg s) {d : Nat} (hd : d < c
 
 /-- **Property 2, no wait under share.** A run under its fair share with a task waiting and not
 held by its `-c` waits only on the gates or the 4T backstop. -/
-theorem no_wait_under {cfg : Cfg} {s : St} (h : Reach cfg s) {r : Nat} (hr : r < cfg.nr)
+theorem no_wait_under {cfg : Cfg} {s : St} (h : Reach cfg s) (htk : cfg.rules.tokens = false) {r : Nat} (hr : r < cfg.nr)
     (he : eligible s r = true) (hu : under cfg s r) :
     s.gate = false ∨ 4 * capT cfg s ≤ total cfg s := by
   obtain ⟨f, hf, hpf, hff⟩ := first_exists hr he
@@ -1115,23 +1151,24 @@ theorem no_wait_under {cfg : Cfg} {s : St} (h : Reach cfg s) {r : Nat} (hr : r <
     have hlt' : total cfg s < 4 * capT cfg s := by omega
     cases ho : cfg.rules.oneLine
     · simp only [front, Bool.and_eq_true] at hff
-      simp [canStart, hff.1, hff.2, hg, hlt', huf, ho] at hc
+      simp [canStart, hff.1, hff.2, hg, hlt', huf, ho, htk] at hc
     · obtain ⟨x, hx⟩ := Option.isSome_iff_exists.1 (head2_isSome hr he)
       obtain ⟨hxn, hxe⟩ := head2_some hx
       have hxu := head2_under hx hf hff huf
       have hc' := reach_start h hxn
       simp only [front, Bool.and_eq_true] at hxe
-      simp [canStart, hxe.1, hxe.2, hg, hlt', hxu, ho, hx] at hc' 
+      simp [canStart, hxe.1, hxe.2, hg, hlt', hxu, ho, hx, htk] at hc' 
 
 /-- **Property 1, work-conserving** (with busy counting only the CPUs no drain isolates). A
 task that waits, not held by the gates, the backstop or its run's `-c`, waits only when its
 project is at or over its share and the machine has no room: busy + starting ≥ T − 0.5. -/
 theorem work_conserving {cfg : Cfg} {s : St} (h : Reach cfg s) (hb : cfg.rules.busyAll = false)
+    (htk : cfg.rules.tokens = false)
     {r : Nat} (hr : r < cfg.nr) (he : eligible s r = true) (hg : s.gate = true)
     (ht : total cfg s < 4 * capT cfg s) :
     ¬ under cfg s r ∧ capT cfg s ≤ taskBusy cfg s + s.outside + startingN cfg s := by
   refine ⟨fun hu => ?_, ?_⟩
-  · rcases no_wait_under h hr he hu with x | x
+  · rcases no_wait_under h htk hr he hu with x | x
     · rw [hg] at x; cases x
     · omega
   · apply Classical.byContradiction
@@ -1144,12 +1181,12 @@ theorem work_conserving {cfg : Cfg} {s : St} (h : Reach cfg s) (hb : cfg.rules.b
       obtain ⟨hxn, hxe⟩ := head_some hx
       simp only [front, Bool.and_eq_true] at hxe
       have hc := reach_start h hxn
-      simp [canStart, hxe.1, hxe.2, hg, ht, hroom, hx, ho] at hc
+      simp [canStart, hxe.1, hxe.2, hg, ht, hroom, hx, ho, htk] at hc
     · obtain ⟨x, hx⟩ := Option.isSome_iff_exists.1 (head2_isSome hr he)
       obtain ⟨hxn, hxe⟩ := head2_some hx
       simp only [front, Bool.and_eq_true] at hxe
       have hc := reach_start h hxn
-      simp [canStart, hxe.1, hxe.2, hg, ht, hroom, hx, ho] at hc
+      simp [canStart, hxe.1, hxe.2, hg, ht, hroom, hx, ho, htk] at hc
 
 /-- **The line.** A run starts a task only as its project's first waiter (no waiter of its
 project has fewer tasks running, or as many and an older ticket); over its share, only with room
@@ -1157,21 +1194,28 @@ and first in line among the projects' first waiters (urgent first task, project 
 weight, fewer running, ticket). -/
 theorem line_order {cfg : Cfg} {s : St} {r : Nat} (hc : canStart cfg s r = true) :
     projFirst cfg s r = true ∧
-    (cfg.rules.oneLine = false → ¬ under cfg s r →
+    (cfg.rules.tokens = false → cfg.rules.oneLine = false → ¬ under cfg s r →
       room cfg s ∧ ∀ i < cfg.nr, front cfg s i = true → before cfg s i r = false) ∧
-    (cfg.rules.oneLine = true →
-      (under cfg s r ∨ room cfg s) ∧ ∀ i < cfg.nr, front cfg s i = true → before2 cfg s i r = false) := by
+    (cfg.rules.tokens = false → cfg.rules.oneLine = true →
+      (under cfg s r ∨ room cfg s) ∧ ∀ i < cfg.nr, front cfg s i = true → before2 cfg s i r = false) ∧
+    (cfg.rules.tokens = true →
+      used cfg s + 1 ≤ capTok cfg s ∧ ∀ i < cfg.nr, front cfg s i = true → before2 cfg s i r = false) := by
   simp only [canStart, Bool.and_eq_true] at hc
-  refine ⟨hc.2.1, fun ho hu => ?_, fun ho => ?_⟩
+  refine ⟨hc.2.1, fun ht ho hu => ?_, fun ht ho => ?_, fun ht => ?_⟩
   · have h2 := hc.2.2
-    simp only [ho, Bool.false_eq_true, ↓reduceIte, Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq,
+    simp only [ht, ho, Bool.false_eq_true, ↓reduceIte, Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq,
       beq_iff_eq] at h2
     rcases h2 with hu' | ⟨hroom, hh⟩
     · exact absurd hu' hu
     · exact ⟨hroom, head_first hh⟩
   · have h2 := hc.2.2
-    simp only [ho, ↓reduceIte, Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at h2
+    simp only [ht, ho, Bool.false_eq_true, ↓reduceIte, Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq,
+      beq_iff_eq] at h2
     exact ⟨h2.2, head2_first h2.1⟩
+  · have h1 := hc.1.2
+    have h2 := hc.2.2
+    simp only [ht, ↓reduceIte, decide_eq_true_eq, beq_iff_eq] at h1 h2
+    exact ⟨h1, head2_first h2⟩
 
 /-- Within a project: a run never starts a task while a waiter of its project comes before it
 (an urgent first task; fewer tasks running; as many and an older last start, a run that never
@@ -1191,7 +1235,8 @@ nothing. -/
 theorem drain_waits_for {cfg : Cfg} {s : St} (h : Reach cfg s) {d : Nat} (hd : d < cfg.nd)
     (hw : (s.drain d).ph = .waiting) :
     s.gate = false ∨ cfg.drainMax < iso cfg s + (cfg.drain d).size ∨ olderDrainWaits cfg s d = true ∨
-      (cfg.rules.drainFifo = true ∧ olderEmptyWaits cfg s d = true) := by
+      (cfg.rules.drainFifo = true ∧ olderEmptyWaits cfg s d = true) ∨
+      (cfg.rules.tokens = true ∧ capTok cfg s < used cfg s + (cfg.drain d).size) := by
   have hc := reach_drain h hd
   cases hg : s.gate
   · exact Or.inl rfl
@@ -1200,8 +1245,16 @@ theorem drain_waits_for {cfg : Cfg} {s : St} (h : Reach cfg s) {d : Nat} (hd : d
     · exact Or.inl hp
     · right
       cases ho : olderDrainWaits cfg s d
-      · cases hf : cfg.rules.drainFifo <;> cases he : olderEmptyWaits cfg s d <;>
-          simp_all [canDrain] <;> omega
+      · right
+        by_cases hq : cfg.rules.drainFifo = true ∧ olderEmptyWaits cfg s d = true
+        · exact Or.inl hq
+        · right
+          cases htk : cfg.rules.tokens
+          · exfalso
+            cases hf : cfg.rules.drainFifo <;> cases he : olderEmptyWaits cfg s d <;> simp_all [canDrain] <;> omega
+          · refine ⟨rfl, ?_⟩
+            apply Classical.byContradiction; intro hn
+            cases hf : cfg.rules.drainFifo <;> cases he : olderEmptyWaits cfg s d <;> simp_all [canDrain] <;> omega
       · exact Or.inl rfl
 
 /-! ## Property 5: what is withheld from tasks -/
@@ -1265,7 +1318,7 @@ def drainAfter (cfg : Cfg) (s : St) (a : Act) (d : Nat) : DrainSt :=
 
 theorem act_run {cfg : Cfg} {s u : St} {a : Act} (h : act cfg s a = some u) (r : Nat) : u.run r = runAfter cfg s a r := by
   cases a with
-  | arriveD _ | dbusy _ _ | dend _ => simp only [act] at h; split at h <;> cases h; rfl
+  | arriveD _ | dbusy _ _ | dend _ | reserve _ => simp only [act] at h; split at h <;> cases h; rfl
   | tick | gate _ | load _ => simp only [act, Option.some.injEq] at h; subst h; rfl
   | arrive e | finS e | finC e | finB e | block e | wake e | limit e _ =>
     simp only [act] at h; split at h
@@ -1277,7 +1330,7 @@ theorem act_run {cfg : Cfg} {s u : St} {a : Act} (h : act cfg s a = some u) (r :
 
 theorem act_drain {cfg : Cfg} {s u : St} {a : Act} (h : act cfg s a = some u) (d : Nat) : u.drain d = drainAfter cfg s a d := by
   cases a with
-  | arrive _ | finS _ | finC _ | finB _ | block _ | wake _ | limit _ _ =>
+  | arrive _ | finS _ | finC _ | finB _ | block _ | wake _ | limit _ _ | reserve _ =>
     simp only [act] at h; split at h <;> cases h; rfl
   | tick | gate _ | load _ => simp only [act, Option.some.injEq] at h; subst h; rfl
   | arriveD e | dbusy e _ | dend e =>
@@ -1335,7 +1388,7 @@ theorem PassPath.frame {cfg : Cfg} {s u : St} (p : PassPath cfg s u) :
     · by_cases hed : e = d
       · subst hed
         simp only [canDrain, Bool.and_eq_true, decide_eq_true_eq] at hc
-        exact absurd hc.1.1.1.1 he
+        exact absurd hc.1.1.1.1.1 he
       · rw [i3 e (by simpa [startD, hed] using he)]; simp [startD, hed]
     · apply i4
       by_cases hed : e = d
@@ -1373,7 +1426,7 @@ theorem M_pass1 {cfg : Cfg} {s t : St} (h : pass1 cfg s = some t) : M cfg t + 1 
     have hc := List.find?_some hd
     have hm := List.mem_range.1 (List.mem_of_find?_eq_some hd)
     simp only [canDrain, Bool.and_eq_true, decide_eq_true_eq] at hc
-    have hw := hc.1.1.1.1
+    have hw := hc.1.1.1.1.1
     have h1 := sum_setDrain (fun _ y => dval y) s (startDr (s.drain d)) hm
     have e1 : dval (s.drain d) = 2 := by simp [dval, hw]
     have e2 : dval (startDr (s.drain d)) = 1 := by simp [dval, startDr]
@@ -1608,7 +1661,7 @@ theorem step_keeps {cfg : Cfg} {s t : St} {a : Act} (ha : a.arrival = false) (hs
 (every run holding a running task later sees one of them end), the gates are open again and
 again, and time keeps passing, then from some time on nothing waits: every task and every
 drain has started. Drains no larger than `drainMax`. -/
-theorem no_starvation {cfg : Cfg} (hp : 0 < cfg.pool)
+theorem no_starvation {cfg : Cfg} (hp : 0 < cfg.pool) (htk : cfg.rules.tokens = false)
     (hsz : ∀ d < cfg.nd, (cfg.drain d).size ≤ cfg.drainMax)
     (ρ : Run cfg) (n0 : Nat) (calm : ∀ n ≥ n0, (ρ.act n).arrival = false)
     (ends : ∀ n r, r < cfg.nr → 0 < ((ρ.st n).run r).running → ∃ m ≥ n, finOf r (ρ.act m))
@@ -1690,9 +1743,9 @@ theorem no_starvation {cfg : Cfg} (hp : 0 < cfg.pool)
       have hpr : projRun cfg (ρ.st m) (cfg.run r).proj = 0 :=
         rsum_eq_zero.2 (fun j hj => by simp [noRun m hm j hj])
       have hu : under cfg (ρ.st m) r := by
-        unfold under; rw [hpr, hcap]; simp only [Nat.zero_mul]
+        unfold under shareCap; rw [hpr, htk]; simp only [Nat.zero_mul, Bool.false_eq_true, ite_false, hcap]
         exact Nat.mul_pos hp (Cfg.w_pos _ _)
-      rcases no_wait_under (ρ.reach m) hr hel hu with x | x
+      rcases no_wait_under (ρ.reach m) htk hr hel hu with x | x
       · rw [hg] at x; cases x
       · rw [htot, hcap] at x; omega
     refine ⟨pend0, fun d hd hw => ?_⟩
@@ -1705,7 +1758,7 @@ theorem no_starvation {cfg : Cfg} (hp : 0 < cfg.pool)
     have hoe : olderEmptyWaits cfg (ρ.st m) e = false := anyLT_false.2 (fun x hx => by
       simp [emptyWaiter, pend0 x hx])
     have hs := hsz e he
-    simp [canDrain, hew, hg, hiso, ho, hoe, hs] at hc
+    simp [canDrain, hew, hg, hiso, ho, hoe, hs, htk] at hc
   -- nothing waits from then on
   have all : ∀ j, Quiet cfg (ρ.st (m + j)) := by
     intro j
@@ -1763,7 +1816,7 @@ theorem PassPath.fifo {cfg : Cfg} (hf : cfg.rules.drainFifo = true) {s u : St} (
     by_cases hed : e = d
     · subst hed
       simp only [canDrain, Bool.and_eq_true, Bool.not_eq_true', decide_eq_true_eq, hf, Bool.true_and] at hc
-      obtain ⟨⟨_, ho⟩, hoe⟩ := hc
+      obtain ⟨⟨⟨_, ho⟩, hoe⟩, _⟩ := hc
       refine ⟨fun r hr he ht => ?_, fun e' he' hw' ht' => ?_⟩
       · have : olderEmptyWaits cfg s' e = true := anyLT_iff.2 ⟨r, hr, by simp [he, ht]⟩
         rw [this] at hoe; cases hoe
@@ -2062,14 +2115,14 @@ theorem Run.calm {cfg : Cfg} (ρ : Run cfg) : ∃ n0, ∀ n ≥ n0, (ρ.act n).a
 /-- **Property 3, for every run of the model.** Arrivals at any times (each run and drain of the
 configuration arrives at most once): if every task ends, the gates reopen and time passes, then
 from some time on nothing waits. -/
-theorem no_starvation_all {cfg : Cfg} (hp : 0 < cfg.pool)
+theorem no_starvation_all {cfg : Cfg} (hp : 0 < cfg.pool) (htk : cfg.rules.tokens = false)
     (hsz : ∀ d < cfg.nd, (cfg.drain d).size ≤ cfg.drainMax) (ρ : Run cfg)
     (ends : ∀ n r, r < cfg.nr → 0 < ((ρ.st n).run r).running → ∃ m ≥ n, finOf r (ρ.act m))
     (gates : ∀ n, ∃ m ≥ n, (ρ.st m).gate = true)
     (time : ∀ n, ∃ m ≥ n, ρ.act m = .tick) :
     ∃ n, ∀ m ≥ n, Quiet cfg (ρ.st m) :=
   let ⟨n0, calm⟩ := ρ.calm
-  no_starvation hp hsz ρ n0 calm ends gates time
+  no_starvation hp htk hsz ρ n0 calm ends gates time
 
 /-! ## Within a project: the oldest last start goes first -/
 

@@ -92,6 +92,7 @@ structure Sh (cfg : Cfg) (R : Ren) (s t : St) : Prop where
   nextk : R.kt ≤ s.next
   now : t.now = ren R.ks R.cs s.now
   nowk : R.ks ≤ s.now
+  reserve : t.reserve = s.reserve
 
 theorem RSh.lk_ {R : Ren} {ak : Bool} {x y : RunSt} (h : RSh R ak x y) (hx : x.here = true) :
     lkOf ak y = renK R (lkOf ak x) := by
@@ -185,8 +186,18 @@ theorem Sh.activeP_ (h : Sh cfg R s t) (p : Nat) : activeP cfg t p = activeP cfg
 
 theorem Sh.W_ (h : Sh cfg R s t) : W cfg t = W cfg s := rsum_congr (fun p _ => by rw [h.activeP_ p])
 
+theorem Sh.capN_ (h : Sh cfg R s t) : capN cfg t = capN cfg s := by unfold capN; rw [h.reserve]
+
+theorem Sh.capTok_ (h : Sh cfg R s t) : capTok cfg t = capTok cfg s := by
+  unfold capTok; rw [h.capN_, h.outside, h.reserve]
+
+theorem Sh.used_ (h : Sh cfg R s t) : used cfg t = used cfg s := by unfold used; rw [h.total_, h.iso_]
+
+theorem Sh.shareCap_ (h : Sh cfg R s t) : shareCap cfg t = shareCap cfg s := by
+  unfold shareCap; rw [h.capN_, h.capT_]
+
 theorem Sh.under_ (h : Sh cfg R s t) (r : Nat) : under cfg t r ↔ under cfg s r := by
-  unfold under; rw [h.projRun_, h.W_, h.capT_]
+  unfold under; rw [h.projRun_, h.W_, h.shareCap_]
 
 theorem Sh.eligible_ (h : Sh cfg R s t) {r : Nat} (hr : r < cfg.nr) : eligible t r = eligible s r := by
   simp only [eligible, (h.run r hr).here, (h.run r hr).pend, (h.run r hr).cap, h.running_ hr]
@@ -268,8 +279,8 @@ theorem Sh.canStart_ (h : Sh cfg R s t) {r : Nat} (hr : r < cfg.nr) : canStart c
   rw [h.eligible_ hr]
   cases e : eligible s r
   · rfl
-  · rw [h.gate, h.total_, h.capT_, h.projFirst_ hr (here_of_eligible e), h.head_, h.head2_, dec_iff (h.under_ r),
-      dec_iff h.room_]
+  · rw [h.gate, h.total_, h.capT_, h.used_, h.capTok_, h.projFirst_ hr (here_of_eligible e), h.head_, h.head2_,
+      dec_iff (h.under_ r), dec_iff h.room_]
 
 theorem Sh.olderDrainWaits_ (h : Sh cfg R s t) {d : Nat} (hd : d < cfg.nd) (na : (s.drain d).ph ≠ .absent) :
     olderDrainWaits cfg t d = olderDrainWaits cfg s d := by
@@ -298,7 +309,7 @@ theorem Sh.canDrain_ (h : Sh cfg R s t) {d : Nat} (hd : d < cfg.nd) : canDrain c
   rw [(h.drain d hd).ph]
   by_cases w : (s.drain d).ph = .waiting
   · have na : (s.drain d).ph ≠ .absent := by rw [w]; simp
-    rw [h.gate, h.iso_, h.olderDrainWaits_ hd na, h.olderEmptyWaits_ hd na]
+    rw [h.gate, h.iso_, h.olderDrainWaits_ hd na, h.olderEmptyWaits_ hd na, h.used_, h.capTok_]
   · simp [w]
 
 theorem Sh.work_ (h : Sh cfg R s t) : work cfg t = work cfg s := by
@@ -366,7 +377,7 @@ theorem Sh.pass1_ (h : Sh cfg R s t) : OSh cfg R (pass1 cfg s) (pass1 cfg t) := 
     have hc := List.find?_some hd
     have hm := List.mem_range.1 (List.mem_of_find?_eq_some hd)
     simp only [canDrain, Bool.and_eq_true, decide_eq_true_eq] at hc
-    exact h.startD_ hm hc.1.1.1.1
+    exact h.startD_ hm hc.1.1.1.1.1
   | none =>
     cases hr : (List.range cfg.nr).find? (canStart cfg s) with
     | none => trivial
@@ -488,9 +499,15 @@ theorem Sh.act_ (h : Sh cfg R s t) (a : Act) : OSh cfg R (act cfg s a) (act cfg 
       next := h.next
       nextk := h.nextk
       now := by show t.now + 1 = ren R.ks R.cs (s.now + 1); rw [h.now, ren_succ h.nowk]
-      nowk := by show R.ks ≤ s.now + 1; have := h.nowk; omega }
+      nowk := by show R.ks ≤ s.now + 1; have := h.nowk; omega
+      reserve := h.reserve }
   | gate b => exact { h with gate := rfl }
   | load k => exact { h with outside := rfl }
+  | reserve k =>
+    simp only [Contest.act]
+    split
+    · exact { h with reserve := rfl }
+    · trivial
 
 theorem Sh.stepS_ (h : Sh cfg R s t) (m : Move) : OSh cfg R (stepS cfg s m) (stepS cfg t m) := by
   cases m with
@@ -545,6 +562,7 @@ theorem Sh.trans_ {cfg : Cfg} {kt ct ct' ks cs cs' : Nat} {a b c : St}
   nextk := h1.nextk
   now := by rw [h2.now, h1.now]; exact ren_comp _ _ _ _
   nowk := h1.nowk
+  reserve := by rw [h2.reserve, h1.reserve]
 
 theorem Sh.refl_ {cfg : Cfg} {kt ks : Nat} {s : St} (h1 : kt ≤ s.next) (h2 : ks ≤ s.now) :
     Sh cfg ⟨kt, 0, ks, 0⟩ s s where
@@ -556,6 +574,7 @@ theorem Sh.refl_ {cfg : Cfg} {kt ks : Nat} {s : St} (h1 : kt ≤ s.next) (h2 : k
   nextk := h1
   now := (ren_zero _ _).symm
   nowk := h2
+  reserve := rfl
 end
 
 /-! ## A cycle repeated forever -/
@@ -577,14 +596,14 @@ def DShB (R : Ren) (x y : DrainSt) : Bool :=
 def ShB (cfg : Cfg) (R : Ren) (s t : St) : Bool :=
   allLT cfg.nr (fun r => RShB R cfg.rules.arrivalKey (s.run r) (t.run r)) && allLT cfg.nd (fun d => DShB R (s.drain d) (t.drain d)) &&
     t.gate == s.gate && t.outside == s.outside && t.next == ren R.kt R.ct s.next && decide (R.kt ≤ s.next) &&
-    t.now == ren R.ks R.cs s.now && decide (R.ks ≤ s.now)
+    t.now == ren R.ks R.cs s.now && decide (R.ks ≤ s.now) && t.reserve == s.reserve
 
 instance : DecidableEq DPh := inferInstance
 
 theorem ShB_sound {cfg : Cfg} {R : Ren} {s t : St} (h : ShB cfg R s t = true) : Sh cfg R s t := by
   simp only [ShB, Bool.and_eq_true, beq_iff_eq, decide_eq_true_eq] at h
-  obtain ⟨⟨⟨⟨⟨⟨⟨hr, hd⟩, hg⟩, ho⟩, hn⟩, hnk⟩, hw⟩, hwk⟩ := h
-  refine ⟨fun r hr' => ?_, fun d hd' => ?_, hg, ho, hn, hnk, hw, hwk⟩
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨hr, hd⟩, hg⟩, ho⟩, hn⟩, hnk⟩, hw⟩, hwk⟩, hres⟩ := h
+  refine ⟨fun r hr' => ?_, fun d hd' => ?_, hg, ho, hn, hnk, hw, hwk, hres⟩
   · have := allLT_iff.1 hr r hr'
     simp only [RShB, Bool.and_eq_true, beq_iff_eq, Bool.or_eq_true, Bool.not_eq_true'] at this
     obtain ⟨⟨⟨⟨⟨⟨⟨⟨a1, a2⟩, a3⟩, a4⟩, a5⟩, a6⟩, a7⟩, a8⟩, a9⟩ := this
