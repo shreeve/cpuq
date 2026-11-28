@@ -10,13 +10,13 @@ const builtin = @import("builtin");
 pub const Qos = enum { unchanged, utility, background, niced };
 
 pub const Config = struct {
-    /// The pool's size: the first this many of its CPUs (`budget`); null: every one.
-    budget: ?u32 = null,
+    /// The CPUs of the pool cpuq never hands out (`reserve`): its last ones in its order. The
+    /// rest are the machine's tokens, at least one. `cpuq reserve N` sets it.
+    reserve: u32 = 2,
     /// Start no task while the OS reports memory pressure.
     pressure_check: bool = true,
-    /// Count the machine's load outside cpuq (beyond the CPUs the pool leaves to it) as busy
-    /// when deciding whether there is spare room (`outside_check`). Off, only cpuq's own tasks
-    /// count.
+    /// Hold back a token for each whole CPU work outside cpuq keeps busy beyond the CPUs cpuq
+    /// leaves to it (the reserve, and any outside the pool) (`outside_check`).
     outside_check: bool = true,
     /// Linux: the `some avg10` percentage of /proc/pressure/memory that
     /// counts as pressure.
@@ -46,8 +46,8 @@ pub const Config = struct {
     /// A drain whose command keeps under `drain_idle_busy` CPUs busy this long while another
     /// run waits is stopped (`drain_idle`, e.g. 5m; off: never).
     drain_idle_s: u32 = 5 * 60,
-    /// The most of the pool's CPUs drains isolate at once, all of them together (`drain_max`: a
-    /// count, or a percentage of the pool such as 50%); always less than the whole pool.
+    /// The most tokens drains hold at once, all of them together (`drain_max`: a count, or a
+    /// percentage of the tokens such as 50%); always fewer than all of them.
     drain_max: Share = .{ .n = 50, .percent = true },
     /// Project weights for sharing the pool (`weights`, e.g. "rig:2 trig:1"); a project not
     /// named weighs 1.
@@ -133,8 +133,8 @@ pub fn parseShare(s: []const u8) ?Share {
     return if (n >= 1 and n <= 4096) .{ .n = n, .percent = false } else null;
 }
 
-/// The most of a pool of `pool_n` CPUs drains may isolate at once (`drain_max`): at least one,
-/// and fewer than the pool where the pool has more than one.
+/// The most of `pool_n` tokens drains may hold at once (`drain_max`): at least one, and fewer
+/// than all of them where there is more than one.
 pub fn drainMax(cfg: Config, pool_n: u32) u32 {
     const v: u32 = if (cfg.drain_max.percent) @intCast(@as(u64, pool_n) * cfg.drain_max.n / 100) else cfg.drain_max.n;
     return @max(1, @min(v, pool_n -| 1));
@@ -170,14 +170,14 @@ const Key = struct {
             .number => std.fmt.comptimePrint("{s} must be a number{s}, {d} to {d}", .{ k.name, of, k.min, k.max }),
             .bytes => k.name ++ " must be off or a size such as 5G or 512M",
             .age => k.name ++ " must be off or a time such as 3d, 36h or 90m",
-            .share => k.name ++ " must be a count of CPUs or a percentage of the pool, such as 13 or 50%",
+            .share => k.name ++ " must be a count of CPUs or a percentage of the tokens, such as 13 or 50%",
             .text => unreachable,
         };
     }
 };
 
 const keys = [_]Key{
-    .{ .name = "budget", .field = "budget", .kind = .whole, .min = 1, .max = 4096, .unit = "CPUs" },
+    .{ .name = "reserve", .field = "reserve", .kind = .whole, .min = 0, .max = 4096, .unit = "CPUs" },
     .{ .name = "pressure_check", .field = "pressure_check", .kind = .on_off },
     .{ .name = "outside_check", .field = "outside_check", .kind = .on_off },
     .{ .name = "pressure_psi", .field = "pressure_psi", .kind = .number, .min = 0, .max = 100 },
@@ -200,7 +200,8 @@ const keys = [_]Key{
 /// that line, so whoever wrote it learns what to write instead.
 pub const removed_keys = [_][2][]const u8{
     .{ "admit", "admit is gone: the pool hands out one CPU per task" },
-    .{ "target", "target is gone: the pool hands out one CPU per task; budget or cpus sizes the pool" },
+    .{ "budget", "budget is gone: reserve = N sets aside the pool's last N CPUs (cpuq reserve N); the rest are its tokens" },
+    .{ "target", "target is gone: the pool hands out one CPU per task; reserve or cpus sizes the pool" },
     .{ "settle", "settle is gone: the pool hands out one CPU per task, never by measured use" },
     .{ "right_size", "right_size is gone: a run holds one CPU per running task" },
     .{ "poll", "poll is gone: a run waits for the line to wake it, not on a timer" },
@@ -218,7 +219,7 @@ pub const removed_keys = [_][2][]const u8{
     .{ "affinity", "affinity is gone: each task is pinned to its own CPU on Linux" },
     .{ "load_check", "load_check is gone: outside load is measured, never the load average" },
     .{ "load_margin", "load_margin is gone: outside load is measured, never the load average" },
-    .{ "active_cap", "active_cap is gone: the pool is the CPUs online (budget or cpus narrows it)" },
+    .{ "active_cap", "active_cap is gone: the pool is the CPUs online (reserve or cpus narrows it)" },
     .{ "qos", "qos is gone: tasks run as they are" },
     .{ "max_memory", "max_memory is gone: limit a task with cpuq cap --mem" },
 };
@@ -287,6 +288,48 @@ fn addRemoteLine(list: *[max_remote_lines]RemoteLine, count: *u8, host: []const 
     if (count.* == max_remote_lines) return bad(diag, std.fmt.comptimePrint("at most {d} hosts", .{max_remote_lines}));
     list[count.*] = .{ .host = host, .cmd = value, .line = line };
     count.* += 1;
+}
+
+/// The config text with `key = value`: the line that sets `key` rewritten (a comment after it
+/// kept), or the line added at the end. The rest stays as it was.
+pub fn withKey(a: std.mem.Allocator, text: []const u8, key: []const u8, value: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var done = false;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |raw| {
+        // The text's last newline ends its last line: no empty line after it.
+        if (lines.peek() == null and raw.len == 0) break;
+        if (!first) try out.append(a, '\n');
+        first = false;
+        const c = commentStart(raw);
+        const body = std.mem.trim(u8, raw[0..c], " \t\r");
+        const k, _ = std.mem.cutScalar(u8, body, '=') orelse .{ "", "" };
+        if (!done and std.mem.eql(u8, std.mem.trim(u8, k, " \t"), key)) {
+            try out.print(a, "{s} = {s}", .{ key, value });
+            if (c < raw.len) try out.print(a, " {s}", .{raw[c..]});
+            done = true;
+        } else try out.appendSlice(a, raw);
+    }
+    if (!first) try out.append(a, '\n');
+    if (!done) try out.print(a, "{s} = {s}\n", .{ key, value });
+    return out.toOwnedSlice(a);
+}
+
+test "withKey: rewrites the line that sets the key, or adds one" {
+    const a = testing.allocator;
+    const one = try withKey(a, "remotes = burst\nreserve = 4 # was\ntimeout = 1h\n", "reserve", "2");
+    defer a.free(one);
+    try testing.expectEqualStrings("remotes = burst\nreserve = 2 # was\ntimeout = 1h\n", one);
+    const two = try withKey(a, "remotes = burst", "reserve", "3");
+    defer a.free(two);
+    try testing.expectEqualStrings("remotes = burst\nreserve = 3\n", two);
+    const three = try withKey(a, "", "reserve", "0");
+    defer a.free(three);
+    try testing.expectEqualStrings("reserve = 0\n", three);
+    const four = try withKey(a, "# reserve = 9\n", "reserve", "1");
+    defer a.free(four);
+    try testing.expectEqualStrings("# reserve = 9\nreserve = 1\n", four);
 }
 
 /// Where a line's comment starts: a `#` at the start or after a space or tab; the line's length
@@ -613,23 +656,27 @@ test "disk gate" {
 test "config file" {
     var cfg: Config = .{};
     var diag: Diagnostic = .{};
-    try parseConfig("# cpuq\nbudget = 6\ntimeout = 30m # tasks\nsubmit_roots = ~/a#b\n", &cfg, &diag);
-    try testing.expectEqual(6, cfg.budget.?);
+    try testing.expectEqual(2, cfg.reserve);
+    try parseConfig("# cpuq\nreserve = 6\ntimeout = 30m # tasks\nsubmit_roots = ~/a#b\n", &cfg, &diag);
+    try testing.expectEqual(6, cfg.reserve);
     try testing.expectEqual(1800, cfg.timeout_s);
     try testing.expectEqualStrings("~/a#b", cfg.submit_roots);
+    var zero: Config = .{};
+    try parseConfig("reserve = 0\n", &zero, &diag);
+    try testing.expectEqual(0, zero.reserve);
 
     var cfg3: Config = .{};
-    try testing.expectError(error.ConfigInvalid, parseConfig("budget = 6\nbudgte = 3\n", &cfg3, &diag));
+    try testing.expectError(error.ConfigInvalid, parseConfig("reserve = 6\nreserv = 3\n", &cfg3, &diag));
     try testing.expectEqual(2, diag.line);
     const refused = [_][]const u8{
-        "budget = 0\n",             "budget = +5\n",        "budget = 1_000\n",   "budget = 5000\n",
-        "budget = 4\nbudget = 5\n", "pressure_psi = 101\n", "submit_slots = 9\n",
+        "reserve = -1\n",             "reserve = +5\n",       "reserve = 1_000\n",  "reserve = 5000\n",
+        "reserve = 4\nreserve = 5\n", "pressure_psi = 101\n", "submit_slots = 9\n",
     };
     for (refused) |text| {
         var c: Config = .{};
         try testing.expectError(error.ConfigInvalid, parseConfig(text, &c, &diag));
     }
-    try testing.expectError(error.ConfigInvalid, parseConfig("budget = 4\n# two\nbudget = 5\n", &cfg3, &diag));
+    try testing.expectError(error.ConfigInvalid, parseConfig("reserve = 4\n# two\nreserve = 5\n", &cfg3, &diag));
     try testing.expectEqualStrings("set twice", diag.message);
     try testing.expectEqual(3, diag.line);
 }
@@ -637,7 +684,7 @@ test "config file" {
 test "a removed key says what replaces it" {
     var diag: Diagnostic = .{};
     var c: Config = .{};
-    try testing.expectError(error.ConfigInvalid, parseConfig("budget = 4\nmax_memory = 16G\n", &c, &diag));
+    try testing.expectError(error.ConfigInvalid, parseConfig("reserve = 4\nmax_memory = 16G\n", &c, &diag));
     try testing.expectEqual(2, diag.line);
     try testing.expectEqualStrings("max_memory is gone: limit a task with cpuq cap --mem", diag.message);
     for (removed_keys) |r| {

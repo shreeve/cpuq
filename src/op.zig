@@ -1,14 +1,11 @@
 //! A run: `cpuq run [-n M] [-c C] [-t T] [-r N] -- CMD`, M tasks of CMD. This process is the
-//! run's one loop. It starts a task whenever the line lets it (pool.zig: first in line, and under
-//! its project's share or with room), up to C at once, and never decides which CPU a task
-//! runs on: the kernel shares the CPUs. On macOS, which has nothing to share time by project, it
-//! also demotes and restores its own tasks (runs them in the background) as the pool's plan says,
-//! never stopping one. It never sleeps while the line would let it start a task.
+//! run's one loop. Each task holds one of the machine's tokens while it runs, pinned to that
+//! token's CPU on Linux; the run takes a freed token whenever it is first in line (pool.zig), up
+//! to C at once. It never sleeps while the line would let it take a token.
 //!
-//!   reap ended tasks -> retry or record them -> under the pool's lock: follow drains (keep
-//!   tasks off a drain's CPUs on Linux; demote them beside one on macOS), follow the demote plan
-//!   (macOS), start what the line allows, wake the runs that may start now (or restore) ->
-//!   sleep until a task ends, a wake comes, or a look is due
+//!   reap ended tasks -> retry or record them -> under the pool's lock: take the tokens the line
+//!   gives (a drain: its whole cores at once, its turn come and their tokens free), wake the runs
+//!   that may take one now -> sleep until a task ends, a wake comes, or a look is due
 const std = @import("std");
 const Io = std.Io;
 const builtin = @import("builtin");
@@ -29,8 +26,8 @@ const is_linux = builtin.os.tag == .linux;
 pub const Opts = struct {
     /// -n: how many tasks; 0 means one, with the terminal (`cpuq run -- CMD`).
     tasks: u32 = 0,
-    /// -c: the most tasks running at once: a count, or a percentage of the pool; 0: no limit of
-    /// its own (the line's backstop, `pool.backstop` × the pool).
+    /// -c: the most tokens it holds at once: a count, or a percentage of the tokens; 0: no limit
+    /// of its own (as the line allows).
     cpus: u32 = 0,
     cpus_percent: bool = false,
     /// -t: each task's time limit, in seconds of running; null takes the machine's (`timeout`).
@@ -66,13 +63,13 @@ const Task = struct {
     /// When it started (monotonic ms), moved on by every stretch it was stopped: its time limit
     /// counts only time running.
     start_ms: i64 = 0,
-    /// When it last started or continued (monotonic ms): fresh for `pool.fresh_ms`.
+    /// When it last started or continued (monotonic ms).
     fresh_ms: i64 = 0,
-    /// When cpuq stopped it (monotonic ms): a drain's command waiting for its turn again after a
-    /// Ctrl-Z; 0 while it runs.
+    /// When cpuq stopped it (monotonic ms): after a Ctrl-Z, until it holds a token again (a
+    /// drain's command, until its drain's turn comes again); 0 while it runs. It holds none.
     paused_ms: i64 = 0,
-    /// macOS: run in the background (demoted) for sharing, or beside a drain.
-    demoted: bool = false,
+    /// The CPU whose token it holds (pinned there on Linux); a drain's command, its first CPU.
+    cpu: u32 = 0,
     /// When TERM was sent for its time limit (0: not yet).
     term_ms: i64 = 0,
     /// When it started, in Unix seconds (for status).
@@ -189,10 +186,9 @@ const Run = struct {
     freed: bool = false,
     /// When the next look is due (monotonic ms).
     next_look: i64 = 0,
-    /// Linux: the CPUs this process may run on, its tasks' own when no drain isolates any, and
-    /// the CPUs drains isolate as last seen (its tasks are kept off them).
-    base: []const u32 = &.{},
-    iso: []const u32 = &.{},
+    /// The machine's tokens as last seen: the pool's first CPUs less the reserve, which the config
+    /// may change while it runs.
+    toks: []const u32 = &.{},
     /// Tasks ended when it last wrote its progress.
     last_progress: u32 = std.math.maxInt(u32),
     /// Its history: the record, when it entered the line, and the most tasks run at once.
@@ -216,8 +212,7 @@ const Run = struct {
     long_at_ms: i64 = 0,
     /// Why it waits, as the record says it: kept here, so it outlives each look.
     why_buf: [256]u8 = undefined,
-    /// A drain: its candidate CPUs in the order it takes them, with their SMT siblings.
-    order: []const u32 = &.{},
+    /// A drain: the pool's cores (its CPUs' SMT siblings).
     topo: []const cpus_mod.Core = &.{},
     /// A drain's watch on work from outside it on its CPUs (Linux): the last per-CPU ticks and
     /// own CPU time, the last process listing (for the busiest outsider), and the totals while
@@ -249,11 +244,17 @@ const Run = struct {
         return @as(u32, @intCast(r.retry.items.len)) + (r.total + 1 - r.next_index);
     }
 
-    /// Tasks it could start now: none while stopped; a drain, its one command until it starts.
+    /// Tasks it could start or continue now, each taking a token: none while stopped; a drain,
+    /// its one command until its turn comes.
     fn waitingNow(r: *const Run) u32 {
         if (r.stopped) return 0;
         if (r.rec.drain) return if (r.rec.dstart == 0 and (r.pending() > 0 or r.running.items.len > 0)) 1 else 0;
-        return @min(r.pending(), r.limit -| @as(u32, @intCast(r.running.items.len)));
+        return @min(r.pending() + r.pausedCount(), r.limit -| r.holding());
+    }
+
+    /// Its tasks holding a token: those running, not stopped by cpuq.
+    fn holding(r: *const Run) u32 {
+        return @as(u32, @intCast(r.running.items.len)) - r.pausedCount();
     }
 
     fn pausedCount(r: *const Run) u32 {
@@ -264,7 +265,7 @@ const Run = struct {
 
     /// Brings the record up to date (in memory).
     fn refresh(r: *Run) void {
-        r.rec.running = @intCast(r.running.items.len);
+        r.rec.running = if (r.rec.drain) @intCast(r.running.items.len) else r.holding();
         r.rec.waiting = r.waitingNow();
         r.rec.stopped = r.stopped;
         r.rec.limit = r.limit;
@@ -279,7 +280,7 @@ const Run = struct {
             .since = t.since_s,
             .fresh = t.fresh_ms,
             .paused = t.paused_ms != 0,
-            .demoted = t.demoted,
+            .cpu = t.cpu,
         }) catch break;
         r.rec.tasks_now = r.now_buf.items;
     }
@@ -307,7 +308,7 @@ fn writeProgress(r: *Run, path: []const u8) void {
 
 /// The pool's CPUs, as this machine's config sets them.
 pub fn poolCpus(ctx: *Ctx) []const u32 {
-    return cpus_mod.list(ctx.io, ctx.arena, if (ctx.cfg.cpus.len != 0) ctx.cfg.cpus else null, envBudget(ctx) orelse ctx.cfg.budget);
+    return cpus_mod.list(ctx.io, ctx.arena, if (ctx.cfg.cpus.len != 0) ctx.cfg.cpus else null);
 }
 
 /// The machine's CPUs online, whatever this process's CPU set.
@@ -324,20 +325,19 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
     };
     // Inside a task already: run within it, with no line to wait in.
     if (!o.drain and (o.nested orelse nested(ctx))) return runNested(ctx, o, exe);
-    // The scope marker is this run's alone (runner.zig), never its tasks'.
-    _ = ctx.env.swapRemove("CPUQ_SCOPE");
 
     const dir = main.stateDir(ctx);
     const pool = Pool.open(ctx.io, a, dir) catch |err| main.fail("pool {s}/v3: {t}", .{ dir, err });
     const pool_cpus = poolCpus(ctx);
-    const pool_n: u32 = @intCast(pool_cpus.len);
+    const toks = pool_mod.tokens(pool_cpus, ctx.cfg.reserve);
+    const ntok: u32 = @intCast(toks.len);
     const single = o.tasks == 0;
     const total: u32 = if (single) 1 else o.tasks;
-    const asked: u32 = if (o.cpus == 0) pool_mod.backstop * pool_n else if (o.cpus_percent) @max(1, @as(u32, @intCast((@as(u64, pool_n) * o.cpus) / 100))) else o.cpus;
+    const asked: u32 = if (o.cpus == 0) total else if (o.cpus_percent) @max(1, @as(u32, @intCast((@as(u64, ntok) * o.cpus) / 100))) else o.cpus;
     const limit: u32 = if (o.drain)
-        (if (o.drain_cpus.len != 0) @as(u32, @intCast(o.drain_cpus.len)) else @max(1, @min(o.cpus, pool_n)))
+        (if (o.drain_cpus.len != 0) @as(u32, @intCast(o.drain_cpus.len)) else @max(1, @min(o.cpus, ntok)))
     else
-        @max(1, @min(@min(asked, total), pool_mod.backstop * pool_n));
+        @max(1, @min(asked, total));
     const timeout_s = o.timeout_s orelse ctx.cfg.timeout_s;
     const timeout_ms: i64 = if (timeout_s == 0) std.math.maxInt(i64) / 2 else @as(i64, timeout_s) * 1000;
 
@@ -347,6 +347,7 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
         .o = o,
         .pool = pool,
         .pool_cpus = pool_cpus,
+        .toks = toks,
         .ncpu = onlineCpus(ctx.io),
         .total = total,
         .single = single,
@@ -354,7 +355,6 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
         .timeout_ms = timeout_ms,
         .exe = exe,
         .started_ms = sys.monoMs(),
-        .base = sys.ownAffinity(a),
         .rec = .{
             .urgent = o.urgent,
             .drain = o.drain,
@@ -373,10 +373,7 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
         },
     };
     if (!single) r.out_dir = outDir(ctx, r.rec.project) catch |err| main.fail("output folder: {t}", .{err});
-    if (o.drain) {
-        r.order = drainOrder(ctx, pool_cpus, o.prefer_fast);
-        r.topo = cpus_mod.cores(ctx.io, a, pool_cpus);
-    }
+    if (o.drain) r.topo = cpus_mod.cores(ctx.io, a, pool_cpus);
 
     installHandlers(!single);
     if (single) sys.installForwarding();
@@ -405,10 +402,7 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
         var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
         defer arena.deinit();
         const ops = r.pool.scan(arena.allocator());
-        // A drain's end changes every run's capacity: all look again.
-        if (r.rec.drain) {
-            for (ops) |x| r.pool.wakeOp(x.ticket);
-        } else wakeReady(&r, arena.allocator(), ops, r.pool.readSample(arena.allocator()));
+        wakeReady(&r, arena.allocator(), ops, r.pool.readSample(arena.allocator()));
     }
     r.pool.unlock();
 
@@ -600,10 +594,10 @@ fn idleDrain(r: *Run) void {
     };
 }
 
-/// `cpuq limit`: run at most `n` tasks at once from now on. Raised, it starts more as the line
+/// `cpuq limit`: hold at most `n` tokens at once from now on. Raised, it starts more as the line
 /// allows; lowered, it starts none until fewer than `n` run. Nothing is killed.
 fn setLimit(r: *Run, n_in: u32) void {
-    const n = @max(1, @min(n_in, pool_mod.backstop * @as(u32, @intCast(r.pool_cpus.len))));
+    const n = @max(1, n_in);
     if (!r.single) std.debug.print("cpuq: now up to {d} at once (was {d}), by cpuq limit\n", .{ n, r.limit });
     r.limit = n;
     r.event = true;
@@ -662,18 +656,6 @@ fn signalTree(r: *Run, t: Task, sig: c.SIG) void {
     };
 }
 
-/// macOS: demotes a task (runs it, and all it started, in the background), or restores it. A
-/// task of many by its process group's members, a single task by its tree. Run again each look
-/// for a demoted task, so processes it starts meanwhile follow.
-fn demoteTask(t: *Task, on: bool, procs: []const sys.Proc, a: std.mem.Allocator) void {
-    t.demoted = on;
-    const in_tree = a.alloc(bool, procs.len) catch return;
-    @memset(in_tree, false);
-    sys.markTree(procs, t.pid, in_tree);
-    sys.setBackground(t.pid, on);
-    for (procs, in_tree) |p, yes| if (yes and p.pid != t.pid) sys.setBackground(p.pid, on);
-}
-
 fn resumeTask(r: *Run, t: *Task, now: i64) void {
     if (t.paused_ms == 0) return;
     // The time stopped doesn't count against its time limit.
@@ -717,19 +699,10 @@ fn cpuListText(a: std.mem.Allocator, cpus: []const u32) []const u8 {
     return out.items;
 }
 
-/// Linux: the CPUs this run's tasks may use: its own, less those drains isolate. Empty when no
-/// drain isolates any (a task keeps cpuq's own CPU set), and elsewhere.
-fn taskCpus(r: *const Run, a: std.mem.Allocator) []const u32 {
-    if (!is_linux or r.iso.len == 0 or r.base.len == 0) return &.{};
-    var out: std.ArrayList(u32) = .empty;
-    for (r.base) |cpu| if (std.mem.findScalar(u32, r.iso, cpu) == null) out.append(a, cpu) catch break;
-    // Every CPU isolated (it can't be: drains isolate at most half the pool): leave it be.
-    return if (out.items.len == 0) &.{} else out.items;
-}
-
-/// Starts the next task (a retry goes behind the tasks not yet started). A drain's command runs
-/// on its CPUs (pinned on Linux), with CPUQ_CPUS naming them.
-fn startTask(r: *Run, a: std.mem.Allocator) void {
+/// Starts the next task (a retry goes behind the tasks not yet started), holding the token of
+/// `cpu` (pinned there on Linux). A drain's command runs on its CPUs (pinned on Linux), with
+/// CPUQ_CPUS naming them.
+fn startTask(r: *Run, a: std.mem.Allocator, cpu: u32) void {
     const t_in: Task = if (r.next_index <= r.total) blk: {
         defer r.next_index += 1;
         break :blk .{ .index = r.next_index, .attempt = 1 };
@@ -764,7 +737,8 @@ fn startTask(r: *Run, a: std.mem.Allocator) void {
             dups.append(a, .{ out_fd, 2 }) catch {};
         }
     }
-    const pin: []const u32 = if (!is_linux) &.{} else if (r.rec.drain) r.rec.pin else taskCpus(r, a);
+    const one = [_]u32{cpu};
+    const pin: []const u32 = if (!is_linux) &.{} else if (r.rec.drain) r.rec.pin else &one;
     const spawned = sys.spawn(r.exe, argv.ptr, @ptrCast(envp.slice.ptr), .unchanged, .{
         .cpus = pin,
         .dups = dups.items,
@@ -783,6 +757,7 @@ fn startTask(r: *Run, a: std.mem.Allocator) void {
     if (r.single) sys.setChild(pid);
     const now = sys.monoMs();
     t.pid = pid;
+    t.cpu = cpu;
     t.pstart = sys.procStart(pid) orelse 0;
     t.start_ms = now;
     t.fresh_ms = now;
@@ -795,59 +770,47 @@ fn startTask(r: *Run, a: std.mem.Allocator) void {
     r.running.append(r.a, t) catch {};
 }
 
-/// Ctrl-Z: stops every task, leaves the line's count (its tasks stop counting against its
-/// project's share), then stops cpuq itself (unless a continue has come meanwhile). Continued,
-/// it continues its tasks, except those cpuq had stopped for sharing; a drain takes its turn
-/// again before its command continues.
+/// Ctrl-Z: stops every task and gives back its tokens (they count against its project's share
+/// no more), then stops cpuq itself (unless a continue has come meanwhile). Continued, each task
+/// continues once it holds a token again, as the line allows (a shell continues the whole group:
+/// they are stopped again till then); a drain takes its turn again before its command continues.
 fn suspend_(r: *Run) void {
     const at = sys.monoMs();
-    for (r.running.items) |t| if (t.paused_ms == 0) signalTree(r, t, .STOP);
+    for (r.running.items) |*t| if (t.paused_ms == 0) {
+        signalTree(r, t.*, .STOP);
+        t.paused_ms = at;
+    };
     r.stopped = true;
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena.deinit();
     r.pool.lock();
     r.syncRecord();
     const ops = r.pool.scan(arena.allocator());
-    if (r.rec.drain) {
-        for (ops) |x| r.pool.wakeOp(x.ticket);
-    } else wakeReady(r, arena.allocator(), ops, r.pool.readSample(arena.allocator()));
+    wakeReady(r, arena.allocator(), ops, r.pool.readSample(arena.allocator()));
     r.pool.unlock();
     // SIGSTOP, not TSTP: a TSTP to a process outside job control (an agent's shell) is dropped.
     // Not once a continue has come since the stop: nothing would continue cpuq after it. Only a
     // continue between this check and the raise is still lost.
     if (conts.load(.acquire) == tstp_conts.load(.acquire)) _ = c.raise(.STOP);
-    // Continued.
-    const now = sys.monoMs();
+    // Continued: its isolation, if a drain, went with the stop; its tasks wait for tokens.
     r.stopped = false;
-    if (r.rec.drain and r.rec.dstart != 0) {
-        // Its isolation went with the stop: it takes its turn again, its command stopped till then.
-        r.rec.dstart = 0;
-        for (r.running.items) |*t| {
-            if (t.paused_ms == 0) t.paused_ms = at;
-            signalTree(r, t.*, .STOP);
-        }
-    } else for (r.running.items) |*t| {
-        if (t.paused_ms != 0) {
-            // A shell continues a whole job's group: one cpuq had stopped stays stopped.
-            signalTree(r, t.*, .STOP);
-            continue;
-        }
-        t.start_ms += now - at;
-        t.fresh_ms = now;
-        signalTree(r, t.*, .CONT);
-    }
+    if (r.rec.drain) r.rec.dstart = 0;
+    for (r.running.items) |t| signalTree(r, t, .STOP);
     r.event = true;
 }
 
-/// One look at the pool: follow the drains and the pause plan, start what the line allows, and
-/// wake the runs that may start now.
+/// One look at the pool: start (or continue) what the line allows, a drain's turn, and wake the
+/// runs that may start now.
 fn look(r: *Run) void {
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // The sample is renewed outside the pool's lock, by one cpuq at a time.
-    const waits = r.waitingNow() > 0;
-    if ((waits and !r.rec.drain) or (!is_linux and r.running.items.len > 0)) {
+    // A change to the config (the reserve, drain_max) is in force at once.
+    main.reloadConfig(r.ctx);
+    r.toks = pool_mod.tokens(r.pool_cpus, r.ctx.cfg.reserve);
+    // The sample (for the outside-load gate) is renewed outside the pool's lock, by one cpuq at a
+    // time.
+    if (r.waitingNow() > 0 and r.ctx.cfg.outside_check) {
         const s = r.pool.readSample(a);
         if (s == null or sys.monoMs() - s.?.ms >= 1000) {
             r.pool.lock();
@@ -857,9 +820,6 @@ fn look(r: *Run) void {
             r.pool.renewSample(a, ops, r.ncpu);
         }
     }
-    // A drain waiting for its turn takes up a change to drain_max (or any other setting) made
-    // while it waits.
-    if (r.rec.drain and r.rec.dstart == 0) main.reloadConfig(r.ctx);
     const why = gate(r, a);
     r.pool.lock();
     r.syncRecord();
@@ -873,49 +833,17 @@ fn look(r: *Run) void {
     };
     const now = sys.monoMs();
     const sample = r.pool.readSample(a);
-    const pool_n: u32 = @intCast(r.pool_cpus.len);
-    const cx: pool_mod.Cx = .{ .pool_n = pool_n, .busy = pool_mod.busyNow(a, ops, sample, r.ctx.cfg.outside_check, r.ncpu, pool_n, now), .now_ms = now };
-    var repin = false;
+    const cx = context(r, a, ops, sample, now);
     var began = false;
     var head = false;
     var blocked = false;
     var started = false;
     if (r.rec.drain) {
-        began = drainStep(r, a, ops, why, now);
+        began = drainStep(r, a, ops, why, cx);
     } else if (!r.stopped) {
-        // Linux: tasks keep off the CPUs drains isolate.
-        if (is_linux) {
-            const iso = pool_mod.isolated(a, ops, now);
-            if (!sameSet(iso, r.iso)) {
-                r.iso = r.a.dupe(u32, iso) catch r.iso;
-                repin = true;
-            }
-        }
-        // macOS: share time by demoting tasks (never stopping one: it could hold a lock others
-        // wait on), as the plan says; beside a drain, which can't isolate cores there, every task
-        // is demoted.
-        if (!is_linux and r.running.items.len != 0) {
-            const procs = sys.processes(r.ctx.io, a);
-            const beside_drain = pool_mod.isolated(a, ops, now).len != 0;
-            const spared = !pool_mod.demotable(ops, ops[me]);
-            const want = a.alloc(bool, r.running.items.len) catch a.alloc(bool, 0) catch unreachable;
-            for (r.running.items, 0..) |t, i| {
-                if (i < want.len) want[i] = !spared and (beside_drain or t.demoted);
-            }
-            if (!beside_drain) for (pool_mod.demotePlan(a, ops, sample, cx)) |step| {
-                if (step.ticket != r.rec.ticket) continue;
-                for (r.running.items, 0..) |t, i| if (t.pid == step.pid and i < want.len) {
-                    want[i] = step.demote;
-                };
-            };
-            for (r.running.items, 0..) |*t, i| {
-                if (i >= want.len) break;
-                if (want[i] or t.demoted) demoteTask(t, want[i], procs, a);
-            }
-        }
         r.refresh();
         ops[me] = r.rec;
-        // Start what the line allows.
+        // Start (or continue) what the line allows, each on a free token's CPU.
         r.setWhy("");
         if (why.len != 0) {
             r.setWhy(why);
@@ -923,27 +851,26 @@ fn look(r: *Run) void {
         } else while (r.waitingNow() > 0) {
             const w = pool_mod.mayStart(a, ops, r.rec.ticket, cx);
             if (w != .go) {
-                r.setWhy(whyText(r, w, cx, ops, a));
-                // Busy, behind or after its project's first: the first waiter looks each second
-                // (`head`), the rest are woken.
-                blocked = w == .backstop;
+                r.setWhy(whyText(w, cx));
+                // Held back for outside work, which changes without a word: look each second.
+                blocked = w == .full and cx.held_back != 0;
                 break;
             }
-            startTask(r, a);
+            const cpu = pool_mod.freeCpu(a, r.toks, ops, now) orelse break;
+            takeToken(r, a, cpu, now);
             started = true;
             r.refresh();
             ops[me] = r.rec;
         }
         if (r.waitingNow() > 0) {
-            const t = pool_mod.capacity(ops, pool_n, now);
-            head = pool_mod.lineFirst(a, ops, t) == r.rec.ticket;
-        } else if (r.pending() > 0 and r.running.items.len >= r.limit) {
+            head = pool_mod.lineFirst(a, ops, cx.n) == r.rec.ticket;
+        } else if (r.pending() > 0 and r.holding() >= r.limit) {
             r.setWhy(a.print("at its -c ({d})", .{r.limit}) catch "at its -c");
         }
     }
     r.refresh();
     ops[me] = r.rec;
-    // Room freed here, a drain began, or a start here passed the turn to another run (of its
+    // A token freed here, a drain began, or a start here passed the turn to another run (of its
     // project, or the next in line): wake whoever may start now.
     if (r.freed or began or started) {
         r.freed = false;
@@ -951,51 +878,53 @@ fn look(r: *Run) void {
     }
     r.syncRecord();
     r.pool.unlock();
-    if (began) isolateOthers(r, a, ops);
-    if (repin) repinOwn(r, a);
     // When to look again: each second while first in line, held back by something that can
-    // change without a word (busy, a gate, a drain), sharing time on macOS, or kept off a
-    // drain's CPUs; else every 10 s (a wake comes when room frees).
+    // change without a word (a gate, outside work), or a drain (waiting for its turn or its
+    // cores; holding them, its idle and noise watches sample each second); else every 10 s (a wake
+    // comes when a token frees).
     var every: i64 = 10_000;
-    if (head or blocked or r.iso.len != 0 or r.pausedCount() != 0) every = 1000;
-    if (r.rec.drain and r.rec.dstart == 0) every = 1000;
-    if (!is_linux and r.running.items.len != 0) every = 1000;
-    for (ops) |o| if (o.drain and o.dstart != 0) {
-        every = 1000;
-    };
+    if (head or blocked or r.rec.drain) every = 1000;
     r.next_look = sys.monoMs() + every;
 }
 
-fn sameSet(x: []const u32, y: []const u32) bool {
-    if (x.len != y.len) return false;
-    for (x) |v| if (std.mem.findScalar(u32, y, v) == null) return false;
-    return true;
+/// What a decision knows besides the records: the tokens, and those held back for outside work.
+fn context(r: *Run, a: std.mem.Allocator, ops: []const Op, sample: ?pool_mod.Sample, now: i64) pool_mod.Cx {
+    const n: u32 = @intCast(r.toks.len);
+    return .{ .n = n, .held_back = pool_mod.heldBack(a, ops, sample, r.ctx.cfg.outside_check, r.ncpu, n, now), .now_ms = now };
 }
 
-/// Wakes every other run that may start a task now, and every drain whose turn has come. Under
+/// Takes the token of `cpu`: continues a task cpuq stopped (after a Ctrl-Z) on that CPU, else
+/// starts the next task there.
+fn takeToken(r: *Run, a: std.mem.Allocator, cpu: u32, now: i64) void {
+    for (r.running.items) |*t| if (t.paused_ms != 0) {
+        t.cpu = cpu;
+        if (is_linux) repinTree(r, a, t.pid, &.{cpu});
+        resumeTask(r, t, now);
+        return;
+    };
+    startTask(r, a, cpu);
+}
+
+/// Wakes every other run that may take a token now, and every drain whose turn has come. Under
 /// the lock.
 fn wakeReady(r: *Run, a: std.mem.Allocator, ops: []const Op, sample: ?pool_mod.Sample) void {
     const now = sys.monoMs();
-    const pool_n: u32 = @intCast(r.pool_cpus.len);
-    const cx: pool_mod.Cx = .{ .pool_n = pool_n, .busy = pool_mod.busyNow(a, ops, sample, r.ctx.cfg.outside_check, r.ncpu, pool_n, now), .now_ms = now };
+    const cx = context(r, a, ops, sample, now);
+    const free = pool_mod.freeTokens(ops, cx.n, cx.held_back, now);
     for (ops) |o| {
-        // A run with tasks in the background looks at once: room may let it restore them, and
-        // the sooner a demoted lock holder's disk is no longer throttled, the better.
-        if (o.ticket != r.rec.ticket and !is_linux) for (o.tasks_now) |t| if (t.demoted) {
-            r.pool.wakeOp(o.ticket);
-            break;
-        };
         if (o.ticket == r.rec.ticket or o.waiting == 0 or o.stopped) continue;
-        // A drain is woken when its turn may have come (it works out its CPUs itself).
-        const ready = if (o.drain) pool_mod.drainMayStart(ops, o.ticket, policy.drainMax(r.ctx.cfg, pool_n), now, 0) == .go else pool_mod.mayStart(a, ops, o.ticket, cx) == .go;
+        // A drain is woken when its turn may have come (it works out its cores itself).
+        const ready = if (o.drain) pool_mod.drainMayStart(ops, o.ticket, policy.drainMax(r.ctx.cfg, cx.n), now, 0, free) == .go else pool_mod.mayStart(a, ops, o.ticket, cx) == .go;
         if (ready) r.pool.wakeOp(o.ticket);
     }
 }
 
-/// A drain's look: once its turn comes, it isolates its CPUs and starts its command (once they
-/// are quiet, with --quiet-max), or continues it after a Ctrl-Z. Returns whether it began isolating now.
-/// Under the lock.
-fn drainStep(r: *Run, a: std.mem.Allocator, ops: []Op, why: []const u8, now: i64) bool {
+/// A drain's look: once its turn comes and the tokens of whole cores enough are free, it takes
+/// them all at once, isolating those CPUs, and starts its command (once they are quiet, with
+/// --quiet-max), or continues it after a Ctrl-Z. Until then it holds nothing. Returns whether it
+/// began isolating now. Under the lock.
+fn drainStep(r: *Run, a: std.mem.Allocator, ops: []Op, why: []const u8, cx: pool_mod.Cx) bool {
+    const now = cx.now_ms;
     if (r.stopped) return false;
     if (r.rec.dstart != 0) {
         // Isolating, and waiting for its CPUs to quiet (--quiet-max): the command starts once a
@@ -1003,7 +932,7 @@ fn drainStep(r: *Run, a: std.mem.Allocator, ops: []Op, why: []const u8, now: i64
         if (r.o.quiet_max) |q| if (r.running.items.len == 0 and r.pending() > 0 and r.noise_measured) {
             if (r.rec.noise <= q) {
                 r.setWhy("");
-                startTask(r, a);
+                startTask(r, a, r.rec.pin[0]);
                 // Its time limit counts from the isolation, the quiet wait included.
                 for (r.running.items) |*t| t.start_ms = r.rec.dstart;
                 r.syncRecord();
@@ -1018,20 +947,35 @@ fn drainStep(r: *Run, a: std.mem.Allocator, ops: []Op, why: []const u8, now: i64
         r.setWhy(why);
         return false;
     }
-    const room = policy.drainMax(r.ctx.cfg, @intCast(r.pool_cpus.len));
-    const pick = pool_mod.pickDrain(a, r.order, r.topo, pool_mod.isolated(a, ops, now), r.limit, r.o.drain_cpus) orelse {
-        r.setWhy(if (r.o.drain_cpus.len != 0) "the CPUs it names (or their siblings) are another drain's" else "too few whole cores are free of other drains");
-        return false;
-    };
-    const need = pool_mod.inPool(pick.cpus, r.pool_cpus);
-    const w = pool_mod.drainMayStart(ops, r.rec.ticket, room, now, need);
-    if (w != .go) {
-        r.setWhy(switch (w) {
+    const room = policy.drainMax(r.ctx.cfg, cx.n);
+    const free = pool_mod.freeTokens(ops, cx.n, cx.held_back, now);
+    // Its turn first: older drains, older runs waiting holding nothing, and drain_max.
+    const turn = pool_mod.drainMayStart(ops, r.rec.ticket, room, now, @min(r.limit, room), cx.n);
+    if (turn != .go) {
+        r.setWhy(switch (turn) {
             .older_waiter => "runs queued before it go first",
             .older_drain => "an older drain goes first",
-            .half_pool => "drains isolate drain_max of the pool already",
-            .taken => "its CPUs are another drain's",
-            .go => "",
+            .half_pool => "drains hold drain_max of the tokens already",
+            .full, .taken, .go => "",
+        });
+        return false;
+    }
+    // Then whole cores whose tokens are all free: every task holds its own CPU's.
+    const order = drainOrder(r.ctx, r.toks, r.o.prefer_fast);
+    const pick = pool_mod.pickDrain(a, order, r.topo, pool_mod.heldCpus(a, ops, now), r.limit, r.o.drain_cpus) orelse {
+        r.setWhy(if (r.o.drain_cpus.len != 0)
+            "waits for the CPUs it names (and their siblings) to be free"
+        else
+            a.print("waits for {d} whole core{s} to be free (tasks hold every token but {d})", .{ r.limit, if (r.limit == 1) "" else "s", free }) catch "waits for whole cores to be free");
+        return false;
+    };
+    const need = pool_mod.inPool(pick.cpus, r.toks);
+    const w = pool_mod.drainMayStart(ops, r.rec.ticket, room, now, need, free);
+    if (w != .go) {
+        r.setWhy(switch (w) {
+            .half_pool => "drains hold drain_max of the tokens already",
+            .full => a.print("waits for {d} free tokens ({d} free)", .{ need, free }) catch "waits for free tokens",
+            else => "",
         });
         return false;
     }
@@ -1046,7 +990,7 @@ fn drainStep(r: *Run, a: std.mem.Allocator, ops: []Op, why: []const u8, now: i64
     r.rec.noisy_top = "";
     r.noise_measured = false;
     if (r.running.items.len == 0) {
-        if (r.o.quiet_max == null) startTask(r, a) else r.setWhy("measures its CPUs for --quiet-max");
+        if (r.o.quiet_max == null) startTask(r, a, r.rec.pin[0]) else r.setWhy("measures its CPUs for --quiet-max");
     } else {
         // Continued after a Ctrl-Z: onto its CPUs (perhaps others than before), then on.
         for (r.running.items) |*t| {
@@ -1056,26 +1000,6 @@ fn drainStep(r: *Run, a: std.mem.Allocator, ops: []Op, why: []const u8, now: i64
     }
     r.syncRecord();
     return true;
-}
-
-/// A drain has just begun: it moves every other run's tasks off its CPUs at once (Linux), without
-/// waiting for their runs to look; then wakes every run, so each follows suit for its own tasks
-/// (and, on macOS, for the smaller capacity).
-fn isolateOthers(r: *Run, a: std.mem.Allocator, ops: []const Op) void {
-    if (is_linux) {
-        const procs = sys.processes(r.ctx.io, a);
-        for (ops) |o| {
-            if (o.ticket == r.rec.ticket or o.drain) continue;
-            for (o.tasks_now) |t| {
-                if (t.start == 0 or sys.procStart(t.pid) != t.start) continue;
-                const in_tree = a.alloc(bool, procs.len) catch continue;
-                @memset(in_tree, false);
-                sys.markTree(procs, t.pid, in_tree);
-                for (procs, in_tree) |p, yes| if (yes) sys.excludeThreads(r.ctx.io, a, p.pid, r.rec.cpus);
-            }
-        }
-    }
-    for (ops) |o| if (o.ticket != r.rec.ticket) r.pool.wakeOp(o.ticket);
 }
 
 /// Whether process `p` may be what crowds a drain: on Linux last seen on its CPUs; on macOS any.
@@ -1180,28 +1104,11 @@ fn repinTree(r: *Run, a: std.mem.Allocator, root: c.pid_t, cpus: []const u32) vo
     for (procs, in_tree) |p, yes| if (yes) sys.setThreads(r.ctx.io, a, p.pid, cpus);
 }
 
-/// Linux: puts this run's tasks on its CPUs less those drains isolate (all of its own once no
-/// drain isolates any).
-fn repinOwn(r: *Run, a: std.mem.Allocator) void {
-    if (!is_linux or r.base.len == 0 or r.running.items.len == 0) return;
-    const cpus = taskCpus(r, a);
-    const want = if (cpus.len == 0) r.base else cpus;
-    const procs = sys.processes(r.ctx.io, a);
-    const in_tree = a.alloc(bool, procs.len) catch return;
-    for (r.running.items) |t| {
-        @memset(in_tree, false);
-        sys.markTree(procs, t.pid, in_tree);
-        for (procs, in_tree) |p, yes| if (yes) sys.setThreads(r.ctx.io, a, p.pid, want);
-    }
-}
-
 /// Why a run waits, in words, for status.
-fn whyText(r: *Run, w: pool_mod.Wait, cx: pool_mod.Cx, ops: []const Op, a: std.mem.Allocator) []const u8 {
-    const t = pool_mod.capacity(ops, cx.pool_n, cx.now_ms);
+fn whyText(w: pool_mod.Wait, cx: pool_mod.Cx) []const u8 {
     return switch (w) {
         .go, .idle => "",
-        .backstop => a.print("{d} tasks run, {d} times the capacity", .{ pool_mod.backstop * t, pool_mod.backstop }) catch "too many tasks run",
-        .busy => a.print("over its share ({d:.1} of {d}); the machine is busy ({d:.1} of {d} CPUs)", .{ pool_mod.fairShare(a, ops, r.rec.project, t), t, cx.busy + @as(f64, @floatFromInt(pool_mod.starting(ops, cx.now_ms))), t }) catch "the machine is busy",
+        .full => if (cx.held_back != 0) "every token is held (some held back for work outside cpuq)" else "every token is held",
         .behind => "another run is first in line",
         .project => "another run of its project goes first",
     };
@@ -1335,11 +1242,6 @@ pub fn projectOf(ctx: *Ctx, o: Opts) []const u8 {
 
 fn weightOf(ctx: *Ctx, project: []const u8) u32 {
     return policy.weightFor(ctx.cfg, project);
-}
-
-fn envBudget(ctx: *Ctx) ?u32 {
-    const s = ctx.env.get("CPUQ_BUDGET") orelse return null;
-    return policy.parseCount(s) orelse main.fail("CPUQ_BUDGET must be a whole number of CPUs, at least 1, not '{s}'", .{s});
 }
 
 // --- Drivers -------------------------------------------------------------------------------
@@ -1504,10 +1406,10 @@ fn drainOrder(ctx: *Ctx, pool_cpus: []const u32, fast: bool) []const u32 {
 
 /// `cpuq drain -c N [--cpus LIST] [--prefer fast] [--quiet-max X] [-t T] [--max T] [--label L]
 /// -- CMD`: times CMD on CPUs of its own. It takes its turn in the line (it passes no run queued
-/// before it that runs nothing yet), then at once isolates N CPUs, whole cores (their SMT
-/// siblings too), for CMD: Linux pins CMD there and keeps every other task off them; macOS stops
-/// others' tasks while they would crowd the rest. Nothing is gathered or held while it waits.
-/// With --max, a drain that hasn't started CMD by then gives up (exit 75).
+/// before it that runs nothing yet), then, once the tokens of N whole cores (their SMT siblings
+/// too) are free, takes them all at once for CMD, pinned there on Linux; no task is on them, as
+/// every task is on its own token's CPU. Nothing is gathered or held while it waits. With --max,
+/// a drain that hasn't started CMD by then gives up (exit 75).
 pub fn cmdDrain(ctx: *Ctx, args: []const [:0]const u8) u8 {
     var o: Opts = .{ .drain = true };
     var count: ?u32 = null;
@@ -1555,32 +1457,33 @@ pub fn cmdDrain(ctx: *Ctx, args: []const [:0]const u8) u8 {
     if (o.cmd.len == 0) return main.usageError("drain needs a command", .{});
     main.loadConfig(ctx);
     const pool_cpus = poolCpus(ctx);
+    const toks = pool_mod.tokens(pool_cpus, ctx.cfg.reserve);
     if (named_text) |text| {
         o.drain_cpus = policy.cpuList(ctx.arena, text) catch return main.usageError("--cpus needs a CPU list such as 0-3 or 2,4, not '{s}'", .{text});
         if (o.drain_cpus.len == 0) return main.usageError("--cpus needs at least one CPU", .{});
-        for (o.drain_cpus) |cpu| if (std.mem.findScalar(u32, pool_cpus, cpu) == null) return main.usageError("--cpus {s}: CPU {d} is not in the pool ({s})", .{ text, cpu, policy.cpuListText(ctx.arena, pool_cpus) });
+        for (o.drain_cpus) |cpu| if (std.mem.findScalar(u32, toks, cpu) == null) return main.usageError("--cpus {s}: CPU {d} is not one of the tokens ({s}; the reserve and CPUs outside the pool are never handed out)", .{ text, cpu, policy.cpuListText(ctx.arena, toks) });
         if (count) |n| if (n != o.drain_cpus.len) return main.usageError("-c {d} and --cpus {s} ({d} CPUs) disagree; --cpus alone is enough", .{ n, text, o.drain_cpus.len });
         if (o.prefer_fast) return main.usageError("--prefer picks the CPUs; --cpus names them: give one", .{});
         count = @intCast(o.drain_cpus.len);
     }
     o.cpus = count orelse return main.usageError("a drain takes -c N, the CPUs it times on (or --cpus LIST, which names them); the rest of the machine keeps working", .{});
     o.cpus_percent = false;
-    // N whole cores, siblings included, must fit in drain_max (half the pool by default).
-    const room = policy.drainMax(ctx.cfg, @intCast(pool_cpus.len));
-    const pick = pool_mod.pickDrain(ctx.arena, drainOrder(ctx, pool_cpus, o.prefer_fast), cpus_mod.cores(ctx.io, ctx.arena, pool_cpus), &.{}, o.cpus, o.drain_cpus) orelse
-        return main.usageError("the pool has too few whole cores for a drain of {d}", .{o.cpus});
-    const need = pool_mod.inPool(pick.cpus, pool_cpus);
+    // N whole cores, siblings included, must fit in drain_max (half the tokens by default).
+    const room = policy.drainMax(ctx.cfg, @intCast(toks.len));
+    const pick = pool_mod.pickDrain(ctx.arena, drainOrder(ctx, toks, o.prefer_fast), cpus_mod.cores(ctx.io, ctx.arena, pool_cpus), &.{}, o.cpus, o.drain_cpus) orelse
+        return main.usageError("the tokens have too few whole cores for a drain of {d}", .{o.cpus});
+    const need = pool_mod.inPool(pick.cpus, toks);
     if (need > room) {
-        if (need > o.cpus) return main.usageError("a drain of {d} CPU{s} isolates {d} with their SMT siblings, more than drain_max ({d} CPUs here)", .{ o.cpus, if (o.cpus == 1) "" else "s", need, room });
-        return main.usageError("a drain takes at most drain_max of the pool ({d} CPUs here)", .{room});
+        if (need > o.cpus) return main.usageError("a drain of {d} CPU{s} takes {d} tokens with their SMT siblings, more than drain_max ({d} here)", .{ o.cpus, if (o.cpus == 1) "" else "s", need, room });
+        return main.usageError("a drain takes at most drain_max of the tokens ({d} here)", .{room});
     }
     if (o.timeout_s == null) o.timeout_s = @min(@max(ctx.cfg.drain_timeout_s, 1), drain_ceiling_s);
     return run(ctx, o);
 }
 
-/// `cpuq limit OP -c C [--host HOST]`: changes how many tasks a running run of this user's runs
-/// at once (its -c), named by its ticket, its cpuq's pid or its label: a count, or a percentage
-/// of the pool. Raised, it starts more as the line allows; lowered, it starts none until fewer
+/// `cpuq limit OP -c C [--host HOST]`: changes how many tokens a running run of this user's
+/// holds at once (its -c), named by its ticket, its cpuq's pid or its label: a count, or a
+/// percentage of the tokens. Raised, it starts more as the line allows; lowered, it starts none until fewer
 /// run.
 pub fn cmdLimit(ctx: *Ctx, args: []const [:0]const u8) u8 {
     var want: ?[]const u8 = null;
@@ -1597,7 +1500,7 @@ pub fn cmdLimit(ctx: *Ctx, args: []const [:0]const u8) u8 {
         } else return main.usageError("limit takes one run (its ticket, pid or label) and -c C", .{});
     }
     const target = want orelse return main.usageError("limit needs the run: its ticket, pid or label (cpuq status shows them)", .{});
-    const value = cpus orelse return main.usageError("limit needs -c C: the most tasks it runs at once, a count or a percentage of the pool (50%)", .{});
+    const value = cpus orelse return main.usageError("limit needs -c C: the most tasks it runs at once, a count or a percentage of the tokens (50%)", .{});
     const pct = std.mem.endsWith(u8, value, "%");
     const count = policy.parseCount(if (pct) value[0 .. value.len - 1] else value) orelse return main.usageError("-c needs a whole number of tasks or a percentage (50%), not '{s}'", .{value});
     if (pct and count > 100) return main.usageError("-c takes at most 100%, not '{s}'", .{value});
@@ -1628,12 +1531,75 @@ pub fn cmdLimit(ctx: *Ctx, args: []const [:0]const u8) u8 {
         std.debug.print("cpuq: {d} ({s}) is a drain: its CPUs are fixed when it starts\n", .{ o.ticket, o.label });
         return 1;
     }
-    const pool_n: u32 = @intCast(pool_cpus.len);
-    const n = @max(1, @min(if (pct) @as(u32, @intCast(@max(1, (@as(u64, pool_n) * count) / 100))) else count, pool_mod.backstop * pool_n));
+    const ntok: u32 = @intCast(pool_mod.tokens(pool_cpus, ctx.cfg.reserve).len);
+    const n = @max(1, if (pct) @as(u32, @intCast(@max(1, (@as(u64, ntok) * count) / 100))) else count);
     pool.askLimit(o.pid, n) catch |err| main.fail("pool: {t}", .{err});
     pool.wakeOp(o.ticket);
     ctx.out.print("{d} ({s}): up to {d} at once, was {d}\n", .{ o.ticket, o.label, n, o.limit }) catch {};
     ctx.out.flush() catch {};
+    return 0;
+}
+
+/// `cpuq reserve [N] [--host HOST]`: sets aside the pool's last N CPUs, which cpuq never hands
+/// out, in the machine's config (`reserve = N`). Every run takes it up at its next look, and is
+/// woken for one now: running tasks finish, and fewer start until fewer than the new N run.
+/// Alone, it prints the tokens and the reserve. There is always at least one token.
+pub fn cmdReserve(ctx: *Ctx, args: []const [:0]const u8) u8 {
+    var want: ?[]const u8 = null;
+    var host: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg: []const u8 = args[i];
+        if (std.mem.eql(u8, arg, "--host") and i + 1 < args.len) {
+            host = args[i + 1];
+            i += 1;
+        } else if (want == null and arg.len != 0 and arg[0] != '-') {
+            want = arg;
+        } else return main.usageError("reserve takes the CPUs to set aside (N) and --host HOST", .{});
+    }
+    if (host) |h| return @import("records.zig").onHost(ctx, h, if (want) |w| ctx.arena.print("cpuq reserve {s}", .{w}) catch return 125 else "cpuq reserve");
+    main.loadConfig(ctx);
+    const pool_n: u32 = @intCast(poolCpus(ctx).len);
+    const was = ctx.cfg.reserve;
+    const show = struct {
+        fn line(cx: *Ctx, n: u32, r: u32, before: ?u32) void {
+            cx.out.print("{d} token{s}, {d} reserved", .{ n, if (n == 1) "" else "s", r }) catch {};
+            if (before) |b| cx.out.print(" (was {d} reserved)", .{b}) catch {};
+            cx.out.writeAll("\n") catch {};
+            cx.out.flush() catch {};
+        }
+    };
+    const pool_tokens = struct {
+        fn of(pn: u32, r: u32) u32 {
+            return @max(1, pn -| r);
+        }
+    };
+    const text = want orelse {
+        show.line(ctx, pool_tokens.of(pool_n, was), @min(was, pool_n -| 1), null);
+        return 0;
+    };
+    const n = policy.parseWhole(u32, text) orelse return main.usageError("reserve needs a whole number of CPUs, such as 2, not '{s}'", .{text});
+    if (n >= pool_n) return main.usageError("reserve {d} would leave no token: the pool has {d} CPUs, so at most {d}", .{ n, pool_n, pool_n -| 1 });
+    if (ctx.cfg_path.len == 0) main.fail("no config file: set HOME or CPUQ_CONFIG", .{});
+    const old = Io.Dir.cwd().readFileAlloc(ctx.io, ctx.cfg_path, ctx.arena, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => "",
+        else => main.fail("{s}: {t}", .{ ctx.cfg_path, err }),
+    };
+    const new = policy.withKey(ctx.arena, old, "reserve", text) catch main.fail("out of memory", .{});
+    // The new text must read as the old did, with the new reserve.
+    var cfg: policy.Config = .{};
+    var diag: policy.Diagnostic = .{};
+    policy.parseConfig(new, &cfg, &diag) catch main.fail("{s}:{d}: {s} ({s}); left as it was", .{ ctx.cfg_path, diag.line, diag.message, diag.key });
+    if (std.fs.path.dirname(ctx.cfg_path)) |dir| Io.Dir.cwd().createDirPath(ctx.io, dir) catch {};
+    const tmp = ctx.arena.print("{s}.new", .{ctx.cfg_path}) catch main.fail("out of memory", .{});
+    Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = tmp, .data = new }) catch |err| main.fail("{s}: {t}", .{ tmp, err });
+    Io.Dir.cwd().rename(tmp, Io.Dir.cwd(), ctx.cfg_path, ctx.io) catch |err| main.fail("{s}: {t}", .{ ctx.cfg_path, err });
+    // Every run looks at once: a raised reserve stops starts, a lowered one hands out more.
+    var pool = Pool.open(ctx.io, ctx.arena, main.stateDir(ctx)) catch |err| main.fail("pool: {t}", .{err});
+    pool.lock();
+    for (pool.scan(ctx.arena)) |o| pool.wakeOp(o.ticket);
+    pool.unlock();
+    show.line(ctx, pool_tokens.of(pool_n, n), n, was);
     return 0;
 }
 

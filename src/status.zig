@@ -1,5 +1,5 @@
 //! `cpuq status`: the runs and their tasks running, the runs waiting and why, each project's
-//! tasks against its fair share of the capacity, and the machine's busy CPUs and gates. This
+//! tasks against its fair share of the tokens, and the machine's busy CPUs and gates. This
 //! machine's and other hosts', as JSON or as boxed tables.
 const std = @import("std");
 const builtin = @import("builtin");
@@ -361,9 +361,10 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
     const now_ms = sys.monoMs();
     const dir = main.stateDir(ctx);
     const pool_cpus = op_mod.poolCpus(ctx);
-    const pool_n: u32 = @intCast(pool_cpus.len);
     const ncpu = op_mod.onlineCpus(io);
-    var pool = Pool.open(io, a, dir) catch |err| main.fail("pool {s}/v3: {t}", .{ dir, err });
+    var pool = Pool.open(io, a, dir) catch |err| main.fail("pool {s}/v4: {t}", .{ dir, err });
+    const toks = pool_mod.tokens(pool_cpus, ctx.cfg.reserve);
+    const n: u32 = @intCast(toks.len);
 
     if (!pool.lockWithin(5000)) lockStuck(ctx, &pool);
     const ops = pool.scan(a);
@@ -373,10 +374,9 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
 
     const m = measureOps(io, a, ops, ncpu, measure);
     const busy = m.busy orelse if (sample) |sm| sm.machine else null;
-    const t = pool_mod.capacity(ops, pool_n, now_ms);
     const gate = gateNow(ctx, a);
-    const line_busy = pool_mod.busyNow(a, ops, sample, ctx.cfg.outside_check, ncpu, pool_n, now_ms);
-    const room = @as(f64, @floatFromInt(t)) - pool_mod.headroom - line_busy - @as(f64, @floatFromInt(pool_mod.starting(ops, now_ms)));
+    const held_back = pool_mod.heldBack(a, ops, sample, ctx.cfg.outside_check, ncpu, n, now_ms);
+    const free = pool_mod.freeTokens(ops, n, held_back, now_ms);
 
     var running: u32 = 0;
     var paused: u32 = 0;
@@ -401,7 +401,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
         if (stopped or o.stopped) flags.append(a, "stopped") catch {};
         if (o.driver and o.dbusy >= pool_mod.driver_min) flags.append(a, "driver_cpu") catch {};
         // Held back by its own -c: tasks queued while the machine has room.
-        if (!o.drain and o.running >= o.limit and o.tasks > o.done + o.failed + o.running and room > 0) flags.append(a, "capped") catch {};
+        if (!o.drain and o.running >= o.limit and o.tasks > o.done + o.failed + o.running and free > 0) flags.append(a, "capped") catch {};
         const ended = o.done + o.failed;
         const ran: f64 = @floatFromInt(@max(now - o.since, 0));
         runs.append(a, .{
@@ -417,8 +417,6 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
             .paused = o.paused(),
             .waiting = if (o.drain) 0 else o.waiting,
             .running_tasks = tasksJson(a, o.tasks_now),
-            .demoted = demotedOf(o),
-            .demoted_for = if (demotedOf(o) == 0) "" else if (pool_mod.isolated(a, ops, now_ms).len != 0) "drain" else "over share",
             .io_wait = io_n,
             .tail = !o.drain and !o.driver and o.running != 0 and o.done + o.failed + o.running >= o.tasks,
             .oldest = oldestOf(o),
@@ -444,7 +442,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
 
     // The line, in its order.
     var waiters: std.ArrayList(JsonWaiter) = .empty;
-    for (lineOrder(a, ops, t), 1..) |tk, place| {
+    for (lineOrder(a, ops, n), 1..) |tk, place| {
         const o = for (ops) |o| {
             if (o.ticket == tk) break o;
         } else continue;
@@ -481,14 +479,18 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
             p.waiting += o.waiting;
         }
     }
-    for (projects.items) |*p| p.fair = pool_mod.fairShare(a, ops, p.name, t);
+    for (projects.items) |*p| p.fair = pool_mod.fairShare(a, ops, p.name, n);
 
     const pressure = if (ctx.cfg.pressure_check) sys.memoryPressure(io, ctx.cfg.pressure_psi) else .off;
     return .{
         .dir = pool.path,
-        .budget = pool_n,
         .pool = pool_cpus,
-        .capacity = t,
+        .tokens = n,
+        .token_cpus = toks,
+        .reserve = @as(u32, @intCast(pool_cpus.len)) - n,
+        .held = pool_mod.heldCount(ops, now_ms),
+        .held_back = held_back,
+        .free = free,
         .isolated = pool_mod.isolated(a, ops, now_ms),
         .cores = sys.totalCpus(io),
         .active_cores = ncpu,
@@ -497,7 +499,6 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
         .waiting = waiting,
         .busy = busy,
         .tasks_busy = m.tasks,
-        .room = room,
         .load = sys.loadAverage(),
         .memory_pressure = @tagName(pressure),
         .memory = sys.memory(io),
@@ -564,13 +565,6 @@ fn tasksText(a: std.mem.Allocator, h: JsonRun, now: i64) []const u8 {
     return a.print("{d}/{d} done{s}", .{ h.done + h.failed, h.tasks, failed }) catch "?";
 }
 
-/// How many of a run's tasks are demoted (macOS: run in the background).
-fn demotedOf(o: Op) u32 {
-    var n: u32 = 0;
-    for (o.tasks_now) |t| n += @intFromBool(t.demoted);
-    return n;
-}
-
 /// When a run's oldest running task started (Unix seconds); 0 when none runs.
 fn oldestOf(o: Op) i64 {
     var oldest: i64 = 0;
@@ -580,18 +574,22 @@ fn oldestOf(o: Op) i64 {
     return oldest;
 }
 
-/// Its tasks running, with those cpuq has stopped, its -c, or a drain's CPUs: "3 · 1 stopped",
-/// "2 of -c 2", "drain 6-7".
+/// Its tasks running and the CPUs whose tokens they hold, its -c, or a drain's CPUs: "3 on 0-2",
+/// "2 of -c 2 on 4,5", "drain 6-7".
 fn runText(a: std.mem.Allocator, h: JsonRun) []const u8 {
     if (h.driver) return a.print("driver · {d:.1} busy itself", .{h.driver_busy}) catch "driver";
     if (h.drain) {
         const iso = if (h.cpus.len > h.pin.len) a.print(" (isolates {s})", .{cpuText(a, h.cpus)}) catch "" else "";
         return a.print("drain {s}{s}", .{ cpuText(a, h.pin), iso }) catch "drain";
     }
-    const d = if (h.demoted != 0) a.print(" · {d} background: {s}", .{ h.demoted, h.demoted_for }) catch "" else "";
+    var on: std.ArrayList(u32) = .empty;
+    for (h.running_tasks) |t| if (!t.paused) on.append(a, t.cpu) catch break;
+    std.mem.sort(u32, on.items, {}, std.sort.asc(u32));
+    const where = if (on.items.len != 0) a.print(" on {s}", .{cpuText(a, on.items)}) catch "" else "";
+    const stopped = if (h.paused != 0) a.print(" · {d} stopped", .{h.paused}) catch "" else "";
     const io = if (h.io_wait) |n| (if (n != 0) a.print(" · {d} on I/O", .{n}) catch "" else "") else "";
     const c = if (h.running >= h.limit and h.tasks > 1) a.print(" of -c {d}", .{h.limit}) catch "" else "";
-    return a.print("{d}{s}{s}{s}", .{ h.running, c, d, io }) catch "?";
+    return a.print("{d}{s}{s}{s}{s}", .{ h.running, c, where, stopped, io }) catch "?";
 }
 
 /// How long it has run, with the time left at its rate so far: "2m10s · ~1m left".
@@ -702,7 +700,7 @@ fn boxed(ctx: *Ctx, st: JsonStatus, remote: ?[]const u8) void {
     const short_host = remote orelse std.mem.sliceTo(host, '.');
     const C = table.Cell;
 
-    // The pool: capacity, tasks running and waiting, the machine busy, and the gate.
+    // The pool: the tokens, tasks running and waiting, the machine busy, and the gate.
     const high = std.mem.eql(u8, st.memory_pressure, "high");
     const mem: C = if (st.memory) |m| .{
         .text = a.print("{s}{s}", .{ ofGb(a, m.used, m.total), if (high) ", pressure" else "" }) catch "?",
@@ -715,14 +713,18 @@ fn boxed(ctx: *Ctx, st: JsonStatus, remote: ?[]const u8) void {
         break :blk .{ .text = a.print("{d:.1}", .{o}) catch "?", .tint = if (o >= 1) .warn else null };
     } else .{ .text = "-", .tint = .dim } else .{ .text = "-", .tint = .dim };
     const gate_open = std.mem.eql(u8, st.gate.state, "open");
-    const cap: C = if (st.capacity == st.budget) .{ .text = a.print("{d}", .{st.budget}) catch "?" } else .{
-        .text = a.print("{d} of {d}", .{ st.capacity, st.budget }) catch "?",
-        .tint = .warn,
+    const cap: C = .{
+        .text = a.print("{d} · {d} reserved", .{ st.tokens, st.reserve }) catch "?",
+    };
+    const free: C = .{
+        .text = if (st.held_back != 0) a.print("{d} · {d} held back", .{ st.free, st.held_back }) catch "?" else a.print("{d}", .{st.free}) catch "?",
+        .tint = if (st.held_back != 0) .warn else if (st.free == 0) .dim else null,
     };
     const summary: table.Table = .{
         .title = a.print("cpuq {s}{s}{s}", .{ st.version, if (short_host.len != 0) " · " else "", short_host }) catch "cpuq",
         .columns = &.{
-            .{ .head = "CAPACITY", .sub = "CPUs", .alignment = .right },
+            .{ .head = "TOKENS", .alignment = .right },
+            .{ .head = "FREE", .alignment = .right },
             .{ .head = "RUNNING", .alignment = .right },
             .{ .head = "WAITING", .alignment = .right },
             .{ .head = "BUSY", .sub = "CPUs", .alignment = .right },
@@ -734,8 +736,9 @@ fn boxed(ctx: *Ctx, st: JsonStatus, remote: ?[]const u8) void {
         },
         .rows = &.{&.{
             cap,
+            free,
             .{ .text = if (st.paused != 0) a.print("{d} · {d} stopped", .{ st.running, st.paused }) catch "?" else a.print("{d}", .{st.running}) catch "?", .tint = if (st.running != 0) .accent else null },
-            .{ .text = a.print("{d}", .{st.waiting}) catch "?", .tint = if (st.waiting != 0 and st.room > 0) .warn else null },
+            .{ .text = a.print("{d}", .{st.waiting}) catch "?", .tint = if (st.waiting != 0 and st.free > 0) .warn else null },
             busy,
             tasks,
             outside,
@@ -760,7 +763,7 @@ fn boxed(ctx: *Ctx, st: JsonStatus, remote: ?[]const u8) void {
                 .{ .text = dash(h.project) },
                 .{ .text = dash(h.label), .tint = .accent },
                 .{ .text = tasksText(a, h, now), .tint = if (h.failed != 0) .warn else null },
-                .{ .text = runText(a, h), .tint = if (h.demoted != 0) .warn else null },
+                .{ .text = runText(a, h), .tint = if (h.paused != 0) .warn else null },
                 using,
                 .{ .text = sinceText(a, h, now) },
                 .{ .text = a.print("{d}", .{h.pid}) catch "?", .tint = if (h.stopped) .bad else .dim },
@@ -839,7 +842,7 @@ fn boxed(ctx: *Ctx, st: JsonStatus, remote: ?[]const u8) void {
             }) catch continue) catch {};
         }
         const t: table.Table = .{
-            .title = a.print("projects: tasks running against the fair share of {d} CPUs by weight", .{st.capacity}) catch "projects",
+            .title = a.print("projects: tasks running against the fair share of {d} tokens by weight", .{st.tokens}) catch "projects",
             .columns = &.{
                 .{ .head = "PROJECT" },
                 .{ .head = "WEIGHT", .alignment = .right },
@@ -877,7 +880,7 @@ fn boxed(ctx: *Ctx, st: JsonStatus, remote: ?[]const u8) void {
 
     var notes: std.ArrayList([]const u8) = .empty;
     if (st.runs.len == 0 and st.waiters.len == 0) notes.append(a, "nothing running or waiting") catch {};
-    if (st.waiting != 0 and st.room > 0 and gate_open) notes.append(a, a.print("room for {d:.1} more CPU{s} of work: the first waiter starts at its next look", .{ st.room, if (st.room < 1.5) "" else "s" }) catch "") catch {};
+    if (st.waiting != 0 and st.free > 0 and gate_open) notes.append(a, a.print("{d} token{s} free: the first in line takes one at its next look", .{ st.free, if (st.free == 1) "" else "s" }) catch "") catch {};
     if (st.runs.len != 0) notes.append(a, "end a run: cpuq kill RUN · for scripts: cpuq status --json") catch {} else notes.append(a, "for scripts: cpuq status --json") catch {};
     if (ctx.watch_note) |n| notes.append(a, n) catch {};
     w.writeAll("\n") catch {};
@@ -894,11 +897,12 @@ fn plain(ctx: *Ctx, st: JsonStatus) void {
     const now = nowSeconds(ctx.io);
     var b: [16]u8 = undefined;
     w.print("dir     {s}\n", .{st.dir}) catch {};
-    w.print("pool    {d} CPUs ({s}); capacity {d}", .{ st.budget, cpuText(a, st.pool), st.capacity }) catch {};
+    w.print("pool    {d} CPUs ({s}); {d} tokens, {d} reserved; {d} held, {d} free", .{ st.pool.len, cpuText(a, st.pool), st.tokens, st.reserve, st.held, st.free }) catch {};
+    if (st.held_back != 0) w.print(" ({d} held back for work outside cpuq)", .{st.held_back}) catch {};
     if (st.isolated.len != 0) w.print(" ({s} isolated by drains)", .{cpuText(a, st.isolated)}) catch {};
     w.print("; running {d}", .{st.running}) catch {};
     if (st.paused != 0) w.print(" ({d} stopped)", .{st.paused}) catch {};
-    w.print(", waiting {d}; room {d:.1}\n", .{ st.waiting, st.room }) catch {};
+    w.print(", waiting {d}\n", .{st.waiting}) catch {};
     if (st.busy) |bz| {
         w.print("busy    {d:.1} of {d} CPUs online", .{ bz, st.active_cores }) catch {};
         if (st.tasks_busy) |t| w.print("; cpuq's tasks {d:.1}, outside {d:.1}", .{ t, @max(0, bz - t) }) catch {};
@@ -982,7 +986,7 @@ test "the line's order: under their share first, then by project share, drains l
 
 fn tasksJson(a: std.mem.Allocator, now: []const pool_mod.TaskNow) []const statusjson.JsonTask {
     const out = a.alloc(statusjson.JsonTask, now.len) catch return &.{};
-    for (now, out) |t, *j| j.* = .{ .task = t.task, .attempt = t.attempt, .pid = t.pid, .since = t.since, .paused = t.paused };
+    for (now, out) |t, *j| j.* = .{ .task = t.task, .attempt = t.attempt, .pid = t.pid, .since = t.since, .paused = t.paused, .cpu = t.cpu };
     return out;
 }
 
