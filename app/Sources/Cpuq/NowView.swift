@@ -282,7 +282,10 @@ final class HourCache {
             guard lo <= hi else { continue }
             for i in lo...hi {
                 let c = cols[i]
-                let o = max(0, min(c.to, b.to ?? end).timeIntervalSince(max(c.from, b.from))) / step
+                // The share of the column it ran, of the column so far: the newest column, still
+                // filling, is not drawn as a fraction of its final height.
+                let length = max(min(c.to, end).timeIntervalSince(c.from), 1)
+                let o = min(max(0, min(c.to, b.to ?? end).timeIntervalSince(max(c.from, b.from))) / length, 1)
                 guard o > 0 else { continue }
                 let cpu: Double?
                 // A job already running when the app started has no average yet: before its
