@@ -178,6 +178,8 @@ const Run = struct {
     gave_up: bool = false,
     started_ms: i64,
     first_start_ms: i64 = 0,
+    /// When its first task started, by the real clock (Unix seconds), as history records it.
+    first_start_t: f64 = 0,
     last_wait: ?sys.Waited = null,
     /// Stopped by Ctrl-Z: it starts nothing, and its tasks are stopped, until continued.
     stopped: bool = false,
@@ -411,7 +413,7 @@ pub fn run(ctx: *Ctx, o: Opts) u8 {
 fn logEnd(r: *Run) void {
     const ctx = r.ctx;
     if (r.gave_up) return joblog.logEvent(ctx, r.job, "gave_up", .{});
-    if (r.first_start_ms != 0) joblog.logEvent(ctx, r.job, "started", .{ .t = r.queued_t + @as(f64, @floatFromInt(r.first_start_ms - r.started_ms)) / 1000 });
+    if (r.first_start_ms != 0) joblog.logEvent(ctx, r.job, "started", .{ .t = r.first_start_t });
     var extra: joblog.EventExtra = .{ .cores = r.peak_running, .cpu = sys.childrenCpu(), .done = r.rec.done, .failed = r.rec.failed };
     if (r.noise_max >= noisy_min) extra.noisy = .{ .cpus = r.noise_sum / @as(f64, @floatFromInt(@max(r.noise_n, 1))), .max = r.noise_max, .top = r.noise_top };
     if (r.single) {
@@ -743,7 +745,10 @@ fn startTask(r: *Run, a: std.mem.Allocator) void {
     t.start_ms = now;
     t.fresh_ms = now;
     t.since_s = main.nowSeconds(ctx.io);
-    if (r.first_start_ms == 0) r.first_start_ms = now;
+    if (r.first_start_ms == 0) {
+        r.first_start_ms = now;
+        r.first_start_t = joblog.nowFloat(ctx.io);
+    }
     r.rec.last = now;
     r.running.append(r.a, t) catch {};
 }
