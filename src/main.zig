@@ -240,7 +240,6 @@ fn dispatch(ctx: *Ctx, args: []const [:0]const u8) u8 {
     if (std.mem.eql(u8, cmd, "clean")) return records.cmdClean(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "reserve")) return @import("op.zig").cmdReserve(ctx, args[1..]);
     if (std.mem.eql(u8, cmd, "budget")) {
-        loadConfig(ctx);
         ctx.out.print("{d}\n", .{@import("pool.zig").tokens(poolCpus(ctx), ctx.cfg.reserve).len}) catch {};
         ctx.out.flush() catch {};
         return 0;
@@ -297,11 +296,15 @@ pub fn loadConfig(ctx: *Ctx) void {
         error.FileNotFound => return,
         else => fail("{s}: {t}", .{ path, err }),
     };
+    // Read into a fresh one: a second load (a command that loads it again) reads the file anew,
+    // never adding its remote lines to those already read.
+    var cfg: policy.Config = .{};
     var diag: policy.Diagnostic = .{};
-    policy.parseConfig(text, &ctx.cfg, &diag) catch {
+    policy.parseConfig(text, &cfg, &diag) catch {
         std.debug.print("cpuq: {s}:{d}: {s} ({s})\n", .{ path, diag.line, diag.message, diag.key });
         std.process.exit(exit_usage);
     };
+    ctx.cfg = cfg;
 }
 
 /// Re-reads the config file when it has changed since it was read, so a cpuq

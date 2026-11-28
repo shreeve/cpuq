@@ -2,7 +2,7 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
-## 0.42.0 — unreleased
+## 0.42.0 — 2026-11-28
 
 A strict token pool. A machine has N tokens, one per CPU of the pool less the reserve. A task
 holds one while it runs and gives it back the moment it ends, so at most N tasks run at once,

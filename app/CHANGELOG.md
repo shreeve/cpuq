@@ -3,7 +3,7 @@
 User-visible changes to Cpuq.app, the menu-bar companion. Each version's section is its release
 notes, shown by the update dialog too.
 
-## 0.28.0 — unreleased
+## 0.28.0 — 2026-11-28
 
 - **Reads cpuq 0.42's status (schema 4),** a strict token pool: the pool's CPUs less the reserve
   are its tokens, and a task holds one while it runs. Needs cpuq 0.42.0 or later; a machine on

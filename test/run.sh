@@ -189,6 +189,10 @@ t_tokens() {
   check "12 sleeping tasks on 2 tokens: never more than 2 at once (most $max over $samples looks), and every run passed (rc $rc)" "[ $max = 2 ] && [ $rc = 0 ]"
   local said budget; said=$("$CPUQ" reserve); budget=$("$CPUQ" budget)
   check "cpuq reserve prints the tokens and the reserve ($said); cpuq budget prints the tokens ($budget)" "[[ '$said' == '2 tokens, '*' reserved' ]] && [ '$budget' = 2 ]"
+  # A config with a remote's lines, read twice by a command that loads it again, reads cleanly.
+  printf 'remotes = h\nremote_start.h = true\n' >>"$CPUQ_CONFIG"
+  local twice; twice=$( { "$CPUQ" budget; "$CPUQ" reserve; "$CPUQ" limit none -c 1; } 2>&1 | grep -c 'set twice')
+  check "budget, reserve and limit read a config with remote lines once (set twice: $twice)" "[ '$twice' = 0 ]"
 }
 
 t_reserve() {
