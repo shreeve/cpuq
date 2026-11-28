@@ -21,12 +21,25 @@ namespace Cpuq.Contest
 section
 variable {cfg : Cfg}
 
-theorem used_admit {s : St} {r : Nat} (hr : r < cfg.nr) : used cfg (admit s r) = used cfg s + 1 := by
-  unfold used; rw [total_admit hr]; have : iso cfg (admit s r) = iso cfg s := rfl; omega
+theorem wd_pos (cfg : Cfg) (r : Nat) : 1 ≤ cfg.wd r := by unfold Cfg.wd; omega
+
+theorem tokT_admit {s : St} {r : Nat} (hr : r < cfg.nr) : tokT cfg (admit s r) = tokT cfg s + cfg.wd r := by
+  have h1 := sum_setRun (fun j x => x.running * cfg.wd j) s (admitR s.now (s.run r)) hr
+  try dsimp only at h1
+  have e1 : (admitR s.now (s.run r)).running * cfg.wd r = (s.run r).running * cfg.wd r + cfg.wd r := by
+    show ((s.run r).start + 1 + (s.run r).comp + (s.run r).blk) * cfg.wd r = _
+    rw [show (s.run r).start + 1 + (s.run r).comp + (s.run r).blk = (s.run r).running + 1 by
+      simp only [RunSt.running]; omega, Nat.succ_mul]
+  unfold tokT admit
+  omega
+
+/-- A start takes exactly its task's `K` tokens. -/
+theorem used_admit {s : St} {r : Nat} (hr : r < cfg.nr) : used cfg (admit s r) = used cfg s + cfg.wd r := by
+  unfold used; rw [tokT_admit hr]; have : iso cfg (admit s r) = iso cfg s := rfl; omega
 
 theorem used_startD {s : St} {d : Nat} (hd : d < cfg.nd) (hw : (s.drain d).ph = .waiting) :
     used cfg (startD s d) = used cfg s + (cfg.drain d).size := by
-  unfold used; rw [iso_startD hd hw]; have : total cfg (startD s d) = total cfg s := rfl; omega
+  unfold used; rw [iso_startD hd hw]; have : tokT cfg (startD s d) = tokT cfg s := rfl; omega
 
 theorem capTok_le (s : St) : capTok cfg s ≤ cfg.pool := by
   unfold capTok capN; omega
@@ -64,7 +77,7 @@ theorem passN_tok (htk : cfg.rules.tokens = true) : ∀ (k : Nat) {s : St}, used
 
 /-- Before the pass, no move raises the tokens held. -/
 theorem pre_used {s u : St} {m : Move} (h : pre cfg s m u) : used cfg u ≤ used cfg s := by
-  have ht : total cfg u ≤ total cfg s := rsum_le (fun b _ => (pre_running h b).1)
+  have ht : tokT cfg u ≤ tokT cfg s := rsum_le (fun b _ => Nat.mul_le_mul_right _ (pre_running h b).1)
   have hi : iso cfg u ≤ iso cfg s := by
     apply iso_le
     intro e he
@@ -120,7 +133,7 @@ theorem tok_le_pool {cfg : Cfg} (htk : cfg.rules.tokens = true) {s : St} (r : Re
   | init =>
     have : used cfg init = 0 := by
       unfold used
-      have a1 : total cfg init = 0 := rsum_eq_zero.2 (fun r _ => by simp [Contest.init, RunSt.running])
+      have a1 : tokT cfg init = 0 := rsum_eq_zero.2 (fun r _ => by simp [Contest.init, RunSt.running])
       have a2 : iso cfg init = 0 := rsum_eq_zero.2 (fun d _ => by simp [Contest.init, isoF])
       omega
     omega
@@ -165,25 +178,31 @@ theorem tok_over_no_start {cfg : Cfg} (htk : cfg.rules.tokens = true) {s : St} (
   refine ⟨fun r => ?_, fun d hd => ?_⟩
   · cases hc : canStart cfg s r
     · rfl
-    · simp only [canStart, htk, Bool.and_eq_true, ↓reduceIte, decide_eq_true_eq] at hc; omega
+    · simp only [canStart, htk, Bool.and_eq_true, ↓reduceIte, decide_eq_true_eq] at hc
+      have := wd_pos cfg r; omega
   · cases hc : canDrain cfg s d
     · rfl
     · simp only [canDrain, htk, Bool.and_eq_true, decide_eq_true_eq, Bool.not_true, Bool.false_or] at hc; omega
 
 /-! ## 2. Work-conserving over tokens -/
 
-/-- **Property 2.** With tokens, in every reachable state, if a run waits (not held by its `-c`)
-and the gates are open, no token is free to hand out: `used + 1 > capTok`. A waiting drain holds
-no token and keeps none free. -/
-theorem tok_work_conserving {cfg : Cfg} (htk : cfg.rules.tokens = true) {s : St} (h : ReachS cfg s) {r : Nat}
+/-- **Property 2.** With tokens and every task of one token (0.42), in every reachable state, if a
+run waits (not held by its `-c`) and the gates are open, no token is free to hand out:
+`used + 1 > capTok`. A waiting drain holds no token and keeps none free. -/
+theorem tok_work_conserving {cfg : Cfg} (htk : cfg.rules.tokens = true) (hw : ∀ x < cfg.nr, cfg.wd x = 1)
+    {s : St} (h : ReachS cfg s) {r : Nat}
     (hr : r < cfg.nr) (he : eligible s r = true) (hg : s.gate = true) : capTok cfg s < used cfg s + 1 := by
   apply Classical.byContradiction; intro hn
-  obtain ⟨x, hx⟩ := Option.isSome_iff_exists.1 (head2_isSome hr he)
+  have hfree : used cfg s + 1 ≤ capTok cfg s := by omega
+  have hce : cand cfg s r = true := by
+    simp only [cand, fits, he, hw r hr, hfree, decide_true, Bool.or_true, Bool.and_self]
+  obtain ⟨x, hx⟩ := Option.isSome_iff_exists.1 (head2_isSome hr hce)
   obtain ⟨hxn, hxe⟩ := head2_some hx
   have hc := reachS_start h hxn
   simp only [front, Bool.and_eq_true] at hxe
-  have hfree : used cfg s + 1 ≤ capTok cfg s := by omega
-  simp [canStart, hxe.1, hxe.2, hg, hfree, hx, htk] at hc
+  have hxel := cand_elig hxe.1
+  have hfx : used cfg s + cfg.wd x ≤ capTok cfg s := by rw [hw x hxn]; exact hfree
+  simp [canStart, hxel, hxe.2, hg, hfx, hx, htk] at hc
 
 /-! ## 3. No starvation of runs -/
 
@@ -192,7 +211,8 @@ stop, a waiting run starts a task if from then on no urgent run arrives, every t
 passes, and again and again the gates are open while outside load is within the reserve and
 `drain_max` < `N`. New runs of every project may keep arriving, and `cpuq reserve` may change. -/
 theorem tok_run_starts {cfg : Cfg} (_htk : cfg.rules.tokens = true) (hak : cfg.rules.arrivalKey = true)
-    (hol : cfg.rules.oneLine = true) (ρ : RunS cfg) {n r : Nat} (hr : r < cfg.nr)
+    (hol : cfg.rules.oneLine = true) (hhold : cfg.rules.hold = true) (hw : ∀ x < cfg.nr, cfg.wd x = 1)
+    (ρ : RunS cfg) {n r : Nat} (hr : r < cfg.nr)
     (hh : ((ρ.st n).run r).here = true) (hp : 0 < ((ρ.st n).run r).pend)
     (noUrgent : ∀ m ≥ n, ∀ b, ρ.mv m = .act (.arrive b) → (cfg.run b).urgent = false)
     (ends : ∀ m b, b < cfg.nr → 0 < ((ρ.st m).run b).running → ∃ m' ≥ m, finOfM b (ρ.mv m'))
@@ -201,15 +221,15 @@ theorem tok_run_starts {cfg : Cfg} (_htk : cfg.rules.tokens = true) (hak : cfg.r
       cfg.drainMax < cfg.pool - (ρ.st m').reserve) :
     ∃ m ≥ n, ((ρ.st m).run r).pend < ((ρ.st n).run r).pend := by
   have hD : cfg.drainMax < cfg.pool := by obtain ⟨m, _, _, _, h⟩ := gates 0; omega
-  exact run_starts_fixed hak hol hD ρ hr hh hp noUrgent ends htime
-    (fun m => let ⟨m', hm, hg, ho, hd⟩ := gates m; ⟨m', hm, hg, fun _ => ⟨ho, hd⟩⟩)
+  exact run_starts_fixed hak hol hD ρ hr hh hp noUrgent ends htime (.inr hhold)
+    (fun m => let ⟨m', hm, hg, ho, hd⟩ := gates m; ⟨m', hm, hg, fun _ => ⟨ho, fun x hx => by rw [hw x hx]; omega⟩⟩)
 
 /-! ## 4, 5. Drains -/
 
 /-- **Property 4.** A drain holds tokens only when started: the tokens held are the tasks running
 plus the started drains' cores, and a waiting drain counts none. -/
 theorem tok_waiting_drain_holds_none {cfg : Cfg} (s : St) {d : Nat} (hw : (s.drain d).ph = .waiting) :
-    isoF cfg d (s.drain d) = 0 ∧ used cfg s = total cfg s + rsum cfg.nd (fun e => isoF cfg e (s.drain e)) := by
+    isoF cfg d (s.drain d) = 0 ∧ used cfg s = tokT cfg s + rsum cfg.nd (fun e => isoF cfg e (s.drain e)) := by
   exact ⟨by simp [isoF, hw], rfl⟩
 
 /-- **Property 5.** In every reachable state a started drain has held its tokens at most its limit

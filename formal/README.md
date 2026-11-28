@@ -49,6 +49,7 @@ It fails if a ranking no longer exists (a weakly fair run that starves, the sear
 | `CpuqModel/Contest.lean` | 0.40.0, contested CPUs: the admission rules; the five properties proved for every configuration with two rule changes, and the gaps of the design as written as reachable states |
 | `CpuqModel/Stream.lean` | 0.40: runs and drains that leave and arrive again, so arrivals never stop; `run_starts`, no-starvation's strongest true form |
 | `CpuqModel/Token.lean` | 0.42.0, the token pool: properties 1–7 |
+| `CpuqModel/Wide.lean` | 0.43.0, tasks of `K` tokens: properties 1–5, rules 4(a) and 4(b) |
 | `CpuqModel/StreamCex.lean` | 0.40: renamed states look alike to the rules (`Sh`); a cycle repeated forever is a run (`cycle_run`); the two infinite runs where a run waits forever while arrivals go on |
 | `CpuqModel/Contest035.lean` | The slot rules before 0.40.0 hold a CPU idle while a task waits (a reachable state of `moveX` under `Rules.released`) |
 
@@ -546,6 +547,41 @@ Not proved with arrivals that never stop: a waiting drain starts. A drain waits 
 the `drainMax` bound and (`drainFifo`) older runs that hold nothing; the first two are finitely many
 and end, but an older run that waits holding nothing can be starved as above, and the drain behind
 it waits with it.
+
+### 0.43.0: tasks of several tokens (`Wide.lean`)
+
+`RunCfg.width` is `cpuq run -j K` (`Cfg.wd`, at least 1). A task holds `K` tokens while it runs:
+`used` = Σ running × `K` + started drains' cores. It starts when its `K` are free
+(`used + K ≤ capTok`), in one step, and gives all `K` back when it ends. A wide task first in line
+that does not fit:
+- rule 4(a), the design (`Rules.hold`, default; `Rules.wide043a`): holds the line, so freed tokens go to no
+  other run;
+- rule 4(b), not chosen (`hold := false`, `Rules.wide043b`; kept for its counterexample): the line skips it (`cand`: waiting, and it fits),
+  and the next run that fits starts.
+
+With every `K = 1` the two agree and are 0.42. Drains are unchanged: a hold does not stop a drain on
+its own turn.
+
+| Design property | Theorem | Status |
+|---|---|---|
+| 1 At most N tokens, none held twice, any K | `wide_within` (≤ pool always; every start leaves ≤ `capTok` ≤ N); `tok_within`, `tok_over_no_start` hold for any `K` | Proved, no bound on `K` needed |
+| 2 Never part of K while waiting | `wide_all_at_once` | Proved: a run holds `K` × its running tasks, a start takes exactly `K`, an end gives back exactly `K` |
+| 3 4(a): no starvation, endless arrivals | `wide_run_starts` | Proved: no urgent arrivals, every task ends, ticks keep coming, and again and again gates open with outside load ≤ reserve and `drain_max` < N; every `K ≤ drain_max`; `drainFifo` |
+| 3 4(a), one tick | `wide_run_starts_fit` | Proved with one tick instead, when every `K + drain_max ≤ N` |
+| 3 idle tokens ≤ K−1, only while a wide task heads the line | `wide_hold_bound` | Proved: a run waits with gates open → the head `x` of the line has fewer than its `K` free |
+| 4 4(b): a wide task may wait forever | `wide_waits_forever` | Counterexample: an infinite run, `K = 2` of 3 tokens (`K ≤ drain_max`), tasks ending, ticks, gates open; every freed token goes to a one-token run. `wide_hold_takes`: with the hold the same moves start it |
+| 5 Work-conserving but for 3's hold | `wide_hold_bound` | Proved; 4(b) is work-conserving outright (`nohold_conserving`) |
+
+Why ticks for 3: once every task has ended, a drain older than the waiting run may still hold its
+cores, and `K` free tokens may need them. Drains newer than the run wait for it (0.41's turn), so
+only older ones may start; ticks end each (limit + grace). The proof's measure `DQ` counts what the
+older drains may still hold. With `K + drain_max ≤ N`, one tick is enough (`wide_run_starts_fit`).
+
+Changed for widths: `used` counts `tokT`; `canStart`'s token case is `used + K ≤ capTok`;
+`projFirst` and `front` read `cand`. `pass_phi`, `project_empties`, `pass_psi` and
+`run_starts_fixed` assume `tokens` off or the hold; `run_starts_fixed`'s token condition is
+`K + drain_max ≤ N`. In `Token.lean`, `tok_work_conserving` and `tok_run_starts` assume every
+`K = 1` (0.42) and, the latter, the hold.
 
 What it does not cover: CPU time between running tasks (the kernel's part); measurement noise
 and multi-threaded tasks (busy is exactly the computing tasks); separate cpuq processes racing
