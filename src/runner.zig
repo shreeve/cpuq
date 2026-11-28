@@ -74,6 +74,7 @@ pub fn cmdRun(ctx: *Ctx, args: []const [:0]const u8) u8 {
         .tasks = o.tasks,
         .cpus = o.cpus,
         .cpus_percent = o.cpus_percent,
+        .width = o.width,
         .timeout_s = o.timeout_s,
         .retries = o.retries,
         .urgent = o.urgent,

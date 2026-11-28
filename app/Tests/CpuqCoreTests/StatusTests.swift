@@ -65,7 +65,7 @@ let schema4 = """
     let r = s.runs[1]
     #expect(r.ticket == 2 && r.pid == 67218 && r.limit == 12 && r.tasks == 12 && r.running == 7 && r.paused == 1)
     #expect(r.ioWait == nil && !r.tail && r.oldest == 1795854704 && r.waiting == 5 && r.flags == ["capped"])
-    #expect(r.runningTasks[6] == Status.Task(task: 7, attempt: 2, pid: 67229, since: 1795854705, paused: false, cpu: 6))
+    #expect(r.runningTasks[6] == Status.Task(task: 7, attempt: 2, pid: 67229, since: 1795854705, paused: false, cpu: 6, cpus: [6]))
     // A paused task holds no token: its CPU is the token of another task's.
     #expect(r.heldCPUs == Array(0...6))
     #expect(s.holders == [0: 1, 1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1, 7: 0])
@@ -123,7 +123,7 @@ let schema4 = """
     let s = try Status.decode(Data(json.utf8))
     #expect(s.running == 0 && s.waiting == 0 && s.free == 0 && s.tokens == 0 && s.busy == nil)
     #expect(s.runs.first?.using == nil && s.runs.first?.ioWait == nil && s.runs.first?.limit == 2)
-    #expect(s.runs.first?.runningTasks == [Status.Task(task: 1, attempt: 1, pid: 0, since: 0, paused: false, cpu: 0)])
+    #expect(s.runs.first?.runningTasks == [Status.Task(task: 1, attempt: 1, pid: 0, since: 0, paused: false, cpu: 0, cpus: [0])])
     #expect(s.waiters.first?.max == 3)
     #expect(s.outside.isEmpty && !s.recorder && s.isolated.isEmpty)
     #expect(s.gate.state == "open")
@@ -270,4 +270,12 @@ let schema4 = """
     #expect(svc.ranBySomeone)
     // None outside: an empty list.
     #expect(try Status.decode(Data(#"{"schema": 4}"#.utf8)).outsideWork.isEmpty)
+}
+
+@Test func wideTaskHoldsItsCPUs() throws {
+    // A task of -j 2 lists both CPUs whose tokens it holds; its run holds both.
+    let json = #"{"schema":4,"tokens":8,"runs":[{"ticket":3,"width":2,"running":1,"running_tasks":[{"task":1,"pid":9,"cpu":41,"cpus":[41,89]}]}]}"#
+    let s = try Status.decode(Data(json.utf8))
+    #expect(s.runs.first?.runningTasks.first?.cpus == [41, 89])
+    #expect(s.runs.first?.heldCPUs == [41, 89])
 }

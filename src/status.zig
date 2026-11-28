@@ -410,6 +410,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
             .project = o.project,
             .weight = o.weight,
             .limit = o.limit,
+            .width = o.width,
             .tasks = o.tasks,
             .done = o.done,
             .failed = o.failed,
@@ -583,12 +584,14 @@ fn runText(a: std.mem.Allocator, h: JsonRun) []const u8 {
         return a.print("drain {s}{s}", .{ cpuText(a, h.pin), iso }) catch "drain";
     }
     var on: std.ArrayList(u32) = .empty;
-    for (h.running_tasks) |t| if (!t.paused) on.append(a, t.cpu) catch break;
+    for (h.running_tasks) |t| if (!t.paused) on.appendSlice(a, t.cpus) catch break;
     std.mem.sort(u32, on.items, {}, std.sort.asc(u32));
     const where = if (on.items.len != 0) a.print(" on {s}", .{cpuText(a, on.items)}) catch "" else "";
     const stopped = if (h.paused != 0) a.print(" · {d} stopped", .{h.paused}) catch "" else "";
     const io = if (h.io_wait) |n| (if (n != 0) a.print(" · {d} on I/O", .{n}) catch "" else "") else "";
     const c = if (h.running >= h.limit and h.tasks > 1) a.print(" of -c {d}", .{h.limit}) catch "" else "";
+    // A run of -j K: the tokens its tasks hold ("2 on 41,89 · -j 2").
+    if (h.width > 1) return a.print("{d}{s}{s} · -j {d}{s}{s}", .{ h.running * h.width, c, where, h.width, stopped, io }) catch "?";
     return a.print("{d}{s}{s}{s}{s}", .{ h.running, c, where, stopped, io }) catch "?";
 }
 
@@ -986,7 +989,7 @@ test "the line's order: under their share first, then by project share, drains l
 
 fn tasksJson(a: std.mem.Allocator, now: []const pool_mod.TaskNow) []const statusjson.JsonTask {
     const out = a.alloc(statusjson.JsonTask, now.len) catch return &.{};
-    for (now, out) |t, *j| j.* = .{ .task = t.task, .attempt = t.attempt, .pid = t.pid, .since = t.since, .paused = t.paused, .cpu = t.cpu };
+    for (now, out) |t, *j| j.* = .{ .task = t.task, .attempt = t.attempt, .pid = t.pid, .since = t.since, .paused = t.paused, .cpu = if (t.cpus.len != 0) t.cpus[0] else 0, .cpus = t.cpus };
     return out;
 }
 

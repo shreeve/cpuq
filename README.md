@@ -98,7 +98,8 @@ borrows, and what is new here.
 | option | meaning |
 |---|---|
 | `-n M` | M tasks of CMD; each gets `CPUQ_TASK` (1 to M) and `CPUQ_TASKS`, and its output goes to a file of its own. Without `-n`, one task, with the terminal |
-| `-c C`, `-c P%` | hold at most C tokens at once, or P% of the tokens (at least 1); default: none of its own |
+| `-c C`, `-c P%` | run at most C tasks at once, or P% of the tokens (at least 1); default: none of its own |
+| `-j K` | each task holds K tokens at once, taken in one step and given back at its end; on Linux it is pinned to its K CPUs (whole cores when K is a multiple of a core's threads: `-j 2` is a sibling pair), which `$CPUQ_CPUS` lists. At most `drain_max` of the tokens. First in line, it holds the line: the tokens freed wait for it, at most K − 1 idle. Its command may run K jobs |
 | `-t T` | each task's time limit, wall time (not the time you stop it with Ctrl-Z): `30s`, `10m`, `2h`, or `off`; default the config's `timeout` (1h) |
 | `-r N` | try a failed task up to N more times; `CPUQ_ATTEMPT` says which try it is |
 | `--label PROJECT:TASK` | the run's name in status and history |

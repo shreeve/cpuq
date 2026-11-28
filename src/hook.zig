@@ -54,7 +54,7 @@ pub fn check(a: std.mem.Allocator, command: []const u8, project: []const u8, adv
 }
 
 /// The `cpuq run` and `cpuq lease` options that take a value (`-n 8`, or `--label=app:test`).
-pub const run_value_options = [_][]const u8{ "--label", "--note", "--host", "--slots", "--return", "--on", "--include", "--repo", "-n", "-c", "-t", "-r", "--wait-max" };
+pub const run_value_options = [_][]const u8{ "--label", "--note", "--host", "--slots", "--return", "--on", "--include", "--repo", "-n", "-c", "-j", "-t", "-r", "--wait-max" };
 
 /// The options `cpuq run` and `cpuq lease` don't take, each with what replaces it, as cpuq says
 /// when given one.
@@ -142,6 +142,8 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, advisor: 
     var elsewhere = false;
     var tethered = false;
     var driver = false;
+    // `-j K`: each task holds K tokens, so its command may run K jobs.
+    var width: u32 = 1;
     // A lease's name comes first.
     var i: usize = if (lease) 3 else 2;
     while (i < w.len) : (i += 1) {
@@ -157,6 +159,10 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, advisor: 
         if (std.mem.eql(u8, name, "--on")) elsewhere = true;
         if (std.mem.eql(u8, name, "--tethered")) tethered = true;
         if (std.mem.eql(u8, name, "--driver")) driver = true;
+        if (!lease and std.mem.eql(u8, name, "-j")) {
+            const v = if (name.len < o.len) o[name.len + 1 ..] else if (i + 1 < w.len) w[i + 1] else "";
+            width = std.fmt.parseInt(u32, v, 10) catch 1;
+        }
         // Options that take a value skip it.
         if (name.len == o.len and takesValue(name)) i += 1;
     }
@@ -174,11 +180,14 @@ fn checkCpuq(a: std.mem.Allocator, cmd: Simple, w: []const []const u8, advisor: 
     } else for (cmds) |ic| {
         const iw = stripWrappers(ic.words);
         if (iw.len == 0 or heavyName(iw) == null) continue;
-        const what = tooParallel(a, iw) orelse continue;
+        const what = tooParallel(a, iw, width) orelse continue;
         const fixed = fixRun(a, w, false);
         const more = " (or split the work into tasks with -n M)";
         return .{
-            .reason = a.print("{s}, but a task counts as one CPU", .{what}) catch "a task counts as one CPU",
+            .reason = if (width > 1)
+                a.print("{s}, but each task holds {d} CPUs (-j {d})", .{ what, width, width }) catch "a task holds -j CPUs"
+            else
+                a.print("{s}, but a task counts as one CPU", .{what}) catch "a task counts as one CPU",
             .instead = if (fixed.whole)
                 a.print("{s}{s}", .{ fixed.text, more }) catch fixed.text
             else
@@ -247,9 +256,9 @@ fn checkDriver(a: std.mem.Allocator, w: []const []const u8, inner: []const []con
     };
 }
 
-/// How a heavy command runs more than one job at once, or null when it runs one (or sets a count
-/// it can't read, such as `-j"$N"`).
-fn tooParallel(a: std.mem.Allocator, w: []const []const u8) ?[]const u8 {
+/// How a heavy command runs more jobs at once than its task's `width` tokens (one, unless the run
+/// has -j K), or null when it runs no more (or sets a count it can't read, such as `-j"$N"`).
+fn tooParallel(a: std.mem.Allocator, w: []const []const u8, width: u32) ?[]const u8 {
     const tool = toolOf(w);
     var i: usize = 1;
     while (i < w.len) : (i += 1) {
@@ -258,7 +267,7 @@ fn tooParallel(a: std.mem.Allocator, w: []const []const u8) ?[]const u8 {
         const text = std.mem.join(a, " ", w[i .. i + j.words]) catch w[i];
         if (std.fmt.parseInt(u32, j.value, 10)) |n| {
             // `pytest -n 0` runs the tests in its own process.
-            if (n == 1 or (n == 0 and isSerial(tool))) return null;
+            if ((n >= 1 and n <= width) or (n == 0 and isSerial(tool))) return null;
             if (n == 0) return a.print("`{s}` sets no limit on jobs", .{text}) catch text;
             return a.print("`{s}` runs {d} jobs at once", .{ text, n }) catch text;
         } else |_| {
@@ -1108,6 +1117,11 @@ test "inside cpuq run, a task runs one job" {
     try std.testing.expect(refused("cpuq run --label a:b -- make -j install"));
     try std.testing.expect(refused("cpuq run --label a:b -- sh -c 'zig build -j16 test'"));
     try std.testing.expect(refused("cpuq run --label a:b -- cargo build -j 16"));
+    // -j K: each task holds K CPUs, so its command may run K jobs, and no more.
+    try std.testing.expect(!refused("cpuq run -j 2 --label a:b -- zig build -j2"));
+    try std.testing.expect(!refused("cpuq run -j=4 --label a:b -- make -j 3"));
+    try std.testing.expect(refused("cpuq run -j 2 --label a:b -- zig build -j8"));
+    try std.testing.expect(refused("cpuq run -j 2 --label a:b -- zig build"));
     try std.testing.expect(refused("cpuq run --label a:b -- pytest -n auto"));
     try std.testing.expect(refused("cpuq run --label a:b -- python3 -m pytest -n 4"));
     try std.testing.expect(refused("cpuq run --label a:b -- ninja -j0"));

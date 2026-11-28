@@ -38,6 +38,8 @@ pub const RunOptions = struct {
     timeout_s: ?u32 = null,
     /// `-r N`: tries again for a task that failed.
     retries: u32 = 0,
+    /// `-j K`: the tokens each task holds, all at once.
+    width: u32 = 1,
     /// `--urgent`: its first task goes ahead of the line ("rebuild first").
     urgent: bool = false,
     /// `--driver`: a runner that only starts other `cpuq run`s: it is no task itself.
@@ -49,7 +51,7 @@ pub const RunOptions = struct {
 const max_returns = 8;
 
 /// The options `cpuq run` takes a value for.
-const value_options = [_][]const u8{ "--label", "--note", "--return", "--on", "--include", "--repo", "-n", "-c", "-t", "-r", "--wait-max" };
+const value_options = [_][]const u8{ "--label", "--note", "--return", "--on", "--include", "--repo", "-n", "-c", "-j", "-t", "-r", "--wait-max" };
 
 /// Parses `cpuq run`'s command line; null after saying what is wrong.
 pub fn parseRun(args: []const [:0]const u8) ?RunOptions {
@@ -100,6 +102,11 @@ pub fn parseRun(args: []const [:0]const u8) ?RunOptions {
             }
             o.cpus = n;
             o.cpus_percent = pct;
+        } else if (std.mem.eql(u8, name, "-j")) {
+            o.width = policy.parseCount(value) orelse {
+                _ = usageError("-j needs the tokens each task holds, a whole number of at least 1, not '{s}'", .{value});
+                return null;
+            };
         } else if (std.mem.eql(u8, name, "-t")) {
             o.timeout_s = policy.parseAge(value) orelse {
                 _ = usageError("-t needs a time limit such as 30s, 10m or 2h (off: none), not '{s}'", .{value});
