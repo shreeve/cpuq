@@ -11,6 +11,8 @@ notes, shown by the update dialog too.
   sawtooth, and the newest column fell to zero until its first poll. Such a column now carries
   the latest reading before it (up to 5 minutes for the machine's own readings), and the app
   keeps App Nap from slowing its polls while its window is open.
+- The newest column, still filling, is drawn at its height so far, not as a fraction of its
+  final height: the right edge no longer climbs from zero every 30 seconds.
 
 ## 0.24.0 — 2026-11-27
 
