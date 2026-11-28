@@ -243,11 +243,15 @@ A run starts its next task when the line lets it:
 - **Fair share.** A project's share is F = T × its weight ÷ the weights of the projects with
   tasks running or waiting. Weights are per project, `weights = rig:2 trig:1` in the config; a
   project not named weighs 1.
-- **Under its share,** a project starts its next task at once, however busy the machine is. The
-  kernel gives it its share of CPU time; nobody's task is stopped for it.
+- **Under its share,** a project starts its next task at once, however busy the machine is
+  (only a gate, its `-c` or the 4T backstop holds it). The kernel gives it its share of CPU time;
+  nobody's task is stopped for it.
 - **Over its share,** a run starts a task only while the machine has room: busy + starting <
   T − 0.5. Only the first such waiter in line takes it: an `--urgent` run's first task, then the
-  project running the fewest tasks for its weight, then the older ticket. A task that waits on
+  project running the fewest tasks for its weight, then the run running the fewest, then the run
+  whose last task started longest ago, then the older ticket. Within a project the same order
+  picks which run starts the project's next task, so a long `-n` run never keeps a newer run of
+  its project waiting. A task that waits on
   I/O leaves room, and more start.
   - **busy** is the CPUs the running tasks keep busy (each task's process-tree CPU time, from one
     machine-wide sample that whichever cpuq finds it a second old renews), plus, with
@@ -349,8 +353,9 @@ waits.
   then stops every other cpuq task (`SIGSTOP`), and continues them when it ends (on macOS through
   the pause plan, as room allows). CMD runs unpinned on the stopped machine.
 
-A drain's turn comes after the runs queued before it that have tasks waiting, and after older
-drains, and for `-c` the half-pool bound; it passes no older waiter. Runs that queue after it
+A drain's turn comes after the runs queued before it that wait with no task running yet, after
+older drains, and for `-c` after the half-pool bound; it passes no such waiter. A run already
+running tasks goes on beside it. Runs that queue after it
 don't wait for it. `--max T` (`90s`, `10m`) gives up if its turn hasn't come by then (exit 75),
 and nothing runs. Ctrl-Z on a drain ends its isolation; continued, it takes its turn again
 before its command continues.

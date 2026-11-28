@@ -271,8 +271,9 @@ stopped drain ends its isolation; continued, it takes its turn again before its 
 limit. It gathers nothing and holds nothing while it waits; it takes its turn, and then isolates
 at once. `drainMayStart` answers:
 
-- **`older_waiter`:** an operation queued before it has tasks waiting: a drain passes no older
-  waiter.
+- **`older_waiter`:** an operation queued before it waits with no task running: a drain passes
+  no such waiter (an operation already running tasks takes the rest of its turn beside the
+  drain, so a long run never holds a drain back).
 - **`older_drain`:** an older drain waits too: drains go in their order.
 - **`half_pool`:** its CPUs would take all `-c` drains' isolation past half the pool
   (`drainRoom`: at least one). `cpuq drain -c N` with N above half the pool is a usage error.
@@ -414,11 +415,12 @@ src/pool.zig and the loop of src/op.zig as its rule sets. The properties it hold
 1. **Work-conserving:** if a task waits (not gated, under its run's `-c`), then
    `busy + starting ≥ T − 0.5`, or its project is over its share and an earlier waiter has the
    room.
-2. **No wait under share:** a project below its fair share never waits, except on a gate or its
-   `-c`.
+2. **No wait under share:** a project below its fair share never waits, except on a gate, its
+   `-c`, or the 4T backstop.
 3. **No starvation:** every waiting task starts, given that tasks end (`-t`) and gates reopen.
 4. **Drain bounded:** an isolation lasts at most its limit plus the grace. A drain waits only for
-   older drains, older waiters and the half-pool bound, and never passes an older waiter.
+   older drains, older runs waiting with no task running, and the half-pool bound, and never
+   passes such a waiter.
 5. **No idle hold:** no state where a CPU is reserved but unused while a task waits: nothing
    reserves one.
 

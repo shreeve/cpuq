@@ -300,6 +300,7 @@ pub const Pool = struct {
         const procs: []const sys.Proc = if (has_tasks) sys.processes(p.io, a) else &.{};
         var per: std.ArrayList(TaskBusy) = .empty;
         var total: f64 = 0;
+        var drains: f64 = 0;
         for (ops) |o| for (o.tasks_now) |t| {
             const cum = sys.treeCpu(procs, t.pid);
             var busy: f64 = 0;
@@ -312,6 +313,7 @@ pub const Pool = struct {
             }
             if (t.paused) busy = 0;
             total += busy;
+            if (o.drain) drains += busy;
             per.append(a, .{ .pid = t.pid, .start = t.start, .cum = cum, .busy = busy }) catch break;
         };
         const ticks = sys.cpuTicks(p.io);
@@ -319,13 +321,24 @@ pub const Pool = struct {
         if (ticks) |t| if (last) |s| if (s.ticks_total != 0 and t.total > s.ticks_total and t.busy >= s.ticks_busy) {
             machine = @as(f64, @floatFromInt(t.busy - s.ticks_busy)) / @as(f64, @floatFromInt(t.total - s.ticks_total)) * @as(f64, @floatFromInt(ncpu));
         };
+        // Linux: each CPU's busy share too, so busy can leave out the CPUs drains isolate.
+        var cpus: std.ArrayList(CpuBusy) = .empty;
+        if (sys.numberedTicks(p.io, a)) |nt| for (nt) |t| {
+            var frac: f64 = 0;
+            if (last) |s| for (s.cpus) |q| if (q.cpu == t.cpu and t.total > q.total) {
+                frac = @as(f64, @floatFromInt(t.busy -| q.busy)) / @as(f64, @floatFromInt(t.total - q.total));
+            };
+            cpus.append(a, .{ .cpu = t.cpu, .busy = t.busy, .total = t.total, .frac = frac }) catch break;
+        };
         const s: Sample = .{
             .ms = now,
             .ticks_busy = if (ticks) |t| t.busy else 0,
             .ticks_total = if (ticks) |t| t.total else 0,
             .machine = machine,
             .tasks = total,
+            .drains = drains,
             .per = per.items,
+            .cpus = cpus.items,
         };
         var out: std.ArrayList(u8) = .empty;
         s.format(a, &out) catch return;
@@ -379,9 +392,12 @@ pub const Sample = struct {
     ticks_total: u64 = 0,
     /// The machine's busy CPUs over the interval before it; null for a first sample.
     machine: ?f64 = null,
-    /// cpuq's tasks' busy CPUs over that interval, all of them.
+    /// cpuq's tasks' busy CPUs over that interval, all of them, and those of drains' commands.
     tasks: f64 = 0,
+    drains: f64 = 0,
     per: []const TaskBusy = &.{},
+    /// Linux: each online CPU's ticks then, and its busy share over the interval.
+    cpus: []const CpuBusy = &.{},
 
     pub fn find(s: Sample, pid: i32, start: u64) ?TaskBusy {
         for (s.per) |t| if (t.pid == pid and t.start == start) return t;
@@ -391,8 +407,9 @@ pub const Sample = struct {
     fn format(s: Sample, a: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
         try out.print(a, "{d} {d} {d} ", .{ s.ms, s.ticks_busy, s.ticks_total });
         if (s.machine) |m| try out.print(a, "{d:.3}", .{m}) else try out.append(a, '-');
-        try out.print(a, " {d:.3}\n", .{s.tasks});
+        try out.print(a, " {d:.3} {d:.3}\n", .{ s.tasks, s.drains });
         for (s.per) |t| try out.print(a, "{d} {d} {d} {d:.3}\n", .{ t.pid, t.start, t.cum, t.busy });
+        for (s.cpus) |c| try out.print(a, "c {d} {d} {d} {d:.3}\n", .{ c.cpu, c.busy, c.total, c.frac });
     }
 
     fn parse(a: std.mem.Allocator, text: []const u8) ?Sample {
@@ -405,9 +422,21 @@ pub const Sample = struct {
         const m = f.next() orelse return null;
         s.machine = std.fmt.parseFloat(f64, m) catch null;
         s.tasks = std.fmt.parseFloat(f64, f.next() orelse "0") catch 0;
+        s.drains = std.fmt.parseFloat(f64, f.next() orelse "0") catch 0;
         var per: std.ArrayList(TaskBusy) = .empty;
+        var cpus: std.ArrayList(CpuBusy) = .empty;
         while (lines.next()) |line| {
             var g = std.mem.tokenizeScalar(u8, line, ' ');
+            if (std.mem.startsWith(u8, line, "c ")) {
+                _ = g.next();
+                cpus.append(a, .{
+                    .cpu = std.fmt.parseInt(u32, g.next() orelse continue, 10) catch continue,
+                    .busy = std.fmt.parseInt(u64, g.next() orelse continue, 10) catch continue,
+                    .total = std.fmt.parseInt(u64, g.next() orelse continue, 10) catch continue,
+                    .frac = std.fmt.parseFloat(f64, g.next() orelse continue) catch continue,
+                }) catch break;
+                continue;
+            }
             per.append(a, .{
                 .pid = std.fmt.parseInt(i32, g.next() orelse continue, 10) catch continue,
                 .start = std.fmt.parseInt(u64, g.next() orelse continue, 10) catch continue,
@@ -416,9 +445,13 @@ pub const Sample = struct {
             }) catch break;
         }
         s.per = per.items;
+        s.cpus = cpus.items;
         return s;
     }
 };
+
+/// One CPU in the sample (Linux): its ticks then, and its busy share over the interval.
+pub const CpuBusy = struct { cpu: u32, busy: u64, total: u64, frac: f64 };
 
 fn ticketOf(name: []const u8) ?u64 {
     const dash = std.mem.findScalar(u8, name, '-') orelse return null;
@@ -609,7 +642,7 @@ pub fn drainRoom(pool_n: u32) u32 {
 pub const DrainWait = enum {
     /// Its turn: it isolates now.
     go,
-    /// A run that queued before it has tasks waiting: a drain passes no older waiter.
+    /// A run that queued before it waits with no task running: a drain passes no such waiter.
     older_waiter,
     /// An older drain waits too: drains go in their order.
     older_drain,
@@ -628,7 +661,9 @@ pub fn drainMayStart(ops: []const Op, me: u64, pool_n: u32, now_ms: i64) DrainWa
     var any = false;
     for (ops) |o| {
         if (o.ticket == me) continue;
-        if (o.ticket < me and o.counts() and o.waiting > 0) return .older_waiter;
+        // 0.34's turn: a run that queued before it and waits holding nothing (no task running)
+        // goes first; one already running tasks takes the rest of its turn beside the drain.
+        if (o.ticket < me and o.counts() and o.waiting > 0 and o.running == 0) return .older_waiter;
         if (o.ticket < me and o.drain and !o.stopped and o.dstart == 0) return .older_drain;
         if (isolating(o, now_ms)) {
             any = true;
@@ -807,8 +842,9 @@ pub fn mayStart(a: std.mem.Allocator, ops: []const Op, me: u64, cx: Cx) Wait {
 /// The machine's busy CPUs as admission counts them: the running tasks' busy CPUs from the
 /// sample (tasks that ended since count no more; tasks cpuq stopped use nothing), plus, with the
 /// outside check on, the load outside cpuq beyond the CPUs the pool leaves to it (`ncpu` −
-/// `pool_n`). A drain's command is left out: its CPUs are out of the capacity.
-pub fn busyNow(ops: []const Op, s: ?Sample, outside_check: bool, ncpu: u32, pool_n: u32) f64 {
+/// `pool_n`). What drains isolate is left out: their commands, and on Linux every tick of their
+/// CPUs (other tasks are kept off them), as those CPUs are out of the capacity.
+pub fn busyNow(a: std.mem.Allocator, ops: []const Op, s: ?Sample, outside_check: bool, ncpu: u32, pool_n: u32, now_ms: i64) f64 {
     const sample = s orelse return 0;
     var tasks: f64 = 0;
     for (ops) |o| if (o.counts()) for (o.tasks_now) |t| {
@@ -816,8 +852,20 @@ pub fn busyNow(ops: []const Op, s: ?Sample, outside_check: bool, ncpu: u32, pool
         if (sample.find(t.pid, t.start)) |b| tasks += b.busy;
     };
     if (!outside_check) return tasks;
-    const machine = sample.machine orelse return tasks;
-    const outside = @max(0, machine - sample.tasks);
+    var outside: f64 = 0;
+    if (sample.cpus.len != 0) {
+        // Linux: the CPUs not isolated, less the tasks that run there (all but drains').
+        const iso = isolated(a, ops, now_ms);
+        var machine: f64 = 0;
+        for (sample.cpus) |c| if (std.mem.findScalar(u32, iso, c.cpu) == null) {
+            machine += c.frac;
+        };
+        outside = @max(0, machine - (sample.tasks - sample.drains));
+    } else {
+        // macOS: the whole machine, less every task (drains' commands included).
+        const machine = sample.machine orelse return tasks;
+        outside = @max(0, machine - sample.tasks);
+    }
     const spill = @max(0, outside - @as(f64, @floatFromInt(ncpu -| pool_n)));
     return tasks + spill;
 }
@@ -1096,11 +1144,15 @@ test "drains: isolation, the half-pool bound, and the turn" {
     d3.limit = 2;
     try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{ d1, d3 }, 2, 8, now));
     try std.testing.expectEqualSlices(u32, &.{ 5, 4 }, pickDrainCpus(a, &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, &.{ 6, 7 }, 2));
-    // A run older than the drain with tasks waiting goes first; a newer one doesn't hold it.
+    // A run older than the drain waiting with no task running goes first; one running tasks
+    // already, or a newer one, doesn't hold it.
     const old: Op = .{ .ticket = 1, .project = "rig", .waiting = 1 };
     const young: Op = .{ .ticket = 3, .project = "rig", .waiting = 1 };
     try std.testing.expectEqual(DrainWait.older_waiter, drainMayStart(&.{ old, d3 }, 2, 8, now));
     try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{ d3, young }, 2, 8, now));
+    var busy_old = old;
+    busy_old.running = 3;
+    try std.testing.expectEqual(DrainWait.go, drainMayStart(&.{ busy_old, d3 }, 2, 8, now));
     // An older drain waiting goes first; --all waits for any drain running.
     const w1: Op = .{ .ticket = 1, .drain = true, .limit = 1, .waiting = 1 };
     try std.testing.expectEqual(DrainWait.older_drain, drainMayStart(&.{ w1, d3 }, 2, 8, now));
@@ -1119,13 +1171,24 @@ test "drains: isolation, the half-pool bound, and the turn" {
     try std.testing.expectEqual(8, capacity(&.{stopped}, 8, now));
 }
 
-test "busy: tasks from the sample, outside load beyond the CPUs left to it" {
+test "busy: tasks from the sample, outside load beyond the CPUs left to it, isolated CPUs left out" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
     const ops = [_]Op{.{ .ticket = 1, .project = "rig", .running = 2, .tasks_now = &.{ tk(1, 0), tk(2, 0) } }};
     const s: Sample = .{ .ms = 1, .machine = 7.0, .tasks = 1.5, .per = &.{ .{ .pid = 1, .start = 1, .cum = 0, .busy = 1.0 }, .{ .pid = 2, .start = 2, .cum = 0, .busy = 0.5 }, .{ .pid = 3, .start = 3, .cum = 0, .busy = 1 } } };
     // Outside: 7 - 1.5 = 5.5 busy, the pool leaves 2 of 10 CPUs to it: 3.5 spills in.
-    try std.testing.expectApproxEqAbs(5.0, busyNow(&ops, s, true, 10, 8), 1e-9);
-    try std.testing.expectApproxEqAbs(1.5, busyNow(&ops, s, false, 10, 8), 1e-9);
-    try std.testing.expectEqual(0, busyNow(&ops, null, true, 10, 8));
+    try std.testing.expectApproxEqAbs(5.0, busyNow(a, &ops, s, true, 10, 8, 0), 1e-9);
+    try std.testing.expectApproxEqAbs(1.5, busyNow(a, &ops, s, false, 10, 8, 0), 1e-9);
+    try std.testing.expectEqual(0, busyNow(a, &ops, null, true, 10, 8, 0));
+    // Linux, 4 CPUs all in the pool: a drain isolates CPU 3 and keeps it busy. Its command's
+    // CPU and CPU 3's ticks count for no one: busy is the tasks' 1.5 and nothing outside.
+    const d: Op = .{ .ticket = 2, .drain = true, .limit = 1, .cpus = &.{3}, .dstart = 1, .tlimit = 600, .running = 1, .tasks_now = &.{tk(3, 0)} };
+    const lin: Sample = .{ .ms = 1, .tasks = 2.5, .drains = 1.0, .per = s.per, .cpus = &.{
+        .{ .cpu = 0, .busy = 0, .total = 0, .frac = 1.0 }, .{ .cpu = 1, .busy = 0, .total = 0, .frac = 0.5 },
+        .{ .cpu = 2, .busy = 0, .total = 0, .frac = 0.0 }, .{ .cpu = 3, .busy = 0, .total = 0, .frac = 1.0 },
+    } };
+    try std.testing.expectApproxEqAbs(1.5, busyNow(a, &.{ ops[0], d }, lin, true, 4, 4, 2), 1e-9);
 }
 
 test "pause plan: stop the newest of the project furthest over its share, continue when room returns" {

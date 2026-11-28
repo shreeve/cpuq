@@ -23,7 +23,7 @@ and a drain no longer gathers any.
   than T + 0.5 CPUs busy, and continues them when room returns. `-t` counts only time a task
   runs.
 - **A drain takes its turn, then isolates at once.** `cpuq drain -c N` waits only for older
-  runs with tasks waiting, older drains and the half-pool bound; then N CPUs are isolated: its
+  runs waiting with no task running, older drains and the half-pool bound; then N CPUs are isolated: its
   command is pinned to them (Linux), and others' tasks are kept off them (Linux) or stopped as
   needed (macOS). Nothing is gathered or held while it waits. `--all` stops every other task, for
   at most 20 minutes. Ctrl-Z on a drain ends its isolation. A drain isolates at most its limit

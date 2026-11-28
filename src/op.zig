@@ -775,7 +775,7 @@ fn look(r: *Run) void {
     const now = sys.monoMs();
     const sample = r.pool.readSample(a);
     const pool_n: u32 = @intCast(r.pool_cpus.len);
-    const cx: pool_mod.Cx = .{ .pool_n = pool_n, .busy = pool_mod.busyNow(ops, sample, r.ctx.cfg.outside_check, r.ncpu, pool_n), .now_ms = now };
+    const cx: pool_mod.Cx = .{ .pool_n = pool_n, .busy = pool_mod.busyNow(a, ops, sample, r.ctx.cfg.outside_check, r.ncpu, pool_n, now), .now_ms = now };
     var repin = false;
     var began = false;
     var head = false;
@@ -872,7 +872,7 @@ fn sameSet(x: []const u32, y: []const u32) bool {
 fn wakeReady(r: *Run, a: std.mem.Allocator, ops: []const Op, sample: ?pool_mod.Sample) void {
     const now = sys.monoMs();
     const pool_n: u32 = @intCast(r.pool_cpus.len);
-    const cx: pool_mod.Cx = .{ .pool_n = pool_n, .busy = pool_mod.busyNow(ops, sample, r.ctx.cfg.outside_check, r.ncpu, pool_n), .now_ms = now };
+    const cx: pool_mod.Cx = .{ .pool_n = pool_n, .busy = pool_mod.busyNow(a, ops, sample, r.ctx.cfg.outside_check, r.ncpu, pool_n, now), .now_ms = now };
     for (ops) |o| {
         if (o.ticket == r.rec.ticket or o.waiting == 0 or o.stopped) continue;
         const ready = if (o.drain) pool_mod.drainMayStart(ops, o.ticket, pool_n, now) == .go else pool_mod.mayStart(a, ops, o.ticket, cx) == .go;

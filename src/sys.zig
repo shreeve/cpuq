@@ -217,6 +217,34 @@ pub fn perCpuTicks(io: Io, a: std.mem.Allocator) ?[]Ticks {
     return if (list.items.len == 0) null else list.items;
 }
 
+/// Linux: each online CPU's time so far, by its number (the cpuN lines of /proc/stat). Null
+/// elsewhere, where a CPU's number names no CPU anything is kept on.
+pub fn numberedTicks(io: Io, a: std.mem.Allocator) ?[]NumberedTicks {
+    if (is_darwin) return null;
+    const buf = a.alloc(u8, 64 << 10) catch return null;
+    const text = Io.Dir.cwd().readFile(io, "/proc/stat", buf) catch return null;
+    var list: std.ArrayList(NumberedTicks) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len < 4 or !std.mem.startsWith(u8, line, "cpu") or !std.ascii.isDigit(line[3])) continue;
+        var f = std.mem.tokenizeScalar(u8, line, ' ');
+        const cpu = std.fmt.parseInt(u32, (f.next() orelse continue)[3..], 10) catch continue;
+        var total: u64 = 0;
+        var idle: u64 = 0;
+        var i: usize = 0;
+        while (f.next()) |v| : (i += 1) {
+            if (i >= 8) break;
+            const n = std.fmt.parseInt(u64, v, 10) catch 0;
+            total += n;
+            if (i == 3 or i == 4) idle += n;
+        }
+        list.append(a, .{ .cpu = cpu, .busy = total - idle, .total = total }) catch return null;
+    }
+    return if (list.items.len == 0) null else list.items;
+}
+
+pub const NumberedTicks = struct { cpu: u32, busy: u64, total: u64 };
+
 /// The share of all CPUs busy between two readings, 0 to 1.
 pub fn busyBetween(a: Ticks, b: Ticks) ?f64 {
     if (b.total <= a.total) return null;

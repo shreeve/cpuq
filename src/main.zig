@@ -94,12 +94,12 @@ const usage =
     \\                        .git included (also listed in the repo's .cpuqinclude)
     \\
     \\commands:
-    \\  drain                 for timing: after the runs queued before it, N CPUs (-c N, at most
-    \\                        half the pool) are isolated for CMD at once: pinned on Linux
-    \\                        (CPUQ_CPUS lists them), others' tasks kept off them; macOS stops
-    \\                        others' tasks while they would crowd the rest. --all stops every
-    \\                        other task (at most 20m); --max T gives up (exit 75); -t T ends
-    \\                        CMD (exit 124; default 20m, at most 2h)
+    \\  drain                 for timing: after the runs queued before it that run nothing yet,
+    \\                        N CPUs (-c N, at most half the pool) are isolated for CMD at
+    \\                        once: pinned on Linux (CPUQ_CPUS lists them), others' tasks kept
+    \\                        off them; macOS stops others' tasks while they would crowd the
+    \\                        rest. --all stops every other task (at most 20m); --max T gives
+    \\                        up (exit 75); -t T ends CMD (exit 124; default 20m, at most 2h)
     \\  kill                  end a run here: SIGTERM to its tasks, SIGKILL 5 s later
     \\  limit                 change a running run's -c (a count or 50%): raised, it starts
     \\                        more as the line allows; lowered, it starts none till fewer run

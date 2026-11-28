@@ -64,7 +64,7 @@ branch names: history is kept by label.
 
     cpuq drain -c 4 --label app:bench --max 10m -t 20m -- ./bench
 
-A drain takes its turn (the runs queued before it go first), then at once isolates N CPUs for CMD:
+A drain takes its turn (runs queued before it that wait with no task running go first), then at once isolates N CPUs for CMD:
 pinned on Linux, others' tasks kept off them; the rest of the machine keeps working. Use
 `$CPUQ_CPUS`, never a `taskset` of your own. `-c` is as many CPUs as the measurement uses, at most
 half the pool. `--all` stops every other task, for at most 20 min: rarely. `-t` ends it (default 20m, at most 2h); one round of timing per drain. A

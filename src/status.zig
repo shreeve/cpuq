@@ -395,7 +395,7 @@ fn collect(ctx: *Ctx, measure: bool) JsonStatus {
     const t = pool_mod.capacity(ops, pool_n, now_ms);
     const all_drain = pool_mod.allDrain(ops, now_ms);
     const gate = gateNow(ctx, a, all_drain);
-    const line_busy = pool_mod.busyNow(ops, sample, ctx.cfg.outside_check, ncpu, pool_n);
+    const line_busy = pool_mod.busyNow(a, ops, sample, ctx.cfg.outside_check, ncpu, pool_n, now_ms);
     const room = @as(f64, @floatFromInt(t)) - pool_mod.headroom - line_busy - @as(f64, @floatFromInt(pool_mod.starting(ops, now_ms)));
 
     var running: u32 = 0;
