@@ -701,6 +701,11 @@ pub fn pickDrain(a: std.mem.Allocator, order: []const u32, topo: []const @import
     const want = if (named.len != 0) named else order;
     for (want) |cpu| {
         if (named.len == 0 and pin.items.len >= n) break;
+        // A named CPU that is a sibling of one named before it is this drain's already.
+        if (named.len != 0 and std.mem.findScalar(u32, all.items, cpu) != null) {
+            pin.append(a, cpu) catch return null;
+            continue;
+        }
         if (!free.core(topo, taken, all.items, cpu)) {
             if (named.len != 0) return null;
             continue;
@@ -713,6 +718,28 @@ pub fn pickDrain(a: std.mem.Allocator, order: []const u32, topo: []const @import
     }
     if (named.len == 0 and pin.items.len < n) return null;
     return .{ .pin = pin.items, .cpus = all.items };
+}
+
+test "a named drain takes both threads of a core" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Core = @import("cpus.zig").Core;
+    // pup: 0 and 5 share a core, 1-2, 3-4 likewise; 13 has none.
+    const topo = [_]Core{
+        .{ .cpu = 0, .siblings = &.{5} }, .{ .cpu = 5, .siblings = &.{0} },
+        .{ .cpu = 1, .siblings = &.{2} }, .{ .cpu = 2, .siblings = &.{1} },
+        .{ .cpu = 3, .siblings = &.{4} }, .{ .cpu = 4, .siblings = &.{3} },
+        .{ .cpu = 13, .siblings = &.{} },
+    };
+    const p = pickDrain(a, &.{}, &topo, &.{}, 7, &.{ 0, 1, 2, 3, 4, 5, 13 }).?;
+    try std.testing.expectEqual(7, p.pin.len);
+    try std.testing.expectEqual(7, p.cpus.len);
+    // Naming one thread of a core isolates its sibling too.
+    const q = pickDrain(a, &.{}, &topo, &.{}, 2, &.{ 0, 1 }).?;
+    try std.testing.expectEqual(4, q.cpus.len);
+    // A named CPU another drain holds: none.
+    try std.testing.expectEqual(null, pickDrain(a, &.{}, &topo, &.{2}, 1, &.{1}));
 }
 
 /// How many of `cpus` are the pool's.

@@ -2,6 +2,12 @@
 
 User-visible changes to cpuq. Each version's section is its release notes.
 
+## 0.40.1 — 2026-11-27
+
+- **`cpuq drain --cpus` takes both threads of a core.** A named list holding a CPU and its SMT
+  sibling (pup's `--cpus 0-11,13`) was refused as "too few whole cores": the sibling, already
+  taken for the first CPU, read as taken by someone else.
+
 ## 0.40.0 — 2026-11-27
 
 CPUs are contested, not owned. cpuq bounds how many tasks run; the kernel shares CPU time among
