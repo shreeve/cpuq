@@ -527,16 +527,50 @@ t_drain_turn() {
 j = {x["label"]: x for x in json.load(sys.stdin)}
 print("ok" if j["t:older"]["started"] < j["t:drain"]["started"] else "wrong")')
   check "an older run starts before the drain (${why:-no turn shown}; by history $order: $got)" "[ '$order' = ok ] && [ -n '$why' ]"
-  # Drains of a few CPUs isolate at most half the pool together: on a pool of 4, a drain of 2
-  # runs, and one of 1 waits for it.
-  setup drain_half "budget = 4"
-  if [ "$(poolcpus | wc -w | tr -d ' ')" -lt 4 ]; then echo "  skipped: needs 4 CPUs for a pool of 4"; return; fi
+  # Drains isolate at most drain_max of the pool together (half by default), a drain's CPUs
+  # counting with their SMT siblings: a second drain that would pass it waits for the first, and
+  # starts once it ends. On a pool of 4, its size is set from what the first isolates (1 CPU, or a
+  # whole core of 2), so it always needs the cap's room. On Linux with SMT, again on a pool of two
+  # whole cores.
+  half_case drain_half "budget = 4"
+  if [ "$(uname)" = Linux ]; then
+    local cores; cores=$(python3 -c '
+import glob, re
+seen, out = set(), []
+def cpus(t):
+    s = []
+    for p in t.split(","):
+        a, _, b = p.partition("-"); s += range(int(a), int(b or a) + 1)
+    return s
+for f in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*/topology/thread_siblings_list"), key=lambda f: int(re.search(r"cpu(\d+)/", f).group(1))):
+    sib = tuple(cpus(open(f).read().strip()))
+    if len(sib) >= 2 and sib not in seen:
+        seen.add(sib); out.append(sib[:2])
+    if len(out) == 2: break
+if len(out) == 2: print(",".join(str(c) for c in (out[0][0], out[1][0], out[0][1], out[1][1])))')
+    if [ -n "$cores" ]; then half_case drain_half_smt "cpus = $cores" "budget = 4"; else echo "  skipped: no SMT here"; fi
+  fi
+}
+
+# half_case NAME [config lines]: drain_turn's half-pool case on the pool its config makes.
+half_case() {
+  local name=$1; shift
+  setup "$name" "$@"
+  if [ "$(poolcpus | wc -w | tr -d ' ')" -lt 4 ]; then echo "  skipped: needs a pool of 4"; return; fi
   local g=$T/half
-  "$CPUQ" drain -c 2 --max 20s --label h:two -- sh -c "echo two-start >>$g; sleep 1.5; echo two-end >>$g" & local d2=$!
-  wait_line "$g" two-start
-  "$CPUQ" drain -c 1 --max 20s --label h:one -- sh -c "echo one-start >>$g" & local d1=$!
-  wait $d2 $d1
-  check "drains isolate at most half the pool: the second waits for the first ($(tr '\n' ' ' <"$g"))" "[ \"\$(tr '\n' ' ' <$g)\" = 'two-start two-end one-start ' ]"
+  "$CPUQ" drain -c 1 --max 20s --label h:first -- sh -c "echo first-start >>$g; sleep 2; echo first-end \$(python3 -c 'import time; print(time.time())') >>$g" & local d1=$!
+  wait_line "$g" first-start
+  local k; k=$(sj 'len(set(s["isolated"]) & set(s["pool"]))')
+  local c2=2; [ "${k:-1}" -ge 2 ] && c2=1
+  "$CPUQ" drain -c $c2 --max 20s --label h:second -- sh -c "echo second-start \$(python3 -c 'import time; print(time.time())') >>$g" & local d2=$!
+  local r1 r2; wait $d1; r1=$?; wait $d2; r2=$?
+  local order gap; order=$(cut -d' ' -f1 <"$g" | tr '\n' ' ')
+  gap=$(python3 -c "
+import sys
+t = {l.split()[0]: float(l.split()[1]) for l in open('$g') if len(l.split()) > 1}
+print('%.1f' % (t['second-start'] - t['first-end']) if len(t) == 2 else 'none')")
+  check "drains isolate at most drain_max: the first isolates $k of the pool ($(poolcpus)), a second of -c $c2 waits for it, and starts ${gap}s after it ends (rc $r1 $r2: $order)" \
+    "[ $r1 = 0 ] && [ $r2 = 0 ] && [ '$order' = 'first-start first-end second-start ' ] && fl '$gap < 2.5'"
 }
 
 t_drain_part() {
