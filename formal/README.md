@@ -46,6 +46,8 @@ It fails if a ranking no longer exists (a weakly fair run that starves, the sear
 | `CpuqModel/CertGen.lean`, `scripts/GenCerts.lean` | Writes the certificates from the search (compiled code; nothing it does is trusted) |
 | `CpuqModel/Certs/*.lean` | The certificates, written by `scripts/GenCerts.lean`, each with the theorems the kernel checks |
 | `CpuqModel/Served.lean` | Waiters and drains served, proved for the configurations certified |
+| `CpuqModel/Contest.lean` | 0.40.0, contested CPUs: the admission rules; the five properties proved for every configuration with two rule changes, and the gaps of the design as written as reachable states |
+| `CpuqModel/Contest035.lean` | The slot rules before 0.40.0 hold a CPU idle while a task waits (a reachable state of `moveX` under `Rules.released`) |
 
 ## The model
 
@@ -335,6 +337,73 @@ that queued after `w` never passes it (`released_no_younger_pass`). A certificat
 past the search's sizes: the kernel checks one in minutes and gigabytes for a few thousand states.
 
 The timed bound (L4) is not done.
+
+## 0.40.0: contested CPUs (`Contest.lean`)
+
+DESIGN-0.40.md replaces slots with admission: cpuq decides how many tasks run, never which CPU
+they hold. `Contest.lean` is a model of its own, smaller than the slot model: per run its tasks
+waiting and its running tasks, each starting, computing or blocked; per drain waiting, started
+(its CPUs isolated) or over, its age and idle count in ticks; the gates; the CPUs busy outside
+cpuq. Busy is abstract: a computing task is one CPU, a blocked one none, and which it is changes
+at any time (`block`, `wake`), as a drain's command (`dbusy`). The kernel's sharing of time
+(cgroup weights, macOS SIGSTOP balancing) is below the model.
+
+Each action is one atomic step and ends with the admission pass (`pass`): drains, then runs,
+start until none may (`canDrain`, `canStart`). A run starts a task when it waits, its `-c`
+allows, the gates are open, fewer than 4T run, it is its project's first waiter (an urgent run's
+first task, then fewest tasks running, then the oldest last start with a run that never started
+first, then ticket: `projFirst`), and its project is under share (`running_p × W < T × w_p`)
+or there is room (`busy + starting + 1 ≤ T`, which is `< T − 0.5` in whole CPUs) and it is first
+in line among the projects' first waiters (an urgent run's first task, then project running ÷
+weight, then fewer tasks running, then ticket: `head`). A drain starts when no older drain waits, at
+most `drainMax` CPUs (`drain_max`, default half the pool) are then isolated, the gates are open, and (`drainFifo`) no older run waits
+holding nothing. Drains are `-c N` only (0.40.0 has no `--all`), N a fixed size with the chosen
+CPUs' SMT siblings counted, and no theorem depends on which CPUs they are. A tick measures every started task (starting → computing) and ages every
+started drain; past limit + grace, or idle more than `idleMax` ticks in a row while something
+waits, it is over.
+
+`Rules.design` is the design as written; `Rules.fixed` has the two rule changes the proofs need:
+busy counts only the CPUs no drain isolates (`busyAll` off), and a drain waits for older runs
+that hold nothing (`drainFifo`). Every theorem below holds for every configuration, by proof; no
+search is involved. Axioms: `propext`, `Classical.choice`, `Quot.sound` (pinned at the end of the
+file).
+
+| Property | Theorem | Holds |
+|---|---|---|
+| Invariant: nothing that may start waits; ≤ `drainMax` isolated; a started drain's age ≤ limit + grace and idle ≤ `idleMax`; ≤ 4 × pool running | `reach_inv`, `pass_closed` | any rules |
+| 1 Work-conserving: a task that waits, not held by the gates, the backstop or its `-c`, is at or over share and busy + starting ≥ T − 0.5 | `work_conserving` | `busyAll` off |
+| 1 fails as written: busy over the whole machine counts a drain's own command against a T that already excludes its CPUs; a task waits beside an idle CPU | `design_not_work_conserving` | (counterexample) |
+| 2 No wait under share: under share, a waiting task waits only on the gates or the 4T backstop (and its `-c`) | `no_wait_under` | any rules |
+| 2 as written ("only a gate or its `-c`") fails: 4T blocked tasks hold an under-share run | `backstop_blocks_under` | (counterexample) |
+| 3 No starvation: after the last arrival, if every task ends, the gates reopen and time passes, every task and every drain starts | `no_starvation` | any rules, drains ≤ `drainMax` |
+| 3 … for every run of the model: each run and drain arrives at most once, so there is always a last arrival | `Run.calm`, `no_starvation_all` | any rules, drains ≤ `drainMax` |
+| 4 Isolation bounded: through any stretch a drain stays started, ≤ limit + grace ticks pass, limit ≤ ceiling | `hold_bound` | any rules |
+| 4 FIFO: a drain starts only after every older run that waited holding nothing has a task running, and every older waiting drain has started | `drain_no_pass` | `drainFifo` |
+| 4 A waiting drain waits only on the gates, the `drainMax` bound, an older drain, or (`drainFifo`) an older run holding nothing | `drain_waits_for` | any rules |
+| 4 as written ("waits only for older drains and the half-pool bound") passes an older waiter | `design_drain_passes` | (counterexample) |
+| 4 A drain larger than `drainMax` never starts | `big_drain_never` | any rules |
+| 5 No idle hold: the CPUs withheld from tasks are exactly the started drains' sizes, ≤ `drainMax`; nothing waiting holds one; with `drainMax < pool` the others keep ≥ pool − `drainMax` ≥ 1 | `withheld`, `capT_pos` | any rules |
+| 5 A started drain whose command idles while something waits keeps its CPUs ≤ `idleMax` ticks; a started task counts as starting until the next tick | `idle_bound`, `tick_settles` | any rules |
+| 5 fails under 0.35.0: a gathering drain holds a CPU, its command not started, while a run waits holding nothing | `Contest035.idle_hold_035` | (counterexample, slot model) |
+| The line: a run starts only as its project's first waiter; over share, only with room and first in line among the projects' first waiters | `line_order` | any rules |
+| Within a project a run never starts a task while a waiter of its project comes before it: a newer run holding nothing goes before a long run, and a run that has just started goes behind the others holding nothing | `project_turn` | any rules |
+| … the long run's task ends and the newer run, never started, goes first | `newer_run_turn` | (trace) |
+| … each new run of a project goes before a run of the project that started before and waits holding nothing; a stream of new runs would hold it as long as the stream lasts | `newcomers_first` | (trace) |
+
+`no_starvation` assumes a time after which nothing arrives (`calm`), that a run with a task
+running later sees one end (`ends`, A-term), that the gates are open at times without end
+(`gates`) and that ticks keep coming (`time`), and a pool of at least one CPU. A configuration
+has finitely many runs and drains and each arrives once, so `calm` always holds
+(`no_starvation_all`). Arrivals that never stop (a stream of new runs) are not modelled and not
+proved: the 4T backstop is a shared limit that under-share starts race for, and the pass takes
+them in no order the design fixes, so a stream could take every opening ahead of one waiter.
+
+What it does not cover: CPU time between running tasks (the kernel's part); measurement noise
+and multi-threaded tasks (busy is exactly the computing tasks); separate cpuq processes racing
+(the pass is atomic: each waiter's check is assumed to see the others' starts, as `starting`
+provides); which CPUs a drain isolates (`--cpus`; its size counts the SMT siblings); retries; outside processes on isolated CPUs; the TERM before KILL (one end at
+limit + grace); the idle stop's 0.25-CPU average (idle here is the command blocked for whole
+ticks).
 
 ## What is assumed
 
